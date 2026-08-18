@@ -12,6 +12,7 @@ import platform
 import re
 import socket
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -359,17 +360,40 @@ def run_agent(token: str, port: int) -> None:
 
 
 def main():
-    # 仮の実装: このコミットの時点ではまだ --init / --join を用意していないため、
-    # 既存トークンがあればそれを、なければその場で生成したトークンを使って起動する。
-    # CLI引数によるinit/joinの切り替えは次のコミットで追加する。
     parser = argparse.ArgumentParser(description="Yoriai: ローカルLLMエージェントの自動発見・自己紹介カード交換プロトタイプ")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--init", action="store_true", help="新しいトークンを生成して組織を作成する(トークンの発行のみ行い、終了する)")
+    group.add_argument("--join", metavar="TOKEN", help="既存の組織のトークンを指定して参加し、そのまま起動する")
     parser.add_argument("--port", type=int, default=0, help="自己紹介カードを配信するHTTPポート番号(0=自動選択、既定値)")
     args = parser.parse_args()
 
-    token = config.load_token()
-    if not token:
+    if args.init:
         token = config.generate_token()
-        config.save_token(token)
+        storage = config.save_token(token)
+        storage_note = "macOS Keychain" if storage == "keychain" else f"平文ファイル({config.CONFIG_FILE})"
+        # 仮の判断: --init はトークンの発行・保存のみを行い、そのまま起動はしない。
+        # 発行したトークンを他のMacに共有してから `python yoriai.py` (このMac自身も含む)
+        # で明示的に起動する、という2段階の操作の方が事故が少ないと判断した。
+        print("新しいトークンを発行しました。このトークンを組織のメンバーに共有してください。")
+        print(f"トークン: {token}")
+        print(f"保存先: {storage_note}")
+        print("このMacでYoriaiを開始するには: python yoriai.py")
+        print("他のMacをこの組織に参加させるには: python yoriai.py --join=<上記のトークン>")
+        return
+
+    if args.join is not None:
+        token = args.join.strip()
+        if not token:
+            logger.error("--join には空でないトークンを指定してください")
+            sys.exit(1)
+        storage = config.save_token(token)
+        storage_note = "macOS Keychain" if storage == "keychain" else f"平文ファイル({config.CONFIG_FILE})"
+        logger.info("トークンを%sに保存しました。この組織のエージェントとして起動します。", storage_note)
+    else:
+        token = config.load_token()
+        if not token:
+            print(NO_TOKEN_GUIDANCE)
+            sys.exit(1)
 
     run_agent(token, args.port)
 
