@@ -12,6 +12,7 @@ import platform
 import re
 import socket
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -20,9 +21,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import requests
 from zeroconf import ServiceBrowser, ServiceInfo, Zeroconf, IPVersion
 
+import config
+
 SERVICE_TYPE = "_yoriai._tcp.local."
 OLLAMA_BASE_URL = "http://localhost:11434"
 CARD_REQUEST_TIMEOUT_SEC = 5
+ORG_FINGERPRINT_HEADER = "X-Yoriai-Org-Fingerprint"
+
+NO_TOKEN_GUIDANCE = (
+    "トークンがありません。--init で新規作成するか、"
+    "--join=<トークン> で既存の組織に参加してください"
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("yoriai")
@@ -151,12 +160,23 @@ def build_profile_card(agent_id: str) -> dict:
 
 class CardRequestHandler(BaseHTTPRequestHandler):
     agent_id = None  # start_card_serverでサブクラス化して差し込む
+    org_fingerprint = None  # 同上
 
     def do_GET(self):
         if self.path != "/card":
             self.send_response(404)
             self.end_headers()
             return
+
+        # 仮の判断: mDNS側でトークン不一致の相手はそもそも問い合わせに来ない想定だが、
+        # /card に直接アクセスされた場合の備えとして、サーバー側でも
+        # 組織フィンガープリント(トークンのSHA-256)の一致をここで再検証する。
+        requester_fingerprint = self.headers.get(ORG_FINGERPRINT_HEADER)
+        if requester_fingerprint != self.org_fingerprint:
+            self.send_response(403)
+            self.end_headers()
+            return
+
         card = build_profile_card(self.agent_id)
         body = json.dumps(card, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
@@ -170,8 +190,12 @@ class CardRequestHandler(BaseHTTPRequestHandler):
         pass
 
 
-def start_card_server(agent_id: str, port: int) -> ThreadingHTTPServer:
-    handler_cls = type("BoundCardRequestHandler", (CardRequestHandler,), {"agent_id": agent_id})
+def start_card_server(agent_id: str, org_fingerprint: str, port: int) -> ThreadingHTTPServer:
+    handler_cls = type(
+        "BoundCardRequestHandler",
+        (CardRequestHandler,),
+        {"agent_id": agent_id, "org_fingerprint": org_fingerprint},
+    )
     server = ThreadingHTTPServer(("0.0.0.0", port), handler_cls)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -195,8 +219,9 @@ def get_local_ip() -> str:
 # ---------------------------------------------------------------------------
 
 class YoriaiListener:
-    def __init__(self, self_agent_id: str):
+    def __init__(self, self_agent_id: str, self_org_fingerprint: str):
         self.self_agent_id = self_agent_id
+        self.self_org_fingerprint = self_org_fingerprint
         self.known_peers = {}
 
     def add_service(self, zc, service_type, name):
@@ -224,15 +249,27 @@ class YoriaiListener:
         if peer_agent_id == self.self_agent_id:
             return  # 自分自身の広告は無視する
 
+        device_name = properties.get("device_name", name)
+        peer_org_fingerprint = properties.get("org_fingerprint")
+        if peer_org_fingerprint != self.self_org_fingerprint:
+            # トークンが異なる相手は「別の組織のエージェント」としてログにだけ残し、
+            # カードの取得は行わない(エラーにはしない)。
+            logger.info("\U0001f512 %s は別の組織のエージェントのようです(トークン不一致のため無視します)", device_name)
+            return
+
         address = socket.inet_ntoa(info.addresses[0])
         port = info.port
-        self.known_peers[name] = {"agent_id": peer_agent_id, "device_name": properties.get("device_name", name)}
+        self.known_peers[name] = {"agent_id": peer_agent_id, "device_name": device_name}
 
         threading.Thread(target=self._fetch_and_log_card, args=(name, address, port), daemon=True).start()
 
     def _fetch_and_log_card(self, name, address, port):
         try:
-            resp = requests.get(f"http://{address}:{port}/card", timeout=CARD_REQUEST_TIMEOUT_SEC)
+            resp = requests.get(
+                f"http://{address}:{port}/card",
+                headers={ORG_FINGERPRINT_HEADER: self.self_org_fingerprint},
+                timeout=CARD_REQUEST_TIMEOUT_SEC,
+            )
             resp.raise_for_status()
             card = resp.json()
         except Exception as exc:
@@ -276,20 +313,17 @@ def pick_free_port() -> int:
         return sock.getsockname()[1]
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Yoriai: ローカルLLMエージェントの自動発見・自己紹介カード交換プロトタイプ")
-    parser.add_argument("--port", type=int, default=0, help="自己紹介カードを配信するHTTPポート番号(0=自動選択、既定値)")
-    args = parser.parse_args()
-
+def run_agent(token: str, port: int) -> None:
     if platform.system() != "Darwin":
         logger.warning("このプロトタイプはmacOS(Apple Silicon)を想定しています。他OSでは一部情報が取得できません。")
 
     agent_id = str(uuid.uuid4())
+    org_fingerprint = config.token_fingerprint(token)
     short_hostname = get_short_hostname()
     local_ip = get_local_ip()
-    port = args.port if args.port else pick_free_port()
+    port = port if port else pick_free_port()
 
-    server = start_card_server(agent_id, port)
+    server = start_card_server(agent_id, org_fingerprint, port)
     logger.info("自己紹介カードサーバーを起動しました: http://%s:%s/card", local_ip, port)
 
     zeroconf = Zeroconf(ip_version=IPVersion.V4Only)
@@ -300,14 +334,17 @@ def main():
         service_name,
         addresses=[socket.inet_aton(local_ip)],
         port=port,
-        properties={"agent_id": agent_id, "device_name": short_hostname},
+        # 仮の判断: mDNSのTXTレコードには生トークンではなくSHA-256のフィンガープリントだけを載せる。
+        # TXTレコードは同一ネットワーク上の誰からでも読めるため、生トークンを流すと
+        # 「トークンによる参加制限」の意味が薄れてしまうため。
+        properties={"agent_id": agent_id, "device_name": short_hostname, "org_fingerprint": org_fingerprint},
         server=f"{short_hostname}.local.",
     )
 
     logger.info("mDNSにサービスを登録します: %s", service_name)
     zeroconf.register_service(service_info)
 
-    listener = YoriaiListener(agent_id)
+    listener = YoriaiListener(agent_id, org_fingerprint)
     ServiceBrowser(zeroconf, SERVICE_TYPE, listener)
 
     logger.info("同じネットワーク上のYoriaiエージェントを探索しています... (Ctrl+Cで終了)")
@@ -320,6 +357,45 @@ def main():
         zeroconf.unregister_service(service_info)
         zeroconf.close()
         server.shutdown()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Yoriai: ローカルLLMエージェントの自動発見・自己紹介カード交換プロトタイプ")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--init", action="store_true", help="新しいトークンを生成して組織を作成する(トークンの発行のみ行い、終了する)")
+    group.add_argument("--join", metavar="TOKEN", help="既存の組織のトークンを指定して参加し、そのまま起動する")
+    parser.add_argument("--port", type=int, default=0, help="自己紹介カードを配信するHTTPポート番号(0=自動選択、既定値)")
+    args = parser.parse_args()
+
+    if args.init:
+        token = config.generate_token()
+        storage = config.save_token(token)
+        storage_note = "macOS Keychain" if storage == "keychain" else f"平文ファイル({config.CONFIG_FILE})"
+        # 仮の判断: --init はトークンの発行・保存のみを行い、そのまま起動はしない。
+        # 発行したトークンを他のMacに共有してから `python yoriai.py` (このMac自身も含む)
+        # で明示的に起動する、という2段階の操作の方が事故が少ないと判断した。
+        print("新しいトークンを発行しました。このトークンを組織のメンバーに共有してください。")
+        print(f"トークン: {token}")
+        print(f"保存先: {storage_note}")
+        print("このMacでYoriaiを開始するには: python yoriai.py")
+        print("他のMacをこの組織に参加させるには: python yoriai.py --join=<上記のトークン>")
+        return
+
+    if args.join is not None:
+        token = args.join.strip()
+        if not token:
+            logger.error("--join には空でないトークンを指定してください")
+            sys.exit(1)
+        storage = config.save_token(token)
+        storage_note = "macOS Keychain" if storage == "keychain" else f"平文ファイル({config.CONFIG_FILE})"
+        logger.info("トークンを%sに保存しました。この組織のエージェントとして起動します。", storage_note)
+    else:
+        token = config.load_token()
+        if not token:
+            print(NO_TOKEN_GUIDANCE)
+            sys.exit(1)
+
+    run_agent(token, args.port)
 
 
 if __name__ == "__main__":
