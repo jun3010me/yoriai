@@ -16,17 +16,27 @@ import sys
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
-from zeroconf import ServiceBrowser, ServiceInfo, Zeroconf, IPVersion
+from zeroconf import ServiceBrowser, ServiceInfo, Zeroconf, IPVersion, InterfaceChoice
 
 import config
+import tailscale
 
 SERVICE_TYPE = "_yoriai._tcp.local."
 OLLAMA_BASE_URL = "http://localhost:11434"
 CARD_REQUEST_TIMEOUT_SEC = 5
 ORG_FINGERPRINT_HEADER = "X-Yoriai-Org-Fingerprint"
+HEARTBEAT_INTERVAL_SEC = 10
+
+# 仮の判断: これまでは既定でOSにポートを自動選択させていたが(0=自動)、
+# Tailscale経由の発見(mDNSが使えない相手に直接ポーリングする方式)では
+# 事前に相手のポート番号を知る手段がないため、固定の既定ポートを設ける。
+# 同一マシン上で複数エージェントをテストしたい場合は `--port 0` で
+# 従来通りOS自動選択に戻せる。
+DEFAULT_CARD_PORT = 47120
 
 NO_TOKEN_GUIDANCE = (
     "トークンがありません。--init で新規作成するか、"
@@ -214,6 +224,38 @@ def get_local_ip() -> str:
         sock.close()
 
 
+def get_physical_lan_ips() -> list:
+    """物理LANインターフェース(macOSの en* )のIPv4アドレス一覧を返す。
+
+    仮の判断: Tailscale(utun*)やAWDL(awdl0)、ブリッジ(bridge*)などの仮想
+    インターフェースをmDNSのバインド対象から除外し、"自宅LAN内向け"の発見に
+    限定するため、macOSで物理イーサネット/Wi-Fiに使われる `en<数字>` という
+    命名規則のインターフェースだけを対象にしている。`ifconfig`の出力を素朴に
+    パースしているだけなので、環境によっては拾えない/拾いすぎる可能性がある。
+    """
+    if platform.system() != "Darwin":
+        return []
+    try:
+        result = subprocess.run(["ifconfig"], capture_output=True, text=True, timeout=3)
+    except Exception as exc:
+        logger.warning("ifconfigの実行に失敗しました: %s", exc)
+        return []
+    if result.returncode != 0:
+        return []
+
+    ips = []
+    current_iface = None
+    for line in result.stdout.splitlines():
+        if line and not line[0].isspace():
+            current_iface = line.split(":", 1)[0]
+            continue
+        if current_iface and re.match(r"^en\d+$", current_iface):
+            match = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", line)
+            if match:
+                ips.append(match.group(1))
+    return ips
+
+
 # ---------------------------------------------------------------------------
 # mDNSによる自動発見と自己紹介カードの交換
 # ---------------------------------------------------------------------------
@@ -278,7 +320,7 @@ class YoriaiListener:
         log_peer_card(card, address, port)
 
 
-def log_peer_card(card: dict, address: str, port: int) -> None:
+def log_peer_card(card: dict, address: str, port: int, via: str = "mDNS") -> None:
     device_name = card.get("device_name", "unknown")
     chip = card.get("os", {}).get("chip", "unknown")
     memory = card.get("memory", {})
@@ -288,19 +330,70 @@ def log_peer_card(card: dict, address: str, port: int) -> None:
     loaded = card.get("models", {}).get("loaded", [])
     loaded_str = ", ".join(loaded) if loaded else "なし"
 
+    # 仮の判断: mDNSでの発見(既存の表示)とTailscale経由の発見を、
+    # 絵文字とラベルで見分けやすくしている。
+    emoji = "\U0001f91d" if via == "mDNS" else "\U0001f310"
+    label = "" if via == "mDNS" else f"[{via}] "
+
     logger.info(
-        "\U0001f91d %s を発見しました (%s:%s)\n"
+        "%s %s%s を発見しました (%s:%s)\n"
         "    チップ: %s\n"
         "    空きメモリ: %s / 総メモリ: %s\n"
         "    ロード済みモデル: %s\n"
         "    インストール済みモデル(%d件): %s",
-        device_name, address, port,
+        emoji, label, device_name, address, port,
         chip,
         f"{free_gb}GB" if free_gb is not None else "不明",
         f"{total_gb}GB" if total_gb is not None else "不明",
         loaded_str,
         len(installed), ", ".join(installed) if installed else "なし",
     )
+
+
+def discover_via_tailscale(agent_id: str, org_fingerprint: str, port: int) -> int:
+    """Tailscale経由でエージェント候補をポーリングし、見つかった台数を返す。
+
+    仮の判断: mDNSのような継続的な発見ではなく、起動時に一度だけスキャンする。
+    Tailscaleピアの参加/離脱をその後も追いたい場合は次フェーズの検討課題とする。
+    """
+    if not tailscale.is_available():
+        logger.info("tailscaleコマンドが見つからないため、Tailscale経由の発見はスキップします。")
+        return 0
+
+    peers = tailscale.get_peers()
+    if not peers:
+        logger.info("Tailscale経由で0台のエージェント候補を確認しました(Tailscaleのピアが見つかりませんでした)")
+        return 0
+
+    def _probe(peer):
+        hostname, ip = peer
+        try:
+            resp = requests.get(
+                f"http://{ip}:{port}/card",
+                headers={ORG_FINGERPRINT_HEADER: org_fingerprint},
+                timeout=CARD_REQUEST_TIMEOUT_SEC,
+            )
+            resp.raise_for_status()
+            card = resp.json()
+        except Exception:
+            # 仮の判断: オフラインのピアやYoriaiを起動していないピアの方が多い想定のため、
+            # 1台ごとの失敗はwarningではなくログを出さずに静かにスキップする。
+            return None
+        if card.get("agent_id") == agent_id:
+            return None  # 自分自身
+        return ip, card
+
+    found_count = 0
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        for result in executor.map(_probe, peers):
+            if result is None:
+                continue
+            ip, card = result
+            found_count += 1
+            log_peer_card(card, ip, port, via="Tailscale")
+
+    logger.info("Tailscale経由で%d台のエージェント候補を確認しました", found_count)
+    return found_count
 
 
 # ---------------------------------------------------------------------------
@@ -320,13 +413,28 @@ def run_agent(token: str, port: int) -> None:
     agent_id = str(uuid.uuid4())
     org_fingerprint = config.token_fingerprint(token)
     short_hostname = get_short_hostname()
-    local_ip = get_local_ip()
+
+    physical_ips = get_physical_lan_ips()
+    if physical_ips:
+        # 仮の判断: 物理LANインターフェースが複数見つかった場合は先頭(通常はen0=Wi-Fi)を
+        # 自己紹介カードの広告先IPとして使う。
+        local_ip = physical_ips[0]
+        zc_interfaces = physical_ips
+        logger.info("mDNSは物理LANインターフェースのみを使用します: %s", ", ".join(physical_ips))
+    else:
+        local_ip = get_local_ip()
+        zc_interfaces = InterfaceChoice.All
+        logger.warning(
+            "物理LANインターフェース(en*)を特定できなかったため、mDNSは全インターフェースを使用します。"
+            "Tailscale等の仮想インターフェースがある環境では発見に失敗することがあります。"
+        )
+
     port = port if port else pick_free_port()
 
     server = start_card_server(agent_id, org_fingerprint, port)
     logger.info("自己紹介カードサーバーを起動しました: http://%s:%s/card", local_ip, port)
 
-    zeroconf = Zeroconf(ip_version=IPVersion.V4Only)
+    zeroconf = Zeroconf(interfaces=zc_interfaces, ip_version=IPVersion.V4Only)
     # 仮の判断: サービスインスタンス名の衝突を避けるため agent_id の先頭8文字を付与する
     service_name = f"{short_hostname}-{agent_id[:8]}.{SERVICE_TYPE}"
     service_info = ServiceInfo(
@@ -347,10 +455,21 @@ def run_agent(token: str, port: int) -> None:
     listener = YoriaiListener(agent_id, org_fingerprint)
     ServiceBrowser(zeroconf, SERVICE_TYPE, listener)
 
+    # mDNSはLANローカルのマルチキャストが前提で、Tailscale越しのリモートデバイスには
+    # 原理的に届かない。そのため起動時に一度だけ、Tailscaleのピア一覧に対して
+    # 自己紹介カードのエンドポイントを直接ポーリングする(mDNSとは別枠の仕組み)。
+    discover_via_tailscale(agent_id, org_fingerprint, port)
+
     logger.info("同じネットワーク上のYoriaiエージェントを探索しています... (Ctrl+Cで終了)")
     try:
+        last_heartbeat = time.monotonic()
         while True:
             time.sleep(1)
+            # 仮の判断: 発見がない間も動作中であることが外から分かるよう、
+            # 一定間隔でハートビートログを出す。
+            if time.monotonic() - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
+                logger.info("探索中... (現在発見数: %d件)", len(listener.known_peers))
+                last_heartbeat = time.monotonic()
     except KeyboardInterrupt:
         logger.info("終了します...")
     finally:
@@ -406,7 +525,10 @@ def main():
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--init", action="store_true", help="組織を作成する(既にトークンがあれば表示のみ。--forceで再発行)")
     group.add_argument("--join", metavar="TOKEN", help="既存の組織のトークンを指定して参加し、そのまま起動する")
-    parser.add_argument("--port", type=int, default=0, help="自己紹介カードを配信するHTTPポート番号(0=自動選択、既定値)")
+    parser.add_argument(
+        "--port", type=int, default=DEFAULT_CARD_PORT,
+        help=f"自己紹介カードを配信するHTTPポート番号(既定値: {DEFAULT_CARD_PORT}。0を指定するとOSに自動選択させる)",
+    )
     parser.add_argument("--force", action="store_true", help="--init と併用し、既存トークンを確認の上で強制的に再発行する")
     args = parser.parse_args()
 
