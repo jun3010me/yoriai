@@ -27,6 +27,7 @@ SERVICE_TYPE = "_yoriai._tcp.local."
 OLLAMA_BASE_URL = "http://localhost:11434"
 CARD_REQUEST_TIMEOUT_SEC = 5
 ORG_FINGERPRINT_HEADER = "X-Yoriai-Org-Fingerprint"
+HEARTBEAT_INTERVAL_SEC = 10
 
 NO_TOKEN_GUIDANCE = (
     "トークンがありません。--init で新規作成するか、"
@@ -396,8 +397,14 @@ def run_agent(token: str, port: int) -> None:
 
     logger.info("同じネットワーク上のYoriaiエージェントを探索しています... (Ctrl+Cで終了)")
     try:
+        last_heartbeat = time.monotonic()
         while True:
             time.sleep(1)
+            # 仮の判断: 発見がない間も動作中であることが外から分かるよう、
+            # 一定間隔でハートビートログを出す。
+            if time.monotonic() - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
+                logger.info("探索中... (現在発見数: %d件)", len(listener.known_peers))
+                last_heartbeat = time.monotonic()
     except KeyboardInterrupt:
         logger.info("終了します...")
     finally:
