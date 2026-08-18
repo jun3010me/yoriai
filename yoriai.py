@@ -29,6 +29,13 @@ CARD_REQUEST_TIMEOUT_SEC = 5
 ORG_FINGERPRINT_HEADER = "X-Yoriai-Org-Fingerprint"
 HEARTBEAT_INTERVAL_SEC = 10
 
+# 仮の判断: これまでは既定でOSにポートを自動選択させていたが(0=自動)、
+# Tailscale経由の発見(mDNSが使えない相手に直接ポーリングする方式)では
+# 事前に相手のポート番号を知る手段がないため、固定の既定ポートを設ける。
+# 同一マシン上で複数エージェントをテストしたい場合は `--port 0` で
+# 従来通りOS自動選択に戻せる。
+DEFAULT_CARD_PORT = 47120
+
 NO_TOKEN_GUIDANCE = (
     "トークンがありません。--init で新規作成するか、"
     "--join=<トークン> で既存の組織に参加してください"
@@ -460,7 +467,10 @@ def main():
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--init", action="store_true", help="組織を作成する(既にトークンがあれば表示のみ。--forceで再発行)")
     group.add_argument("--join", metavar="TOKEN", help="既存の組織のトークンを指定して参加し、そのまま起動する")
-    parser.add_argument("--port", type=int, default=0, help="自己紹介カードを配信するHTTPポート番号(0=自動選択、既定値)")
+    parser.add_argument(
+        "--port", type=int, default=DEFAULT_CARD_PORT,
+        help=f"自己紹介カードを配信するHTTPポート番号(既定値: {DEFAULT_CARD_PORT}。0を指定するとOSに自動選択させる)",
+    )
     parser.add_argument("--force", action="store_true", help="--init と併用し、既存トークンを確認の上で強制的に再発行する")
     args = parser.parse_args()
 
