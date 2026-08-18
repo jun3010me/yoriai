@@ -19,7 +19,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
-from zeroconf import ServiceBrowser, ServiceInfo, Zeroconf, IPVersion
+from zeroconf import ServiceBrowser, ServiceInfo, Zeroconf, IPVersion, InterfaceChoice
 
 import config
 
@@ -214,6 +214,38 @@ def get_local_ip() -> str:
         sock.close()
 
 
+def get_physical_lan_ips() -> list:
+    """物理LANインターフェース(macOSの en* )のIPv4アドレス一覧を返す。
+
+    仮の判断: Tailscale(utun*)やAWDL(awdl0)、ブリッジ(bridge*)などの仮想
+    インターフェースをmDNSのバインド対象から除外し、"自宅LAN内向け"の発見に
+    限定するため、macOSで物理イーサネット/Wi-Fiに使われる `en<数字>` という
+    命名規則のインターフェースだけを対象にしている。`ifconfig`の出力を素朴に
+    パースしているだけなので、環境によっては拾えない/拾いすぎる可能性がある。
+    """
+    if platform.system() != "Darwin":
+        return []
+    try:
+        result = subprocess.run(["ifconfig"], capture_output=True, text=True, timeout=3)
+    except Exception as exc:
+        logger.warning("ifconfigの実行に失敗しました: %s", exc)
+        return []
+    if result.returncode != 0:
+        return []
+
+    ips = []
+    current_iface = None
+    for line in result.stdout.splitlines():
+        if line and not line[0].isspace():
+            current_iface = line.split(":", 1)[0]
+            continue
+        if current_iface and re.match(r"^en\d+$", current_iface):
+            match = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", line)
+            if match:
+                ips.append(match.group(1))
+    return ips
+
+
 # ---------------------------------------------------------------------------
 # mDNSによる自動発見と自己紹介カードの交換
 # ---------------------------------------------------------------------------
@@ -320,13 +352,28 @@ def run_agent(token: str, port: int) -> None:
     agent_id = str(uuid.uuid4())
     org_fingerprint = config.token_fingerprint(token)
     short_hostname = get_short_hostname()
-    local_ip = get_local_ip()
+
+    physical_ips = get_physical_lan_ips()
+    if physical_ips:
+        # 仮の判断: 物理LANインターフェースが複数見つかった場合は先頭(通常はen0=Wi-Fi)を
+        # 自己紹介カードの広告先IPとして使う。
+        local_ip = physical_ips[0]
+        zc_interfaces = physical_ips
+        logger.info("mDNSは物理LANインターフェースのみを使用します: %s", ", ".join(physical_ips))
+    else:
+        local_ip = get_local_ip()
+        zc_interfaces = InterfaceChoice.All
+        logger.warning(
+            "物理LANインターフェース(en*)を特定できなかったため、mDNSは全インターフェースを使用します。"
+            "Tailscale等の仮想インターフェースがある環境では発見に失敗することがあります。"
+        )
+
     port = port if port else pick_free_port()
 
     server = start_card_server(agent_id, org_fingerprint, port)
     logger.info("自己紹介カードサーバーを起動しました: http://%s:%s/card", local_ip, port)
 
-    zeroconf = Zeroconf(ip_version=IPVersion.V4Only)
+    zeroconf = Zeroconf(interfaces=zc_interfaces, ip_version=IPVersion.V4Only)
     # 仮の判断: サービスインスタンス名の衝突を避けるため agent_id の先頭8文字を付与する
     service_name = f"{short_hostname}-{agent_id[:8]}.{SERVICE_TYPE}"
     service_info = ServiceInfo(
