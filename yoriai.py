@@ -16,12 +16,14 @@ import sys
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 from zeroconf import ServiceBrowser, ServiceInfo, Zeroconf, IPVersion, InterfaceChoice
 
 import config
+import tailscale
 
 SERVICE_TYPE = "_yoriai._tcp.local."
 OLLAMA_BASE_URL = "http://localhost:11434"
@@ -318,7 +320,7 @@ class YoriaiListener:
         log_peer_card(card, address, port)
 
 
-def log_peer_card(card: dict, address: str, port: int) -> None:
+def log_peer_card(card: dict, address: str, port: int, via: str = "mDNS") -> None:
     device_name = card.get("device_name", "unknown")
     chip = card.get("os", {}).get("chip", "unknown")
     memory = card.get("memory", {})
@@ -328,19 +330,70 @@ def log_peer_card(card: dict, address: str, port: int) -> None:
     loaded = card.get("models", {}).get("loaded", [])
     loaded_str = ", ".join(loaded) if loaded else "なし"
 
+    # 仮の判断: mDNSでの発見(既存の表示)とTailscale経由の発見を、
+    # 絵文字とラベルで見分けやすくしている。
+    emoji = "\U0001f91d" if via == "mDNS" else "\U0001f310"
+    label = "" if via == "mDNS" else f"[{via}] "
+
     logger.info(
-        "\U0001f91d %s を発見しました (%s:%s)\n"
+        "%s %s%s を発見しました (%s:%s)\n"
         "    チップ: %s\n"
         "    空きメモリ: %s / 総メモリ: %s\n"
         "    ロード済みモデル: %s\n"
         "    インストール済みモデル(%d件): %s",
-        device_name, address, port,
+        emoji, label, device_name, address, port,
         chip,
         f"{free_gb}GB" if free_gb is not None else "不明",
         f"{total_gb}GB" if total_gb is not None else "不明",
         loaded_str,
         len(installed), ", ".join(installed) if installed else "なし",
     )
+
+
+def discover_via_tailscale(agent_id: str, org_fingerprint: str, port: int) -> int:
+    """Tailscale経由でエージェント候補をポーリングし、見つかった台数を返す。
+
+    仮の判断: mDNSのような継続的な発見ではなく、起動時に一度だけスキャンする。
+    Tailscaleピアの参加/離脱をその後も追いたい場合は次フェーズの検討課題とする。
+    """
+    if not tailscale.is_available():
+        logger.info("tailscaleコマンドが見つからないため、Tailscale経由の発見はスキップします。")
+        return 0
+
+    peers = tailscale.get_peers()
+    if not peers:
+        logger.info("Tailscale経由で0台のエージェント候補を確認しました(Tailscaleのピアが見つかりませんでした)")
+        return 0
+
+    def _probe(peer):
+        hostname, ip = peer
+        try:
+            resp = requests.get(
+                f"http://{ip}:{port}/card",
+                headers={ORG_FINGERPRINT_HEADER: org_fingerprint},
+                timeout=CARD_REQUEST_TIMEOUT_SEC,
+            )
+            resp.raise_for_status()
+            card = resp.json()
+        except Exception:
+            # 仮の判断: オフラインのピアやYoriaiを起動していないピアの方が多い想定のため、
+            # 1台ごとの失敗はwarningではなくログを出さずに静かにスキップする。
+            return None
+        if card.get("agent_id") == agent_id:
+            return None  # 自分自身
+        return ip, card
+
+    found_count = 0
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        for result in executor.map(_probe, peers):
+            if result is None:
+                continue
+            ip, card = result
+            found_count += 1
+            log_peer_card(card, ip, port, via="Tailscale")
+
+    logger.info("Tailscale経由で%d台のエージェント候補を確認しました", found_count)
+    return found_count
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +454,11 @@ def run_agent(token: str, port: int) -> None:
 
     listener = YoriaiListener(agent_id, org_fingerprint)
     ServiceBrowser(zeroconf, SERVICE_TYPE, listener)
+
+    # mDNSはLANローカルのマルチキャストが前提で、Tailscale越しのリモートデバイスには
+    # 原理的に届かない。そのため起動時に一度だけ、Tailscaleのピア一覧に対して
+    # 自己紹介カードのエンドポイントを直接ポーリングする(mDNSとは別枠の仕組み)。
+    discover_via_tailscale(agent_id, org_fingerprint, port)
 
     logger.info("同じネットワーク上のYoriaiエージェントを探索しています... (Ctrl+Cで終了)")
     try:
