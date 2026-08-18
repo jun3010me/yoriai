@@ -359,26 +359,59 @@ def run_agent(token: str, port: int) -> None:
         server.shutdown()
 
 
+def _prompt_yes_no(question: str) -> bool:
+    try:
+        answer = input(f"{question} [y/N]: ")
+    except (EOFError, KeyboardInterrupt):
+        # 仮の判断: 確認入力ができない状況(非対話実行など)では、
+        # 安全側に倒して「上書きしない」ものとして扱う。
+        print()
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
+def handle_init(force: bool) -> None:
+    existing_token = config.load_token()
+
+    if existing_token and not force:
+        # 既にトークンがある場合は無条件に上書きせず、既存のトークンを案内するだけにする。
+        # うっかり --init を叩き直しただけで組織が分裂してしまう事故を避けるため。
+        print(f"既にこの組織のトークンが存在します: {existing_token}")
+        print("このMacでYoriaiを開始するには: python yoriai.py")
+        print("トークンを再発行したい場合は: python yoriai.py --init --force")
+        return
+
+    if existing_token and force:
+        print("既存のトークンを新しいトークンで上書きしようとしています。")
+        print(f"現在のトークン: {existing_token}")
+        if not _prompt_yes_no("本当に上書きしますか?(既存の組織との接続が切れます)"):
+            print("キャンセルしました。既存のトークンをそのまま使用します。")
+            return
+
+    token = config.generate_token()
+    storage = config.save_token(token)
+    storage_note = "macOS Keychain" if storage == "keychain" else f"平文ファイル({config.CONFIG_FILE})"
+    # 仮の判断: --init はトークンの発行・保存のみを行い、そのまま起動はしない。
+    # 発行したトークンを他のMacに共有してから `python yoriai.py` (このMac自身も含む)
+    # で明示的に起動する、という2段階の操作の方が事故が少ないと判断した。
+    print("新しいトークンを発行しました。このトークンを組織のメンバーに共有してください。")
+    print(f"トークン: {token}")
+    print(f"保存先: {storage_note}")
+    print("このMacでYoriaiを開始するには: python yoriai.py")
+    print("他のMacをこの組織に参加させるには: python yoriai.py --join=<上記のトークン>")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Yoriai: ローカルLLMエージェントの自動発見・自己紹介カード交換プロトタイプ")
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--init", action="store_true", help="新しいトークンを生成して組織を作成する(トークンの発行のみ行い、終了する)")
+    group.add_argument("--init", action="store_true", help="組織を作成する(既にトークンがあれば表示のみ。--forceで再発行)")
     group.add_argument("--join", metavar="TOKEN", help="既存の組織のトークンを指定して参加し、そのまま起動する")
     parser.add_argument("--port", type=int, default=0, help="自己紹介カードを配信するHTTPポート番号(0=自動選択、既定値)")
+    parser.add_argument("--force", action="store_true", help="--init と併用し、既存トークンを確認の上で強制的に再発行する")
     args = parser.parse_args()
 
     if args.init:
-        token = config.generate_token()
-        storage = config.save_token(token)
-        storage_note = "macOS Keychain" if storage == "keychain" else f"平文ファイル({config.CONFIG_FILE})"
-        # 仮の判断: --init はトークンの発行・保存のみを行い、そのまま起動はしない。
-        # 発行したトークンを他のMacに共有してから `python yoriai.py` (このMac自身も含む)
-        # で明示的に起動する、という2段階の操作の方が事故が少ないと判断した。
-        print("新しいトークンを発行しました。このトークンを組織のメンバーに共有してください。")
-        print(f"トークン: {token}")
-        print(f"保存先: {storage_note}")
-        print("このMacでYoriaiを開始するには: python yoriai.py")
-        print("他のMacをこの組織に参加させるには: python yoriai.py --join=<上記のトークン>")
+        handle_init(args.force)
         return
 
     if args.join is not None:
