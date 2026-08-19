@@ -367,6 +367,11 @@ def discover_via_tailscale(agent_id: str, org_fingerprint: str, port: int) -> in
         logger.info("Tailscale経由で0台のエージェント候補を確認しました(Tailscaleのピアが見つかりませんでした)")
         return 0
 
+    logger.info(
+        "Tailscaleのピアを%d件確認しました。自己紹介カードへの問い合わせを試みます: %s",
+        len(peers), ", ".join(f"{hostname}({ip})" for hostname, ip in peers),
+    )
+
     def _probe(peer):
         hostname, ip = peer
         try:
@@ -377,9 +382,11 @@ def discover_via_tailscale(agent_id: str, org_fingerprint: str, port: int) -> in
             )
             resp.raise_for_status()
             card = resp.json()
-        except Exception:
-            # 仮の判断: オフラインのピアやYoriaiを起動していないピアの方が多い想定のため、
-            # 1台ごとの失敗はwarningではなくログを出さずに静かにスキップする。
+        except Exception as exc:
+            # 仮の判断: 当初は1台ごとの失敗を無言でスキップしていたが、「トークン不一致で403」
+            # と「そもそも繋がらない(タイムアウト/接続拒否)」の区別がつかず実機での原因切り分けが
+            # 困難だったため、原因が分かるようINFOログに残すようにした。
+            logger.info("Tailscale経由の問い合わせに失敗しました: %s (%s) - %s", hostname, ip, exc)
             return None
         if card.get("agent_id") == agent_id:
             return None  # 自分自身
