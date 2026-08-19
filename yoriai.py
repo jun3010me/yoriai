@@ -31,6 +31,14 @@ CARD_REQUEST_TIMEOUT_SEC = 5
 ORG_FINGERPRINT_HEADER = "X-Yoriai-Org-Fingerprint"
 HEARTBEAT_INTERVAL_SEC = 10
 
+# 仮の判断: 起動時1回だけのスキャンだと、たまたま相手のYoriaiがまだ起動しきっていない
+# タイミングで実行してしまった場合に「Connection refused」で失敗し、その後相手が
+# 起動してもずっと0件のまま固定されてしまう問題が実機検証で見つかった。
+# そのため定期的に再スキャンするようにした。ハートビートと同じ10秒間隔にすると、
+# ピア数が多いTailnetでは問い合わせのログが頻繁に出てノイズになりうるため、
+# 少し長めの間隔にしている。
+TAILSCALE_RESCAN_INTERVAL_SEC = 30
+
 # 仮の判断: これまでは既定でOSにポートを自動選択させていたが(0=自動)、
 # Tailscale経由の発見(mDNSが使えない相手に直接ポーリングする方式)では
 # 事前に相手のポート番号を知る手段がないため、固定の既定ポートを設ける。
@@ -353,8 +361,9 @@ def log_peer_card(card: dict, address: str, port: int, via: str = "mDNS") -> Non
 def discover_via_tailscale(agent_id: str, org_fingerprint: str, port: int) -> int:
     """Tailscale経由でエージェント候補をポーリングし、見つかった台数を返す。
 
-    仮の判断: mDNSのような継続的な発見ではなく、起動時に一度だけスキャンする。
-    Tailscaleピアの参加/離脱をその後も追いたい場合は次フェーズの検討課題とする。
+    呼び出し元(run_agent)が起動時とTAILSCALE_RESCAN_INTERVAL_SEC間隔で
+    繰り返し呼び出す想定。1回の呼び出しは毎回この関数の中で完結するスキャンで、
+    前回までの結果は保持しない(呼び出しごとに毎回ゼロから数え直す)。
     """
     cli_path = tailscale.find_cli()
     if not cli_path:
@@ -367,6 +376,11 @@ def discover_via_tailscale(agent_id: str, org_fingerprint: str, port: int) -> in
         logger.info("Tailscale経由で0台のエージェント候補を確認しました(Tailscaleのピアが見つかりませんでした)")
         return 0
 
+    logger.info(
+        "Tailscaleのピアを%d件確認しました。自己紹介カードへの問い合わせを試みます: %s",
+        len(peers), ", ".join(f"{hostname}({ip})" for hostname, ip in peers),
+    )
+
     def _probe(peer):
         hostname, ip = peer
         try:
@@ -377,9 +391,11 @@ def discover_via_tailscale(agent_id: str, org_fingerprint: str, port: int) -> in
             )
             resp.raise_for_status()
             card = resp.json()
-        except Exception:
-            # 仮の判断: オフラインのピアやYoriaiを起動していないピアの方が多い想定のため、
-            # 1台ごとの失敗はwarningではなくログを出さずに静かにスキップする。
+        except Exception as exc:
+            # 仮の判断: 当初は1台ごとの失敗を無言でスキップしていたが、「トークン不一致で403」
+            # と「そもそも繋がらない(タイムアウト/接続拒否)」の区別がつかず実機での原因切り分けが
+            # 困難だったため、原因が分かるようINFOログに残すようにした。
+            logger.info("Tailscale経由の問い合わせに失敗しました: %s (%s) - %s", hostname, ip, exc)
             return None
         if card.get("agent_id") == agent_id:
             return None  # 自分自身
@@ -458,15 +474,16 @@ def run_agent(token: str, port: int) -> None:
     ServiceBrowser(zeroconf, SERVICE_TYPE, listener)
 
     # mDNSはLANローカルのマルチキャストが前提で、Tailscale越しのリモートデバイスには
-    # 原理的に届かない。そのため起動時に一度だけ、Tailscaleのピア一覧に対して
-    # 自己紹介カードのエンドポイントを直接ポーリングする(mDNSとは別枠の仕組み)。
-    # 仮の判断: この件数は起動時点のスナップショットであり、mDNS発見数のように
-    # 継続更新はされない(Tailscaleピアの増減を継続的に追う仕組みは次フェーズで検討)。
+    # 原理的に届かない。そのため、Tailscaleのピア一覧に対して自己紹介カードの
+    # エンドポイントを直接ポーリングする(mDNSとは別枠の仕組み)。起動直後にまず
+    # 1回実行し、以降はTAILSCALE_RESCAN_INTERVAL_SEC間隔で再スキャンする
+    # (相手がまだ起動しきっていないタイミングで一度失敗しても、後で拾えるようにするため)。
     tailscale_found_count = discover_via_tailscale(agent_id, org_fingerprint, port)
 
     logger.info("同じネットワーク上のYoriaiエージェントを探索しています... (Ctrl+Cで終了)")
     try:
         last_heartbeat = time.monotonic()
+        last_tailscale_scan = time.monotonic()
         while True:
             time.sleep(1)
             # 仮の判断: 発見がない間も動作中であることが外から分かるよう、
@@ -474,9 +491,12 @@ def run_agent(token: str, port: int) -> None:
             # (例: クライアント間マルチキャストが遮断された環境)でも、
             # Tailscale経由の発見数を合わせて見せることで「本当に0台なのか」を
             # 判断しやすくする。
+            if time.monotonic() - last_tailscale_scan >= TAILSCALE_RESCAN_INTERVAL_SEC:
+                tailscale_found_count = discover_via_tailscale(agent_id, org_fingerprint, port)
+                last_tailscale_scan = time.monotonic()
             if time.monotonic() - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
                 logger.info(
-                    "探索中... (現在発見数: mDNS %d件 / Tailscale %d件 [起動時点])",
+                    "探索中... (現在発見数: mDNS %d件 / Tailscale %d件)",
                     len(listener.known_peers), tailscale_found_count,
                 )
                 last_heartbeat = time.monotonic()
