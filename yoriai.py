@@ -27,6 +27,7 @@ import tailscale
 
 SERVICE_TYPE = "_yoriai._tcp.local."
 OLLAMA_BASE_URL = "http://localhost:11434"
+LMSTUDIO_BASE_URL = "http://localhost:1234"
 CARD_REQUEST_TIMEOUT_SEC = 5
 ORG_FINGERPRINT_HEADER = "X-Yoriai-Org-Fingerprint"
 HEARTBEAT_INTERVAL_SEC = 10
@@ -133,7 +134,7 @@ def get_memory_info() -> dict:
     }
 
 
-def get_installed_models() -> list:
+def get_ollama_installed_models() -> list:
     try:
         resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=3)
         resp.raise_for_status()
@@ -143,7 +144,7 @@ def get_installed_models() -> list:
         return []
 
 
-def get_loaded_models() -> list:
+def get_ollama_loaded_models() -> list:
     try:
         resp = requests.get(f"{OLLAMA_BASE_URL}/api/ps", timeout=3)
         resp.raise_for_status()
@@ -151,6 +152,42 @@ def get_loaded_models() -> list:
     except Exception as exc:
         logger.warning("Ollamaのロード済みモデル一覧の取得に失敗しました: %s", exc)
         return []
+
+
+def get_lmstudio_models() -> list:
+    """LM Studioのローカルサーバー(OpenAI互換API)からモデル一覧を取得する。
+
+    仮の判断: `/v1/models` はロード状態(インストール済みかロード済みか)を
+    区別して返してくれないため、ここで取得できたモデルは「インストール済み」
+    「ロード済み」の両方として扱う。LM Studio側で「Local Server」を
+    起動していない場合は空リストを返す(エラーにはしない)。
+    """
+    try:
+        resp = requests.get(f"{LMSTUDIO_BASE_URL}/v1/models", timeout=3)
+        resp.raise_for_status()
+        return [m.get("id") for m in resp.json().get("data", [])]
+    except Exception as exc:
+        logger.warning("LM Studioのモデル一覧の取得に失敗しました: %s", exc)
+        return []
+
+
+def _merge_model_lists(*model_lists: list) -> list:
+    merged = []
+    for models in model_lists:
+        for name in models:
+            if name not in merged:
+                merged.append(name)
+    return merged
+
+
+def get_installed_models() -> list:
+    # 仮の判断: OllamaとLM Studioのどちらが動いていても自己紹介カードに反映されるよう、
+    # 両方に問い合わせて結果を合算する(両方動いている場合は両方のモデルが載る)。
+    return _merge_model_lists(get_ollama_installed_models(), get_lmstudio_models())
+
+
+def get_loaded_models() -> list:
+    return _merge_model_lists(get_ollama_loaded_models(), get_lmstudio_models())
 
 
 def build_profile_card(agent_id: str) -> dict:
