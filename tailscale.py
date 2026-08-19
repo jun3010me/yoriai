@@ -13,6 +13,7 @@ Yoriai側は既定のポート(yoriai.DEFAULT_CARD_PORT)で待ち受けている
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 
@@ -20,22 +21,51 @@ logger = logging.getLogger("yoriai.tailscale")
 
 STATUS_TIMEOUT_SEC = 5
 
+# 仮の判断: GUI版Tailscale(App Store/dmg配布)は /Applications 以下のアプリバンドルに
+# 実行ファイルが入っており、PATHには通っていないことが多い。また、このバイナリは
+# アプリバンドルとしての起動を前提にしているらしく、/usr/local/bin などへの
+# シンボリックリンク経由で呼び出すと
+# "Fatal error: The current bundleIdentifier is unknown to the registry"
+# で失敗することを確認したため、シンボリックリンクは使わずアプリバンドル内の
+# 実体パスを直接指定して呼び出す。Homebrew版の一般的な設置場所もフォールバックとして追加する。
+CLI_CANDIDATES = [
+    "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+    "/usr/local/bin/tailscale",
+    "/opt/homebrew/bin/tailscale",
+]
+
+
+def find_cli():
+    """呼び出すtailscale CLIの実行ファイルパスを探す。見つからなければNoneを返す。
+
+    探索順序:
+    1. PATHが通っている `tailscale` (CLI版、Homebrewのsymlinkなど)
+    2. GUI版のアプリバンドル内バイナリ(絶対パスを直接指定)
+    3. Homebrewでの典型的な設置場所(Intel/Apple Silicon)
+    """
+    path_cli = shutil.which("tailscale")
+    if path_cli:
+        return path_cli
+
+    for candidate in CLI_CANDIDATES:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+
+    return None
+
 
 def is_available() -> bool:
-    return shutil.which("tailscale") is not None
+    return find_cli() is not None
 
 
-def get_peers() -> list:
+def get_peers(cli_path: str) -> list:
     """Tailscaleに参加中のピア(自分以外)の (hostname, ipv4) タプルのリストを返す。
-    tailscaleコマンドが無い場合や実行・解析に失敗した場合は、エラーにはせず
-    空リストを返す(呼び出し側はTailscale未導入として扱えばよい)。
+    実行・解析に失敗した場合は、エラーにはせず空リストを返す
+    (呼び出し側はTailscale未導入として扱えばよい)。
     """
-    if not is_available():
-        return []
-
     try:
         result = subprocess.run(
-            ["tailscale", "status", "--json"],
+            [cli_path, "status", "--json"],
             capture_output=True, text=True, timeout=STATUS_TIMEOUT_SEC,
         )
         if result.returncode != 0:

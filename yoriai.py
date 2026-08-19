@@ -356,11 +356,13 @@ def discover_via_tailscale(agent_id: str, org_fingerprint: str, port: int) -> in
     仮の判断: mDNSのような継続的な発見ではなく、起動時に一度だけスキャンする。
     Tailscaleピアの参加/離脱をその後も追いたい場合は次フェーズの検討課題とする。
     """
-    if not tailscale.is_available():
+    cli_path = tailscale.find_cli()
+    if not cli_path:
         logger.info("tailscaleコマンドが見つからないため、Tailscale経由の発見はスキップします。")
         return 0
+    logger.info("Tailscale CLIを検出しました: %s", cli_path)
 
-    peers = tailscale.get_peers()
+    peers = tailscale.get_peers(cli_path)
     if not peers:
         logger.info("Tailscale経由で0台のエージェント候補を確認しました(Tailscaleのピアが見つかりませんでした)")
         return 0
