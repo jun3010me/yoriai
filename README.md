@@ -30,7 +30,10 @@
 - ローカルLLMバックエンドとして、以下のどちらか(または両方)が動作していること
   - [Ollama](https://ollama.com/): `ollama serve` (通常は自動起動) が起動していること
   - [LM Studio](https://lmstudio.ai/): アプリ内の「Local Server」機能を起動していること
-    (既定ポート`1234`のOpenAI互換API。`lms server start` でも起動できます)
+    (既定ポート`1234`のOpenAI互換API。`lms server start` でも起動できます)。
+    **Local Serverの設定で「Require Authentication」がONになっていると、
+    Yoriaiは認証ヘッダーを付けずに問い合わせるため401エラーになり、
+    モデル一覧が常に空になります。OFFにしておいてください。**
   - どちらも動いていない場合、モデル一覧は空のまま自己紹介カードが生成されます(エラーにはなりません)
 
 ## セットアップ
@@ -359,3 +362,10 @@ Mac A側のログに「🔒 ... は別の組織のエージェントのようで
 - **LM Studioの既定ポートは`1234`固定**: LM StudioのLocal Server機能の既定ポートを
   そのまま使っている。Ollamaの`11434`と同様、ポート変更に対応する設定項目は
   今回のスコープには含めていない。
+- **既知のハマりどころ: LM Studioの「Require Authentication」設定**: 実機検証で、
+  LM Studioのサーバー自体は起動しているのに自己紹介カードのモデル一覧が常に空になる、
+  という事象が発生した。原因はLM StudioのLocal Server設定で
+  「Require Authentication」がONになっていたこと。Yoriaiは現状APIキー/認証ヘッダーを
+  一切送らずに`/v1/models`を叩く実装(今回のスコープでは認証の仕組みは実装しない、という
+  当初の方針通り)のため、認証必須の設定だと401で弾かれ、`get_lmstudio_models()`が
+  例外を握りつぶして空リストを返していた。LM Studio側でこの設定をOFFにすることで解決した。
