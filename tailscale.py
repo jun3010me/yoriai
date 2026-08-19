@@ -23,11 +23,13 @@ STATUS_TIMEOUT_SEC = 5
 
 # 仮の判断: GUI版Tailscale(App Store/dmg配布)は /Applications 以下のアプリバンドルに
 # 実行ファイルが入っており、PATHには通っていないことが多い。また、このバイナリは
-# アプリバンドルとしての起動を前提にしているらしく、/usr/local/bin などへの
-# シンボリックリンク経由で呼び出すと
+# アプリバンドルとしての起動を前提にしているらしく、シンボリックリンク経由で呼び出すと
 # "Fatal error: The current bundleIdentifier is unknown to the registry"
-# で失敗することを確認したため、シンボリックリンクは使わずアプリバンドル内の
-# 実体パスを直接指定して呼び出す。Homebrew版の一般的な設置場所もフォールバックとして追加する。
+# で失敗することを確認した。GUI版アプリの「Install command-line tool」を有効にすると
+# /usr/local/bin/tailscale にこのバイナリへのシンボリックリンクが自動生成されるため、
+# PATH経由(`shutil.which`)で見つかるパスがシンボリックリンクであるケースが実際にあった。
+# そのため、見つかったパスがシンボリックリンクかどうかによらず、常に `os.path.realpath()`
+# で実体パスに解決してから呼び出すことで、シンボリックリンク経由の起動を避ける。
 CLI_CANDIDATES = [
     "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
     "/usr/local/bin/tailscale",
@@ -36,20 +38,21 @@ CLI_CANDIDATES = [
 
 
 def find_cli():
-    """呼び出すtailscale CLIの実行ファイルパスを探す。見つからなければNoneを返す。
+    """呼び出すtailscale CLIの実行ファイルの実体パスを探す。見つからなければNoneを返す。
 
     探索順序:
-    1. PATHが通っている `tailscale` (CLI版、Homebrewのsymlinkなど)
-    2. GUI版のアプリバンドル内バイナリ(絶対パスを直接指定)
+    1. PATHが通っている `tailscale` (CLI版、GUI版が作るsymlinkなど)
+    2. GUI版のアプリバンドル内バイナリ
     3. Homebrewでの典型的な設置場所(Intel/Apple Silicon)
+    いずれもシンボリックリンクである場合は `os.path.realpath()` で実体パスに解決して返す。
     """
     path_cli = shutil.which("tailscale")
     if path_cli:
-        return path_cli
+        return os.path.realpath(path_cli)
 
     for candidate in CLI_CANDIDATES:
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
+            return os.path.realpath(candidate)
 
     return None
 
