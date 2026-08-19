@@ -460,7 +460,9 @@ def run_agent(token: str, port: int) -> None:
     # mDNSはLANローカルのマルチキャストが前提で、Tailscale越しのリモートデバイスには
     # 原理的に届かない。そのため起動時に一度だけ、Tailscaleのピア一覧に対して
     # 自己紹介カードのエンドポイントを直接ポーリングする(mDNSとは別枠の仕組み)。
-    discover_via_tailscale(agent_id, org_fingerprint, port)
+    # 仮の判断: この件数は起動時点のスナップショットであり、mDNS発見数のように
+    # 継続更新はされない(Tailscaleピアの増減を継続的に追う仕組みは次フェーズで検討)。
+    tailscale_found_count = discover_via_tailscale(agent_id, org_fingerprint, port)
 
     logger.info("同じネットワーク上のYoriaiエージェントを探索しています... (Ctrl+Cで終了)")
     try:
@@ -468,9 +470,15 @@ def run_agent(token: str, port: int) -> None:
         while True:
             time.sleep(1)
             # 仮の判断: 発見がない間も動作中であることが外から分かるよう、
-            # 一定間隔でハートビートログを出す。
+            # 一定間隔でハートビートログを出す。mDNSが機能しないネットワーク
+            # (例: クライアント間マルチキャストが遮断された環境)でも、
+            # Tailscale経由の発見数を合わせて見せることで「本当に0台なのか」を
+            # 判断しやすくする。
             if time.monotonic() - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
-                logger.info("探索中... (現在発見数: %d件)", len(listener.known_peers))
+                logger.info(
+                    "探索中... (現在発見数: mDNS %d件 / Tailscale %d件 [起動時点])",
+                    len(listener.known_peers), tailscale_found_count,
+                )
                 last_heartbeat = time.monotonic()
     except KeyboardInterrupt:
         logger.info("終了します...")
