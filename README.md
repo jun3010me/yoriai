@@ -109,6 +109,9 @@ python3 yoriai.py
 
 - さらに起動時に一度だけ、Tailscaleが導入されていれば `tailscale status --json` でピア一覧を取得し、
   各ピアの `/card` エンドポイントに直接アクセスを試みます(mDNSとは別枠の仕組みです)。
+  Tailscale CLIはPATH上の`tailscale`だけでなく、GUI版(App Store/dmg配布)のアプリバンドルや
+  Homebrewでの典型的な設置場所も探すため、どこにインストールしていても
+  「Tailscale CLIを検出しました: /Applications/...」のようにログで確認できます。
   トークンが一致する応答があった場合は mDNS と同様のログに `🌐 [Tailscale]` のラベルが付いて表示され、
   最後に「Tailscale経由でN台のエージェント候補を確認しました」とまとめて表示されます。
   Tailscale未導入の場合はスキップされ、エラーにはなりません。
@@ -280,6 +283,16 @@ Mac A側のログに「🔒 ... は別の組織のエージェントのようで
   追跡する実装にはしていない。Tailscaleのピア一覧を都度ポーリングし続ける設計にすると
   複雑さが増すため、今回のスコープでは「起動時に一度だけ確認する」という簡易な仕様にとどめた。
   ピアの増減をリアルタイムに追いたい場合は次フェーズでの検討課題とする。
-- **Tailscale未導入環境でのふるまい**: `shutil.which("tailscale")` でコマンドの有無を確認し、
-  見つからない場合は例外を投げずに空リストを返してスキップする設計にした(`tailscale.py`)。
+- **Tailscale未導入環境でのふるまい**: `tailscale.find_cli()` でコマンドの有無を確認し、
+  見つからない場合は例外を投げずにTailscale経由の発見をスキップする設計にした(`tailscale.py`)。
   Tailscaleを使わない組織/メンバーがいても、mDNSでの発見には一切影響しない。
+- **Tailscale CLIの探索先を複数用意した理由**: 当初はPATH上の`tailscale`コマンドのみを
+  見ていたが、App Store版/dmg配布のGUI版Tailscaleを使っている環境ではCLIがPATHに出てこず、
+  常にスキップ扱いになってしまっていた。`/usr/local/bin/tailscale`へのシンボリックリンクで
+  回避しようとしたところ、GUI版のバイナリはアプリバンドルとしての起動を前提にしているらしく
+  "Fatal error: The current bundleIdentifier is unknown to the registry" で失敗することを
+  確認したため、シンボリックリンクは使わない方針にした。代わりに (1) PATH上の`tailscale`、
+  (2) GUI版のアプリバンドル内バイナリを絶対パスで直接指定
+  (`/Applications/Tailscale.app/Contents/MacOS/Tailscale`)、(3) Homebrewでの典型的な設置場所
+  (`/usr/local/bin`、`/opt/homebrew/bin`)の順に探し、見つかったパスを起動時のログに表示する
+  ようにした。これでもインストール場所が特殊な環境では見つからない可能性が残る。
