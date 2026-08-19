@@ -298,6 +298,16 @@ Mac A側のログに「🔒 ... は別の組織のエージェントのようで
   (`/Applications/Tailscale.app/Contents/MacOS/Tailscale`)、(3) Homebrewでの典型的な設置場所
   (`/usr/local/bin`、`/opt/homebrew/bin`)の順に探し、見つかったパスを起動時のログに表示する
   ようにした。これでもインストール場所が特殊な環境では見つからない可能性が残る。
+- **見つかったパスを`os.path.realpath()`で実体パスに解決する理由**: 上記の対策後も、
+  実機で "Tailscale CLIを検出しました: /usr/local/bin/tailscale" の直後に
+  "Fatal error: The current bundleIdentifier is unknown to the registry" で
+  失敗するケースが見つかった。原因は、GUI版Tailscaleアプリの「Install command-line tool」
+  設定により `/usr/local/bin/tailscale` にアプリバンドル内バイナリへのシンボリックリンクが
+  自動生成されており、`shutil.which("tailscale")` がPATH経由でこのシンボリックリンクを
+  真っ先に見つけてしまい、アプリバンドルの実体パスを直接指定するという当初の対策より前に
+  返ってしまっていたため。見つかったパスがPATH経由・候補パス経由のどちらであっても
+  `os.path.realpath()` で実体パスに解決してから呼び出すようにし、シンボリックリンク経由の
+  起動を確実に避けるようにした。
 - **ハートビートログにTailscale発見数も表示した理由**: 実際に2台のMac(Mac mini/Mac Studio)で
   検証したところ、ルーター側の設定(クライアント間のマルチキャスト遮断と思われる)により
   mDNSがネットワークレベルで一切機能しない環境があることが判明した
