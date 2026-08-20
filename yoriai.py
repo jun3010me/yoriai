@@ -939,7 +939,17 @@ def pick_free_port() -> int:
         return sock.getsockname()[1]
 
 
-def run_agent(token: str, port: int) -> None:
+def _setup_agent(token: str, port: int) -> dict:
+    """エージェントの起動処理(自己紹介カードサーバー、mDNS登録、Tailscaleの
+    初回発見)をまとめて行い、以降の探索ループ(_discovery_loop)や対話モード
+    (REPL)が使う情報をひとつの辞書(ctx)にまとめて返す。
+
+    仮の判断: 従来1つの関数(run_agent)にまとまっていたセットアップ処理と
+    「探索し続けるループ」を分離した。対話モード(REPL)では、探索ループを
+    バックグラウンドスレッドで動かしつつメインスレッドで入力を受け付ける
+    必要があり、常駐(headless)実行ではこれまで通りメインスレッドで
+    ループさせたいため、両者で共有できる形にしている。
+    """
     if platform.system() not in ("Darwin", "Linux"):
         logger.warning("このプロトタイプはmacOS/Linuxを想定しています。他OSでは一部情報が取得できません。")
 
@@ -996,32 +1006,118 @@ def run_agent(token: str, port: int) -> None:
     # (相手がまだ起動しきっていないタイミングで一度失敗しても、後で拾えるようにするため)。
     tailscale_found_count = discover_via_tailscale(agent_id, org_fingerprint, port, registry)
 
+    return {
+        "agent_id": agent_id,
+        "org_fingerprint": org_fingerprint,
+        "port": port,
+        "registry": registry,
+        "server": server,
+        "zeroconf": zeroconf,
+        "service_info": service_info,
+        "listener": listener,
+        "tailscale_found_count": tailscale_found_count,
+    }
+
+
+def _discovery_loop(ctx: dict, stop_event: "threading.Event" = None) -> None:
+    """探索ループ本体(ハートビートログ・Tailscaleの定期再スキャン)。
+
+    常駐(headless)実行時はメインスレッドでKeyboardInterruptが起きるまで、
+    対話モード(REPL)実行時はバックグラウンドスレッドでstop_eventが
+    セットされるまで回り続ける。
+    """
     logger.info("同じネットワーク上のYoriaiエージェントを探索しています... (Ctrl+Cで終了)")
+    last_heartbeat = time.monotonic()
+    last_tailscale_scan = time.monotonic()
+    while stop_event is None or not stop_event.is_set():
+        time.sleep(1)
+        # 仮の判断: 発見がない間も動作中であることが外から分かるよう、
+        # 一定間隔でハートビートログを出す。mDNSが機能しないネットワーク
+        # (例: クライアント間マルチキャストが遮断された環境)でも、
+        # Tailscale経由の発見数を合わせて見せることで「本当に0台なのか」を
+        # 判断しやすくする。
+        if time.monotonic() - last_tailscale_scan >= TAILSCALE_RESCAN_INTERVAL_SEC:
+            ctx["tailscale_found_count"] = discover_via_tailscale(
+                ctx["agent_id"], ctx["org_fingerprint"], ctx["port"], ctx["registry"],
+            )
+            last_tailscale_scan = time.monotonic()
+        if time.monotonic() - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
+            logger.info(
+                "探索中... (現在発見数: mDNS %d件 / Tailscale %d件)",
+                len(ctx["listener"].known_peers), ctx["tailscale_found_count"],
+            )
+            last_heartbeat = time.monotonic()
+
+
+def _shutdown_agent(ctx: dict) -> None:
+    ctx["zeroconf"].unregister_service(ctx["service_info"])
+    ctx["zeroconf"].close()
+    ctx["server"].shutdown()
+
+
+def run_agent(token: str, port: int) -> None:
+    """常駐(headless)実行のエントリーポイント。systemd/launchdなど、対話的な
+    入出力ができない環境から起動される想定で、フェーズ5導入前と挙動を変えない。
+    """
+    ctx = _setup_agent(token, port)
     try:
-        last_heartbeat = time.monotonic()
-        last_tailscale_scan = time.monotonic()
-        while True:
-            time.sleep(1)
-            # 仮の判断: 発見がない間も動作中であることが外から分かるよう、
-            # 一定間隔でハートビートログを出す。mDNSが機能しないネットワーク
-            # (例: クライアント間マルチキャストが遮断された環境)でも、
-            # Tailscale経由の発見数を合わせて見せることで「本当に0台なのか」を
-            # 判断しやすくする。
-            if time.monotonic() - last_tailscale_scan >= TAILSCALE_RESCAN_INTERVAL_SEC:
-                tailscale_found_count = discover_via_tailscale(agent_id, org_fingerprint, port, registry)
-                last_tailscale_scan = time.monotonic()
-            if time.monotonic() - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
-                logger.info(
-                    "探索中... (現在発見数: mDNS %d件 / Tailscale %d件)",
-                    len(listener.known_peers), tailscale_found_count,
-                )
-                last_heartbeat = time.monotonic()
+        _discovery_loop(ctx)
     except KeyboardInterrupt:
         logger.info("終了します...")
     finally:
-        zeroconf.unregister_service(service_info)
-        zeroconf.close()
-        server.shutdown()
+        _shutdown_agent(ctx)
+
+
+def _run_repl(ctx: dict) -> None:
+    print()
+    print("=== Yoriai 対話モード ===")
+    print("組織のメンバーに質問できます。終了するには exit または quit と入力するか、Ctrl+Cを押してください。")
+    print()
+
+    # 仮の判断: 会話履歴(messages)はこのセッション内でのみ保持し、終了したら破棄する。
+    # 次回起動時に前回の会話を引き継ぐ機能は今回のスコープ外。
+    messages = []
+    while True:
+        try:
+            text = input("Yoriai> ").strip()
+        except EOFError:
+            print()
+            break
+        except KeyboardInterrupt:
+            print()
+            break
+
+        if not text:
+            continue
+        if text.lower() in ("exit", "quit"):
+            break
+
+        messages.append({"role": "user", "content": text})
+        try:
+            _ask_organization(ctx, messages)
+        except KeyboardInterrupt:
+            print()
+            continue
+
+    print("対話モードを終了します。")
+
+
+def run_agent_with_repl(token: str, port: int) -> None:
+    """対話モード(REPL)付きの起動エントリーポイント。ターミナルから直接
+    `python3 yoriai.py` を実行した場合に使う。mDNS/Tailscaleの探索・
+    ハートビートはバックグラウンドスレッドで継続しつつ、メインスレッドで
+    対話入力を受け付ける。
+    """
+    ctx = _setup_agent(token, port)
+    stop_event = threading.Event()
+    discovery_thread = threading.Thread(target=_discovery_loop, args=(ctx, stop_event), daemon=True)
+    discovery_thread.start()
+
+    try:
+        _run_repl(ctx)
+    finally:
+        stop_event.set()
+        _shutdown_agent(ctx)
 
 
 def _prompt_yes_no(question: str) -> bool:
@@ -1216,7 +1312,14 @@ def main():
             print(NO_TOKEN_GUIDANCE)
             sys.exit(1)
 
-    run_agent(token, args.port)
+    # 仮の判断: 標準入力がターミナル(TTY)に繋がっているかどうかで、対話モード
+    # (REPL)を出すか常駐(headless)動作にするかを自動判定する。systemd/launchd
+    # から起動された場合や `curl | bash` のようにパイプ経由で動く場合は標準入力が
+    # TTYではないため、従来通りの常駐動作(挙動を変えない)になる。
+    if sys.stdin.isatty():
+        run_agent_with_repl(token, args.port)
+    else:
+        run_agent(token, args.port)
 
 
 if __name__ == "__main__":
