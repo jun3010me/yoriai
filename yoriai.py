@@ -285,30 +285,104 @@ def build_profile_card(agent_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 発見済みピアの共有レジストリ(--status コマンドの情報源)
+# ---------------------------------------------------------------------------
+
+class PeerRegistry:
+    """mDNS/Tailscaleで発見したピアの最新カードを保持する、複数スレッドから
+    アクセスされる共有ストア。--status コマンドが問い合わせる `/status`
+    エンドポイントの情報源になる。
+
+    仮の判断: mDNSは「見えなくなった」イベント(remove_service)があるので
+    即座に取り除けるが、Tailscale経由はそのようなイベントが無く定期スキャンの
+    結果でしか判断できない。そのため、Tailscale経由で見つけたピアは
+    「直近のスキャンで見つからなかったら消す」という形で間接的に古い情報を
+    掃除している(sync_tailscale)。同じピアがmDNSでも見えている場合は
+    Tailscale側のスキャン結果に関わらず残す。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._peers = {}  # agent_id -> {"card", "via", "address", "port", "last_seen"}
+
+    def upsert(self, agent_id: str, card: dict, via: str, address: str, port: int) -> None:
+        with self._lock:
+            self._peers[agent_id] = {
+                "card": card,
+                "via": via,
+                "address": address,
+                "port": port,
+                "last_seen": time.time(),
+            }
+
+    def remove(self, agent_id: str) -> None:
+        with self._lock:
+            self._peers.pop(agent_id, None)
+
+    def sync_tailscale(self, found_agent_ids) -> None:
+        found_agent_ids = set(found_agent_ids)
+        with self._lock:
+            stale = [
+                agent_id for agent_id, info in self._peers.items()
+                if info["via"] == "Tailscale" and agent_id not in found_agent_ids
+            ]
+            for agent_id in stale:
+                del self._peers[agent_id]
+
+    def snapshot(self) -> list:
+        with self._lock:
+            return list(self._peers.values())
+
+
+# ---------------------------------------------------------------------------
 # 自己紹介カードをHTTPで配信するサーバー
 # ---------------------------------------------------------------------------
 
 class CardRequestHandler(BaseHTTPRequestHandler):
     agent_id = None  # start_card_serverでサブクラス化して差し込む
     org_fingerprint = None  # 同上
+    registry = None  # 同上(PeerRegistry、/status で使う)
 
     def do_GET(self):
-        if self.path != "/card":
+        if self.path == "/card":
+            self._handle_card()
+        elif self.path == "/status":
+            self._handle_status()
+        else:
             self.send_response(404)
             self.end_headers()
-            return
 
+    def _check_org_fingerprint(self) -> bool:
         # 仮の判断: mDNS側でトークン不一致の相手はそもそも問い合わせに来ない想定だが、
-        # /card に直接アクセスされた場合の備えとして、サーバー側でも
+        # エンドポイントに直接アクセスされた場合の備えとして、サーバー側でも
         # 組織フィンガープリント(トークンのSHA-256)の一致をここで再検証する。
         requester_fingerprint = self.headers.get(ORG_FINGERPRINT_HEADER)
         if requester_fingerprint != self.org_fingerprint:
             self.send_response(403)
             self.end_headers()
-            return
+            return False
+        return True
 
-        card = build_profile_card(self.agent_id)
-        body = json.dumps(card, ensure_ascii=False).encode("utf-8")
+    def _handle_card(self):
+        if not self._check_org_fingerprint():
+            return
+        self._send_json(build_profile_card(self.agent_id))
+
+    def _handle_status(self):
+        # 仮の判断: --status はこのエンドポイントに問い合わせるだけの軽量な
+        # コマンドにしたいので、自分自身のカードと、mDNS/Tailscaleでこれまでに
+        # 発見済みのピア一覧(PeerRegistryのスナップショット)をまとめて返す。
+        # 新たにネットワークを再スキャンしたりはしない。
+        if not self._check_org_fingerprint():
+            return
+        peers = self.registry.snapshot() if self.registry else []
+        self._send_json({
+            "self": build_profile_card(self.agent_id),
+            "peers": peers,
+        })
+
+    def _send_json(self, data: dict) -> None:
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -320,11 +394,11 @@ class CardRequestHandler(BaseHTTPRequestHandler):
         pass
 
 
-def start_card_server(agent_id: str, org_fingerprint: str, port: int) -> ThreadingHTTPServer:
+def start_card_server(agent_id: str, org_fingerprint: str, port: int, registry: "PeerRegistry") -> ThreadingHTTPServer:
     handler_cls = type(
         "BoundCardRequestHandler",
         (CardRequestHandler,),
-        {"agent_id": agent_id, "org_fingerprint": org_fingerprint},
+        {"agent_id": agent_id, "org_fingerprint": org_fingerprint, "registry": registry},
     )
     server = ThreadingHTTPServer(("0.0.0.0", port), handler_cls)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -428,9 +502,10 @@ def _get_physical_lan_ips_linux() -> list:
 # ---------------------------------------------------------------------------
 
 class YoriaiListener:
-    def __init__(self, self_agent_id: str, self_org_fingerprint: str):
+    def __init__(self, self_agent_id: str, self_org_fingerprint: str, registry: "PeerRegistry" = None):
         self.self_agent_id = self_agent_id
         self.self_org_fingerprint = self_org_fingerprint
+        self.registry = registry
         self.known_peers = {}
 
     def add_service(self, zc, service_type, name):
@@ -443,6 +518,8 @@ class YoriaiListener:
         peer = self.known_peers.pop(name, None)
         if peer:
             logger.info("エージェントが見えなくなりました: %s", peer.get("device_name", name))
+            if self.registry:
+                self.registry.remove(peer.get("agent_id"))
 
     def _handle_peer(self, zc, name):
         info = zc.get_service_info(SERVICE_TYPE, name)
@@ -470,9 +547,11 @@ class YoriaiListener:
         port = info.port
         self.known_peers[name] = {"agent_id": peer_agent_id, "device_name": device_name}
 
-        threading.Thread(target=self._fetch_and_log_card, args=(name, address, port), daemon=True).start()
+        threading.Thread(
+            target=self._fetch_and_log_card, args=(name, peer_agent_id, address, port), daemon=True,
+        ).start()
 
-    def _fetch_and_log_card(self, name, address, port):
+    def _fetch_and_log_card(self, name, peer_agent_id, address, port):
         try:
             resp = requests.get(
                 f"http://{address}:{port}/card",
@@ -484,6 +563,8 @@ class YoriaiListener:
         except Exception as exc:
             logger.warning("%s からの自己紹介カード取得に失敗しました: %s", name, exc)
             return
+        if self.registry:
+            self.registry.upsert(peer_agent_id, card, "mDNS", address, port)
         log_peer_card(card, address, port)
 
 
@@ -517,7 +598,7 @@ def log_peer_card(card: dict, address: str, port: int, via: str = "mDNS") -> Non
     )
 
 
-def discover_via_tailscale(agent_id: str, org_fingerprint: str, port: int) -> int:
+def discover_via_tailscale(agent_id: str, org_fingerprint: str, port: int, registry: "PeerRegistry" = None) -> int:
     """Tailscale経由でエージェント候補をポーリングし、見つかった台数を返す。
 
     呼び出し元(run_agent)が起動時とTAILSCALE_RESCAN_INTERVAL_SEC間隔で
@@ -527,12 +608,16 @@ def discover_via_tailscale(agent_id: str, org_fingerprint: str, port: int) -> in
     cli_path = tailscale.find_cli()
     if not cli_path:
         logger.info("tailscaleコマンドが見つからないため、Tailscale経由の発見はスキップします。")
+        if registry:
+            registry.sync_tailscale([])  # tailscaleが使えなくなった場合、以前の発見結果を掃除する
         return 0
     logger.info("Tailscale CLIを検出しました: %s", cli_path)
 
     peers = tailscale.get_peers(cli_path)
     if not peers:
         logger.info("Tailscale経由で0台のエージェント候補を確認しました(Tailscaleのピアが見つかりませんでした)")
+        if registry:
+            registry.sync_tailscale([])
         return 0
 
     logger.info(
@@ -561,13 +646,20 @@ def discover_via_tailscale(agent_id: str, org_fingerprint: str, port: int) -> in
         return ip, card
 
     found_count = 0
+    found_agent_ids = []
     with ThreadPoolExecutor(max_workers=8) as executor:
         for result in executor.map(_probe, peers):
             if result is None:
                 continue
             ip, card = result
             found_count += 1
+            found_agent_ids.append(card.get("agent_id"))
+            if registry:
+                registry.upsert(card.get("agent_id"), card, "Tailscale", ip, port)
             log_peer_card(card, ip, port, via="Tailscale")
+
+    if registry:
+        registry.sync_tailscale(found_agent_ids)
 
     logger.info("Tailscale経由で%d台のエージェント候補を確認しました", found_count)
     return found_count
@@ -608,7 +700,8 @@ def run_agent(token: str, port: int) -> None:
 
     port = port if port else pick_free_port()
 
-    server = start_card_server(agent_id, org_fingerprint, port)
+    registry = PeerRegistry()
+    server = start_card_server(agent_id, org_fingerprint, port, registry)
     logger.info("自己紹介カードサーバーを起動しました: http://%s:%s/card", local_ip, port)
 
     zeroconf = Zeroconf(interfaces=zc_interfaces, ip_version=IPVersion.V4Only)
@@ -629,7 +722,7 @@ def run_agent(token: str, port: int) -> None:
     logger.info("mDNSにサービスを登録します: %s", service_name)
     zeroconf.register_service(service_info)
 
-    listener = YoriaiListener(agent_id, org_fingerprint)
+    listener = YoriaiListener(agent_id, org_fingerprint, registry)
     ServiceBrowser(zeroconf, SERVICE_TYPE, listener)
 
     # mDNSはLANローカルのマルチキャストが前提で、Tailscale越しのリモートデバイスには
@@ -637,7 +730,7 @@ def run_agent(token: str, port: int) -> None:
     # エンドポイントを直接ポーリングする(mDNSとは別枠の仕組み)。起動直後にまず
     # 1回実行し、以降はTAILSCALE_RESCAN_INTERVAL_SEC間隔で再スキャンする
     # (相手がまだ起動しきっていないタイミングで一度失敗しても、後で拾えるようにするため)。
-    tailscale_found_count = discover_via_tailscale(agent_id, org_fingerprint, port)
+    tailscale_found_count = discover_via_tailscale(agent_id, org_fingerprint, port, registry)
 
     logger.info("同じネットワーク上のYoriaiエージェントを探索しています... (Ctrl+Cで終了)")
     try:
@@ -651,7 +744,7 @@ def run_agent(token: str, port: int) -> None:
             # Tailscale経由の発見数を合わせて見せることで「本当に0台なのか」を
             # 判断しやすくする。
             if time.monotonic() - last_tailscale_scan >= TAILSCALE_RESCAN_INTERVAL_SEC:
-                tailscale_found_count = discover_via_tailscale(agent_id, org_fingerprint, port)
+                tailscale_found_count = discover_via_tailscale(agent_id, org_fingerprint, port, registry)
                 last_tailscale_scan = time.monotonic()
             if time.monotonic() - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
                 logger.info(
@@ -732,6 +825,86 @@ def handle_init(force: bool, custom_passphrase=None) -> None:
     print(f"他の{device}をこの組織に参加させるには: python yoriai.py --join=<上記のトークン>")
 
 
+def _format_seconds_ago(timestamp: float) -> str:
+    delta = max(0, time.time() - timestamp)
+    if delta < 60:
+        return f"{int(delta)}秒前"
+    if delta < 3600:
+        return f"{int(delta // 60)}分前"
+    return f"{int(delta // 3600)}時間前"
+
+
+def _format_status_member(card: dict, index: int, label: str, last_seen: float = None) -> str:
+    device_name = card.get("device_name", "unknown")
+    chip = card.get("os", {}).get("chip", "unknown")
+    memory = card.get("memory", {})
+    free_gb = memory.get("free_gb")
+    total_gb = memory.get("total_gb")
+    installed = card.get("models", {}).get("installed", [])
+    loaded = card.get("models", {}).get("loaded", [])
+
+    if free_gb is not None and total_gb is not None:
+        memory_line = f"    メモリ: 空き {free_gb}GB / 総 {total_gb}GB"
+    else:
+        memory_line = "    メモリ: 不明"
+
+    lines = [
+        f"[{index}] {device_name} {label}",
+        f"    チップ: {chip}",
+        memory_line,
+        f"    ロード済みモデル: {', '.join(loaded) if loaded else 'なし'}",
+        f"    インストール済みモデル({len(installed)}件): {', '.join(installed) if installed else 'なし'}",
+    ]
+    if last_seen is not None:
+        lines.append(f"    最終確認: {_format_seconds_ago(last_seen)}")
+    return "\n".join(lines)
+
+
+def handle_status(port: int) -> None:
+    token = config.load_token()
+    if not token:
+        print(NO_TOKEN_GUIDANCE)
+        sys.exit(1)
+    org_fingerprint = config.token_fingerprint(token)
+
+    try:
+        resp = requests.get(
+            f"http://localhost:{port}/status",
+            headers={ORG_FINGERPRINT_HEADER: org_fingerprint},
+            timeout=CARD_REQUEST_TIMEOUT_SEC,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        # 仮の判断: --status は「今動いている常駐プロセスに問い合わせるだけ」の
+        # 軽量なコマンドという要件のため、エージェントが起動していない場合は
+        # 新たに起動したりはせず、案内を出して終了する。
+        print("実行中のYoriaiエージェントに接続できませんでした。")
+        print(f"詳細: {exc}")
+        print("先に python3 yoriai.py でエージェントを起動してください")
+        print("(常駐化している場合は、想定しているポートで動作しているか確認してください)。")
+        sys.exit(1)
+
+    self_card = data.get("self", {})
+    peers = data.get("peers", [])
+
+    print("=== Yoriai 組織の状態 ===")
+    print()
+    print(_format_status_member(self_card, 1, "[自分]"))
+    print()
+
+    if not peers:
+        print("現在、組織にはあなた1人だけです。")
+        return
+
+    for i, peer in enumerate(peers, start=2):
+        label = f"({peer.get('via', 'unknown')}経由)"
+        print(_format_status_member(peer.get("card", {}), i, label, peer.get("last_seen")))
+        print()
+
+    print(f"合計: {len(peers) + 1}台のエージェントが組織に参加中")
+
+
 # --init が値なしで指定された(合言葉を対話入力する)ことを表す印。
 # 「--initそのものが指定されなかった」(default=None)と区別するために使う。
 _INIT_INTERACTIVE = object()
@@ -746,6 +919,10 @@ def main():
              "--init=<合言葉> で好きな文字列を指定でき、省略時は対話入力(空欄ならランダム生成)",
     )
     group.add_argument("--join", metavar="TOKEN", help="既存の組織のトークンを指定して参加し、そのまま起動する")
+    group.add_argument(
+        "--status", action="store_true",
+        help="常駐中のYoriaiエージェントに問い合わせ、組織に参加しているメンバー一覧を表示して終了する",
+    )
     parser.add_argument(
         "--port", type=int, default=DEFAULT_CARD_PORT,
         help=f"自己紹介カードを配信するHTTPポート番号(既定値: {DEFAULT_CARD_PORT}。0を指定するとOSに自動選択させる)",
@@ -756,6 +933,10 @@ def main():
     if args.init is not None:
         custom_passphrase = None if args.init is _INIT_INTERACTIVE else args.init
         handle_init(args.force, custom_passphrase)
+        return
+
+    if args.status:
+        handle_status(args.port)
         return
 
     if args.join is not None:
