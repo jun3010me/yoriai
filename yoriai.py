@@ -31,6 +31,8 @@ import tailscale
 SERVICE_TYPE = "_yoriai._tcp.local."
 OLLAMA_BASE_URL = "http://localhost:11434"
 LMSTUDIO_BASE_URL = "http://localhost:1234"
+# 仮の判断: mlx_lm.serverの既定ポート(8080)を前提とする。
+MLX_LM_BASE_URL = "http://localhost:8080"
 CARD_REQUEST_TIMEOUT_SEC = 5
 ORG_FINGERPRINT_HEADER = "X-Yoriai-Org-Fingerprint"
 HEARTBEAT_INTERVAL_SEC = 10
@@ -255,6 +257,27 @@ def get_lmstudio_models() -> list:
         return []
 
 
+def get_mlx_lm_models() -> list:
+    """MLX-LM(`python -m mlx_lm.server`)のOpenAI互換APIからモデル一覧を取得する。
+
+    仮の判断: MLX-LMのサーバーは起動時に指定した1つのモデルだけを保持する
+    アーキテクチャで、Ollamaのように複数モデルをインストールしておいて
+    要求ごとに切り替える、という概念が無い。そのためLM Studioと同様、
+    ここで取得できたモデルは「インストール済み」「ロード済み」の両方として
+    扱う。既定ポートは8080(mlx_lm.serverの既定値)を前提としており、
+    別ポートで起動している場合は検出できない(設定可能にするのは今回の
+    スコープ外)。MLX-LMのサーバーが起動していない場合は空リストを返す
+    (エラーにはしない)。
+    """
+    try:
+        resp = requests.get(f"{MLX_LM_BASE_URL}/v1/models", timeout=3)
+        resp.raise_for_status()
+        return [m.get("id") for m in resp.json().get("data", [])]
+    except Exception as exc:
+        logger.warning("MLX-LMのモデル一覧の取得に失敗しました: %s", exc)
+        return []
+
+
 def _merge_model_lists(*model_lists: list) -> list:
     merged = []
     for models in model_lists:
@@ -262,16 +285,6 @@ def _merge_model_lists(*model_lists: list) -> list:
             if name not in merged:
                 merged.append(name)
     return merged
-
-
-def get_installed_models() -> list:
-    # 仮の判断: OllamaとLM Studioのどちらが動いていても自己紹介カードに反映されるよう、
-    # 両方に問い合わせて結果を合算する(両方動いている場合は両方のモデルが載る)。
-    return _merge_model_lists(get_ollama_installed_models(), get_lmstudio_models())
-
-
-def get_loaded_models() -> list:
-    return _merge_model_lists(get_ollama_loaded_models(), get_lmstudio_models())
 
 
 # ---------------------------------------------------------------------------
@@ -472,9 +485,10 @@ def _stream_ollama_turn(model: str, messages: list, tools: list):
     yield {"tool_calls": tool_calls}
 
 
-def _stream_lmstudio_turn(model: str, messages: list, tools: list):
-    """LM StudioのOpenAI互換API(/v1/chat/completions、SSEストリーミング)に
-    1往復だけ問い合わせ、Ollama版と同じ正規化イベントを順にyieldする。
+def _stream_openai_compatible_turn(base_url: str, model: str, messages: list, tools: list):
+    """OpenAI互換のstreaming chat completions API(/v1/chat/completions、SSE)に
+    1往復だけ問い合わせ、正規化イベントを順にyieldする。LM Studio・MLX-LMは
+    どちらもこの同じワイヤ形式を話すため、共通の実装として1箇所にまとめている。
 
     仮の判断: OpenAI互換のストリーミングではtool_callsが複数チャンクに
     分割されて送られてくる(引数のJSON文字列が少しずつ届く)ため、
@@ -482,7 +496,7 @@ def _stream_lmstudio_turn(model: str, messages: list, tools: list):
     """
     try:
         resp = requests.post(
-            f"{LMSTUDIO_BASE_URL}/v1/chat/completions",
+            f"{base_url}/v1/chat/completions",
             json={"model": model, "messages": messages, "tools": tools, "stream": True},
             stream=True,
             timeout=(CHAT_CONNECT_TIMEOUT_SEC, CHAT_READ_TIMEOUT_SEC),
@@ -543,6 +557,19 @@ def _stream_lmstudio_turn(model: str, messages: list, tools: list):
         for _, entry in sorted(tool_calls_by_index.items())
     ]
     yield {"tool_calls": tool_calls}
+
+
+def _stream_lmstudio_turn(model: str, messages: list, tools: list):
+    yield from _stream_openai_compatible_turn(LMSTUDIO_BASE_URL, model, messages, tools)
+
+
+def _stream_mlx_lm_turn(model: str, messages: list, tools: list):
+    # 仮の判断: MLX-LMのFunction Calling対応はバックエンド/バージョンによって
+    # 未対応・不安定な場合がある。未対応の場合はエラーになるかtoolsを無視して
+    # 通常のチャットとして応答するかのどちらかになりうるが、いずれの場合も
+    # 既存のエラーハンドリング/漏れ検出フォールバックがそのまま機能するため、
+    # ここで特別な分岐は設けていない。
+    yield from _stream_openai_compatible_turn(MLX_LM_BASE_URL, model, messages, tools)
 
 
 # 仮の判断: 一部のモデル/バックエンドの組み合わせ(例: LM Studioで一部の
@@ -641,8 +668,8 @@ def _run_turn_with_leak_detection(turn, tools: list):
 
 
 def stream_chat_completion(model: str, messages: list):
-    """モデル名からOllama/LM Studioどちらにチャットを振るかを決め、正規化された
-    ストリーミングイベント({"content": ...} / {"tool_call": <ツール名>} /
+    """モデル名からOllama/LM Studio/MLX-LMのどれにチャットを振るかを決め、
+    正規化されたストリーミングイベント({"content": ...} / {"tool_call": <ツール名>} /
     {"done": True} / {"error": ...})を順にyieldする。
 
     モデルがツール(現状はweb_searchのみ)の呼び出しを要求した場合は、
@@ -653,7 +680,11 @@ def stream_chat_completion(model: str, messages: list):
     仮の判断: フェーズ5では「タスクの難易度に応じた賢い振り分け」はスコープ外の
     ため、モデルの選定自体は呼び出し元(候補選定ロジック)に任せ、ここでは
     単純に「Ollamaのロード済みモデル一覧に名前があればOllama、なければ
-    LM Studio」というバックエンドの振り分けだけを行う。
+    MLX-LMのモデル一覧に名前があればMLX-LM、どちらでもなければLM Studio」
+    というバックエンドの振り分けだけを行う。LM Studioを最後のデフォルトに
+    しているのは、フェーズ5時点からの既存の挙動を変えないため。
+    Ollama/MLX-LMどちらのモデル一覧にも同名のモデルが存在する場合はOllama
+    側が優先される(仮の判断、Ollamaを優先する明確な理由は無いが決め打ちが必要だった)。
 
     仮の判断: バックエンド/モデルの組み合わせによっては、ツール呼び出しの
     構造化出力に対応しておらず、モデル自身の内部記法がそのまま回答本文に
@@ -667,6 +698,8 @@ def stream_chat_completion(model: str, messages: list):
     for round_num in range(MAX_TOOL_CALL_ROUNDS + 1):
         if model in get_ollama_loaded_models():
             turn = _stream_ollama_turn(model, messages, tools)
+        elif model in get_mlx_lm_models():
+            turn = _stream_mlx_lm_turn(model, messages, tools)
         else:
             turn = _stream_lmstudio_turn(model, messages, tools)
 
@@ -707,6 +740,24 @@ def stream_chat_completion(model: str, messages: list):
 
 
 def build_profile_card(agent_id: str) -> dict:
+    # 仮の判断: 「インストール済み/ロード済みモデル」と「利用可能なバックエンド」を
+    # それぞれ別々の関数で問い合わせると、同じバックエンド(特にLM Studio・
+    # MLX-LMのように問い合わせ1回でインストール済み=ロード済みを兼ねるもの)に
+    # 何度も重複してHTTPリクエストを送ることになるため、ここで各バックエンドに
+    # 1回ずつ問い合わせて使い回す。
+    ollama_installed = get_ollama_installed_models()
+    ollama_loaded = get_ollama_loaded_models()
+    lmstudio_models = get_lmstudio_models()
+    mlx_lm_models = get_mlx_lm_models()
+
+    backends = []
+    if ollama_installed:
+        backends.append("ollama")
+    if lmstudio_models:
+        backends.append("lmstudio")
+    if mlx_lm_models:
+        backends.append("mlx_lm")
+
     return {
         "agent_id": agent_id,
         "device_name": get_short_hostname(),
@@ -718,8 +769,9 @@ def build_profile_card(agent_id: str) -> dict:
         },
         "memory": get_memory_info(),
         "models": {
-            "installed": get_installed_models(),
-            "loaded": get_loaded_models(),
+            "installed": _merge_model_lists(ollama_installed, lmstudio_models, mlx_lm_models),
+            "loaded": _merge_model_lists(ollama_loaded, lmstudio_models, mlx_lm_models),
+            "backends": backends,
         },
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
@@ -1755,6 +1807,7 @@ def _format_status_member(card: dict, index: int, label: str, last_seen: float =
     total_gb = memory.get("total_gb")
     installed = card.get("models", {}).get("installed", [])
     loaded = card.get("models", {}).get("loaded", [])
+    backends = card.get("models", {}).get("backends", [])
 
     if free_gb is not None and total_gb is not None:
         memory_line = f"    メモリ: 空き {free_gb}GB / 総 {total_gb}GB"
@@ -1765,6 +1818,7 @@ def _format_status_member(card: dict, index: int, label: str, last_seen: float =
         f"[{index}] {device_name} {label}",
         f"    チップ: {chip}",
         memory_line,
+        f"    利用可能なバックエンド: {', '.join(backends) if backends else 'なし'}",
         f"    ロード済みモデル: {', '.join(loaded) if loaded else 'なし'}",
         f"    インストール済みモデル({len(installed)}件): {', '.join(installed) if installed else 'なし'}",
     ]
