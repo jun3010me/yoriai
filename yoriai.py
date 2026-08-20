@@ -32,6 +32,12 @@ CARD_REQUEST_TIMEOUT_SEC = 5
 ORG_FINGERPRINT_HEADER = "X-Yoriai-Org-Fingerprint"
 HEARTBEAT_INTERVAL_SEC = 10
 
+# 仮の判断: チャットの接続確立自体はカード取得と同程度の速さで判定してよいが、
+# LLMの生成そのものは(モデルサイズや質問内容によっては)数十秒かかることが
+# あるため、読み取りタイムアウトは長めに取る。
+CHAT_CONNECT_TIMEOUT_SEC = 5
+CHAT_READ_TIMEOUT_SEC = 120
+
 # 仮の判断: 起動時1回だけのスキャンだと、たまたま相手のYoriaiがまだ起動しきっていない
 # タイミングで実行してしまった場合に「Connection refused」で失敗し、その後相手が
 # 起動してもずっと0件のまま固定されてしまう問題が実機検証で見つかった。
@@ -265,6 +271,102 @@ def get_loaded_models() -> list:
     return _merge_model_lists(get_ollama_loaded_models(), get_lmstudio_models())
 
 
+# ---------------------------------------------------------------------------
+# チャットのプロキシ(Ollama/LM Studioへのストリーミング問い合わせ)
+# ---------------------------------------------------------------------------
+
+def _stream_ollama_chat(model: str, messages: list):
+    """OllamaのネイティブAPI(/api/chat、NDJSONストリーミング)に問い合わせ、
+    正規化したイベント({"content": ...} / {"done": True} / {"error": ...})を
+    順にyieldする。
+    """
+    try:
+        resp = requests.post(
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json={"model": model, "messages": messages, "stream": True},
+            stream=True,
+            timeout=(CHAT_CONNECT_TIMEOUT_SEC, CHAT_READ_TIMEOUT_SEC),
+        )
+        resp.raise_for_status()
+    except Exception as exc:
+        yield {"error": str(exc)}
+        return
+
+    try:
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            content = obj.get("message", {}).get("content")
+            if content:
+                yield {"content": content}
+            if obj.get("done"):
+                break
+    except Exception as exc:
+        yield {"error": str(exc)}
+        return
+    yield {"done": True}
+
+
+def _stream_lmstudio_chat(model: str, messages: list):
+    """LM StudioのOpenAI互換API(/v1/chat/completions、SSEストリーミング)に
+    問い合わせ、Ollama版と同じ正規化イベントを順にyieldする。
+    """
+    try:
+        resp = requests.post(
+            f"{LMSTUDIO_BASE_URL}/v1/chat/completions",
+            json={"model": model, "messages": messages, "stream": True},
+            stream=True,
+            timeout=(CHAT_CONNECT_TIMEOUT_SEC, CHAT_READ_TIMEOUT_SEC),
+        )
+        resp.raise_for_status()
+    except Exception as exc:
+        yield {"error": str(exc)}
+        return
+
+    try:
+        for raw_line in resp.iter_lines():
+            if not raw_line:
+                continue
+            line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else raw_line
+            if not line.startswith("data:"):
+                continue
+            data = line[len("data:"):].strip()
+            if data == "[DONE]":
+                break
+            try:
+                obj = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            choices = obj.get("choices", [])
+            if choices:
+                content = choices[0].get("delta", {}).get("content")
+                if content:
+                    yield {"content": content}
+    except Exception as exc:
+        yield {"error": str(exc)}
+        return
+    yield {"done": True}
+
+
+def stream_chat_completion(model: str, messages: list):
+    """モデル名からOllama/LM Studioどちらにチャットを振るかを決め、
+    正規化されたストリーミングイベントを順にyieldする。
+
+    仮の判断: フェーズ5では「タスクの難易度に応じた賢い振り分け」はスコープ外の
+    ため、モデルの選定自体は呼び出し元(候補選定ロジック)に任せ、ここでは
+    単純に「Ollamaのロード済みモデル一覧に名前があればOllama、なければ
+    LM Studio」というバックエンドの振り分けだけを行う。
+    """
+    if model in get_ollama_loaded_models():
+        yield from _stream_ollama_chat(model, messages)
+    else:
+        yield from _stream_lmstudio_chat(model, messages)
+
+
 def build_profile_card(agent_id: str) -> dict:
     return {
         "agent_id": agent_id,
@@ -352,6 +454,13 @@ class CardRequestHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+    def do_POST(self):
+        if self.path == "/chat":
+            self._handle_chat()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
     def _check_org_fingerprint(self) -> bool:
         # 仮の判断: mDNS側でトークン不一致の相手はそもそも問い合わせに来ない想定だが、
         # エンドポイントに直接アクセスされた場合の備えとして、サーバー側でも
@@ -380,6 +489,36 @@ class CardRequestHandler(BaseHTTPRequestHandler):
             "self": build_profile_card(self.agent_id),
             "peers": peers,
         })
+
+    def _handle_chat(self):
+        # 仮の判断: /chat も /card と同じくトークンのフィンガープリントで認証する。
+        if not self._check_org_fingerprint():
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+        except Exception:
+            self.send_response(400)
+            self.end_headers()
+            return
+
+        model = body.get("model")
+        messages = body.get("messages", [])
+
+        # 仮の判断: 応答は事前にサイズが分からないストリーミングなので
+        # Content-Lengthは付けず、NDJSON(1行1イベントのJSON)として都度書き出す。
+        # クライアント側が対応できない場合でも、単純に行ごとに読めば動く形式にした。
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        try:
+            for event in stream_chat_completion(model, messages):
+                self.wfile.write(json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # 仮の判断: 相手が受信を打ち切った場合、ここでは何もせず単に配信を止める
 
     def _send_json(self, data: dict) -> None:
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
