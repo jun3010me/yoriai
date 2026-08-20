@@ -694,14 +694,22 @@ def _resolve_new_token(custom_passphrase) -> str:
     return entered if entered else config.generate_token()
 
 
+def _device_label() -> str:
+    # 仮の判断: 案内メッセージの「このMac」「他のMac」という表現は、
+    # macOS専用プロトタイプだった頃の名残でLinux(Raspberry Piなど)でも
+    # 誤ってそのまま表示されていた。実行環境に応じて表現を出し分ける。
+    return "Mac" if platform.system() == "Darwin" else "端末"
+
+
 def handle_init(force: bool, custom_passphrase=None) -> None:
     existing_token = config.load_token()
+    device = _device_label()
 
     if existing_token and not force:
         # 既にトークンがある場合は無条件に上書きせず、既存のトークンを案内するだけにする。
         # うっかり --init を叩き直しただけで組織が分裂してしまう事故を避けるため。
         print(f"既にこの組織のトークンが存在します: {existing_token}")
-        print("このMacでYoriaiを開始するには: python yoriai.py")
+        print(f"この{device}でYoriaiを開始するには: python yoriai.py")
         print("トークンを再発行したい場合は: python yoriai.py --init --force")
         return
 
@@ -715,13 +723,13 @@ def handle_init(force: bool, custom_passphrase=None) -> None:
     token = _resolve_new_token(custom_passphrase)
     config.save_token(token)
     # 仮の判断: --init はトークンの発行・保存のみを行い、そのまま起動はしない。
-    # 発行したトークンを他のMacに共有してから `python yoriai.py` (このMac自身も含む)
+    # 発行したトークンを他の端末に共有してから `python yoriai.py` (この端末自身も含む)
     # で明示的に起動する、という2段階の操作の方が事故が少ないと判断した。
     print("新しいトークンを発行しました。このトークンを組織のメンバーに共有してください。")
     print(f"トークン: {token}")
     print(f"保存先: {config.CONFIG_FILE}")
-    print("このMacでYoriaiを開始するには: python yoriai.py")
-    print("他のMacをこの組織に参加させるには: python yoriai.py --join=<上記のトークン>")
+    print(f"この{device}でYoriaiを開始するには: python yoriai.py")
+    print(f"他の{device}をこの組織に参加させるには: python yoriai.py --join=<上記のトークン>")
 
 
 # --init が値なしで指定された(合言葉を対話入力する)ことを表す印。
