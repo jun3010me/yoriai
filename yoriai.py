@@ -528,8 +528,18 @@ def _stream_lmstudio_turn(model: str, messages: list, tools: list):
         yield {"error": str(exc)}
         return
 
+    # 仮の判断: OpenAI互換のtool_calls形式は各要素に"type": "function"を
+    # 必須で要求する。これを省いたまま次のラウンドでmessages履歴に含めて
+    # 送り返すと、LM Studio側のスキーマ検証で400 Bad Requestになることが
+    # 実機で見つかった。またidもストリーミングの途中で一度も送られてこず
+    # nullのままになることがあり、これも同様に不正な形として拒否されうる
+    # ため、その場合は仮のIDを補って必ず有効な文字列にする。
     tool_calls = [
-        {"id": entry["id"], "function": entry["function"]}
+        {
+            "id": entry["id"] or f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": entry["function"],
+        }
         for _, entry in sorted(tool_calls_by_index.items())
     ]
     yield {"tool_calls": tool_calls}
