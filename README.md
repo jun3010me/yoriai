@@ -20,12 +20,17 @@
 4. **Tailscale経由での発見(フェーズ2.5)**: mDNSは同一LAN内向けの発見として維持しつつ、
    Tailscaleで接続されたリモートデバイスも `tailscale status --json` のピア一覧を使って
    別枠で発見できるようにしています。
+5. **Linux対応 + 常駐化(フェーズ4)**: macOSに加えてLinux(Raspberry Pi 4を含むDebian系など)
+   でも動作します。macOSはlaunchd、Linuxはsystemdによる常駐化スクリプトも用意しており、
+   SSHセッションを切っても動き続け、クラッシュ時は自動再起動されます。
 
 タスクの割り振り、Ollama/LM Studioの自動インストール、モデル剪定などは**次フェーズ以降**の対象です。
 
 ## 動作環境
 
-- macOS (Apple Silicon) ※チップ情報・メモリ情報の取得は `sysctl` / `vm_stat` を利用するためmacOS専用です
+- macOS (Apple Silicon) または Linux(Raspberry Pi 4を含むDebian系などで動作確認)
+  - チップ情報・メモリ情報の取得方法はOSごとに異なります
+    (macOS: `sysctl` / `vm_stat`、Linux: `/proc/cpuinfo` / `/proc/meminfo`)
 - Python 3.9以降
 - ローカルLLMバックエンドとして、以下のどちらか(または両方)が動作していること
   - [Ollama](https://ollama.com/): `ollama serve` (通常は自動起動) が起動していること
@@ -54,7 +59,15 @@ Yoriaiは起動前に「トークン(組織の合言葉)」が必要です。ま
 python3 yoriai.py --init
 ```
 
-ランダムなトークンが生成され、コンソールに表示されます。このトークンをメモしておき、
+対話的に合言葉(トークン)の入力を求められます。好きな文字列を入力するとそれが
+そのまま合言葉になります。何も入力せず空欄でEnterを押すと、ランダムなトークンが
+自動生成されます。合言葉を先に決めておきたい場合は、引数で直接指定することもできます。
+
+```bash
+python3 yoriai.py --init="うちの合言葉"
+```
+
+決まった合言葉/トークンはコンソールに表示されます。これをメモしておき、
 同じ組織に参加させたい他のMacに共有してください。
 `--init` はトークンの発行・保存のみを行い、エージェントの起動は行いません
 (理由は後述の「実装上の判断メモ」を参照)。
@@ -227,6 +240,96 @@ Mac A側のログに「🔒 ... は別の組織のエージェントのようで
   (「物理LANインターフェース(en\*)を特定できなかったため」という警告が出ていないか)。
 - (Tailscale経由の場合)双方とも既定ポート(`47120`)で起動しているか。
 
+## Raspberry Pi(Linux)での動作確認手順
+
+1. Raspberry Pi 4(Debian系、Raspberry Pi OSなど)にPython 3.9以降がインストールされていることを確認します。
+
+   ```bash
+   python3 --version
+   ```
+
+2. このリポジトリをclone/転送し、依存関係をインストールします。
+
+   ```bash
+   git clone <このリポジトリのURL>
+   cd yoriai
+   python3 -m venv .venv && source .venv/bin/activate
+   pip install -r requirements.txt
+   ```
+
+3. トークンを用意します(既に組織がある場合は`--join`、新規なら`--init`)。
+
+   ```bash
+   python3 yoriai.py --join=<共有されたトークン>
+   ```
+
+4. 起動ログで、チップ情報が `/proc/cpuinfo` から取得したボード名
+   (例: `Raspberry Pi 4 Model B Rev 1.4`)になっているか、メモリ情報が
+   `/proc/meminfo` ベースの値になっているかを確認します。
+5. Mac側のYoriaiと同様に、mDNS(同一LAN内)またはTailscale経由でお互いを発見できるか確認します。
+   Raspberry PiのmDNS向け物理LANインターフェース検出は、macOS版のような許可リストではなく、
+   既知の仮想インターフェース(`tailscale*`, `docker*`, `veth*`など)を除外するブロックリスト方式です
+   (詳細は後述の判断メモを参照)。`ip`/`ifconfig`コマンドが入っていない最小構成でも、
+   Python標準ライブラリだけで動作するように作っています。
+
+## 常駐化(自動起動)
+
+SSHセッションを切っても動き続け、クラッシュ時は自動的に再起動されるように、
+OSごとの常駐化スクリプトを `scripts/` 以下に用意しています。
+
+**重要**: 常駐化スクリプトを実行する前に、必ず `--init` または `--join` で
+トークンを保存しておいてください。トークン未設定のまま常駐化すると、
+`python3 yoriai.py`(引数なし)が起動のたびにすぐ終了し、
+launchd/systemdが再起動を繰り返してしまいます。
+
+### macOS(launchd)
+
+```bash
+./scripts/launchd/install.sh
+```
+
+ユーザーのLaunchAgentとして `~/Library/LaunchAgents/com.yoriai.agent.plist` に登録されます。
+ログイン時に自動起動し、異常終了(クラッシュ)時は自動再起動されます
+(`launchctl`のKeepAlive設定。正常終了時=`Ctrl+C`相当では再起動しません)。
+ログは `~/.yoriai/logs/agent.log` / `agent.error.log` に出力されます。
+
+```bash
+# 状態確認
+launchctl list | grep com.yoriai.agent
+
+# 一時停止・再開
+launchctl unload ~/Library/LaunchAgents/com.yoriai.agent.plist
+launchctl load ~/Library/LaunchAgents/com.yoriai.agent.plist
+
+# アンインストール
+./scripts/launchd/uninstall.sh
+```
+
+### Linux(systemd、Raspberry Pi 4など)
+
+```bash
+./scripts/systemd/install.sh
+```
+
+システム全体のsystemdサービス(`/etc/systemd/system/yoriai.service`)として登録されるため、
+`sudo`のパスワード入力を求められます。OS起動時に自動起動し、異常終了時は
+5秒後に自動再起動されます(`Restart=on-failure`)。
+
+```bash
+# 状態確認
+sudo systemctl status yoriai.service
+
+# ログ確認
+sudo journalctl -u yoriai.service -f
+
+# 一時停止・再開
+sudo systemctl stop yoriai.service
+sudo systemctl start yoriai.service
+
+# アンインストール
+./scripts/systemd/uninstall.sh
+```
+
 ## 実装上の判断メモ(仮決め箇所)
 
 今回の実装で判断に迷い、ひとまずこう決めた箇所を残しておきます。次フェーズで見直す際の参考にしてください。
@@ -250,12 +353,10 @@ Mac A側のログに「🔒 ... は別の組織のエージェントのようで
 
 ### フェーズ2(トークンによる参加制御)で判断に迷った箇所
 
-- **トークンの保存先**: macOS Keychainを優先し、`security`コマンド(add-generic-password /
-  find-generic-password)が使える場合はそちらに保存します。使えない場合(macOS以外での動作確認や、
-  何らかの理由でKeychainにアクセスできない場合)は `~/.yoriai/config.json` への平文保存にフォールバックします。
-  **本来はKeychain等のセキュアストレージで一元管理するのが望ましく**、平文ファイル保存はあくまで
-  フォールバックという位置づけです(せめてファイルパーミッションは所有者のみ読み書き可能に絞っています)。
-  実装は `config.py` を参照してください。
+- **トークンの保存先**: `~/.yoriai/config.json` への平文保存です(せめてファイルパーミッションは
+  所有者のみ読み書き可能に絞っています)。当初はmacOS Keychainを優先する設計でしたが、
+  フェーズ3で個人のローカル/Tailscaleネットワーク内での利用を前提に、運用のしやすさを優先して
+  平文ファイル保存に統一しました(詳細は後述の「フェーズ3」を参照)。実装は `config.py` を参照してください。
 - **mDNS/HTTPで流すのは生トークンではなくハッシュ値**: mDNSのTXTレコードは同一ネットワーク上の
   誰からでも読めてしまうため、生トークンをそのまま広告すると「トークンによる参加制限」の意味が
   薄れてしまいます。そのため `SHA-256(トークン)` の値(`org_fingerprint`)だけを広告し、
@@ -369,3 +470,60 @@ Mac A側のログに「🔒 ... は別の組織のエージェントのようで
   一切送らずに`/v1/models`を叩く実装(今回のスコープでは認証の仕組みは実装しない、という
   当初の方針通り)のため、認証必須の設定だと401で弾かれ、`get_lmstudio_models()`が
   例外を握りつぶして空リストを返していた。LM Studio側でこの設定をOFFにすることで解決した。
+
+### フェーズ3(トークン運用のシンプル化)で判断に迷った箇所
+
+- **Keychain保存の廃止**: 個人のローカル/Tailscaleネットワーク内での利用が前提であり、
+  厳重なセキュリティよりも運用のしやすさ(合言葉を人に伝えやすい、設定ファイルを直接見て
+  確認・編集できる、など)を優先することにした。macOS Keychain連携のコード(`security`
+  コマンドの呼び出し)は削除し、`~/.yoriai/config.json` への平文保存に一本化した。
+  なお、mDNS/HTTP上で流すのは引き続きSHA-256でハッシュ化した値のみで、生トークンを
+  ネットワークに流さない設計は変更していない。
+- **`--init` の合言葉指定方法を「引数 + 対話入力」の2通りにした理由**: `--init=<合言葉>`
+  による直接指定は、スクリプトからの利用や複数台へ手早く展開したい場合に便利な一方、
+  端末の履歴やスクリーンショットに合言葉が残りやすいという弱点がある。対話入力
+  (`--init` を値なしで実行)はその場でしか見えないため、状況に応じて使い分けられるよう
+  両方を用意した。対話入力で何も入力しなかった場合は、従来通りランダムな32バイトの
+  トークンにフォールバックする(依頼にあった仕様通り)。
+- **合言葉の形式チェックはしていない**: 空白のみの入力は無効(トリムして空ならランダム
+  生成にフォールバック)とした以外、長さや文字種の制限は設けていない。短すぎる合言葉は
+  推測されやすくなるが、今回のスコープでは利用者の判断に委ねることにした。
+
+### フェーズ4(Linux対応 + 常駐化)で判断に迷った箇所
+
+- **Linuxのメモリ情報にMemAvailableを使う理由**: `/proc/meminfo` には `MemFree`(本当に
+  何にも使われていないメモリ)と `MemAvailable`(キャッシュなどを解放すれば新規プロセスに
+  割り当てられる量の推定値)の両方がある。macOS版で「Pages free + Pages inactive」を
+  「空きメモリ」とみなした判断と一貫性を持たせるため、Linux版でも `MemFree` 単体ではなく
+  より実態に近い `MemAvailable` を使うことにした。
+- **Linuxの物理LANインターフェース検出を許可リストではなくブロックリストにした理由**:
+  macOS版は物理イーサネット/Wi-Fiが `en<数字>` という命名規則にほぼ統一されているため
+  許可リスト方式で十分だったが、Linuxは `eth0`, `wlan0`, `enp3s0`, `wlp2s0` など機種や
+  ディストリビューションによって命名がまちまちで、許可リストだと拾いこぼす可能性が高い。
+  そのため逆に、既知の仮想インターフェース(`lo`, `tailscale*`, `docker*`, `veth*`, `br-*`,
+  `virbr*`, `tun*`, `tap*`, `wg*`)だけを除外するブロックリスト方式にした。想定していない
+  仮想インターフェースがあれば拾ってしまう可能性は残る。
+- **`ip`/`ifconfig`コマンドを使わず標準ライブラリだけで実装した理由**: Raspberry Pi OS Lite
+  などの最小構成では `iproute2`/`net-tools` が入っていないことがある。そこで
+  `socket.if_nameindex()`(インターフェース一覧)と `fcntl.ioctl(SIOCGIFADDR)`
+  (各インターフェースのIPv4アドレス取得、Linux固有のシステムコール)を組み合わせ、
+  外部コマンドに一切依存しない実装にした。
+- **常駐化はmacOS=ユーザーLaunchAgent、Linux=システムsystemdサービスにした理由**:
+  「ログアウト後も動き続ける」という要件に対して、launchdのユーザーエージェントは
+  ログイン中は問題なく動くため素直に採用した。一方Linuxのユーザーセッションsystemd
+  (`systemctl --user`)はログアウトすると既定で停止してしまい、`loginctl enable-linger`
+  という追加設定をしないと動き続けない。設定を1つ増やすよりは、最初から
+  システム全体のsystemdサービス(`/etc/systemd/system/`、要sudo)として登録する方が
+  「ログアウト後も動き続ける」を単純に満たせると判断した。
+- **クラッシュ時のみ自動再起動する設定にした理由**: launchdは`KeepAlive`を
+  `{SuccessfulExit: false}` にし、systemdは`Restart=on-failure`にすることで、
+  異常終了(クラッシュ、非0の終了コード)の場合だけ自動再起動し、正常終了
+  (終了コード0)の場合は再起動しないようにした。ただし、トークン未設定のまま
+  `python3 yoriai.py` を実行すると `sys.exit(1)`(異常終了扱い)で終了する仕様のため、
+  常駐化スクリプトを実行する前に必ずトークンを用意しておく必要がある、という
+  制約が生まれている(README本文に注記済み)。
+- **常駐化スクリプトの配置場所を`scripts/`以下にした理由**: 将来的にOSやツールが
+  増えても整理しやすいよう、`scripts/launchd/`・`scripts/systemd/`という
+  OS別ディレクトリに分けた。テンプレートファイル(`.plist.template`/`.service.template`)
+  と、`sed`でプレースホルダー(`__PYTHON_BIN__`など)を実際のパスに置換して配置する
+  `install.sh`/`uninstall.sh`という構成に統一している。

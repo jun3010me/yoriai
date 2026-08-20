@@ -2,7 +2,7 @@
 """Yoriai: 同一ネットワーク上のローカルLLMエージェントを mDNS で自動発見し、
 自己紹介カード(JSON)を交換する最小構成プロトタイプ。
 
-対象OS: macOS (Apple Silicon) のみ動作確認。
+対象OS: macOS (Apple Silicon) / Linux (Raspberry Pi 4を含むDebian系など)。
 """
 
 import argparse
@@ -69,6 +69,20 @@ def get_short_hostname() -> str:
 
 
 def get_chip_info() -> str:
+    system = platform.system()
+    if system == "Darwin":
+        info = _get_chip_info_macos()
+    elif system == "Linux":
+        info = _get_chip_info_linux()
+    else:
+        info = None
+    if info:
+        return info
+    # 仮の判断: OS別の取得方法が使えない環境ではplatformの値で代用する
+    return platform.processor() or platform.machine()
+
+
+def _get_chip_info_macos():
     try:
         result = subprocess.run(
             ["sysctl", "-n", "machdep.cpu.brand_string"],
@@ -78,8 +92,29 @@ def get_chip_info() -> str:
             return result.stdout.strip()
     except Exception:
         pass
-    # 仮の判断: sysctlが使えない環境(macOS以外)ではplatformの値で代用する
-    return platform.processor() or platform.machine()
+    return None
+
+
+def _get_chip_info_linux():
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except Exception:
+        return None
+
+    # 仮の判断: Raspberry PiなどのARMボードでは/proc/cpuinfoの末尾に
+    # ボード名を表す "Model" 行が付くことが多いため、まずそちらを優先する。
+    # x86系のように"Model"行が無い場合は、コアごとに繰り返し出てくる
+    # "model name" 行の先頭のものを使う。
+    model_match = re.search(r"^Model\s*:\s*(.+)$", content, re.MULTILINE)
+    if model_match:
+        return model_match.group(1).strip()
+
+    name_match = re.search(r"^model name\s*:\s*(.+)$", content, re.MULTILINE)
+    if name_match:
+        return name_match.group(1).strip()
+
+    return None
 
 
 def _parse_vm_stat_free_bytes(vm_stat_output: str):
@@ -107,7 +142,29 @@ def _parse_vm_stat_free_bytes(vm_stat_output: str):
     return free_pages * page_size
 
 
+def _empty_memory_info() -> dict:
+    return {"total_bytes": None, "free_bytes": None, "total_gb": None, "free_gb": None}
+
+
+def _memory_info_from_bytes(total_bytes, free_bytes) -> dict:
+    return {
+        "total_bytes": total_bytes,
+        "free_bytes": free_bytes,
+        "total_gb": round(total_bytes / 1e9, 1) if total_bytes else None,
+        "free_gb": round(free_bytes / 1e9, 1) if free_bytes else None,
+    }
+
+
 def get_memory_info() -> dict:
+    system = platform.system()
+    if system == "Darwin":
+        return _get_memory_info_macos()
+    elif system == "Linux":
+        return _get_memory_info_linux()
+    return _empty_memory_info()
+
+
+def _get_memory_info_macos() -> dict:
     total_bytes = None
     try:
         result = subprocess.run(
@@ -126,12 +183,30 @@ def get_memory_info() -> dict:
     except Exception:
         pass
 
-    return {
-        "total_bytes": total_bytes,
-        "free_bytes": free_bytes,
-        "total_gb": round(total_bytes / 1e9, 1) if total_bytes else None,
-        "free_gb": round(free_bytes / 1e9, 1) if free_bytes else None,
-    }
+    return _memory_info_from_bytes(total_bytes, free_bytes)
+
+
+def _get_memory_info_linux() -> dict:
+    try:
+        with open("/proc/meminfo", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except Exception as exc:
+        logger.warning("/proc/meminfoの読み込みに失敗しました: %s", exc)
+        return _empty_memory_info()
+
+    values = {}
+    for line in content.splitlines():
+        match = re.match(r"^(\w+):\s+(\d+)\s*kB", line)
+        if match:
+            values[match.group(1)] = int(match.group(2)) * 1024  # kB -> bytes
+
+    total_bytes = values.get("MemTotal")
+    # 仮の判断: 「空きメモリ」はMemFreeではなくMemAvailable(すぐに確保可能な
+    # メモリの推定値)を使う。macOS版のPages free+inactiveと同様、キャッシュ分を
+    # 含めないと実態よりかなり少なく見えてしまうため。
+    free_bytes = values.get("MemAvailable")
+
+    return _memory_info_from_bytes(total_bytes, free_bytes)
 
 
 def get_ollama_installed_models() -> list:
@@ -270,16 +345,23 @@ def get_local_ip() -> str:
 
 
 def get_physical_lan_ips() -> list:
-    """物理LANインターフェース(macOSの en* )のIPv4アドレス一覧を返す。
-
-    仮の判断: Tailscale(utun*)やAWDL(awdl0)、ブリッジ(bridge*)などの仮想
+    """物理LANインターフェースのIPv4アドレス一覧を返す(Tailscale等の仮想
     インターフェースをmDNSのバインド対象から除外し、"自宅LAN内向け"の発見に
-    限定するため、macOSで物理イーサネット/Wi-Fiに使われる `en<数字>` という
-    命名規則のインターフェースだけを対象にしている。`ifconfig`の出力を素朴に
-    パースしているだけなので、環境によっては拾えない/拾いすぎる可能性がある。
+    限定するため)。
     """
-    if platform.system() != "Darwin":
-        return []
+    system = platform.system()
+    if system == "Darwin":
+        return _get_physical_lan_ips_macos()
+    elif system == "Linux":
+        return _get_physical_lan_ips_linux()
+    return []
+
+
+def _get_physical_lan_ips_macos() -> list:
+    """macOSで物理イーサネット/Wi-Fiに使われる `en<数字>` という命名規則の
+    インターフェースだけを対象にする。`ifconfig`の出力を素朴にパースしている
+    だけなので、環境によっては拾えない/拾いすぎる可能性がある(仮の判断)。
+    """
     try:
         result = subprocess.run(["ifconfig"], capture_output=True, text=True, timeout=3)
     except Exception as exc:
@@ -298,6 +380,46 @@ def get_physical_lan_ips() -> list:
             match = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", line)
             if match:
                 ips.append(match.group(1))
+    return ips
+
+
+# 仮の判断: Linuxはインターフェースの命名規則がディストリビューション/機種に
+# よってまちまち(eth0, wlan0, enp3s0, wlp2s0 など)で、macOSの `en<数字>` の
+# ようなシンプルな許可リストでは網羅できない。そのため逆に、既知の仮想
+# インターフェースの名前だけを除外するブロックリスト方式にしている。
+LINUX_VIRTUAL_IFACE_PREFIXES = ("lo", "tailscale", "docker", "veth", "br-", "virbr", "tun", "tap", "wg")
+
+_SIOCGIFADDR = 0x8915  # Linux固有のioctlリクエスト番号(インターフェースのIPv4アドレス取得用)
+
+
+def _get_physical_lan_ips_linux() -> list:
+    """`ip`/`ifconfig`コマンドに依存せず、標準ライブラリの`socket`/`fcntl`だけで
+    インターフェース一覧とIPv4アドレスを取得する(最小構成のRaspberry Pi OSなど、
+    iproute2/net-toolsが入っていない環境でも動かすための仮の判断)。
+    """
+    import fcntl
+    import struct
+
+    try:
+        iface_names = [name for _, name in socket.if_nameindex()]
+    except OSError as exc:
+        logger.warning("ネットワークインターフェース一覧の取得に失敗しました: %s", exc)
+        return []
+
+    ips = []
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        for iface in iface_names:
+            if iface.startswith(LINUX_VIRTUAL_IFACE_PREFIXES):
+                continue
+            try:
+                result = fcntl.ioctl(
+                    sock.fileno(),
+                    _SIOCGIFADDR,
+                    struct.pack("256s", iface[:15].encode("utf-8")),
+                )
+            except OSError:
+                continue  # IPv4アドレスが割り当てられていないインターフェース
+            ips.append(socket.inet_ntoa(result[20:24]))
     return ips
 
 
@@ -462,8 +584,8 @@ def pick_free_port() -> int:
 
 
 def run_agent(token: str, port: int) -> None:
-    if platform.system() != "Darwin":
-        logger.warning("このプロトタイプはmacOS(Apple Silicon)を想定しています。他OSでは一部情報が取得できません。")
+    if platform.system() not in ("Darwin", "Linux"):
+        logger.warning("このプロトタイプはmacOS/Linuxを想定しています。他OSでは一部情報が取得できません。")
 
     agent_id = str(uuid.uuid4())
     org_fingerprint = config.token_fingerprint(token)
@@ -556,7 +678,23 @@ def _prompt_yes_no(question: str) -> bool:
     return answer.strip().lower() in ("y", "yes")
 
 
-def handle_init(force: bool) -> None:
+def _resolve_new_token(custom_passphrase) -> str:
+    if custom_passphrase:
+        return custom_passphrase.strip()
+
+    # 仮の判断: --init=<合言葉> の指定が無い場合は対話的に合言葉の入力を促す。
+    # 空欄のまま(または非対話実行などで入力できない)場合のみ、
+    # 従来通りランダムなトークンを生成する。
+    try:
+        entered = input("合言葉(トークン)を入力してください(空欄でランダム生成): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        entered = ""
+
+    return entered if entered else config.generate_token()
+
+
+def handle_init(force: bool, custom_passphrase=None) -> None:
     existing_token = config.load_token()
 
     if existing_token and not force:
@@ -574,23 +712,31 @@ def handle_init(force: bool) -> None:
             print("キャンセルしました。既存のトークンをそのまま使用します。")
             return
 
-    token = config.generate_token()
-    storage = config.save_token(token)
-    storage_note = "macOS Keychain" if storage == "keychain" else f"平文ファイル({config.CONFIG_FILE})"
+    token = _resolve_new_token(custom_passphrase)
+    config.save_token(token)
     # 仮の判断: --init はトークンの発行・保存のみを行い、そのまま起動はしない。
     # 発行したトークンを他のMacに共有してから `python yoriai.py` (このMac自身も含む)
     # で明示的に起動する、という2段階の操作の方が事故が少ないと判断した。
     print("新しいトークンを発行しました。このトークンを組織のメンバーに共有してください。")
     print(f"トークン: {token}")
-    print(f"保存先: {storage_note}")
+    print(f"保存先: {config.CONFIG_FILE}")
     print("このMacでYoriaiを開始するには: python yoriai.py")
     print("他のMacをこの組織に参加させるには: python yoriai.py --join=<上記のトークン>")
+
+
+# --init が値なしで指定された(合言葉を対話入力する)ことを表す印。
+# 「--initそのものが指定されなかった」(default=None)と区別するために使う。
+_INIT_INTERACTIVE = object()
 
 
 def main():
     parser = argparse.ArgumentParser(description="Yoriai: ローカルLLMエージェントの自動発見・自己紹介カード交換プロトタイプ")
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--init", action="store_true", help="組織を作成する(既にトークンがあれば表示のみ。--forceで再発行)")
+    group.add_argument(
+        "--init", nargs="?", const=_INIT_INTERACTIVE, default=None, metavar="合言葉",
+        help="組織を作成する(既にトークンがあれば表示のみ。--forceで再発行)。"
+             "--init=<合言葉> で好きな文字列を指定でき、省略時は対話入力(空欄ならランダム生成)",
+    )
     group.add_argument("--join", metavar="TOKEN", help="既存の組織のトークンを指定して参加し、そのまま起動する")
     parser.add_argument(
         "--port", type=int, default=DEFAULT_CARD_PORT,
@@ -599,8 +745,9 @@ def main():
     parser.add_argument("--force", action="store_true", help="--init と併用し、既存トークンを確認の上で強制的に再発行する")
     args = parser.parse_args()
 
-    if args.init:
-        handle_init(args.force)
+    if args.init is not None:
+        custom_passphrase = None if args.init is _INIT_INTERACTIVE else args.init
+        handle_init(args.force, custom_passphrase)
         return
 
     if args.join is not None:
@@ -608,9 +755,8 @@ def main():
         if not token:
             logger.error("--join には空でないトークンを指定してください")
             sys.exit(1)
-        storage = config.save_token(token)
-        storage_note = "macOS Keychain" if storage == "keychain" else f"平文ファイル({config.CONFIG_FILE})"
-        logger.info("トークンを%sに保存しました。この組織のエージェントとして起動します。", storage_note)
+        config.save_token(token)
+        logger.info("トークンを設定ファイル(%s)に保存しました。この組織のエージェントとして起動します。", config.CONFIG_FILE)
     else:
         token = config.load_token()
         if not token:
