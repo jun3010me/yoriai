@@ -32,6 +32,12 @@ CARD_REQUEST_TIMEOUT_SEC = 5
 ORG_FINGERPRINT_HEADER = "X-Yoriai-Org-Fingerprint"
 HEARTBEAT_INTERVAL_SEC = 10
 
+# 仮の判断: チャットの接続確立自体はカード取得と同程度の速さで判定してよいが、
+# LLMの生成そのものは(モデルサイズや質問内容によっては)数十秒かかることが
+# あるため、読み取りタイムアウトは長めに取る。
+CHAT_CONNECT_TIMEOUT_SEC = 5
+CHAT_READ_TIMEOUT_SEC = 120
+
 # 仮の判断: 起動時1回だけのスキャンだと、たまたま相手のYoriaiがまだ起動しきっていない
 # タイミングで実行してしまった場合に「Connection refused」で失敗し、その後相手が
 # 起動してもずっと0件のまま固定されてしまう問題が実機検証で見つかった。
@@ -265,6 +271,102 @@ def get_loaded_models() -> list:
     return _merge_model_lists(get_ollama_loaded_models(), get_lmstudio_models())
 
 
+# ---------------------------------------------------------------------------
+# チャットのプロキシ(Ollama/LM Studioへのストリーミング問い合わせ)
+# ---------------------------------------------------------------------------
+
+def _stream_ollama_chat(model: str, messages: list):
+    """OllamaのネイティブAPI(/api/chat、NDJSONストリーミング)に問い合わせ、
+    正規化したイベント({"content": ...} / {"done": True} / {"error": ...})を
+    順にyieldする。
+    """
+    try:
+        resp = requests.post(
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json={"model": model, "messages": messages, "stream": True},
+            stream=True,
+            timeout=(CHAT_CONNECT_TIMEOUT_SEC, CHAT_READ_TIMEOUT_SEC),
+        )
+        resp.raise_for_status()
+    except Exception as exc:
+        yield {"error": str(exc)}
+        return
+
+    try:
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            content = obj.get("message", {}).get("content")
+            if content:
+                yield {"content": content}
+            if obj.get("done"):
+                break
+    except Exception as exc:
+        yield {"error": str(exc)}
+        return
+    yield {"done": True}
+
+
+def _stream_lmstudio_chat(model: str, messages: list):
+    """LM StudioのOpenAI互換API(/v1/chat/completions、SSEストリーミング)に
+    問い合わせ、Ollama版と同じ正規化イベントを順にyieldする。
+    """
+    try:
+        resp = requests.post(
+            f"{LMSTUDIO_BASE_URL}/v1/chat/completions",
+            json={"model": model, "messages": messages, "stream": True},
+            stream=True,
+            timeout=(CHAT_CONNECT_TIMEOUT_SEC, CHAT_READ_TIMEOUT_SEC),
+        )
+        resp.raise_for_status()
+    except Exception as exc:
+        yield {"error": str(exc)}
+        return
+
+    try:
+        for raw_line in resp.iter_lines():
+            if not raw_line:
+                continue
+            line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else raw_line
+            if not line.startswith("data:"):
+                continue
+            data = line[len("data:"):].strip()
+            if data == "[DONE]":
+                break
+            try:
+                obj = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            choices = obj.get("choices", [])
+            if choices:
+                content = choices[0].get("delta", {}).get("content")
+                if content:
+                    yield {"content": content}
+    except Exception as exc:
+        yield {"error": str(exc)}
+        return
+    yield {"done": True}
+
+
+def stream_chat_completion(model: str, messages: list):
+    """モデル名からOllama/LM Studioどちらにチャットを振るかを決め、
+    正規化されたストリーミングイベントを順にyieldする。
+
+    仮の判断: フェーズ5では「タスクの難易度に応じた賢い振り分け」はスコープ外の
+    ため、モデルの選定自体は呼び出し元(候補選定ロジック)に任せ、ここでは
+    単純に「Ollamaのロード済みモデル一覧に名前があればOllama、なければ
+    LM Studio」というバックエンドの振り分けだけを行う。
+    """
+    if model in get_ollama_loaded_models():
+        yield from _stream_ollama_chat(model, messages)
+    else:
+        yield from _stream_lmstudio_chat(model, messages)
+
+
 def build_profile_card(agent_id: str) -> dict:
     return {
         "agent_id": agent_id,
@@ -352,6 +454,13 @@ class CardRequestHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+    def do_POST(self):
+        if self.path == "/chat":
+            self._handle_chat()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
     def _check_org_fingerprint(self) -> bool:
         # 仮の判断: mDNS側でトークン不一致の相手はそもそも問い合わせに来ない想定だが、
         # エンドポイントに直接アクセスされた場合の備えとして、サーバー側でも
@@ -380,6 +489,36 @@ class CardRequestHandler(BaseHTTPRequestHandler):
             "self": build_profile_card(self.agent_id),
             "peers": peers,
         })
+
+    def _handle_chat(self):
+        # 仮の判断: /chat も /card と同じくトークンのフィンガープリントで認証する。
+        if not self._check_org_fingerprint():
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+        except Exception:
+            self.send_response(400)
+            self.end_headers()
+            return
+
+        model = body.get("model")
+        messages = body.get("messages", [])
+
+        # 仮の判断: 応答は事前にサイズが分からないストリーミングなので
+        # Content-Lengthは付けず、NDJSON(1行1イベントのJSON)として都度書き出す。
+        # クライアント側が対応できない場合でも、単純に行ごとに読めば動く形式にした。
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        try:
+            for event in stream_chat_completion(model, messages):
+                self.wfile.write(json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # 仮の判断: 相手が受信を打ち切った場合、ここでは何もせず単に配信を止める
 
     def _send_json(self, data: dict) -> None:
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -666,6 +805,131 @@ def discover_via_tailscale(agent_id: str, org_fingerprint: str, port: int, regis
 
 
 # ---------------------------------------------------------------------------
+# 対話モード(REPL): 組織内メンバーへの問い合わせ
+# ---------------------------------------------------------------------------
+
+def _build_chat_candidate(card: dict, is_self: bool, address: str = None, port: int = None):
+    """自己紹介カードから、チャットの問い合わせ先候補(ロード済みモデルを
+    持つメンバー)を作る。ロード済みモデルが無いメンバーはNoneを返す。
+    """
+    loaded = card.get("models", {}).get("loaded", [])
+    if not loaded:
+        return None
+    label = card.get("device_name", "unknown")
+    if is_self:
+        label += "(自分)"
+    return {
+        "label": label,
+        # 仮の判断: ロード済みモデルが複数ある場合はどれを使うべきかの判断基準が
+        # まだ無いため、単純に先頭のものを使う。
+        "model": loaded[0],
+        "free_gb": card.get("memory", {}).get("free_gb"),
+        "is_self": is_self,
+        "address": address,
+        "port": port,
+    }
+
+
+def _select_chat_candidates(self_card: dict, peers: list) -> list:
+    """組織内から問い合わせ候補を集め、空きメモリの多い順に並べて返す。
+
+    仮の判断: フェーズ5では「タスクの難易度に応じた賢い振り分け」はスコープ外
+    のため、単純に「ロード済みモデルがあり、空きメモリが最も多いメンバー」を
+    選ぶだけにする。空きメモリが不明なメンバーは最下位として扱う。
+    """
+    candidates = []
+    self_candidate = _build_chat_candidate(self_card, is_self=True)
+    if self_candidate:
+        candidates.append(self_candidate)
+    for peer in peers:
+        candidate = _build_chat_candidate(
+            peer.get("card", {}), is_self=False, address=peer.get("address"), port=peer.get("port"),
+        )
+        if candidate:
+            candidates.append(candidate)
+
+    candidates.sort(key=lambda c: c["free_gb"] if c["free_gb"] is not None else -1, reverse=True)
+    return candidates
+
+
+def _stream_chat_from_candidate(candidate: dict, org_fingerprint: str, messages: list):
+    """候補が自分自身ならプロセス内で直接、他のメンバーならHTTP経由(/chat)で
+    問い合わせ、正規化されたストリーミングイベントを順にyieldする。
+    """
+    if candidate["is_self"]:
+        yield from stream_chat_completion(candidate["model"], messages)
+        return
+
+    try:
+        resp = requests.post(
+            f"http://{candidate['address']}:{candidate['port']}/chat",
+            json={"model": candidate["model"], "messages": messages},
+            headers={ORG_FINGERPRINT_HEADER: org_fingerprint},
+            stream=True,
+            timeout=(CHAT_CONNECT_TIMEOUT_SEC, CHAT_READ_TIMEOUT_SEC),
+        )
+        resp.raise_for_status()
+    except Exception as exc:
+        yield {"error": str(exc)}
+        return
+
+    try:
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    except Exception as exc:
+        yield {"error": str(exc)}
+
+
+def _ask_organization(ctx: dict, messages: list) -> None:
+    """組織内のメンバーに順番に問い合わせ、失敗したら次に空きメモリが多い
+    候補へ自動でフォールバックしながら回答をストリーミング表示する。
+
+    成功した場合はassistantの回答を`messages`に追記する(会話履歴の継続)。
+    """
+    self_card = build_profile_card(ctx["agent_id"])
+    peers = ctx["registry"].snapshot()
+    candidates = _select_chat_candidates(self_card, peers)
+
+    if not candidates:
+        print("組織内にロード済みモデルを持つメンバーがいません。")
+        return
+
+    for i, candidate in enumerate(candidates):
+        if i == 0:
+            print(f"[{candidate['label']} に問い合わせています... (モデル: {candidate['model']})]")
+        else:
+            print(f"[フォールバック: {candidate['label']} に問い合わせています... (モデル: {candidate['model']})]")
+
+        answer_parts = []
+        failed = False
+        for event in _stream_chat_from_candidate(candidate, ctx["org_fingerprint"], messages):
+            if "error" in event:
+                logger.warning("%s への問い合わせに失敗しました: %s", candidate["label"], event["error"])
+                failed = True
+                break
+            content = event.get("content")
+            if content:
+                print(content, end="", flush=True)
+                answer_parts.append(content)
+            if event.get("done"):
+                break
+
+        if answer_parts:
+            print()
+            messages.append({"role": "assistant", "content": "".join(answer_parts)})
+            return
+        if not failed:
+            logger.warning("%s から有効な応答が得られませんでした。", candidate["label"])
+
+    print("すべての候補への問い合わせに失敗しました。しばらくしてから再度お試しください。")
+
+
+# ---------------------------------------------------------------------------
 # エントリーポイント
 # ---------------------------------------------------------------------------
 
@@ -675,7 +939,17 @@ def pick_free_port() -> int:
         return sock.getsockname()[1]
 
 
-def run_agent(token: str, port: int) -> None:
+def _setup_agent(token: str, port: int) -> dict:
+    """エージェントの起動処理(自己紹介カードサーバー、mDNS登録、Tailscaleの
+    初回発見)をまとめて行い、以降の探索ループ(_discovery_loop)や対話モード
+    (REPL)が使う情報をひとつの辞書(ctx)にまとめて返す。
+
+    仮の判断: 従来1つの関数(run_agent)にまとまっていたセットアップ処理と
+    「探索し続けるループ」を分離した。対話モード(REPL)では、探索ループを
+    バックグラウンドスレッドで動かしつつメインスレッドで入力を受け付ける
+    必要があり、常駐(headless)実行ではこれまで通りメインスレッドで
+    ループさせたいため、両者で共有できる形にしている。
+    """
     if platform.system() not in ("Darwin", "Linux"):
         logger.warning("このプロトタイプはmacOS/Linuxを想定しています。他OSでは一部情報が取得できません。")
 
@@ -732,32 +1006,118 @@ def run_agent(token: str, port: int) -> None:
     # (相手がまだ起動しきっていないタイミングで一度失敗しても、後で拾えるようにするため)。
     tailscale_found_count = discover_via_tailscale(agent_id, org_fingerprint, port, registry)
 
+    return {
+        "agent_id": agent_id,
+        "org_fingerprint": org_fingerprint,
+        "port": port,
+        "registry": registry,
+        "server": server,
+        "zeroconf": zeroconf,
+        "service_info": service_info,
+        "listener": listener,
+        "tailscale_found_count": tailscale_found_count,
+    }
+
+
+def _discovery_loop(ctx: dict, stop_event: "threading.Event" = None) -> None:
+    """探索ループ本体(ハートビートログ・Tailscaleの定期再スキャン)。
+
+    常駐(headless)実行時はメインスレッドでKeyboardInterruptが起きるまで、
+    対話モード(REPL)実行時はバックグラウンドスレッドでstop_eventが
+    セットされるまで回り続ける。
+    """
     logger.info("同じネットワーク上のYoriaiエージェントを探索しています... (Ctrl+Cで終了)")
+    last_heartbeat = time.monotonic()
+    last_tailscale_scan = time.monotonic()
+    while stop_event is None or not stop_event.is_set():
+        time.sleep(1)
+        # 仮の判断: 発見がない間も動作中であることが外から分かるよう、
+        # 一定間隔でハートビートログを出す。mDNSが機能しないネットワーク
+        # (例: クライアント間マルチキャストが遮断された環境)でも、
+        # Tailscale経由の発見数を合わせて見せることで「本当に0台なのか」を
+        # 判断しやすくする。
+        if time.monotonic() - last_tailscale_scan >= TAILSCALE_RESCAN_INTERVAL_SEC:
+            ctx["tailscale_found_count"] = discover_via_tailscale(
+                ctx["agent_id"], ctx["org_fingerprint"], ctx["port"], ctx["registry"],
+            )
+            last_tailscale_scan = time.monotonic()
+        if time.monotonic() - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
+            logger.info(
+                "探索中... (現在発見数: mDNS %d件 / Tailscale %d件)",
+                len(ctx["listener"].known_peers), ctx["tailscale_found_count"],
+            )
+            last_heartbeat = time.monotonic()
+
+
+def _shutdown_agent(ctx: dict) -> None:
+    ctx["zeroconf"].unregister_service(ctx["service_info"])
+    ctx["zeroconf"].close()
+    ctx["server"].shutdown()
+
+
+def run_agent(token: str, port: int) -> None:
+    """常駐(headless)実行のエントリーポイント。systemd/launchdなど、対話的な
+    入出力ができない環境から起動される想定で、フェーズ5導入前と挙動を変えない。
+    """
+    ctx = _setup_agent(token, port)
     try:
-        last_heartbeat = time.monotonic()
-        last_tailscale_scan = time.monotonic()
-        while True:
-            time.sleep(1)
-            # 仮の判断: 発見がない間も動作中であることが外から分かるよう、
-            # 一定間隔でハートビートログを出す。mDNSが機能しないネットワーク
-            # (例: クライアント間マルチキャストが遮断された環境)でも、
-            # Tailscale経由の発見数を合わせて見せることで「本当に0台なのか」を
-            # 判断しやすくする。
-            if time.monotonic() - last_tailscale_scan >= TAILSCALE_RESCAN_INTERVAL_SEC:
-                tailscale_found_count = discover_via_tailscale(agent_id, org_fingerprint, port, registry)
-                last_tailscale_scan = time.monotonic()
-            if time.monotonic() - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
-                logger.info(
-                    "探索中... (現在発見数: mDNS %d件 / Tailscale %d件)",
-                    len(listener.known_peers), tailscale_found_count,
-                )
-                last_heartbeat = time.monotonic()
+        _discovery_loop(ctx)
     except KeyboardInterrupt:
         logger.info("終了します...")
     finally:
-        zeroconf.unregister_service(service_info)
-        zeroconf.close()
-        server.shutdown()
+        _shutdown_agent(ctx)
+
+
+def _run_repl(ctx: dict) -> None:
+    print()
+    print("=== Yoriai 対話モード ===")
+    print("組織のメンバーに質問できます。終了するには exit または quit と入力するか、Ctrl+Cを押してください。")
+    print()
+
+    # 仮の判断: 会話履歴(messages)はこのセッション内でのみ保持し、終了したら破棄する。
+    # 次回起動時に前回の会話を引き継ぐ機能は今回のスコープ外。
+    messages = []
+    while True:
+        try:
+            text = input("Yoriai> ").strip()
+        except EOFError:
+            print()
+            break
+        except KeyboardInterrupt:
+            print()
+            break
+
+        if not text:
+            continue
+        if text.lower() in ("exit", "quit"):
+            break
+
+        messages.append({"role": "user", "content": text})
+        try:
+            _ask_organization(ctx, messages)
+        except KeyboardInterrupt:
+            print()
+            continue
+
+    print("対話モードを終了します。")
+
+
+def run_agent_with_repl(token: str, port: int) -> None:
+    """対話モード(REPL)付きの起動エントリーポイント。ターミナルから直接
+    `python3 yoriai.py` を実行した場合に使う。mDNS/Tailscaleの探索・
+    ハートビートはバックグラウンドスレッドで継続しつつ、メインスレッドで
+    対話入力を受け付ける。
+    """
+    ctx = _setup_agent(token, port)
+    stop_event = threading.Event()
+    discovery_thread = threading.Thread(target=_discovery_loop, args=(ctx, stop_event), daemon=True)
+    discovery_thread.start()
+
+    try:
+        _run_repl(ctx)
+    finally:
+        stop_event.set()
+        _shutdown_agent(ctx)
 
 
 def _prompt_yes_no(question: str) -> bool:
@@ -952,7 +1312,14 @@ def main():
             print(NO_TOKEN_GUIDANCE)
             sys.exit(1)
 
-    run_agent(token, args.port)
+    # 仮の判断: 標準入力がターミナル(TTY)に繋がっているかどうかで、対話モード
+    # (REPL)を出すか常駐(headless)動作にするかを自動判定する。systemd/launchd
+    # から起動された場合や `curl | bash` のようにパイプ経由で動く場合は標準入力が
+    # TTYではないため、従来通りの常駐動作(挙動を変えない)になる。
+    if sys.stdin.isatty():
+        run_agent_with_repl(token, args.port)
+    else:
+        run_agent(token, args.port)
 
 
 if __name__ == "__main__":
