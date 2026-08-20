@@ -31,6 +31,8 @@ import tailscale
 SERVICE_TYPE = "_yoriai._tcp.local."
 OLLAMA_BASE_URL = "http://localhost:11434"
 LMSTUDIO_BASE_URL = "http://localhost:1234"
+# 仮の判断: mlx_lm.serverの既定ポート(8080)を前提とする。
+MLX_LM_BASE_URL = "http://localhost:8080"
 CARD_REQUEST_TIMEOUT_SEC = 5
 ORG_FINGERPRINT_HEADER = "X-Yoriai-Org-Fingerprint"
 HEARTBEAT_INTERVAL_SEC = 10
@@ -255,6 +257,27 @@ def get_lmstudio_models() -> list:
         return []
 
 
+def get_mlx_lm_models() -> list:
+    """MLX-LM(`python -m mlx_lm.server`)のOpenAI互換APIからモデル一覧を取得する。
+
+    仮の判断: MLX-LMのサーバーは起動時に指定した1つのモデルだけを保持する
+    アーキテクチャで、Ollamaのように複数モデルをインストールしておいて
+    要求ごとに切り替える、という概念が無い。そのためLM Studioと同様、
+    ここで取得できたモデルは「インストール済み」「ロード済み」の両方として
+    扱う。既定ポートは8080(mlx_lm.serverの既定値)を前提としており、
+    別ポートで起動している場合は検出できない(設定可能にするのは今回の
+    スコープ外)。MLX-LMのサーバーが起動していない場合は空リストを返す
+    (エラーにはしない)。
+    """
+    try:
+        resp = requests.get(f"{MLX_LM_BASE_URL}/v1/models", timeout=3)
+        resp.raise_for_status()
+        return [m.get("id") for m in resp.json().get("data", [])]
+    except Exception as exc:
+        logger.warning("MLX-LMのモデル一覧の取得に失敗しました: %s", exc)
+        return []
+
+
 def _merge_model_lists(*model_lists: list) -> list:
     merged = []
     for models in model_lists:
@@ -262,16 +285,6 @@ def _merge_model_lists(*model_lists: list) -> list:
             if name not in merged:
                 merged.append(name)
     return merged
-
-
-def get_installed_models() -> list:
-    # 仮の判断: OllamaとLM Studioのどちらが動いていても自己紹介カードに反映されるよう、
-    # 両方に問い合わせて結果を合算する(両方動いている場合は両方のモデルが載る)。
-    return _merge_model_lists(get_ollama_installed_models(), get_lmstudio_models())
-
-
-def get_loaded_models() -> list:
-    return _merge_model_lists(get_ollama_loaded_models(), get_lmstudio_models())
 
 
 # ---------------------------------------------------------------------------
@@ -472,9 +485,10 @@ def _stream_ollama_turn(model: str, messages: list, tools: list):
     yield {"tool_calls": tool_calls}
 
 
-def _stream_lmstudio_turn(model: str, messages: list, tools: list):
-    """LM StudioのOpenAI互換API(/v1/chat/completions、SSEストリーミング)に
-    1往復だけ問い合わせ、Ollama版と同じ正規化イベントを順にyieldする。
+def _stream_openai_compatible_turn(base_url: str, model: str, messages: list, tools: list):
+    """OpenAI互換のstreaming chat completions API(/v1/chat/completions、SSE)に
+    1往復だけ問い合わせ、正規化イベントを順にyieldする。LM Studio・MLX-LMは
+    どちらもこの同じワイヤ形式を話すため、共通の実装として1箇所にまとめている。
 
     仮の判断: OpenAI互換のストリーミングではtool_callsが複数チャンクに
     分割されて送られてくる(引数のJSON文字列が少しずつ届く)ため、
@@ -482,7 +496,7 @@ def _stream_lmstudio_turn(model: str, messages: list, tools: list):
     """
     try:
         resp = requests.post(
-            f"{LMSTUDIO_BASE_URL}/v1/chat/completions",
+            f"{base_url}/v1/chat/completions",
             json={"model": model, "messages": messages, "tools": tools, "stream": True},
             stream=True,
             timeout=(CHAT_CONNECT_TIMEOUT_SEC, CHAT_READ_TIMEOUT_SEC),
@@ -543,6 +557,19 @@ def _stream_lmstudio_turn(model: str, messages: list, tools: list):
         for _, entry in sorted(tool_calls_by_index.items())
     ]
     yield {"tool_calls": tool_calls}
+
+
+def _stream_lmstudio_turn(model: str, messages: list, tools: list):
+    yield from _stream_openai_compatible_turn(LMSTUDIO_BASE_URL, model, messages, tools)
+
+
+def _stream_mlx_lm_turn(model: str, messages: list, tools: list):
+    # 仮の判断: MLX-LMのFunction Calling対応はバックエンド/バージョンによって
+    # 未対応・不安定な場合がある。未対応の場合はエラーになるかtoolsを無視して
+    # 通常のチャットとして応答するかのどちらかになりうるが、いずれの場合も
+    # 既存のエラーハンドリング/漏れ検出フォールバックがそのまま機能するため、
+    # ここで特別な分岐は設けていない。
+    yield from _stream_openai_compatible_turn(MLX_LM_BASE_URL, model, messages, tools)
 
 
 # 仮の判断: 一部のモデル/バックエンドの組み合わせ(例: LM Studioで一部の
@@ -641,8 +668,8 @@ def _run_turn_with_leak_detection(turn, tools: list):
 
 
 def stream_chat_completion(model: str, messages: list):
-    """モデル名からOllama/LM Studioどちらにチャットを振るかを決め、正規化された
-    ストリーミングイベント({"content": ...} / {"tool_call": <ツール名>} /
+    """モデル名からOllama/LM Studio/MLX-LMのどれにチャットを振るかを決め、
+    正規化されたストリーミングイベント({"content": ...} / {"tool_call": <ツール名>} /
     {"done": True} / {"error": ...})を順にyieldする。
 
     モデルがツール(現状はweb_searchのみ)の呼び出しを要求した場合は、
@@ -653,7 +680,11 @@ def stream_chat_completion(model: str, messages: list):
     仮の判断: フェーズ5では「タスクの難易度に応じた賢い振り分け」はスコープ外の
     ため、モデルの選定自体は呼び出し元(候補選定ロジック)に任せ、ここでは
     単純に「Ollamaのロード済みモデル一覧に名前があればOllama、なければ
-    LM Studio」というバックエンドの振り分けだけを行う。
+    MLX-LMのモデル一覧に名前があればMLX-LM、どちらでもなければLM Studio」
+    というバックエンドの振り分けだけを行う。LM Studioを最後のデフォルトに
+    しているのは、フェーズ5時点からの既存の挙動を変えないため。
+    Ollama/MLX-LMどちらのモデル一覧にも同名のモデルが存在する場合はOllama
+    側が優先される(仮の判断、Ollamaを優先する明確な理由は無いが決め打ちが必要だった)。
 
     仮の判断: バックエンド/モデルの組み合わせによっては、ツール呼び出しの
     構造化出力に対応しておらず、モデル自身の内部記法がそのまま回答本文に
@@ -667,6 +698,8 @@ def stream_chat_completion(model: str, messages: list):
     for round_num in range(MAX_TOOL_CALL_ROUNDS + 1):
         if model in get_ollama_loaded_models():
             turn = _stream_ollama_turn(model, messages, tools)
+        elif model in get_mlx_lm_models():
+            turn = _stream_mlx_lm_turn(model, messages, tools)
         else:
             turn = _stream_lmstudio_turn(model, messages, tools)
 
@@ -707,6 +740,24 @@ def stream_chat_completion(model: str, messages: list):
 
 
 def build_profile_card(agent_id: str) -> dict:
+    # 仮の判断: 「インストール済み/ロード済みモデル」と「利用可能なバックエンド」を
+    # それぞれ別々の関数で問い合わせると、同じバックエンド(特にLM Studio・
+    # MLX-LMのように問い合わせ1回でインストール済み=ロード済みを兼ねるもの)に
+    # 何度も重複してHTTPリクエストを送ることになるため、ここで各バックエンドに
+    # 1回ずつ問い合わせて使い回す。
+    ollama_installed = get_ollama_installed_models()
+    ollama_loaded = get_ollama_loaded_models()
+    lmstudio_models = get_lmstudio_models()
+    mlx_lm_models = get_mlx_lm_models()
+
+    backends = []
+    if ollama_installed:
+        backends.append("ollama")
+    if lmstudio_models:
+        backends.append("lmstudio")
+    if mlx_lm_models:
+        backends.append("mlx_lm")
+
     return {
         "agent_id": agent_id,
         "device_name": get_short_hostname(),
@@ -718,8 +769,9 @@ def build_profile_card(agent_id: str) -> dict:
         },
         "memory": get_memory_info(),
         "models": {
-            "installed": get_installed_models(),
-            "loaded": get_loaded_models(),
+            "installed": _merge_model_lists(ollama_installed, lmstudio_models, mlx_lm_models),
+            "loaded": _merge_model_lists(ollama_loaded, lmstudio_models, mlx_lm_models),
+            "backends": backends,
         },
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
@@ -1197,9 +1249,58 @@ def _fetch_org_snapshot(port: int, org_fingerprint: str, fail_fast: bool = False
         return None
 
 
-def _build_chat_candidate(card: dict, is_self: bool, address: str, port: int):
+# ---------------------------------------------------------------------------
+# タスクの性質に応じた振り分け(フェーズ6・項目1)
+# ---------------------------------------------------------------------------
+
+TASK_TYPE_CODING = "coding"
+TASK_TYPE_GENERAL = "general"
+
+# 仮の判断: 依頼の要件通り、モデルによる高度な分類ではなく単純なキーワード
+# マッチによる簡易分類にとどめる。コードブロック(```や`...`)を含む場合、
+# または以下のいずれかの単語(日本語・英語)を含む場合はコーディング系とみなす。
+_CODE_BLOCK_PATTERN = re.compile(r"```|`[^`\n]+`")
+_CODING_TASK_KEYWORDS = (
+    "コード", "コーディング", "関数", "エラー", "バグ", "実装", "プログラム",
+    "スクリプト", "クラス", "デバッグ", "リファクタ", "アルゴリズム", "コンパイル",
+    "code", "coding", "function", "error", "bug", "debug", "script", "algorithm",
+    "traceback", "stack trace", "exception", "compile", "refactor",
+)
+
+
+def _classify_task(text: str) -> str:
+    """ユーザーの質問文を簡易的に「コーディング系」か「一般」かに分類する。
+
+    仮の判断: タスクの難易度・専門性を厳密に判定するのは今回のスコープ外
+    なので、コーディング系かどうかの二値分類のみを行う。
+    """
+    if _CODE_BLOCK_PATTERN.search(text):
+        return TASK_TYPE_CODING
+    lowered = text.lower()
+    for keyword in _CODING_TASK_KEYWORDS:
+        if keyword.lower() in lowered:
+            return TASK_TYPE_CODING
+    return TASK_TYPE_GENERAL
+
+
+# 仮の判断: コーディング系モデルはほぼ例外なく名前に"coder"を含む
+# (qwen2.5-coder、qwen3-coder、deepseek-coder、opencoderなど)。
+# その他の代表的な派生名も併せて拾う。
+_CODING_MODEL_KEYWORDS = ("coder", "codellama", "starcoder", "codegemma", "codestral")
+
+
+def _is_coding_model(model_name: str) -> bool:
+    lowered = model_name.lower()
+    return any(keyword in lowered for keyword in _CODING_MODEL_KEYWORDS)
+
+
+def _build_chat_candidate(card: dict, is_self: bool, address: str, port: int, task_type: str = TASK_TYPE_GENERAL):
     """自己紹介カードから、チャットの問い合わせ先候補(ロード済みモデルを
     持つメンバー)を作る。ロード済みモデルが無いメンバーはNoneを返す。
+
+    仮の判断: task_typeが「コーディング系」で、かつロード済みモデルの中に
+    コーディング系モデルがあれば、そのモデルを候補の代表モデルとして使う
+    (先頭のモデルではなく)。それ以外は従来通り先頭のモデルを使う。
     """
     loaded = card.get("models", {}).get("loaded", [])
     if not loaded:
@@ -1207,38 +1308,57 @@ def _build_chat_candidate(card: dict, is_self: bool, address: str, port: int):
     label = card.get("device_name", "unknown")
     if is_self:
         label += "(自分)"
+
+    coding_models = [m for m in loaded if _is_coding_model(m)]
+    has_coding_model = bool(coding_models)
+    if task_type == TASK_TYPE_CODING and has_coding_model:
+        model = coding_models[0]
+    else:
+        # 仮の判断: ロード済みモデルが複数ある場合にどれを使うべきかの判断基準が
+        # 他に無いため、単純に先頭のものを使う。
+        model = loaded[0]
+
     return {
         "label": label,
-        # 仮の判断: ロード済みモデルが複数ある場合はどれを使うべきかの判断基準が
-        # まだ無いため、単純に先頭のものを使う。
-        "model": loaded[0],
+        "model": model,
         "free_gb": card.get("memory", {}).get("free_gb"),
         "address": address,
         "port": port,
+        "has_coding_model": has_coding_model,
     }
 
 
-def _select_chat_candidates(self_card: dict, peers: list, local_port: int) -> list:
-    """組織内から問い合わせ候補を集め、空きメモリの多い順に並べて返す。
+def _select_chat_candidates(self_card: dict, peers: list, local_port: int, task_type: str = TASK_TYPE_GENERAL) -> list:
+    """組織内から問い合わせ候補を集め、優先順位をつけて並べて返す。
 
-    仮の判断: フェーズ5では「タスクの難易度に応じた賢い振り分け」はスコープ外
-    のため、単純に「ロード済みモデルがあり、空きメモリが最も多いメンバー」を
-    選ぶだけにする。空きメモリが不明なメンバーは最下位として扱う。自分自身は
-    キッチン(常駐エージェント)がlocalhost:local_portで`/chat`を提供している
+    仮の判断: 「タスクの難易度に応じた賢い振り分け」は依頼の項目1で
+    コーディング系/一般の二値分類のみサポートする。一般タスクはこれまで
+    通り「ロード済みモデルがあり、空きメモリが最も多いメンバー」を選ぶ。
+    コーディング系タスクは、コーディング系モデルを持つメンバーを優先し
+    (その中では空きメモリの多い順)、コーディング系モデルを持つメンバーが
+    誰もいない場合は一般タスクと同じ並び(空きメモリ順のみ)に自然と一致する。
+    空きメモリが不明なメンバーは最下位として扱う。自分自身はキッチン
+    (常駐エージェント)がlocalhost:local_portで`/chat`を提供している
     前提でアドレスを組み立てる。
     """
     candidates = []
-    self_candidate = _build_chat_candidate(self_card, is_self=True, address="localhost", port=local_port)
+    self_candidate = _build_chat_candidate(self_card, is_self=True, address="localhost", port=local_port, task_type=task_type)
     if self_candidate:
         candidates.append(self_candidate)
     for peer in peers:
         candidate = _build_chat_candidate(
-            peer.get("card", {}), is_self=False, address=peer.get("address"), port=peer.get("port"),
+            peer.get("card", {}), is_self=False, address=peer.get("address"), port=peer.get("port"), task_type=task_type,
         )
         if candidate:
             candidates.append(candidate)
 
-    candidates.sort(key=lambda c: c["free_gb"] if c["free_gb"] is not None else -1, reverse=True)
+    if task_type == TASK_TYPE_CODING:
+        candidates.sort(
+            key=lambda c: (c["has_coding_model"], c["free_gb"] if c["free_gb"] is not None else -1),
+            reverse=True,
+        )
+    else:
+        candidates.sort(key=lambda c: c["free_gb"] if c["free_gb"] is not None else -1, reverse=True)
     return candidates
 
 
@@ -1271,6 +1391,15 @@ def _stream_chat_from_candidate(candidate: dict, org_fingerprint: str, messages:
         yield {"error": str(exc)}
 
 
+def _selection_reason_label(task_type: str, top_candidate: dict) -> str:
+    """先頭候補が選ばれた理由を、画面表示用の短いラベルにする。"""
+    if task_type == TASK_TYPE_CODING and top_candidate["has_coding_model"]:
+        return "コーディング系の質問と判断し、コーディング系モデルを優先"
+    if task_type == TASK_TYPE_CODING:
+        return "コーディング系の質問と判断しましたが、コーディング系モデルを持つメンバーがいないため空きメモリの多さで選択"
+    return "空きメモリの多さで選択"
+
+
 def _ask_organization(port: int, org_fingerprint: str, messages: list) -> None:
     """自分のキッチン(常駐エージェント)の`/status`で組織内の候補を集め、順番に
     問い合わせて、失敗したら次に空きメモリが多い候補へ自動でフォールバックしながら
@@ -1282,7 +1411,9 @@ def _ask_organization(port: int, org_fingerprint: str, messages: list) -> None:
     if data is None:
         return  # 案内メッセージは_fetch_org_snapshot内で表示済み
 
-    candidates = _select_chat_candidates(data.get("self", {}), data.get("peers", []), port)
+    latest_question = messages[-1]["content"] if messages else ""
+    task_type = _classify_task(latest_question)
+    candidates = _select_chat_candidates(data.get("self", {}), data.get("peers", []), port, task_type)
 
     if not candidates:
         print("組織内にロード済みモデルを持つメンバーがいません。")
@@ -1290,7 +1421,7 @@ def _ask_organization(port: int, org_fingerprint: str, messages: list) -> None:
 
     for i, candidate in enumerate(candidates):
         if i == 0:
-            print(f"[{candidate['label']} に問い合わせています... (モデル: {candidate['model']})]")
+            print(f"[{_selection_reason_label(task_type, candidate)}: {candidate['label']} に問い合わせています... (モデル: {candidate['model']})]")
         else:
             print(f"[フォールバック: {candidate['label']} に問い合わせています... (モデル: {candidate['model']})]")
 
@@ -1326,6 +1457,98 @@ def _ask_organization(port: int, org_fingerprint: str, messages: list) -> None:
             logger.warning("%s から有効な応答が得られませんでした。", candidate["label"])
 
     print("すべての候補への問い合わせに失敗しました。しばらくしてから再度お試しください。")
+
+
+# ---------------------------------------------------------------------------
+# 複数メンバーへの並列質問(フェーズ6・項目2、"//multi"コマンド)
+# ---------------------------------------------------------------------------
+
+MULTI_QUERY_COMMAND = "//multi"
+# 仮の判断: 依頼文の「空きリソース上位2〜3台」という表現の範囲内で、
+# 上限を3台に固定する(候補がそれより少ない場合は、いる分だけに送る)。
+MULTI_QUERY_TARGET_COUNT = 3
+
+
+def _collect_answer_from_candidate(candidate: dict, org_fingerprint: str, messages: list):
+    """1候補に問い合わせ、回答をすべて集めて文字列として返す
+    (content, error)のタプル。エラー時はcontentが空文字列になる。
+
+    仮の判断: //multi では複数候補への問い合わせを並列に行うため、通常モード
+    のように1文字ずつその場で画面に出す(ライブストリーミング)方式のままだと
+    複数候補の出力が入り交じって読めなくなってしまう。そのため、この関数は
+    ストリーミング自体はバックグラウンドで最後まで受信しきり、完成した
+    回答をまとめて呼び出し元に返す(表示は呼び出し元が候補ごとに区切って行う)。
+    """
+    answer_parts = []
+    error = None
+    for event in _stream_chat_from_candidate(candidate, org_fingerprint, messages):
+        if "error" in event:
+            error = event["error"]
+            break
+        content = event.get("content")
+        if content:
+            answer_parts.append(content)
+        if event.get("done"):
+            break
+    return "".join(answer_parts), error
+
+
+def _ask_organization_multi(port: int, org_fingerprint: str, messages: list) -> None:
+    """`//multi <質問>` 用: 組織内の空きリソース上位複数台(既定3台)に同時に
+    同じ質問を送り、それぞれの回答を完了した順に表示する。
+
+    仮の判断: 通常モードと同じ「タスクの性質に応じた優先順位」で候補を
+    並べたうえで、上位から複数台を選ぶ。会話履歴には、成功した候補のうち
+    優先順位が最も高いものの回答だけをassistantの発言として追記する
+    (全員分の回答を履歴に混ぜると、次の質問時に「会話の前提」が曖昧に
+    なってしまうため)。
+    """
+    data = _fetch_org_snapshot(port, org_fingerprint)
+    if data is None:
+        return
+
+    latest_question = messages[-1]["content"] if messages else ""
+    task_type = _classify_task(latest_question)
+    candidates = _select_chat_candidates(data.get("self", {}), data.get("peers", []), port, task_type)
+
+    if not candidates:
+        print("組織内にロード済みモデルを持つメンバーがいません。")
+        return
+
+    targets = candidates[:MULTI_QUERY_TARGET_COUNT]
+    target_labels = ", ".join(f"{c['label']}(モデル: {c['model']})" for c in targets)
+    print(f"[📡 {_selection_reason_label(task_type, targets[0])}: {len(targets)}台に同時問い合わせしています: {target_labels}]")
+
+    results = [None] * len(targets)
+    print_lock = threading.Lock()
+
+    def worker(index: int, candidate: dict) -> None:
+        # 仮の判断: 複数スレッドが同じmessagesを同時に読むこと自体は安全だが、
+        # 誤って書き換えてしまうバグを将来混入させないよう、念のため
+        # スレッドごとにコピーを渡す。
+        answer, error = _collect_answer_from_candidate(candidate, org_fingerprint, list(messages))
+        results[index] = (candidate, answer, error)
+        with print_lock:
+            print()
+            print(f"--- {candidate['label']} (モデル: {candidate['model']}) ---")
+            if error:
+                print(f"(問い合わせに失敗しました: {error})")
+            else:
+                print(answer if answer else "(応答がありませんでした)")
+
+    threads = [threading.Thread(target=worker, args=(i, c), daemon=True) for i, c in enumerate(targets)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    print()
+
+    # 優先順位が最も高い(targets先頭に近い)候補の中から、最初に成功したものの
+    # 回答だけを会話履歴に残す。
+    for candidate, answer, error in results:
+        if not error and answer:
+            messages.append({"role": "assistant", "content": answer})
+            break
 
 
 # ---------------------------------------------------------------------------
@@ -1433,6 +1656,7 @@ def _run_repl_client(port: int, org_fingerprint: str) -> None:
     print()
     print("=== Yoriai 対話モード ===")
     print("組織のメンバーに質問できます。終了するには exit または quit と入力するか、Ctrl+Cを押してください。")
+    print(f"{MULTI_QUERY_COMMAND} <質問文> で、空きリソース上位{MULTI_QUERY_TARGET_COUNT}台に同時に質問できます。")
     print()
 
     # 仮の判断: 会話履歴(messages)はこのセッション内でのみ保持し、終了したら破棄する。
@@ -1459,6 +1683,18 @@ def _run_repl_client(port: int, org_fingerprint: str) -> None:
             continue
         if text.lower() in ("exit", "quit"):
             break
+
+        if text.startswith(MULTI_QUERY_COMMAND):
+            question = text[len(MULTI_QUERY_COMMAND):].strip()
+            if not question:
+                print(f"使い方: {MULTI_QUERY_COMMAND} <質問文>  (例: {MULTI_QUERY_COMMAND} こんにちは)")
+                continue
+            messages.append({"role": "user", "content": question})
+            try:
+                _ask_organization_multi(port, org_fingerprint, messages)
+            except KeyboardInterrupt:
+                print()
+            continue
 
         messages.append({"role": "user", "content": text})
         try:
@@ -1571,6 +1807,7 @@ def _format_status_member(card: dict, index: int, label: str, last_seen: float =
     total_gb = memory.get("total_gb")
     installed = card.get("models", {}).get("installed", [])
     loaded = card.get("models", {}).get("loaded", [])
+    backends = card.get("models", {}).get("backends", [])
 
     if free_gb is not None and total_gb is not None:
         memory_line = f"    メモリ: 空き {free_gb}GB / 総 {total_gb}GB"
@@ -1581,6 +1818,7 @@ def _format_status_member(card: dict, index: int, label: str, last_seen: float =
         f"[{index}] {device_name} {label}",
         f"    チップ: {chip}",
         memory_line,
+        f"    利用可能なバックエンド: {', '.join(backends) if backends else 'なし'}",
         f"    ロード済みモデル: {', '.join(loaded) if loaded else 'なし'}",
         f"    インストール済みモデル({len(installed)}件): {', '.join(installed) if installed else 'なし'}",
     ]
