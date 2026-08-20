@@ -539,7 +539,24 @@ def start_card_server(agent_id: str, org_fingerprint: str, port: int, registry: 
         (CardRequestHandler,),
         {"agent_id": agent_id, "org_fingerprint": org_fingerprint, "registry": registry},
     )
-    server = ThreadingHTTPServer(("0.0.0.0", port), handler_cls)
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", port), handler_cls)
+    except OSError as exc:
+        # 仮の判断: 常駐化(systemd/launchd)している状態で手動で `python3 yoriai.py` を
+        # 実行すると、同じポートへのbindが衝突してOSErrorの生トレースバックが出て
+        # しまい原因が分かりにくかった(実機での報告により発覚)。よくある原因
+        # (既に別プロセスとしてYoriaiが起動中)を案内するメッセージに変えたうえで
+        # 終了する。errno 98はLinux、48はmacOSでの「アドレスは既に使用中」を表す。
+        if exc.errno in (48, 98):
+            logger.error("ポート %d は既に使用中です。", port)
+            logger.error(
+                "Yoriaiが既に別プロセス(常駐化サービスなど)として起動していないか確認してください。"
+                "常駐状態を確認するには systemctl status yoriai.service (Linux) や "
+                "launchctl list | grep yoriai (macOS) を、組織の状態だけ見たい場合は "
+                "python3 yoriai.py --status を使ってください。"
+            )
+            sys.exit(1)
+        raise
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server
