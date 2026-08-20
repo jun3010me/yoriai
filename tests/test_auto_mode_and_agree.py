@@ -185,12 +185,74 @@ def test_agree_aborts_cleanly_when_architect_response_is_unparseable():
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
+def test_implementer_receives_full_plan_even_when_architect_output_is_self_inconsistent():
+    """実機で実際に報告された不具合(設計担当の回答内で、cli.py行は
+    add_task/remove_task/update_task/list_tasksという名前、storage.py行は
+    save_todos/load_todosという全く別の名前で書かれていた)を再現し、
+    このような「設計担当自身の回答が最初から矛盾している」ケースでも、
+    各実装担当への依頼文には実装計画全体(=矛盾する両方の記述)が
+    そのまま埋め込まれることを確認する。
+
+    これは矛盾そのものを自動解消する仕組みではないが、(1)実装担当が
+    他ファイルの想定インターフェースに実装時点で気づける可能性を高める、
+    (2)対話モードの標準出力に生の回答をそのまま表示するため、
+    ユーザーが「設計担当の時点で既に矛盾していた」と判別できるようにする、
+    という2点を検証する。
+    """
+    original_snapshot = yoriai._fetch_org_snapshot
+    original_stream = yoriai._stream_chat_from_candidate
+
+    # 実機で報告された、設計担当の回答自体が既に矛盾しているケースを再現する。
+    inconsistent_breakdown_answer = (
+        "storage.py: save_todos(todos, filepath) と load_todos(filepath) を実装する\n"
+        "cli.py: storageから add_task, remove_task, update_task, list_tasks をimportして使う\n"
+    )
+
+    received_requests_log = []
+
+    def fake_stream(candidate, org_fingerprint, messages):
+        label = candidate["label"]
+        request_text = messages[0]["content"]
+        received_requests_log.append((label, request_text))
+        if "ファイルに分割する実装計画" in request_text:
+            yield {"content": inconsistent_breakdown_answer}
+        else:
+            yield {"content": "```python\npass\n```"}
+        yield {"done": True}
+
+    yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False: _three_member_snapshot()
+    yoriai._stream_chat_from_candidate = fake_stream
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_agree_test_")
+    try:
+        yoriai._ask_organization_collaborate(47120, "fingerprint", "ToDoリストのCLIツールを作って", out_dir)
+
+        cli_requests = [req for label, req in received_requests_log if label == "junnoMac-mini"]
+        assert len(cli_requests) == 1, received_requests_log
+        cli_request = cli_requests[0]
+
+        # 修正前は「cli.py行の内容だけ」しか実装担当に渡らなかったため、
+        # storage.py側の実際の関数名(save_todos/load_todos)を実装担当が
+        # 目にする機会が無かった。修正後は計画全体が埋め込まれるため、
+        # 矛盾していてもstorage.py側の名前がcli.py実装依頼に含まれるはず。
+        assert "save_todos" in cli_request and "load_todos" in cli_request, (
+            f"storage.py側の関数名が実装計画全体としてcli.py担当への依頼に含まれていません: {cli_request!r}"
+        )
+        # cli.py行自身の内容も引き続き含まれること
+        assert "add_task" in cli_request, cli_request
+    finally:
+        yoriai._fetch_org_snapshot = original_snapshot
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
 def main():
     tests = [
         test_execution_mode_classification_matches_requested_examples,
         test_parse_module_breakdown_handles_bullets_and_code_fence,
         test_agree_uses_top_candidate_as_architect_and_propagates_interface_to_implementers,
         test_agree_aborts_cleanly_when_architect_response_is_unparseable,
+        test_implementer_receives_full_plan_even_when_architect_output_is_self_inconsistent,
     ]
     failures = 0
     for test in tests:
