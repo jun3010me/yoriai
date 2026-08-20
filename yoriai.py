@@ -8,6 +8,7 @@
 import argparse
 import json
 import logging
+import os
 import platform
 import re
 import socket
@@ -1654,6 +1655,160 @@ def _ask_organization_multi(port: int, org_fingerprint: str, messages: list) -> 
 
 
 # ---------------------------------------------------------------------------
+# 異なる依頼を異なるメンバーへ同時に振り分ける("//parallel"コマンド、実験1)
+# ---------------------------------------------------------------------------
+#
+# //multi は「同じ質問」を複数メンバーに投げて回答を見比べる仕組みだが、
+# 「storage.pyの実装をメンバーA、cli.pyの実装をメンバーBに、同時にそれぞれ
+# 依頼する」という並行モジュール開発の実験には使えない。//parallel はこの
+# 「異なる依頼を、異なるメンバーに同時に送り、各回答からコード部分を
+# 抽出して手元に保存する」というユースケース専用のコマンドとして追加した。
+
+PARALLEL_QUERY_COMMAND = "//parallel"
+
+# 仮の判断: 「<ファイル名>:<依頼内容>」を"|"区切りで並べる構文にした。
+# 依頼内容そのものに"|"を含めたい場合には対応できないが、今回のスコープ
+# (短い1行の依頼文を複数メンバーに振り分ける)では十分と判断した。
+_PARALLEL_TASK_PATTERN = re.compile(r"^([^:]+):(.+)$", re.DOTALL)
+
+
+def _parse_parallel_tasks(text: str) -> list:
+    """`//parallel <ファイル名1>:<依頼1> | <ファイル名2>:<依頼2> ...` の
+    引数部分を解析し、[(ファイル名, 依頼内容), ...] のリストにする。
+    構文に合わない要素(":"が無い等)は無視する。
+    """
+    tasks = []
+    for chunk in text.split("|"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        match = _PARALLEL_TASK_PATTERN.match(chunk)
+        if not match:
+            continue
+        filename = match.group(1).strip()
+        request = match.group(2).strip()
+        if filename and request:
+            tasks.append((filename, request))
+    return tasks
+
+
+# 仮の判断: 応答テキストの中から最初のフェンス付きコードブロック
+# (```python ... ``` や ``` ... ```)の中身だけを取り出す。言語名の有無は
+# 問わない。
+_CODE_BLOCK_PATTERN = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
+
+
+def _extract_code_from_answer(answer: str) -> str:
+    """回答テキストからコードブロックの中身を抽出する。コードブロックが
+    見つからない場合は、応答テキスト全体をそのまま返す(仮の判断:
+    モデルがコードブロックを使わずテキストだけでコードを返してくる
+    可能性もあるため、抽出失敗を理由に何も保存しないより、応答全体を
+    保存して人間が後で判断できるようにする方を優先した)。
+    """
+    match = _CODE_BLOCK_PATTERN.search(answer)
+    if match:
+        return match.group(1).rstrip("\n") + "\n"
+    return answer.rstrip("\n") + "\n" if answer else answer
+
+
+def _ask_organization_parallel(port: int, org_fingerprint: str, command_text: str, out_dir: str) -> None:
+    """`//parallel <ファイル名1>:<依頼1> | <ファイル名2>:<依頼2> ...` 用:
+    タスクごとに異なるメンバーへ同時に依頼を送り、各回答からコード部分を
+    抽出して out_dir 配下にファイル名で保存する。
+
+    仮の判断:
+    - 割り当ては「タスクを書いた順」と「優先順位順に並べた候補」を先頭から
+      1対1で対応させるだけの単純な方式にした。特定のメンバーを名指しで
+      選ぶ構文は今回のスコープ外。
+    - コード生成の依頼という性質上、候補の優先順位付けは常にコーディング系
+      タスク(TASK_TYPE_CODING)として行う(コーディング系モデルを持つ
+      メンバーを優先)。
+    - 各タスクは独立した1回きりのやりとりとして扱い、対話モードの会話履歴
+      (messages)には追加しない(//parallelの結果はファイル保存が主目的で、
+      後続の会話の前提として扱うべき性質のものではないため)。
+    - 候補がタスク数より少ない場合は、先頭から割り当てられる分だけ実行し、
+      残りはスキップしてその旨をログに残す(今回のスコープでは自動リトライや
+      1台への複数タスク割り当てまでは行わない)。
+    """
+    tasks = _parse_parallel_tasks(command_text)
+    if not tasks:
+        print(
+            f"使い方: {PARALLEL_QUERY_COMMAND} <ファイル名1>:<依頼内容1> | <ファイル名2>:<依頼内容2> ...\n"
+            f"例: {PARALLEL_QUERY_COMMAND} storage.py:ToDoをJSONで管理する関数群を書いて | cli.py:storageを使うCLIを書いて"
+        )
+        return
+
+    data = _fetch_org_snapshot(port, org_fingerprint)
+    if data is None:
+        return
+
+    candidates = _select_chat_candidates(data.get("self", {}), data.get("peers", []), port, TASK_TYPE_CODING)
+    if not candidates:
+        print("組織内にロード済みモデルを持つメンバーがいません。")
+        return
+
+    if len(candidates) < len(tasks):
+        print(
+            f"[⚠️ 依頼数({len(tasks)}件)に対して、問い合わせ可能なメンバーが{len(candidates)}台しかいません。"
+            f"先頭から割り当てられる分だけ実行します。]"
+        )
+        skipped = tasks[len(candidates):]
+        for filename, _request in skipped:
+            logger.warning("%s の依頼は割り当て可能なメンバーが無かったためスキップしました。", filename)
+        tasks = tasks[:len(candidates)]
+
+    assignments = list(zip(tasks, candidates))
+    target_labels = ", ".join(
+        f"{filename}→{c['label']}(モデル: {c['model']})" for (filename, _req), c in assignments
+    )
+    print(f"[📡 {len(assignments)}件のタスクを異なるメンバーに同時に依頼しています: {target_labels}]")
+
+    results = [None] * len(assignments)
+    print_lock = threading.Lock()
+
+    def worker(index: int, filename: str, request: str, candidate: dict) -> None:
+        task_messages = [{"role": "user", "content": request}]
+        answer, error = _collect_answer_from_candidate(candidate, org_fingerprint, task_messages)
+        results[index] = (filename, candidate, answer, error)
+        with print_lock:
+            print()
+            print(f"--- {filename} ← {candidate['label']} (モデル: {candidate['model']}) ---")
+            if error:
+                print(f"(問い合わせに失敗しました: {error})")
+            else:
+                print(answer if answer else "(応答がありませんでした)")
+
+    threads = [
+        threading.Thread(target=worker, args=(i, filename, request, candidate), daemon=True)
+        for i, ((filename, request), candidate) in enumerate(assignments)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    print()
+
+    os.makedirs(out_dir, exist_ok=True)
+    saved = []
+    for filename, candidate, answer, error in results:
+        if error or not answer:
+            logger.warning(
+                "%s の生成に失敗したため保存をスキップしました(担当: %s): %s",
+                filename, candidate["label"], error or "応答なし",
+            )
+            continue
+        code = _extract_code_from_answer(answer)
+        dest_path = os.path.join(out_dir, filename)
+        with open(dest_path, "w", encoding="utf-8") as f:
+            f.write(code)
+        saved.append(dest_path)
+        print(f"[💾 {dest_path} に保存しました (担当: {candidate['label']})]")
+
+    if not saved:
+        print("保存できたファイルがありませんでした。")
+
+
+# ---------------------------------------------------------------------------
 # エントリーポイント
 # ---------------------------------------------------------------------------
 
@@ -1754,11 +1909,15 @@ def run_agent(token: str, port: int) -> None:
         server.shutdown()
 
 
-def _run_repl_client(port: int, org_fingerprint: str) -> None:
+def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
     print()
     print("=== Yoriai 対話モード ===")
     print("組織のメンバーに質問できます。終了するには exit または quit と入力するか、Ctrl+Cを押してください。")
     print(f"{MULTI_QUERY_COMMAND} <質問文> で、空きリソース上位{MULTI_QUERY_TARGET_COUNT}台に同時に質問できます。")
+    print(
+        f"{PARALLEL_QUERY_COMMAND} <ファイル名1>:<依頼1> | <ファイル名2>:<依頼2> ... で、"
+        f"異なる依頼を異なるメンバーに同時に振り分け、回答からコードを抽出して{out_dir}に保存できます。"
+    )
     print()
 
     # 仮の判断: 会話履歴(messages)はこのセッション内でのみ保持し、終了したら破棄する。
@@ -1786,6 +1945,14 @@ def _run_repl_client(port: int, org_fingerprint: str) -> None:
         if text.lower() in ("exit", "quit"):
             break
 
+        if text.startswith(PARALLEL_QUERY_COMMAND):
+            command_text = text[len(PARALLEL_QUERY_COMMAND):].strip()
+            try:
+                _ask_organization_parallel(port, org_fingerprint, command_text, out_dir)
+            except KeyboardInterrupt:
+                print()
+            continue
+
         if text.startswith(MULTI_QUERY_COMMAND):
             question = text[len(MULTI_QUERY_COMMAND):].strip()
             if not question:
@@ -1808,7 +1975,7 @@ def _run_repl_client(port: int, org_fingerprint: str) -> None:
     print("対話モードを終了します。")
 
 
-def handle_chat(port: int) -> None:
+def handle_chat(port: int, out_dir: str) -> None:
     """対話モード(フロント)のエントリーポイント。`python3 yoriai.py --chat`で
     起動される。このプロセス自身はポートのbindもmDNS/Tailscale探索も一切行わず、
     既に起動しているキッチン(常駐エージェント)の`/status`・`/chat`にHTTPで
@@ -1824,7 +1991,7 @@ def handle_chat(port: int) -> None:
     # (--statusと同じ考え方。到達できない場合は案内を出して終了する)。
     _fetch_org_snapshot(port, org_fingerprint, fail_fast=True)
 
-    _run_repl_client(port, org_fingerprint)
+    _run_repl_client(port, org_fingerprint, out_dir)
 
 
 def _prompt_yes_no(question: str) -> bool:
@@ -2004,6 +2171,10 @@ def main():
         help=f"自己紹介カードを配信するHTTPポート番号(既定値: {DEFAULT_CARD_PORT}。0を指定するとOSに自動選択させる)",
     )
     parser.add_argument("--force", action="store_true", help="--init と併用し、既存トークンを確認の上で強制的に再発行する")
+    parser.add_argument(
+        "--dir", dest="out_dir", default=".", metavar="DIR",
+        help=f"--chat と併用し、{PARALLEL_QUERY_COMMAND} コマンドで保存するファイルの保存先ディレクトリ(既定値: カレントディレクトリ)",
+    )
     args = parser.parse_args()
 
     if args.init is not None:
@@ -2016,7 +2187,7 @@ def main():
         return
 
     if args.chat:
-        handle_chat(args.port)
+        handle_chat(args.port, args.out_dir)
         return
 
     if args.join is not None:
