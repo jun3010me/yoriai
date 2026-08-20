@@ -1711,42 +1711,23 @@ def _extract_code_from_answer(answer: str) -> str:
     return answer.rstrip("\n") + "\n" if answer else answer
 
 
-def _ask_organization_parallel(port: int, org_fingerprint: str, command_text: str, out_dir: str) -> None:
-    """`//parallel <ファイル名1>:<依頼1> | <ファイル名2>:<依頼2> ...` 用:
-    タスクごとに異なるメンバーへ同時に依頼を送り、各回答からコード部分を
-    抽出して out_dir 配下にファイル名で保存する。
+def _dispatch_and_save_parallel_tasks(tasks: list, candidates: list, org_fingerprint: str, out_dir: str) -> None:
+    """タスク(ファイル名, 依頼内容)のリストを、優先順位順に並べた候補へ先頭から
+    1対1で割り当て、同時に問い合わせて各回答からコード部分を抽出し、
+    out_dir 配下にファイル名で保存する。`//parallel`(手動指定)と協業モード・
+    `//agree`(合意フェーズ後の並行実装)の両方から共通して使われる下請け関数。
 
     仮の判断:
     - 割り当ては「タスクを書いた順」と「優先順位順に並べた候補」を先頭から
       1対1で対応させるだけの単純な方式にした。特定のメンバーを名指しで
       選ぶ構文は今回のスコープ外。
-    - コード生成の依頼という性質上、候補の優先順位付けは常にコーディング系
-      タスク(TASK_TYPE_CODING)として行う(コーディング系モデルを持つ
-      メンバーを優先)。
     - 各タスクは独立した1回きりのやりとりとして扱い、対話モードの会話履歴
-      (messages)には追加しない(//parallelの結果はファイル保存が主目的で、
-      後続の会話の前提として扱うべき性質のものではないため)。
+      (messages)には追加しない(結果はファイル保存が主目的で、後続の会話の
+      前提として扱うべき性質のものではないため)。
     - 候補がタスク数より少ない場合は、先頭から割り当てられる分だけ実行し、
       残りはスキップしてその旨をログに残す(今回のスコープでは自動リトライや
       1台への複数タスク割り当てまでは行わない)。
     """
-    tasks = _parse_parallel_tasks(command_text)
-    if not tasks:
-        print(
-            f"使い方: {PARALLEL_QUERY_COMMAND} <ファイル名1>:<依頼内容1> | <ファイル名2>:<依頼内容2> ...\n"
-            f"例: {PARALLEL_QUERY_COMMAND} storage.py:ToDoをJSONで管理する関数群を書いて | cli.py:storageを使うCLIを書いて"
-        )
-        return
-
-    data = _fetch_org_snapshot(port, org_fingerprint)
-    if data is None:
-        return
-
-    candidates = _select_chat_candidates(data.get("self", {}), data.get("peers", []), port, TASK_TYPE_CODING)
-    if not candidates:
-        print("組織内にロード済みモデルを持つメンバーがいません。")
-        return
-
     if len(candidates) < len(tasks):
         print(
             f"[⚠️ 依頼数({len(tasks)}件)に対して、問い合わせ可能なメンバーが{len(candidates)}台しかいません。"
@@ -1758,6 +1739,10 @@ def _ask_organization_parallel(port: int, org_fingerprint: str, command_text: st
         tasks = tasks[:len(candidates)]
 
     assignments = list(zip(tasks, candidates))
+    if not assignments:
+        print("実行できるタスクがありませんでした。")
+        return
+
     target_labels = ", ".join(
         f"{filename}→{c['label']}(モデル: {c['model']})" for (filename, _req), c in assignments
     )
@@ -1806,6 +1791,199 @@ def _ask_organization_parallel(port: int, org_fingerprint: str, command_text: st
 
     if not saved:
         print("保存できたファイルがありませんでした。")
+
+
+def _ask_organization_parallel(port: int, org_fingerprint: str, command_text: str, out_dir: str) -> None:
+    """`//parallel <ファイル名1>:<依頼1> | <ファイル名2>:<依頼2> ...` 用:
+    タスクごとに異なるメンバーへ同時に依頼を送り、各回答からコード部分を
+    抽出して out_dir 配下にファイル名で保存する。
+
+    仮の判断: コード生成の依頼という性質上、候補の優先順位付けは常に
+    コーディング系タスク(TASK_TYPE_CODING)として行う(コーディング系
+    モデルを持つメンバーを優先)。実際の割り当て・実行は
+    `_dispatch_and_save_parallel_tasks`に委ねる。
+    """
+    tasks = _parse_parallel_tasks(command_text)
+    if not tasks:
+        print(
+            f"使い方: {PARALLEL_QUERY_COMMAND} <ファイル名1>:<依頼内容1> | <ファイル名2>:<依頼内容2> ...\n"
+            f"例: {PARALLEL_QUERY_COMMAND} storage.py:ToDoをJSONで管理する関数群を書いて | cli.py:storageを使うCLIを書いて"
+        )
+        return
+
+    data = _fetch_org_snapshot(port, org_fingerprint)
+    if data is None:
+        return
+
+    candidates = _select_chat_candidates(data.get("self", {}), data.get("peers", []), port, TASK_TYPE_CODING)
+    if not candidates:
+        print("組織内にロード済みモデルを持つメンバーがいません。")
+        return
+
+    _dispatch_and_save_parallel_tasks(tasks, candidates, org_fingerprint, out_dir)
+
+
+# ---------------------------------------------------------------------------
+# 制作依頼の事前すり合わせ("//agree"コマンド・協業モード、実験2)
+# ---------------------------------------------------------------------------
+#
+# 実験1で、複数メンバーに別々のファイルを実装させると、依頼文にインター
+# フェースを書いても関数名・データ形式がズレる不具合が実機で見つかった
+# (storage.py側はadd_todo等の仕様通りの名前だったが、cli.py側はadd等の
+# 汎用的な名前でimportしており連携が失敗した)。//agree は、実装を並行
+# させる前に「モジュール分割・インターフェース設計」をまず1台に考えさせ、
+# その合意内容をそのまま各メンバーへの依頼文に含めることで、この不一致を
+# 減らすことを狙った仕組み。
+
+AGREE_COMMAND = "//agree"
+
+# 仮の判断: 設計担当への指示は、出力形式を厳密に固定するために日本語の
+# プロンプトテンプレートとして持つ。出力形式は`//parallel`と同じ
+# 「ファイル名: 内容」なので、`_parse_parallel_tasks`と同じ正規表現
+# (`_PARALLEL_TASK_PATTERN`)を流用して解析できる(区切りが"|"ではなく
+# 改行になる点のみ異なる)。
+_MODULE_BREAKDOWN_PROMPT_TEMPLATE = """あなたはソフトウェア設計を担当します。以下の依頼を、複数人で分担して実装できるよう、複数のファイルに分割する実装計画を考えてください。
+
+各ファイルが実装すべき内容には、他のファイルから呼び出される関数のシグネチャ(関数名・引数名・型・戻り値の型)や、やり取りするデータの形式(辞書のキー名など)を具体的に明記してください。担当が異なるファイル同士が正しく連携できるよう、インターフェースの記述は曖昧にせず、できるだけ厳密に書いてください。
+
+出力は次の形式のみとし、他の説明文や前置き・後書きは一切含めないでください。ファイルごとに1行、「ファイル名: 実装すべき内容(インターフェースの詳細を含む)」という形式で出力してください(2〜4ファイル程度を想定します):
+
+storage.py: <実装すべき内容をここに>
+cli.py: <実装すべき内容をここに>
+
+依頼内容: {request}
+"""
+
+
+def _build_module_breakdown_prompt(request: str) -> str:
+    return _MODULE_BREAKDOWN_PROMPT_TEMPLATE.format(request=request)
+
+
+def _parse_module_breakdown(text: str) -> list:
+    """設計担当メンバーの回答(1行1ファイルの「ファイル名: 内容」形式)を
+    [(ファイル名, 内容), ...] のリストに変換する。コードフェンス
+    (```で始まる行)や、行頭の箇条書き記号("- "等)が付いて返ってくる
+    場合にも対応する。
+    """
+    tasks = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("```"):
+            continue
+        line = line.lstrip("-*・ ").strip()
+        match = _PARALLEL_TASK_PATTERN.match(line)
+        if not match:
+            continue
+        filename = match.group(1).strip()
+        content = match.group(2).strip()
+        if filename and content:
+            tasks.append((filename, content))
+    return tasks
+
+
+def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str, out_dir: str) -> None:
+    """「〇〇を作って」のような制作依頼用: まず優先順位が最も高い1台に
+    モジュール分割案とインターフェース設計を相談し(合意フェーズ)、
+    その結果を`_dispatch_and_save_parallel_tasks`で異なるメンバーに
+    並行実装させる。
+
+    仮の判断:
+    - 「設計担当」の選び方は他の候補選びと同じ優先順位ロジック
+      (コーディング系タスクとして最優先の候補)をそのまま流用する。
+      設計専用のモデルを分けて選ぶ仕組みは今回のスコープ外。
+    - 設計担当の回答が期待した形式(「ファイル名: 内容」の行)で
+      1件も得られなかった場合は、その旨と回答全文を表示して中断する
+      (フォーマットの自動修正・再質問までは今回のスコープ外)。
+    """
+    data = _fetch_org_snapshot(port, org_fingerprint)
+    if data is None:
+        return
+
+    candidates = _select_chat_candidates(data.get("self", {}), data.get("peers", []), port, TASK_TYPE_CODING)
+    if not candidates:
+        print("組織内にロード済みモデルを持つメンバーがいません。")
+        return
+
+    architect = candidates[0]
+    print(
+        f"[🧭 まず {architect['label']} (モデル: {architect['model']}) に"
+        f"モジュール分割案とインターフェース設計を相談しています...]"
+    )
+
+    breakdown_prompt = _build_module_breakdown_prompt(request)
+    answer, error = _collect_answer_from_candidate(
+        architect, org_fingerprint, [{"role": "user", "content": breakdown_prompt}],
+    )
+    if error:
+        print(f"設計担当への問い合わせに失敗しました: {error}")
+        return
+    if not answer:
+        print("設計担当から応答が得られませんでした。")
+        return
+
+    tasks = _parse_module_breakdown(answer)
+    if not tasks:
+        print("設計担当の回答からファイル分割案を読み取れませんでした。応答内容は次の通りです:")
+        print(answer)
+        return
+
+    print(f"[📐 モジュール分割案がまとまりました({len(tasks)}ファイル): {', '.join(f for f, _ in tasks)}]")
+    for filename, content in tasks:
+        print(f"  - {filename}: {content}")
+
+    _dispatch_and_save_parallel_tasks(tasks, candidates, org_fingerprint, out_dir)
+
+
+# ---------------------------------------------------------------------------
+# 実行モードの自動判定(コマンド不要化)
+# ---------------------------------------------------------------------------
+#
+# これまでは単発質問・//multi・//parallel・//agree と、人間がコマンドを
+# 使い分けて実行モードを指定する設計だった。これを「ただ話しかけるだけ」で
+# Yoriai自身が適切なモードを選ぶ方式に変更する。明示コマンドは、自動判定を
+# 上書きしたい場合の手動指定として引き続き使える。
+
+EXECUTION_MODE_SINGLE = "single"
+EXECUTION_MODE_COMPARE = "compare"
+EXECUTION_MODE_COLLABORATE = "collaborate"
+
+# 仮の判断: 「作って」等、まとまった制作物を要求するキーワードを協業モードの
+# 判定に使う。「書いて」は1つの関数・スニペットの依頼でも使われがちなため、
+# 誤判定を避けるためあえて含めていない。
+_COLLABORATE_MODE_KEYWORDS = ("作って", "作成して", "つくって", "開発して", "構築して")
+
+# 仮の判断: 「複数の答えを見比べたい」という意図が読み取れる表現を比較
+# モードの判定に使う。
+_COMPARE_MODE_KEYWORDS = (
+    "意見を聞", "意見がほし", "意見を教えて", "みんなの意見", "比較して", "比べて",
+    "複数の案", "複数の意見", "見比べ", "どう思う", "案を出して", "案がほしい",
+)
+
+
+def _classify_execution_mode(text: str) -> str:
+    """依頼文から実行モード(単発/比較/協業)を判定する。
+
+    仮の判断: キーワードベースの単純な判定にとどめる。協業系キーワード
+    (「作って」等)を最優先で確認し、次に比較系キーワード(「意見を聞かせて」等)を
+    確認する。「作ってほしいものについて意見を聞かせて」のような複合的な
+    依頼文の優先順位は今回のスコープでは厳密には詰めない。どちらにも
+    該当しなければ単発モードとする。
+    """
+    for keyword in _COLLABORATE_MODE_KEYWORDS:
+        if keyword in text:
+            return EXECUTION_MODE_COLLABORATE
+    for keyword in _COMPARE_MODE_KEYWORDS:
+        if keyword in text:
+            return EXECUTION_MODE_COMPARE
+    return EXECUTION_MODE_SINGLE
+
+
+def _execution_mode_reason_label(mode: str) -> str:
+    if mode == EXECUTION_MODE_COLLABORATE:
+        return "制作依頼と判断し、事前すり合わせを行います"
+    if mode == EXECUTION_MODE_COMPARE:
+        return "複数の意見を求めていると判断し、複数メンバーに問い合わせます"
+    return "単発の質問と判断しました"
 
 
 # ---------------------------------------------------------------------------
@@ -1913,10 +2091,16 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
     print()
     print("=== Yoriai 対話モード ===")
     print("組織のメンバーに質問できます。終了するには exit または quit と入力するか、Ctrl+Cを押してください。")
-    print(f"{MULTI_QUERY_COMMAND} <質問文> で、空きリソース上位{MULTI_QUERY_TARGET_COUNT}台に同時に質問できます。")
+    print("コマンドを付けずに話しかけると、依頼内容から単発/比較/協業のどのモードで")
+    print("問い合わせるかを自動的に判断します(判断理由は[判断: ...]として表示されます)。")
+    print(f"{MULTI_QUERY_COMMAND} <質問文> で、自動判定に関わらず必ず空きリソース上位{MULTI_QUERY_TARGET_COUNT}台に同時に質問できます。")
+    print(
+        f"{AGREE_COMMAND} <制作依頼> で、自動判定に関わらず必ず事前すり合わせ(合意フェーズ)を経て並行実装させます。"
+    )
     print(
         f"{PARALLEL_QUERY_COMMAND} <ファイル名1>:<依頼1> | <ファイル名2>:<依頼2> ... で、"
-        f"異なる依頼を異なるメンバーに同時に振り分け、回答からコードを抽出して{out_dir}に保存できます。"
+        f"割り振り内容を自分で指定し、異なる依頼を異なるメンバーに同時に振り分け、"
+        f"回答からコードを抽出して{out_dir}に保存できます。"
     )
     print()
 
@@ -1945,6 +2129,17 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
         if text.lower() in ("exit", "quit"):
             break
 
+        if text.startswith(AGREE_COMMAND):
+            request = text[len(AGREE_COMMAND):].strip()
+            if not request:
+                print(f"使い方: {AGREE_COMMAND} <制作依頼>  (例: {AGREE_COMMAND} ToDoリストのCLIツールを作って)")
+                continue
+            try:
+                _ask_organization_collaborate(port, org_fingerprint, request, out_dir)
+            except KeyboardInterrupt:
+                print()
+            continue
+
         if text.startswith(PARALLEL_QUERY_COMMAND):
             command_text = text[len(PARALLEL_QUERY_COMMAND):].strip()
             try:
@@ -1965,9 +2160,26 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                 print()
             continue
 
+        # 仮の判断: 明示コマンド(//agree・//parallel・//multi)のいずれにも
+        # 一致しない通常の入力は、依頼文の内容から実行モードを自動判定する。
+        # 判定根拠は既存のメンバー選定理由の表示と同じスタイルで
+        # 「[判断: ...]」として一言添える。
+        mode = _classify_execution_mode(text)
+        print(f"[判断: {_execution_mode_reason_label(mode)}]")
+
+        if mode == EXECUTION_MODE_COLLABORATE:
+            try:
+                _ask_organization_collaborate(port, org_fingerprint, text, out_dir)
+            except KeyboardInterrupt:
+                print()
+            continue
+
         messages.append({"role": "user", "content": text})
         try:
-            _ask_organization(port, org_fingerprint, messages)
+            if mode == EXECUTION_MODE_COMPARE:
+                _ask_organization_multi(port, org_fingerprint, messages)
+            else:
+                _ask_organization(port, org_fingerprint, messages)
         except KeyboardInterrupt:
             print()
             continue
@@ -2173,7 +2385,7 @@ def main():
     parser.add_argument("--force", action="store_true", help="--init と併用し、既存トークンを確認の上で強制的に再発行する")
     parser.add_argument(
         "--dir", dest="out_dir", default=".", metavar="DIR",
-        help=f"--chat と併用し、{PARALLEL_QUERY_COMMAND} コマンドで保存するファイルの保存先ディレクトリ(既定値: カレントディレクトリ)",
+        help=f"--chat と併用し、{PARALLEL_QUERY_COMMAND}・{AGREE_COMMAND}・協業モードで保存するファイルの保存先ディレクトリ(既定値: カレントディレクトリ)",
     )
     args = parser.parse_args()
 
