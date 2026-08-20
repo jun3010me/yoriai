@@ -198,10 +198,12 @@ def test_collaborate_dispatches_exactly_two_files_when_architect_uses_nested_for
             47120, "fingerprint", "ToDoリストのCLIツールを作って", out_dir,
         )
 
-        # 設計担当への相談を除いた、実装依頼の宛先(ラベル)の集合を確認する。
+        # 実装依頼(【あなたが実装を担当するファイル】を含むプロンプト)の
+        # 宛先(ラベル)の集合を確認する。設計担当への相談やレビューフェーズの
+        # 問い合わせと区別するため、実装依頼に特有の文言で絞り込む。
         implementation_labels = [
             label for label, req in received_requests_log
-            if "ファイルに分割する実装計画" not in req
+            if "あなたが実装を担当するファイル" in req
         ]
         assert len(implementation_labels) == 2, (
             f"ファイル数(2件)ちょうどに実装依頼が飛ぶはずです: {received_requests_log}"
@@ -281,7 +283,12 @@ def test_agree_uses_top_candidate_as_architect_and_propagates_interface_to_imple
         # cli.py担当(junnoMac-mini)への実装依頼文に、設計担当が決めた
         # インターフェース(add_todo/list_todosという具体的な関数名)が
         # そのまま引き継がれていることを確認する(実験1の関数名不一致の再発防止)。
-        cli_requests = [req for label, req in received_requests_log if label == "junnoMac-mini"]
+        # レビューフェーズでもjunnoMac-miniへの問い合わせ(storage.pyのレビュー)が
+        # 発生するため、実装依頼特有の文言で絞り込む。
+        cli_requests = [
+            req for label, req in received_requests_log
+            if label == "junnoMac-mini" and "あなたが実装を担当するファイル" in req
+        ]
         assert len(cli_requests) == 1, received_requests_log
         assert "add_todo" in cli_requests[0] and "list_todos" in cli_requests[0], (
             f"設計担当が決めたインターフェースが実装依頼に引き継がれていません: {cli_requests[0]!r}"
@@ -372,7 +379,12 @@ def test_implementer_receives_full_plan_even_when_architect_output_is_self_incon
     try:
         yoriai._ask_organization_collaborate(47120, "fingerprint", "ToDoリストのCLIツールを作って", out_dir)
 
-        cli_requests = [req for label, req in received_requests_log if label == "junnoMac-mini"]
+        # レビューフェーズでもjunnoMac-miniへの問い合わせが発生するため、
+        # 実装依頼特有の文言で絞り込む。
+        cli_requests = [
+            req for label, req in received_requests_log
+            if label == "junnoMac-mini" and "あなたが実装を担当するファイル" in req
+        ]
         assert len(cli_requests) == 1, received_requests_log
         cli_request = cli_requests[0]
 
