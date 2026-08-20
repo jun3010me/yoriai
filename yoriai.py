@@ -825,6 +825,86 @@ def handle_init(force: bool, custom_passphrase=None) -> None:
     print(f"他の{device}をこの組織に参加させるには: python yoriai.py --join=<上記のトークン>")
 
 
+def _format_seconds_ago(timestamp: float) -> str:
+    delta = max(0, time.time() - timestamp)
+    if delta < 60:
+        return f"{int(delta)}秒前"
+    if delta < 3600:
+        return f"{int(delta // 60)}分前"
+    return f"{int(delta // 3600)}時間前"
+
+
+def _format_status_member(card: dict, index: int, label: str, last_seen: float = None) -> str:
+    device_name = card.get("device_name", "unknown")
+    chip = card.get("os", {}).get("chip", "unknown")
+    memory = card.get("memory", {})
+    free_gb = memory.get("free_gb")
+    total_gb = memory.get("total_gb")
+    installed = card.get("models", {}).get("installed", [])
+    loaded = card.get("models", {}).get("loaded", [])
+
+    if free_gb is not None and total_gb is not None:
+        memory_line = f"    メモリ: 空き {free_gb}GB / 総 {total_gb}GB"
+    else:
+        memory_line = "    メモリ: 不明"
+
+    lines = [
+        f"[{index}] {device_name} {label}",
+        f"    チップ: {chip}",
+        memory_line,
+        f"    ロード済みモデル: {', '.join(loaded) if loaded else 'なし'}",
+        f"    インストール済みモデル({len(installed)}件): {', '.join(installed) if installed else 'なし'}",
+    ]
+    if last_seen is not None:
+        lines.append(f"    最終確認: {_format_seconds_ago(last_seen)}")
+    return "\n".join(lines)
+
+
+def handle_status(port: int) -> None:
+    token = config.load_token()
+    if not token:
+        print(NO_TOKEN_GUIDANCE)
+        sys.exit(1)
+    org_fingerprint = config.token_fingerprint(token)
+
+    try:
+        resp = requests.get(
+            f"http://localhost:{port}/status",
+            headers={ORG_FINGERPRINT_HEADER: org_fingerprint},
+            timeout=CARD_REQUEST_TIMEOUT_SEC,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        # 仮の判断: --status は「今動いている常駐プロセスに問い合わせるだけ」の
+        # 軽量なコマンドという要件のため、エージェントが起動していない場合は
+        # 新たに起動したりはせず、案内を出して終了する。
+        print("実行中のYoriaiエージェントに接続できませんでした。")
+        print(f"詳細: {exc}")
+        print("先に python3 yoriai.py でエージェントを起動してください")
+        print("(常駐化している場合は、想定しているポートで動作しているか確認してください)。")
+        sys.exit(1)
+
+    self_card = data.get("self", {})
+    peers = data.get("peers", [])
+
+    print("=== Yoriai 組織の状態 ===")
+    print()
+    print(_format_status_member(self_card, 1, "[自分]"))
+    print()
+
+    if not peers:
+        print("現在、組織にはあなた1人だけです。")
+        return
+
+    for i, peer in enumerate(peers, start=2):
+        label = f"({peer.get('via', 'unknown')}経由)"
+        print(_format_status_member(peer.get("card", {}), i, label, peer.get("last_seen")))
+        print()
+
+    print(f"合計: {len(peers) + 1}台のエージェントが組織に参加中")
+
+
 # --init が値なしで指定された(合言葉を対話入力する)ことを表す印。
 # 「--initそのものが指定されなかった」(default=None)と区別するために使う。
 _INIT_INTERACTIVE = object()
@@ -839,6 +919,10 @@ def main():
              "--init=<合言葉> で好きな文字列を指定でき、省略時は対話入力(空欄ならランダム生成)",
     )
     group.add_argument("--join", metavar="TOKEN", help="既存の組織のトークンを指定して参加し、そのまま起動する")
+    group.add_argument(
+        "--status", action="store_true",
+        help="常駐中のYoriaiエージェントに問い合わせ、組織に参加しているメンバー一覧を表示して終了する",
+    )
     parser.add_argument(
         "--port", type=int, default=DEFAULT_CARD_PORT,
         help=f"自己紹介カードを配信するHTTPポート番号(既定値: {DEFAULT_CARD_PORT}。0を指定するとOSに自動選択させる)",
@@ -849,6 +933,10 @@ def main():
     if args.init is not None:
         custom_passphrase = None if args.init is _INIT_INTERACTIVE else args.init
         handle_init(args.force, custom_passphrase)
+        return
+
+    if args.status:
+        handle_status(args.port)
         return
 
     if args.join is not None:
