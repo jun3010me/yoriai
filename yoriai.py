@@ -1837,11 +1837,11 @@ def _ask_organization_parallel(port: int, org_fingerprint: str, command_text: st
 
 AGREE_COMMAND = "//agree"
 
-# 仮の判断: 設計担当への指示は、出力形式を厳密に固定するために日本語の
-# プロンプトテンプレートとして持つ。出力形式は`//parallel`と同じ
-# 「ファイル名: 内容」なので、`_parse_parallel_tasks`と同じ正規表現
-# (`_PARALLEL_TASK_PATTERN`)を流用して解析できる(区切りが"|"ではなく
-# 改行になる点のみ異なる)。
+# 仮の判断: 設計担当への指示は、出力形式をできるだけ単純な1行1ファイル形式に
+# 寄せるために日本語のプロンプトテンプレートとして持つ。ただし実際には
+# モデルがこの形式を厳密に守るとは限らず、ファイル名を見出しとして詳細を
+# 複数行にぶら下げる階層的な形式で返してくることもあるため、解析側
+# (`_parse_module_breakdown`)はそれも扱えるようにしてある。
 _MODULE_BREAKDOWN_PROMPT_TEMPLATE = """あなたはソフトウェア設計を担当します。以下の依頼を、複数人で分担して実装できるよう、複数のファイルに分割する実装計画を考えてください。
 
 各ファイルが実装すべき内容には、他のファイルから呼び出される関数のシグネチャ(関数名・引数名・型・戻り値の型)や、やり取りするデータの形式(辞書のキー名など)を具体的に明記してください。担当が異なるファイル同士が正しく連携できるよう、インターフェースの記述は曖昧にせず、できるだけ厳密に書いてください。
@@ -1885,26 +1885,66 @@ def _build_collaborative_implementation_request(filename: str, own_content: str,
     )
 
 
+# 仮の判断: 設計担当の回答を解析する際、`//parallel`用の`_PARALLEL_TASK_PATTERN`
+# (":"の前を無条件にファイル名として扱う)をそのまま流用すると、設計担当が
+# 「ファイル名を見出しとし、その配下に関数シグネチャを箇条書きでぶら下げる」
+# という階層的な形式で回答してきた場合に、見出し配下の詳細行(関数シグネチャ等)
+# までファイル名として誤認識してしまう(実機で、storage.py/cli.pyの2ファイルの
+# はずが、関数シグネチャまで含めて9項目のフラットなリストとして解析され、
+# 本来ファイルではない行が実装依頼の宛先にされてしまう不具合が発生した)。
+#
+# これはToDoリストというお題に限った問題ではなく、「見出し(ファイル)」と
+# 「詳細(そのファイルの内部要素)」を区別せずに全行を同列に解析するという、
+# パース処理そのものの設計上の問題である。そのため、「見出し行として扱って
+# よいのは、拡張子付きの裸のファイル名(空白・括弧・矢印等を含まない)が
+# コロンの直前にある行に限る」という、ファイル名の形そのものに基づく汎用的な
+# 判定に変更した。関数シグネチャの行(例: `load_todos() -> list: 説明`)は
+# 括弧を含むため見出しとは判定されず、直前の見出し(ファイル)の詳細として
+# まとめられる。
+_FILE_HEADER_PATTERN = re.compile(r"^([\w./\-]+\.[A-Za-z0-9]+):\s*(.*)$")
+
+
 def _parse_module_breakdown(text: str) -> list:
-    """設計担当メンバーの回答(1行1ファイルの「ファイル名: 内容」形式)を
-    [(ファイル名, 内容), ...] のリストに変換する。コードフェンス
-    (```で始まる行)や、行頭の箇条書き記号("- "等)が付いて返ってくる
-    場合にも対応する。
+    """設計担当メンバーの回答を [(ファイル名, 内容), ...] のリストに変換する。
+
+    対応する形式:
+    - フラットな1行1ファイル形式(例: `storage.py: <実装内容>`)
+    - 階層的な形式(例: `storage.py:` を見出し行とし、その配下に
+      `- load_todos() -> list: ...` のような関数シグネチャ等の詳細を
+      複数行の箇条書きでぶら下げる形式)
+
+    見出し行かどうかは、コロンの直前が「拡張子付きの裸のファイル名」
+    (空白・括弧・矢印等を含まない)であるかどうかだけで判定する
+    (`_FILE_HEADER_PATTERN`)。見出しに該当しない行は、直前に出てきた
+    見出し(ファイル)の詳細としてまとめる。実行単位は常にファイル単位を
+    保つ(ファイルより細かい粒度には分割しない)。
     """
+    # tasks: [[ファイル名, [詳細行, ...]], ...]
     tasks = []
-    for line in text.splitlines():
-        line = line.strip()
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
         if not line or line.startswith("```"):
             continue
-        line = line.lstrip("-*・ ").strip()
-        match = _PARALLEL_TASK_PATTERN.match(line)
-        if not match:
+        # 仮の判断: 箇条書き記号("- "等)やMarkdown見出し記号("#"等)、
+        # バッククォートは見出し判定の妨げになるだけなので取り除く。
+        stripped = line.lstrip("-*・# ").strip().replace("`", "")
+        if not stripped:
             continue
-        filename = match.group(1).strip()
-        content = match.group(2).strip()
-        if filename and content:
-            tasks.append((filename, content))
-    return tasks
+
+        match = _FILE_HEADER_PATTERN.match(stripped)
+        if match:
+            filename = match.group(1).strip()
+            inline_content = match.group(2).strip()
+            tasks.append([filename, [inline_content] if inline_content else []])
+        elif tasks:
+            # 直前に見出しが1つも無い場合(設計担当の前置き文など)は無視する。
+            tasks[-1][1].append(stripped)
+
+    return [
+        (filename, "\n".join(details))
+        for filename, details in tasks
+        if details  # 詳細が全く無いファイル(見出しだけ)は実装依頼のしようがないため除外
+    ]
 
 
 def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str, out_dir: str) -> None:
