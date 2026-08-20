@@ -1278,6 +1278,21 @@ _INIT_INTERACTIVE = object()
 
 
 def main():
+    # 仮の判断: input()が使う文字コードはOSのロケール設定(LANG/LC_ALL)に依存する。
+    # ラズパイなどでシステムロケールがUTF-8になっていない(C/POSIXのままなど)環境では、
+    # 端末側は自分のロケール(通常UTF-8)で正しく描画・送信しているにもかかわらず、
+    # Python側がそれをロケールの指示通り別の文字コードとして解釈しようとして
+    # UnicodeDecodeErrorになることがある(実機での報告により発覚)。「画面には正しく
+    # 表示されているのにデコードに失敗する」のは、表示は端末側、デコードはPython側の
+    # ロケール依存という別々の処理だから起こりうる。現代のほとんどの端末はUTF-8で
+    # 送ってくる前提のため、システムロケールに関わらずstdinの文字コードを明示的に
+    # UTF-8に固定する(万一それでも解釈できないバイト列があった場合は例外にせず
+    # 置換文字に変換する)。
+    try:
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
     parser = argparse.ArgumentParser(description="Yoriai: ローカルLLMエージェントの自動発見・自己紹介カード交換プロトタイプ")
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
