@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import urllib.parse
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -541,18 +542,19 @@ def _stream_lmstudio_turn(model: str, messages: list, tools: list):
 # Mistralの`[TOOL_CALLS]`、Llamaの`<|python_tag|>`など)がそのまま回答本文
 # (content)として画面に漏れてしまうことが実機での報告により見つかった。
 #
-# 仮の判断: 当初`<｜`(フルワイド縦棒 U+FF5C)を直接パターンに含めていたが、
-# 実機で再現しなかった(検出できずに漏れが素通りしてしまった)。DeepSeek系
-# モデルが実際に使う特殊トークンの区切り文字は、フォント表示だけでは正確な
-# コードポイントを判別しづらく、亜種がありうる。一方で画面上には常に
-# 読み取れるASCII文字列として"DSML"が現れていることが実機のスクリーンショット
-# から確認できたため、区切り文字の厳密なコードポイントに依存せず、
-# "DSML"という文字列そのものをより頑健な手がかりとして直接検出する
-# (通常の会話の回答にこの文字列が出現することはまず無いはずなので、
-# 誤検出のリスクは低いと判断した)。
+# 仮の判断: 当初`<｜`(フルワイド縦棒 U+FF5C)や"DSML"という文字列そのものを直接
+# パターンに含めていたが、いずれも実機で再現しなかった(検出できずに漏れが
+# 素通りしてしまった)。スクリーンショットの見た目だけでは、実際の文字が
+# 通常のASCII("D""S""M""L"、半角の`<`/`|`)なのか、それとも似た形の別の
+# Unicode文字(全角のＤＳＭＬや｜など)なのかを正確に判別できない。
+# そこで文字の見た目の一致に頼るのをやめ、判定前に文字列をUnicode正規化
+# (NFKC)してから既知のパターンと照合するようにした。NFKCは全角英数字
+# (Ｄ→D)や全角記号(｜→|、＜→<など「互換分解」を持つ文字)を対応する
+# 半角/標準形に変換するため、モデルが全角文字で特殊トークンを表現していても、
+# 半角のASCIIパターンだけを用意しておけば検出できるようになる。
 _LEAKED_TOOL_CALL_PATTERN = re.compile(
     r"DSML"
-    r"|<\/?\s*[|｜]"  # <｜ </｜ <| </| のようなパイプ風の特殊トークン区切り全般
+    r"|<\/?\s*[|｜]"  # 正規化後は基本<|/</|の形になるが、念のため全角も残す
     r"|<tool_call>"
     r"|\[TOOL_CALLS\]"
     r"|<\|python_tag\|>"
@@ -564,10 +566,10 @@ _LEAKED_TOOL_CALL_PATTERN = re.compile(
 # ここまで溜めても記法にマッチしなければ、通常のストリーミング応答とみなす。
 _LEAK_PEEK_CHARS = 30
 
-# 仮の判断: 既知の漏れ記法はすべて`<`か`[`で始まる。答えの書き出しの1文字目が
-# それ以外であれば、その時点で「漏れではない」と確定してよい。これにより、
-# 大半の通常の応答では待ち時間なしでストリーミング表示が始まる
-# (バッファはあくまで`<`/`[`から始まる場合の"念のための確認"用)。
+# 仮の判断: 既知の漏れ記法はすべて(NFKC正規化後は)`<`か`[`で始まる。答えの
+# 書き出しの1文字目がそれ以外であれば、その時点で「漏れではない」と確定して
+# よい。これにより、大半の通常の応答では待ち時間なしでストリーミング表示が
+# 始まる(バッファはあくまで`<`/`[`から始まる場合の"念のための確認"用)。
 _LEAK_TRIGGER_CHARS = "<["
 
 
@@ -599,14 +601,25 @@ def _run_turn_with_leak_detection(turn, tools: list):
         chunk = event["content"]
         buffered_chunks.append(chunk)
         buffered_text += chunk
-        if _LEAKED_TOOL_CALL_PATTERN.search(buffered_text):
+        # 全角文字での偽装(全角のＤＳＭＬ、｜、＜など)を素の文字列比較で
+        # 見逃さないよう、判定はNFKC正規化した文字列に対して行う。
+        normalized = unicodedata.normalize("NFKC", buffered_text)
+        if _LEAKED_TOOL_CALL_PATTERN.search(normalized):
             state = "leaked"
             yield {"tool_call_failed": True}
             buffered_chunks = []
             continue
 
-        starts_safely = buffered_text[0] not in _LEAK_TRIGGER_CHARS
+        starts_safely = bool(normalized) and normalized[0] not in _LEAK_TRIGGER_CHARS
         if starts_safely or len(buffered_text) >= _LEAK_PEEK_CHARS:
+            if not starts_safely:
+                # 仮の判断: `<`/`[`で書き出されたのに既知のパターンに一致しないまま
+                # バッファ上限に達したケース(=検出漏れの可能性がある境界事例)を、
+                # 生のバイト列(repr)付きでログに残す。過去に見た目だけでは
+                # 正確な文字が判別できず検出漏れを2度繰り返した反省から、次に
+                # 同種の問題が起きた際は勘に頼らずログから正確に原因を特定できる
+                # ようにしている。
+                logger.info("ツール呼び出し記法の漏れチェック: 既知パターン不一致のまま先頭バッファを確定します: %r", buffered_text)
             state = "streaming"
             for buffered_chunk in buffered_chunks:
                 yield {"content": buffered_chunk}
