@@ -272,18 +272,104 @@ def get_loaded_models() -> list:
 
 
 # ---------------------------------------------------------------------------
+# ウェブ検索ツール(DuckDuckGo)
+# ---------------------------------------------------------------------------
+
+WEB_SEARCH_TOOL_NAME = "web_search"
+
+# 仮の判断: ツールはOllama/LM StudioどちらもOpenAI互換のtools形式
+# (type: function)を受け付けるため、共通のスキーマを1つだけ用意する。
+WEB_SEARCH_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": WEB_SEARCH_TOOL_NAME,
+        "description": "インターネットを検索して、最新の情報や自分の知識だけでは分からない情報を調べる。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "検索したいキーワードや質問文"},
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+CHAT_TOOLS = [WEB_SEARCH_TOOL_SCHEMA]
+
+# 仮の判断: モデルが延々とツール呼び出しを繰り返すループに陥らないよう、
+# 1つの質問あたりのツール呼び出しラウンド数に上限を設ける。
+MAX_TOOL_CALL_ROUNDS = 3
+
+WEB_SEARCH_MAX_RESULTS = 5
+
+
+def web_search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS) -> list:
+    """DuckDuckGo(ddgsライブラリ)でウェブ検索し、結果のリストを返す。
+
+    仮の判断: 検索バックエンドはAPIキー登録が不要ですぐ使えるDuckDuckGoを選んだ。
+    非公式スクレイピングのため失敗することもあるが、失敗時は例外を投げずに
+    空リストを返し、モデル側には「検索結果が得られなかった」ことだけ伝える。
+    """
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        logger.warning("ddgsライブラリが見つかりません。`pip install ddgs`(または`pip install -r requirements.txt`)でインストールしてください。")
+        return []
+
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results, backend="duckduckgo"))
+    except Exception as exc:
+        logger.warning("ウェブ検索に失敗しました: %s", exc)
+        return []
+
+    return [
+        {
+            "title": r.get("title", ""),
+            "url": r.get("href", r.get("url", "")),
+            "snippet": r.get("body", ""),
+        }
+        for r in results
+    ]
+
+
+def _execute_tool_call(tool_call: dict) -> str:
+    """モデルからのtool_call(OpenAI互換形式)を実行し、モデルに返す結果を
+    JSON文字列として返す。
+    """
+    function = tool_call.get("function", {})
+    name = function.get("name")
+    arguments = function.get("arguments", {})
+    # 仮の判断: argumentsはOllamaでは辞書、LM Studio(OpenAI互換)では
+    # JSON文字列で来ることが多いため、両方に対応する。
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments) if arguments else {}
+        except json.JSONDecodeError:
+            arguments = {}
+
+    if name == WEB_SEARCH_TOOL_NAME:
+        query = arguments.get("query", "")
+        results = web_search(query)
+        return json.dumps({"query": query, "results": results}, ensure_ascii=False)
+
+    return json.dumps({"error": f"不明なツールです: {name}"}, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
 # チャットのプロキシ(Ollama/LM Studioへのストリーミング問い合わせ)
 # ---------------------------------------------------------------------------
 
-def _stream_ollama_chat(model: str, messages: list):
-    """OllamaのネイティブAPI(/api/chat、NDJSONストリーミング)に問い合わせ、
-    正規化したイベント({"content": ...} / {"done": True} / {"error": ...})を
-    順にyieldする。
+def _stream_ollama_turn(model: str, messages: list, tools: list):
+    """OllamaのネイティブAPI(/api/chat、NDJSONストリーミング)に1往復だけ
+    問い合わせ、正規化したイベント({"content": ...} / {"error": ...})を
+    順にyieldし、最後にそのターンで要求されたtool_calls一覧
+    ({"tool_calls": [...]}、無ければ空リスト)をyieldする。
     """
     try:
         resp = requests.post(
             f"{OLLAMA_BASE_URL}/api/chat",
-            json={"model": model, "messages": messages, "stream": True},
+            json={"model": model, "messages": messages, "tools": tools, "stream": True},
             stream=True,
             timeout=(CHAT_CONNECT_TIMEOUT_SEC, CHAT_READ_TIMEOUT_SEC),
         )
@@ -292,6 +378,7 @@ def _stream_ollama_chat(model: str, messages: list):
         yield {"error": str(exc)}
         return
 
+    tool_calls = []
     try:
         for line in resp.iter_lines():
             if not line:
@@ -300,25 +387,32 @@ def _stream_ollama_chat(model: str, messages: list):
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            content = obj.get("message", {}).get("content")
+            message = obj.get("message", {})
+            content = message.get("content")
             if content:
                 yield {"content": content}
+            if message.get("tool_calls"):
+                tool_calls.extend(message["tool_calls"])
             if obj.get("done"):
                 break
     except Exception as exc:
         yield {"error": str(exc)}
         return
-    yield {"done": True}
+    yield {"tool_calls": tool_calls}
 
 
-def _stream_lmstudio_chat(model: str, messages: list):
+def _stream_lmstudio_turn(model: str, messages: list, tools: list):
     """LM StudioのOpenAI互換API(/v1/chat/completions、SSEストリーミング)に
-    問い合わせ、Ollama版と同じ正規化イベントを順にyieldする。
+    1往復だけ問い合わせ、Ollama版と同じ正規化イベントを順にyieldする。
+
+    仮の判断: OpenAI互換のストリーミングではtool_callsが複数チャンクに
+    分割されて送られてくる(引数のJSON文字列が少しずつ届く)ため、
+    indexごとに文字列を連結して組み立てる。
     """
     try:
         resp = requests.post(
             f"{LMSTUDIO_BASE_URL}/v1/chat/completions",
-            json={"model": model, "messages": messages, "stream": True},
+            json={"model": model, "messages": messages, "tools": tools, "stream": True},
             stream=True,
             timeout=(CHAT_CONNECT_TIMEOUT_SEC, CHAT_READ_TIMEOUT_SEC),
         )
@@ -327,6 +421,7 @@ def _stream_lmstudio_chat(model: str, messages: list):
         yield {"error": str(exc)}
         return
 
+    tool_calls_by_index = {}
     try:
         for raw_line in resp.iter_lines():
             if not raw_line:
@@ -342,29 +437,81 @@ def _stream_lmstudio_chat(model: str, messages: list):
             except json.JSONDecodeError:
                 continue
             choices = obj.get("choices", [])
-            if choices:
-                content = choices[0].get("delta", {}).get("content")
-                if content:
-                    yield {"content": content}
+            if not choices:
+                continue
+            delta = choices[0].get("delta", {})
+            content = delta.get("content")
+            if content:
+                yield {"content": content}
+            for tc_delta in delta.get("tool_calls") or []:
+                index = tc_delta.get("index", 0)
+                entry = tool_calls_by_index.setdefault(index, {"id": None, "function": {"name": "", "arguments": ""}})
+                if tc_delta.get("id"):
+                    entry["id"] = tc_delta["id"]
+                fn_delta = tc_delta.get("function") or {}
+                if fn_delta.get("name"):
+                    entry["function"]["name"] += fn_delta["name"]
+                if fn_delta.get("arguments"):
+                    entry["function"]["arguments"] += fn_delta["arguments"]
     except Exception as exc:
         yield {"error": str(exc)}
         return
-    yield {"done": True}
+
+    tool_calls = [
+        {"id": entry["id"], "function": entry["function"]}
+        for _, entry in sorted(tool_calls_by_index.items())
+    ]
+    yield {"tool_calls": tool_calls}
 
 
 def stream_chat_completion(model: str, messages: list):
-    """モデル名からOllama/LM Studioどちらにチャットを振るかを決め、
-    正規化されたストリーミングイベントを順にyieldする。
+    """モデル名からOllama/LM Studioどちらにチャットを振るかを決め、正規化された
+    ストリーミングイベント({"content": ...} / {"tool_call": <ツール名>} /
+    {"done": True} / {"error": ...})を順にyieldする。
+
+    モデルがツール(現状はweb_searchのみ)の呼び出しを要求した場合は、
+    ここでツールを実行して結果を会話履歴に追加し、モデルに再度問い合わせる
+    (最大MAX_TOOL_CALL_ROUNDSラウンドまで)。呼び出し元(REPL等)からは
+    ツールの存在を意識せず、通常のチャットと同じように使える。
 
     仮の判断: フェーズ5では「タスクの難易度に応じた賢い振り分け」はスコープ外の
     ため、モデルの選定自体は呼び出し元(候補選定ロジック)に任せ、ここでは
     単純に「Ollamaのロード済みモデル一覧に名前があればOllama、なければ
     LM Studio」というバックエンドの振り分けだけを行う。
     """
-    if model in get_ollama_loaded_models():
-        yield from _stream_ollama_chat(model, messages)
-    else:
-        yield from _stream_lmstudio_chat(model, messages)
+    messages = list(messages)  # 呼び出し元のリストをツール実行の追記で汚さない
+
+    for round_num in range(MAX_TOOL_CALL_ROUNDS + 1):
+        if model in get_ollama_loaded_models():
+            turn = _stream_ollama_turn(model, messages, CHAT_TOOLS)
+        else:
+            turn = _stream_lmstudio_turn(model, messages, CHAT_TOOLS)
+
+        tool_calls = []
+        for event in turn:
+            if "error" in event:
+                yield event
+                return
+            if "content" in event:
+                yield event
+            elif "tool_calls" in event:
+                tool_calls = event["tool_calls"]
+
+        if not tool_calls or round_num == MAX_TOOL_CALL_ROUNDS:
+            break
+
+        messages.append({"role": "assistant", "content": "", "tool_calls": tool_calls})
+        for tool_call in tool_calls:
+            tool_name = tool_call.get("function", {}).get("name", "")
+            yield {"tool_call": tool_name}
+            result = _execute_tool_call(tool_call)
+            messages.append({
+                "role": "tool",
+                "content": result,
+                "tool_call_id": tool_call.get("id"),
+            })
+
+    yield {"done": True}
 
 
 def build_profile_card(agent_id: str) -> dict:
@@ -962,6 +1109,13 @@ def _ask_organization(port: int, org_fingerprint: str, messages: list) -> None:
                 logger.warning("%s への問い合わせに失敗しました: %s", candidate["label"], event["error"])
                 failed = True
                 break
+            tool_call_name = event.get("tool_call")
+            if tool_call_name == WEB_SEARCH_TOOL_NAME:
+                print("\n[🔍 ウェブ検索しています...]")
+                continue
+            elif tool_call_name:
+                print(f"\n[🔧 {tool_call_name} を実行しています...]")
+                continue
             content = event.get("content")
             if content:
                 print(content, end="", flush=True)
