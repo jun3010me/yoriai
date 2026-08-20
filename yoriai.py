@@ -846,11 +846,20 @@ def build_profile_card(agent_id: str) -> dict:
     backends = []
     if ollama_installed:
         backends.append("ollama")
-    if lmstudio_models:
-        backends.append("lmstudio")
     if mlx_lm_models:
         backends.append("mlx_lm")
+    if lmstudio_models:
+        backends.append("lmstudio")
 
+    # 仮の判断: 同一メンバーが複数のバックエンド(例: MacStudioでLM StudioとMLX-LMの
+    # 両方)を同時に動かしている場合、_build_chat_candidateは`loaded`の先頭
+    # (loaded[0])をそのメンバーの代表モデルとして使う。そのため、ここでの並び順が
+    # そのまま「同一メンバー内でどのバックエンドのモデルが選ばれるか」を決めて
+    # しまう。stream_chat_completion()のバックエンド振り分け優先順位
+    # (Ollama→MLX-LM→LM Studio)と一致させないと、「ドキュメント上はMLX-LMが
+    # 優先されるはずなのに、実際にはLM Studio側のモデルが選ばれる」という
+    # 不整合が起きる(実機の検証で実際に発生した)。そのため、両方の優先順位を
+    # 揃えてOllama→MLX-LM→LM Studioの順でマージする。
     return {
         "agent_id": agent_id,
         "device_name": get_short_hostname(),
@@ -862,8 +871,8 @@ def build_profile_card(agent_id: str) -> dict:
         },
         "memory": get_memory_info(),
         "models": {
-            "installed": _merge_model_lists(ollama_installed, lmstudio_models, mlx_lm_models),
-            "loaded": _merge_model_lists(ollama_loaded, lmstudio_models, mlx_lm_models),
+            "installed": _merge_model_lists(ollama_installed, mlx_lm_models, lmstudio_models),
+            "loaded": _merge_model_lists(ollama_loaded, mlx_lm_models, lmstudio_models),
             "backends": backends,
         },
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
