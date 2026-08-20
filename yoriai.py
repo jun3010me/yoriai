@@ -285,6 +285,56 @@ def build_profile_card(agent_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 発見済みピアの共有レジストリ(--status コマンドの情報源)
+# ---------------------------------------------------------------------------
+
+class PeerRegistry:
+    """mDNS/Tailscaleで発見したピアの最新カードを保持する、複数スレッドから
+    アクセスされる共有ストア。--status コマンドが問い合わせる `/status`
+    エンドポイントの情報源になる。
+
+    仮の判断: mDNSは「見えなくなった」イベント(remove_service)があるので
+    即座に取り除けるが、Tailscale経由はそのようなイベントが無く定期スキャンの
+    結果でしか判断できない。そのため、Tailscale経由で見つけたピアは
+    「直近のスキャンで見つからなかったら消す」という形で間接的に古い情報を
+    掃除している(sync_tailscale)。同じピアがmDNSでも見えている場合は
+    Tailscale側のスキャン結果に関わらず残す。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._peers = {}  # agent_id -> {"card", "via", "address", "port", "last_seen"}
+
+    def upsert(self, agent_id: str, card: dict, via: str, address: str, port: int) -> None:
+        with self._lock:
+            self._peers[agent_id] = {
+                "card": card,
+                "via": via,
+                "address": address,
+                "port": port,
+                "last_seen": time.time(),
+            }
+
+    def remove(self, agent_id: str) -> None:
+        with self._lock:
+            self._peers.pop(agent_id, None)
+
+    def sync_tailscale(self, found_agent_ids) -> None:
+        found_agent_ids = set(found_agent_ids)
+        with self._lock:
+            stale = [
+                agent_id for agent_id, info in self._peers.items()
+                if info["via"] == "Tailscale" and agent_id not in found_agent_ids
+            ]
+            for agent_id in stale:
+                del self._peers[agent_id]
+
+    def snapshot(self) -> list:
+        with self._lock:
+            return list(self._peers.values())
+
+
+# ---------------------------------------------------------------------------
 # 自己紹介カードをHTTPで配信するサーバー
 # ---------------------------------------------------------------------------
 
