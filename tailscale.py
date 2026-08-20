@@ -34,6 +34,7 @@ CLI_CANDIDATES = [
     "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
     "/usr/local/bin/tailscale",
     "/opt/homebrew/bin/tailscale",
+    "/usr/bin/tailscale",  # Linux(Debian系のtailscale公式パッケージなど)の一般的な設置場所
 ]
 
 

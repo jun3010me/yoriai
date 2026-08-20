@@ -2,7 +2,7 @@
 """Yoriai: 同一ネットワーク上のローカルLLMエージェントを mDNS で自動発見し、
 自己紹介カード(JSON)を交換する最小構成プロトタイプ。
 
-対象OS: macOS (Apple Silicon) のみ動作確認。
+対象OS: macOS (Apple Silicon) / Linux (Raspberry Pi 4を含むDebian系など)。
 """
 
 import argparse
@@ -69,6 +69,20 @@ def get_short_hostname() -> str:
 
 
 def get_chip_info() -> str:
+    system = platform.system()
+    if system == "Darwin":
+        info = _get_chip_info_macos()
+    elif system == "Linux":
+        info = _get_chip_info_linux()
+    else:
+        info = None
+    if info:
+        return info
+    # 仮の判断: OS別の取得方法が使えない環境ではplatformの値で代用する
+    return platform.processor() or platform.machine()
+
+
+def _get_chip_info_macos():
     try:
         result = subprocess.run(
             ["sysctl", "-n", "machdep.cpu.brand_string"],
@@ -78,8 +92,29 @@ def get_chip_info() -> str:
             return result.stdout.strip()
     except Exception:
         pass
-    # 仮の判断: sysctlが使えない環境(macOS以外)ではplatformの値で代用する
-    return platform.processor() or platform.machine()
+    return None
+
+
+def _get_chip_info_linux():
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except Exception:
+        return None
+
+    # 仮の判断: Raspberry PiなどのARMボードでは/proc/cpuinfoの末尾に
+    # ボード名を表す "Model" 行が付くことが多いため、まずそちらを優先する。
+    # x86系のように"Model"行が無い場合は、コアごとに繰り返し出てくる
+    # "model name" 行の先頭のものを使う。
+    model_match = re.search(r"^Model\s*:\s*(.+)$", content, re.MULTILINE)
+    if model_match:
+        return model_match.group(1).strip()
+
+    name_match = re.search(r"^model name\s*:\s*(.+)$", content, re.MULTILINE)
+    if name_match:
+        return name_match.group(1).strip()
+
+    return None
 
 
 def _parse_vm_stat_free_bytes(vm_stat_output: str):
@@ -107,7 +142,29 @@ def _parse_vm_stat_free_bytes(vm_stat_output: str):
     return free_pages * page_size
 
 
+def _empty_memory_info() -> dict:
+    return {"total_bytes": None, "free_bytes": None, "total_gb": None, "free_gb": None}
+
+
+def _memory_info_from_bytes(total_bytes, free_bytes) -> dict:
+    return {
+        "total_bytes": total_bytes,
+        "free_bytes": free_bytes,
+        "total_gb": round(total_bytes / 1e9, 1) if total_bytes else None,
+        "free_gb": round(free_bytes / 1e9, 1) if free_bytes else None,
+    }
+
+
 def get_memory_info() -> dict:
+    system = platform.system()
+    if system == "Darwin":
+        return _get_memory_info_macos()
+    elif system == "Linux":
+        return _get_memory_info_linux()
+    return _empty_memory_info()
+
+
+def _get_memory_info_macos() -> dict:
     total_bytes = None
     try:
         result = subprocess.run(
@@ -126,12 +183,30 @@ def get_memory_info() -> dict:
     except Exception:
         pass
 
-    return {
-        "total_bytes": total_bytes,
-        "free_bytes": free_bytes,
-        "total_gb": round(total_bytes / 1e9, 1) if total_bytes else None,
-        "free_gb": round(free_bytes / 1e9, 1) if free_bytes else None,
-    }
+    return _memory_info_from_bytes(total_bytes, free_bytes)
+
+
+def _get_memory_info_linux() -> dict:
+    try:
+        with open("/proc/meminfo", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except Exception as exc:
+        logger.warning("/proc/meminfoの読み込みに失敗しました: %s", exc)
+        return _empty_memory_info()
+
+    values = {}
+    for line in content.splitlines():
+        match = re.match(r"^(\w+):\s+(\d+)\s*kB", line)
+        if match:
+            values[match.group(1)] = int(match.group(2)) * 1024  # kB -> bytes
+
+    total_bytes = values.get("MemTotal")
+    # 仮の判断: 「空きメモリ」はMemFreeではなくMemAvailable(すぐに確保可能な
+    # メモリの推定値)を使う。macOS版のPages free+inactiveと同様、キャッシュ分を
+    # 含めないと実態よりかなり少なく見えてしまうため。
+    free_bytes = values.get("MemAvailable")
+
+    return _memory_info_from_bytes(total_bytes, free_bytes)
 
 
 def get_ollama_installed_models() -> list:
@@ -270,16 +345,23 @@ def get_local_ip() -> str:
 
 
 def get_physical_lan_ips() -> list:
-    """物理LANインターフェース(macOSの en* )のIPv4アドレス一覧を返す。
-
-    仮の判断: Tailscale(utun*)やAWDL(awdl0)、ブリッジ(bridge*)などの仮想
+    """物理LANインターフェースのIPv4アドレス一覧を返す(Tailscale等の仮想
     インターフェースをmDNSのバインド対象から除外し、"自宅LAN内向け"の発見に
-    限定するため、macOSで物理イーサネット/Wi-Fiに使われる `en<数字>` という
-    命名規則のインターフェースだけを対象にしている。`ifconfig`の出力を素朴に
-    パースしているだけなので、環境によっては拾えない/拾いすぎる可能性がある。
+    限定するため)。
     """
-    if platform.system() != "Darwin":
-        return []
+    system = platform.system()
+    if system == "Darwin":
+        return _get_physical_lan_ips_macos()
+    elif system == "Linux":
+        return _get_physical_lan_ips_linux()
+    return []
+
+
+def _get_physical_lan_ips_macos() -> list:
+    """macOSで物理イーサネット/Wi-Fiに使われる `en<数字>` という命名規則の
+    インターフェースだけを対象にする。`ifconfig`の出力を素朴にパースしている
+    だけなので、環境によっては拾えない/拾いすぎる可能性がある(仮の判断)。
+    """
     try:
         result = subprocess.run(["ifconfig"], capture_output=True, text=True, timeout=3)
     except Exception as exc:
@@ -298,6 +380,46 @@ def get_physical_lan_ips() -> list:
             match = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", line)
             if match:
                 ips.append(match.group(1))
+    return ips
+
+
+# 仮の判断: Linuxはインターフェースの命名規則がディストリビューション/機種に
+# よってまちまち(eth0, wlan0, enp3s0, wlp2s0 など)で、macOSの `en<数字>` の
+# ようなシンプルな許可リストでは網羅できない。そのため逆に、既知の仮想
+# インターフェースの名前だけを除外するブロックリスト方式にしている。
+LINUX_VIRTUAL_IFACE_PREFIXES = ("lo", "tailscale", "docker", "veth", "br-", "virbr", "tun", "tap", "wg")
+
+_SIOCGIFADDR = 0x8915  # Linux固有のioctlリクエスト番号(インターフェースのIPv4アドレス取得用)
+
+
+def _get_physical_lan_ips_linux() -> list:
+    """`ip`/`ifconfig`コマンドに依存せず、標準ライブラリの`socket`/`fcntl`だけで
+    インターフェース一覧とIPv4アドレスを取得する(最小構成のRaspberry Pi OSなど、
+    iproute2/net-toolsが入っていない環境でも動かすための仮の判断)。
+    """
+    import fcntl
+    import struct
+
+    try:
+        iface_names = [name for _, name in socket.if_nameindex()]
+    except OSError as exc:
+        logger.warning("ネットワークインターフェース一覧の取得に失敗しました: %s", exc)
+        return []
+
+    ips = []
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        for iface in iface_names:
+            if iface.startswith(LINUX_VIRTUAL_IFACE_PREFIXES):
+                continue
+            try:
+                result = fcntl.ioctl(
+                    sock.fileno(),
+                    _SIOCGIFADDR,
+                    struct.pack("256s", iface[:15].encode("utf-8")),
+                )
+            except OSError:
+                continue  # IPv4アドレスが割り当てられていないインターフェース
+            ips.append(socket.inet_ntoa(result[20:24]))
     return ips
 
 
@@ -462,8 +584,8 @@ def pick_free_port() -> int:
 
 
 def run_agent(token: str, port: int) -> None:
-    if platform.system() != "Darwin":
-        logger.warning("このプロトタイプはmacOS(Apple Silicon)を想定しています。他OSでは一部情報が取得できません。")
+    if platform.system() not in ("Darwin", "Linux"):
+        logger.warning("このプロトタイプはmacOS/Linuxを想定しています。他OSでは一部情報が取得できません。")
 
     agent_id = str(uuid.uuid4())
     org_fingerprint = config.token_fingerprint(token)
