@@ -745,16 +745,28 @@ def stream_chat_completion(model: str, messages: list):
         tools_rejected = False
         for event in _run_turn_with_leak_detection(turn, tools):
             if "error" in event:
-                if tools and event.get("status_code") in TOOLS_UNSUPPORTED_STATUS_CODES:
+                status_code = event.get("status_code")
+                # 仮の判断: 「tools無し再試行が発動したかどうか」がログから一目で
+                # 分かるよう、発動する場合・しない場合の両方で明示的にログを出す
+                # (「ロジックが呼ばれたのか、そもそも古いコードのままなのか」の
+                # 切り分けに使えるようにするため)。
+                if tools and status_code in TOOLS_UNSUPPORTED_STATUS_CODES:
                     logger.warning(
-                        "%s がツール付きリクエストを%sで拒否しました"
-                        "(モデルがツール呼び出しに対応していない可能性があります)。"
-                        "ツールなしで再試行します。",
-                        model, event.get("status_code"),
+                        "[tools無し再試行] %s がツール付きリクエストをステータス%sで"
+                        "拒否しました(モデルがツール呼び出しに対応していない可能性が"
+                        "あります)。同一モデル(%s)へツールなしで再試行します。",
+                        model, status_code, model,
                     )
                     tools_rejected = True
                     yield {"tool_call_failed": True}
                     break
+                if tools:
+                    logger.warning(
+                        "[tools無し再試行なし] %s への問い合わせでエラーが発生しましたが、"
+                        "ツールなし再試行の対象(ステータス%s)ではないと判断しました"
+                        "(status_code=%s)。このままエラーとして扱います。",
+                        model, TOOLS_UNSUPPORTED_STATUS_CODES, status_code,
+                    )
                 yield event
                 return
             if event.get("tool_call_failed"):
