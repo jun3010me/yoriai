@@ -822,10 +822,43 @@ def discover_via_tailscale(agent_id: str, org_fingerprint: str, port: int, regis
 
 
 # ---------------------------------------------------------------------------
-# 対話モード(REPL): 組織内メンバーへの問い合わせ
+# 対話モード(フロント): 常駐エージェント(キッチン)への問い合わせ専用クライアント
+#
+# 仮の判断: 当初は「対話モードも1つのエージェントとして自分でmDNS/HTTPサーバーを
+# 起動する」設計だったが、常駐化(systemd/launchd)している状態で手動で
+# `python3 yoriai.py` すると同じポートへのbindが衝突する問題が実機で見つかった。
+# カフェの「キッチン(常駐エージェント。自己紹介カードサーバー・mDNS/Tailscale探索・
+# /chatの提供を担う)」と「フロント(対話モードのUI。注文=質問を取り次ぐだけ)」を
+# 分けるように設計し直した。対話モードは自分ではポートを一切bindせず、mDNS/Tailscale
+# 探索も行わない。常に既に起動しているキッチン(常駐エージェント)の`/status`と
+# `/chat`にHTTPで問い合わせるだけのクライアントにした。これにより、対話モードは
+# 常駐サービスを止めずに何度でも起動でき、複数の対話モードを同時に開くことすらできる。
 # ---------------------------------------------------------------------------
 
-def _build_chat_candidate(card: dict, is_self: bool, address: str = None, port: int = None):
+def _fetch_org_snapshot(port: int, org_fingerprint: str, fail_fast: bool = False):
+    """キッチン(常駐エージェント)の`/status`に問い合わせ、自分自身のカードと
+    ピア一覧を取得する。接続できない場合はNoneを返す
+    (fail_fast=Trueの場合は案内を表示してプロセスごと終了する)。
+    """
+    try:
+        resp = requests.get(
+            f"http://localhost:{port}/status",
+            headers={ORG_FINGERPRINT_HEADER: org_fingerprint},
+            timeout=CARD_REQUEST_TIMEOUT_SEC,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:
+        print("実行中のYoriaiエージェントに接続できませんでした。")
+        print(f"詳細: {exc}")
+        print("先に python3 yoriai.py でエージェント(常駐プロセス)を起動してください")
+        print("(常駐化している場合は、想定しているポートで動作しているか確認してください)。")
+        if fail_fast:
+            sys.exit(1)
+        return None
+
+
+def _build_chat_candidate(card: dict, is_self: bool, address: str, port: int):
     """自己紹介カードから、チャットの問い合わせ先候補(ロード済みモデルを
     持つメンバー)を作る。ロード済みモデルが無いメンバーはNoneを返す。
     """
@@ -841,21 +874,22 @@ def _build_chat_candidate(card: dict, is_self: bool, address: str = None, port: 
         # まだ無いため、単純に先頭のものを使う。
         "model": loaded[0],
         "free_gb": card.get("memory", {}).get("free_gb"),
-        "is_self": is_self,
         "address": address,
         "port": port,
     }
 
 
-def _select_chat_candidates(self_card: dict, peers: list) -> list:
+def _select_chat_candidates(self_card: dict, peers: list, local_port: int) -> list:
     """組織内から問い合わせ候補を集め、空きメモリの多い順に並べて返す。
 
     仮の判断: フェーズ5では「タスクの難易度に応じた賢い振り分け」はスコープ外
     のため、単純に「ロード済みモデルがあり、空きメモリが最も多いメンバー」を
-    選ぶだけにする。空きメモリが不明なメンバーは最下位として扱う。
+    選ぶだけにする。空きメモリが不明なメンバーは最下位として扱う。自分自身は
+    キッチン(常駐エージェント)がlocalhost:local_portで`/chat`を提供している
+    前提でアドレスを組み立てる。
     """
     candidates = []
-    self_candidate = _build_chat_candidate(self_card, is_self=True)
+    self_candidate = _build_chat_candidate(self_card, is_self=True, address="localhost", port=local_port)
     if self_candidate:
         candidates.append(self_candidate)
     for peer in peers:
@@ -870,13 +904,9 @@ def _select_chat_candidates(self_card: dict, peers: list) -> list:
 
 
 def _stream_chat_from_candidate(candidate: dict, org_fingerprint: str, messages: list):
-    """候補が自分自身ならプロセス内で直接、他のメンバーならHTTP経由(/chat)で
-    問い合わせ、正規化されたストリーミングイベントを順にyieldする。
+    """候補(自分自身を含む)のキッチンにHTTP経由(/chat)で問い合わせ、
+    正規化されたストリーミングイベントを順にyieldする。
     """
-    if candidate["is_self"]:
-        yield from stream_chat_completion(candidate["model"], messages)
-        return
-
     try:
         resp = requests.post(
             f"http://{candidate['address']}:{candidate['port']}/chat",
@@ -902,15 +932,18 @@ def _stream_chat_from_candidate(candidate: dict, org_fingerprint: str, messages:
         yield {"error": str(exc)}
 
 
-def _ask_organization(ctx: dict, messages: list) -> None:
-    """組織内のメンバーに順番に問い合わせ、失敗したら次に空きメモリが多い
-    候補へ自動でフォールバックしながら回答をストリーミング表示する。
+def _ask_organization(port: int, org_fingerprint: str, messages: list) -> None:
+    """自分のキッチン(常駐エージェント)の`/status`で組織内の候補を集め、順番に
+    問い合わせて、失敗したら次に空きメモリが多い候補へ自動でフォールバックしながら
+    回答をストリーミング表示する。
 
     成功した場合はassistantの回答を`messages`に追記する(会話履歴の継続)。
     """
-    self_card = build_profile_card(ctx["agent_id"])
-    peers = ctx["registry"].snapshot()
-    candidates = _select_chat_candidates(self_card, peers)
+    data = _fetch_org_snapshot(port, org_fingerprint)
+    if data is None:
+        return  # 案内メッセージは_fetch_org_snapshot内で表示済み
+
+    candidates = _select_chat_candidates(data.get("self", {}), data.get("peers", []), port)
 
     if not candidates:
         print("組織内にロード済みモデルを持つメンバーがいません。")
@@ -924,7 +957,7 @@ def _ask_organization(ctx: dict, messages: list) -> None:
 
         answer_parts = []
         failed = False
-        for event in _stream_chat_from_candidate(candidate, ctx["org_fingerprint"], messages):
+        for event in _stream_chat_from_candidate(candidate, org_fingerprint, messages):
             if "error" in event:
                 logger.warning("%s への問い合わせに失敗しました: %s", candidate["label"], event["error"])
                 failed = True
@@ -956,16 +989,12 @@ def pick_free_port() -> int:
         return sock.getsockname()[1]
 
 
-def _setup_agent(token: str, port: int) -> dict:
-    """エージェントの起動処理(自己紹介カードサーバー、mDNS登録、Tailscaleの
-    初回発見)をまとめて行い、以降の探索ループ(_discovery_loop)や対話モード
-    (REPL)が使う情報をひとつの辞書(ctx)にまとめて返す。
-
-    仮の判断: 従来1つの関数(run_agent)にまとまっていたセットアップ処理と
-    「探索し続けるループ」を分離した。対話モード(REPL)では、探索ループを
-    バックグラウンドスレッドで動かしつつメインスレッドで入力を受け付ける
-    必要があり、常駐(headless)実行ではこれまで通りメインスレッドで
-    ループさせたいため、両者で共有できる形にしている。
+def run_agent(token: str, port: int) -> None:
+    """常駐(キッチン)実行のエントリーポイント。`python3 yoriai.py` (対話モード関連の
+    引数なし)で常に呼ばれる。systemd/launchdからでも、ターミナルからのフォアグラウンド
+    実行でも同じ挙動(自己紹介カードサーバー・mDNS/Tailscale探索・/chatの提供)になる。
+    対話モードのUI(フロント)は同じプロセスには含まれない
+    (別プロセスの`python3 yoriai.py --chat`から`/status`・`/chat`経由で問い合わせる)。
     """
     if platform.system() not in ("Darwin", "Linux"):
         logger.warning("このプロトタイプはmacOS/Linuxを想定しています。他OSでは一部情報が取得できません。")
@@ -1023,69 +1052,35 @@ def _setup_agent(token: str, port: int) -> dict:
     # (相手がまだ起動しきっていないタイミングで一度失敗しても、後で拾えるようにするため)。
     tailscale_found_count = discover_via_tailscale(agent_id, org_fingerprint, port, registry)
 
-    return {
-        "agent_id": agent_id,
-        "org_fingerprint": org_fingerprint,
-        "port": port,
-        "registry": registry,
-        "server": server,
-        "zeroconf": zeroconf,
-        "service_info": service_info,
-        "listener": listener,
-        "tailscale_found_count": tailscale_found_count,
-    }
-
-
-def _discovery_loop(ctx: dict, stop_event: "threading.Event" = None) -> None:
-    """探索ループ本体(ハートビートログ・Tailscaleの定期再スキャン)。
-
-    常駐(headless)実行時はメインスレッドでKeyboardInterruptが起きるまで、
-    対話モード(REPL)実行時はバックグラウンドスレッドでstop_eventが
-    セットされるまで回り続ける。
-    """
     logger.info("同じネットワーク上のYoriaiエージェントを探索しています... (Ctrl+Cで終了)")
-    last_heartbeat = time.monotonic()
-    last_tailscale_scan = time.monotonic()
-    while stop_event is None or not stop_event.is_set():
-        time.sleep(1)
-        # 仮の判断: 発見がない間も動作中であることが外から分かるよう、
-        # 一定間隔でハートビートログを出す。mDNSが機能しないネットワーク
-        # (例: クライアント間マルチキャストが遮断された環境)でも、
-        # Tailscale経由の発見数を合わせて見せることで「本当に0台なのか」を
-        # 判断しやすくする。
-        if time.monotonic() - last_tailscale_scan >= TAILSCALE_RESCAN_INTERVAL_SEC:
-            ctx["tailscale_found_count"] = discover_via_tailscale(
-                ctx["agent_id"], ctx["org_fingerprint"], ctx["port"], ctx["registry"],
-            )
-            last_tailscale_scan = time.monotonic()
-        if time.monotonic() - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
-            logger.info(
-                "探索中... (現在発見数: mDNS %d件 / Tailscale %d件)",
-                len(ctx["listener"].known_peers), ctx["tailscale_found_count"],
-            )
-            last_heartbeat = time.monotonic()
-
-
-def _shutdown_agent(ctx: dict) -> None:
-    ctx["zeroconf"].unregister_service(ctx["service_info"])
-    ctx["zeroconf"].close()
-    ctx["server"].shutdown()
-
-
-def run_agent(token: str, port: int) -> None:
-    """常駐(headless)実行のエントリーポイント。systemd/launchdなど、対話的な
-    入出力ができない環境から起動される想定で、フェーズ5導入前と挙動を変えない。
-    """
-    ctx = _setup_agent(token, port)
     try:
-        _discovery_loop(ctx)
+        last_heartbeat = time.monotonic()
+        last_tailscale_scan = time.monotonic()
+        while True:
+            time.sleep(1)
+            # 仮の判断: 発見がない間も動作中であることが外から分かるよう、
+            # 一定間隔でハートビートログを出す。mDNSが機能しないネットワーク
+            # (例: クライアント間マルチキャストが遮断された環境)でも、
+            # Tailscale経由の発見数を合わせて見せることで「本当に0台なのか」を
+            # 判断しやすくする。
+            if time.monotonic() - last_tailscale_scan >= TAILSCALE_RESCAN_INTERVAL_SEC:
+                tailscale_found_count = discover_via_tailscale(agent_id, org_fingerprint, port, registry)
+                last_tailscale_scan = time.monotonic()
+            if time.monotonic() - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
+                logger.info(
+                    "探索中... (現在発見数: mDNS %d件 / Tailscale %d件)",
+                    len(listener.known_peers), tailscale_found_count,
+                )
+                last_heartbeat = time.monotonic()
     except KeyboardInterrupt:
         logger.info("終了します...")
     finally:
-        _shutdown_agent(ctx)
+        zeroconf.unregister_service(service_info)
+        zeroconf.close()
+        server.shutdown()
 
 
-def _run_repl(ctx: dict) -> None:
+def _run_repl_client(port: int, org_fingerprint: str) -> None:
     print()
     print("=== Yoriai 対話モード ===")
     print("組織のメンバーに質問できます。終了するには exit または quit と入力するか、Ctrl+Cを押してください。")
@@ -1111,7 +1106,7 @@ def _run_repl(ctx: dict) -> None:
 
         messages.append({"role": "user", "content": text})
         try:
-            _ask_organization(ctx, messages)
+            _ask_organization(port, org_fingerprint, messages)
         except KeyboardInterrupt:
             print()
             continue
@@ -1119,22 +1114,23 @@ def _run_repl(ctx: dict) -> None:
     print("対話モードを終了します。")
 
 
-def run_agent_with_repl(token: str, port: int) -> None:
-    """対話モード(REPL)付きの起動エントリーポイント。ターミナルから直接
-    `python3 yoriai.py` を実行した場合に使う。mDNS/Tailscaleの探索・
-    ハートビートはバックグラウンドスレッドで継続しつつ、メインスレッドで
-    対話入力を受け付ける。
+def handle_chat(port: int) -> None:
+    """対話モード(フロント)のエントリーポイント。`python3 yoriai.py --chat`で
+    起動される。このプロセス自身はポートのbindもmDNS/Tailscale探索も一切行わず、
+    既に起動しているキッチン(常駐エージェント)の`/status`・`/chat`にHTTPで
+    問い合わせるだけのクライアントとして動く。
     """
-    ctx = _setup_agent(token, port)
-    stop_event = threading.Event()
-    discovery_thread = threading.Thread(target=_discovery_loop, args=(ctx, stop_event), daemon=True)
-    discovery_thread.start()
+    token = config.load_token()
+    if not token:
+        print(NO_TOKEN_GUIDANCE)
+        sys.exit(1)
+    org_fingerprint = config.token_fingerprint(token)
 
-    try:
-        _run_repl(ctx)
-    finally:
-        stop_event.set()
-        _shutdown_agent(ctx)
+    # 起動時に1回、キッチン(常駐エージェント)に到達できるか確認しておく
+    # (--statusと同じ考え方。到達できない場合は案内を出して終了する)。
+    _fetch_org_snapshot(port, org_fingerprint, fail_fast=True)
+
+    _run_repl_client(port, org_fingerprint)
 
 
 def _prompt_yes_no(question: str) -> bool:
@@ -1238,29 +1234,16 @@ def _format_status_member(card: dict, index: int, label: str, last_seen: float =
 
 
 def handle_status(port: int) -> None:
+    # 仮の判断: --status は「今動いている常駐プロセスに問い合わせるだけ」の
+    # 軽量なコマンドという要件のため、エージェントが起動していない場合は
+    # 新たに起動したりはせず、案内を出して終了する(_fetch_org_snapshotが行う)。
     token = config.load_token()
     if not token:
         print(NO_TOKEN_GUIDANCE)
         sys.exit(1)
     org_fingerprint = config.token_fingerprint(token)
 
-    try:
-        resp = requests.get(
-            f"http://localhost:{port}/status",
-            headers={ORG_FINGERPRINT_HEADER: org_fingerprint},
-            timeout=CARD_REQUEST_TIMEOUT_SEC,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:
-        # 仮の判断: --status は「今動いている常駐プロセスに問い合わせるだけ」の
-        # 軽量なコマンドという要件のため、エージェントが起動していない場合は
-        # 新たに起動したりはせず、案内を出して終了する。
-        print("実行中のYoriaiエージェントに接続できませんでした。")
-        print(f"詳細: {exc}")
-        print("先に python3 yoriai.py でエージェントを起動してください")
-        print("(常駐化している場合は、想定しているポートで動作しているか確認してください)。")
-        sys.exit(1)
+    data = _fetch_org_snapshot(port, org_fingerprint, fail_fast=True)
 
     self_card = data.get("self", {})
     peers = data.get("peers", [])
@@ -1300,6 +1283,11 @@ def main():
         "--status", action="store_true",
         help="常駐中のYoriaiエージェントに問い合わせ、組織に参加しているメンバー一覧を表示して終了する",
     )
+    group.add_argument(
+        "--chat", action="store_true",
+        help="常駐中のYoriaiエージェント(キッチン)に接続し、対話的に組織のメンバーへ質問する"
+             "(このプロセス自身はポートのbindやmDNS/Tailscale探索を行わないフロント専用)",
+    )
     parser.add_argument(
         "--port", type=int, default=DEFAULT_CARD_PORT,
         help=f"自己紹介カードを配信するHTTPポート番号(既定値: {DEFAULT_CARD_PORT}。0を指定するとOSに自動選択させる)",
@@ -1316,6 +1304,10 @@ def main():
         handle_status(args.port)
         return
 
+    if args.chat:
+        handle_chat(args.port)
+        return
+
     if args.join is not None:
         token = args.join.strip()
         if not token:
@@ -1329,14 +1321,7 @@ def main():
             print(NO_TOKEN_GUIDANCE)
             sys.exit(1)
 
-    # 仮の判断: 標準入力がターミナル(TTY)に繋がっているかどうかで、対話モード
-    # (REPL)を出すか常駐(headless)動作にするかを自動判定する。systemd/launchd
-    # から起動された場合や `curl | bash` のようにパイプ経由で動く場合は標準入力が
-    # TTYではないため、従来通りの常駐動作(挙動を変えない)になる。
-    if sys.stdin.isatty():
-        run_agent_with_repl(token, args.port)
-    else:
-        run_agent(token, args.port)
+    run_agent(token, args.port)
 
 
 if __name__ == "__main__":
