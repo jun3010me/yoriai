@@ -1711,11 +1711,16 @@ def _extract_code_from_answer(answer: str) -> str:
     return answer.rstrip("\n") + "\n" if answer else answer
 
 
-def _dispatch_and_save_parallel_tasks(tasks: list, candidates: list, org_fingerprint: str, out_dir: str) -> None:
+def _dispatch_and_save_parallel_tasks(tasks: list, candidates: list, org_fingerprint: str, out_dir: str) -> list:
     """タスク(ファイル名, 依頼内容)のリストを、優先順位順に並べた候補へ先頭から
     1対1で割り当て、同時に問い合わせて各回答からコード部分を抽出し、
     out_dir 配下にファイル名で保存する。`//parallel`(手動指定)と協業モード・
     `//agree`(合意フェーズ後の並行実装)の両方から共通して使われる下請け関数。
+
+    保存に成功したタスクについて、`[{"filename":, "candidate":, "code":}, ...]`
+    (タスクを書いた順)を返す。この戻り値は、協業モードのレビューフェーズ
+    (`_run_review_phase`)が「どのメンバーがどのファイルを実装したか」を
+    知るために使う。`//parallel`(手動指定)側は戻り値を使わない。
 
     仮の判断:
     - 割り当ては「タスクを書いた順」と「優先順位順に並べた候補」を先頭から
@@ -1741,7 +1746,7 @@ def _dispatch_and_save_parallel_tasks(tasks: list, candidates: list, org_fingerp
     assignments = list(zip(tasks, candidates))
     if not assignments:
         print("実行できるタスクがありませんでした。")
-        return
+        return []
 
     target_labels = ", ".join(
         f"{filename}→{c['label']}(モデル: {c['model']})" for (filename, _req), c in assignments
@@ -1786,11 +1791,13 @@ def _dispatch_and_save_parallel_tasks(tasks: list, candidates: list, org_fingerp
         dest_path = os.path.join(out_dir, filename)
         with open(dest_path, "w", encoding="utf-8") as f:
             f.write(code)
-        saved.append(dest_path)
+        saved.append({"filename": filename, "candidate": candidate, "code": code})
         print(f"[💾 {dest_path} に保存しました (担当: {candidate['label']})]")
 
     if not saved:
         print("保存できたファイルがありませんでした。")
+
+    return saved
 
 
 def _ask_organization_parallel(port: int, org_fingerprint: str, command_text: str, out_dir: str) -> None:
@@ -1951,7 +1958,8 @@ def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str,
     """「〇〇を作って」のような制作依頼用: まず優先順位が最も高い1台に
     モジュール分割案とインターフェース設計を相談し(合意フェーズ)、
     その結果を`_dispatch_and_save_parallel_tasks`で異なるメンバーに
-    並行実装させる。
+    並行実装させ(実装フェーズ)、最後にお互いが担当外のファイルを
+    レビューし合う(レビューフェーズ、`_run_review_phase`)。
 
     仮の判断:
     - 「設計担当」の選び方は他の候補選びと同じ優先順位ロジック
@@ -2011,7 +2019,208 @@ def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str,
     ]
 
     print(f"[🔨 実装フェーズ開始: 合意した計画に基づき、{len(enriched_tasks)}件のファイルを異なるメンバーに並行実装させます]")
-    _dispatch_and_save_parallel_tasks(enriched_tasks, candidates, org_fingerprint, out_dir)
+    implemented = _dispatch_and_save_parallel_tasks(enriched_tasks, candidates, org_fingerprint, out_dir)
+
+    # 仮の判断: レビューフェーズは「お互いが担当外のファイルをレビューする」
+    # 前提のため、実装に成功したファイルが2件以上無いと成立しない
+    # (1件しか実装できなかった場合、担当外のレビュー担当が存在しない)。
+    if len(implemented) < 2:
+        print("[🔎 レビューフェーズはスキップします: 相互レビューを行うには実装済みファイルが2件以上必要です]")
+        return
+
+    _run_review_phase(implemented, tasks, org_fingerprint, out_dir)
+
+
+# ---------------------------------------------------------------------------
+# 相互レビューフェーズ(実験3)
+# ---------------------------------------------------------------------------
+#
+# 実装フェーズが完了した後、各メンバーに「自分以外が担当した、もう一方の
+# ファイルのコード」を見せてレビューさせ、問題があれば担当メンバーに
+# 修正を依頼する。暴走防止のため、1ファイルにつき初回レビュー+修正後の
+# 再レビューの最大2回までとし、ループ処理ではなく2回分を明示的に順番に
+# 呼び出す構造にすることで、実装上も「それ以上繰り返せない」ようにしてある。
+
+_REVIEW_PROMPT_TEMPLATE = """あなたはコードレビュー担当です。以下は、組織内の別のメンバーが実装した{filename}のコードです。
+
+【実装計画全体(事前に合意した内容)】
+{full_plan}
+
+【あなたが担当した{reviewer_own_filename}(参考: 正しく連携できそうか確認する際に使ってください)】
+```python
+{reviewer_own_code}
+```
+
+【レビュー対象: {filename}】
+```python
+{code}
+```
+
+以下の観点でレビューしてください:
+1. 実装計画で合意した内容(関数名・引数・戻り値の型・データ形式)と、実際のコードが一致しているか
+2. あなたが担当した{reviewer_own_filename}と正しく連携できそうか
+3. 例外処理の欠如・タイポなど、コードとして明らかな不備がないか
+
+出力は次の形式のみとし、他の説明文は含めないでください。
+- 問題が無ければ、1行目に「問題なし」とだけ書いてください。
+- 問題があれば、1行目に「問題あり」と書き、2行目以降に具体的な指摘内容を書いてください。
+"""
+
+_FIX_PROMPT_TEMPLATE = """以下はあなたが実装した{filename}のコードですが、レビュー担当から指摘がありました。指摘内容を踏まえて修正したコードを出力してください。
+
+【実装計画全体(事前に合意した内容)】
+{full_plan}
+
+【現在のコード: {filename}】
+```python
+{code}
+```
+
+【レビュー担当からの指摘】
+{feedback}
+
+修正後の{filename}の完全なコードを、コードブロックで出力してください。説明文は不要です。
+"""
+
+
+def _build_review_prompt(filename: str, code: str, reviewer_own_filename: str, reviewer_own_code: str, full_plan: str) -> str:
+    return _REVIEW_PROMPT_TEMPLATE.format(
+        filename=filename, code=code,
+        reviewer_own_filename=reviewer_own_filename, reviewer_own_code=reviewer_own_code,
+        full_plan=full_plan,
+    )
+
+
+def _build_fix_prompt(filename: str, code: str, feedback: str, full_plan: str) -> str:
+    return _FIX_PROMPT_TEMPLATE.format(filename=filename, code=code, feedback=feedback, full_plan=full_plan)
+
+
+def _parse_review_verdict(answer: str) -> tuple:
+    """レビュー担当の回答(1行目に「問題なし」または「問題あり」)を
+    (問題なしかどうか, 指摘内容)に変換する。1行目にどちらの語も
+    含まれない場合は、暴走防止のため「問題なし」側に倒す(仮の判断:
+    レビュー担当の回答が期待した形式でなかった場合にまで自動修正
+    ループへ進めてしまうより、安全側に倒して手動確認に委ねる方が
+    無難と判断した)。
+    """
+    lines = [line.strip() for line in answer.strip().splitlines() if line.strip()]
+    if not lines:
+        return True, ""
+    first_line = lines[0]
+    if "問題あり" in first_line:
+        feedback = "\n".join(lines[1:]).strip()
+        return False, feedback if feedback else answer.strip()
+    return True, ""
+
+
+def _review_one_file(
+    filename: str, code: str, reviewer: dict, reviewer_own_filename: str, reviewer_own_code: str,
+    full_plan: str, org_fingerprint: str, round_label: str,
+) -> tuple:
+    """1回分のレビューを実行し、(問題なしかどうか, 指摘内容)を返す。
+    問い合わせ自体が失敗した場合も「問題あり」として扱う(暴走防止のため
+    無条件に成功扱いにはしない)。
+    """
+    print(f"[🔎 {round_label}] {reviewer['label']} が {filename} をレビューしています...")
+    prompt = _build_review_prompt(filename, code, reviewer_own_filename, reviewer_own_code, full_plan)
+    answer, error = _collect_answer_from_candidate(reviewer, org_fingerprint, [{"role": "user", "content": prompt}])
+    if error or not answer:
+        message = error or "応答がありませんでした"
+        print(f"[{reviewer['label']}が{filename}をレビュー] 問い合わせに失敗しました: {message}")
+        return False, f"レビューへの問い合わせに失敗しました: {message}"
+
+    ok, feedback = _parse_review_verdict(answer)
+    if ok:
+        print(f"[{reviewer['label']}が{filename}をレビュー] 問題なし")
+    else:
+        print(f"[{reviewer['label']}が{filename}をレビュー] 問題あり: {feedback}")
+    return ok, feedback
+
+
+def _request_fix(filename: str, code: str, feedback: str, owner: dict, full_plan: str, org_fingerprint: str, out_dir: str):
+    """レビューで指摘された内容を担当メンバーに伝え、修正版のコードを
+    取得して保存する。修正後のコード文字列を返し、失敗時はNoneを返す。
+    """
+    print(f"[🔧 {owner['label']} に {filename} の修正を依頼しています...]")
+    prompt = _build_fix_prompt(filename, code, feedback, full_plan)
+    answer, error = _collect_answer_from_candidate(owner, org_fingerprint, [{"role": "user", "content": prompt}])
+    if error or not answer:
+        print(f"  → 修正依頼への問い合わせに失敗しました: {error or '応答がありませんでした'}")
+        return None
+
+    fixed_code = _extract_code_from_answer(answer)
+    dest_path = os.path.join(out_dir, filename)
+    with open(dest_path, "w", encoding="utf-8") as f:
+        f.write(fixed_code)
+    print(f"[💾 修正版の {dest_path} を保存しました (担当: {owner['label']})]")
+    return fixed_code
+
+
+def _review_and_fix_one_file(
+    filename: str, owner: dict, code: str, reviewer: dict, reviewer_own_filename: str, reviewer_own_code: str,
+    full_plan: str, org_fingerprint: str, out_dir: str,
+) -> bool:
+    """1ファイル分のレビュー→(必要なら)修正→再レビューを行い、最終的に
+    「問題なし」になったかどうかを返す。
+
+    仮の判断: ループではなく「1回目のレビュー」→「(問題があれば)修正」→
+    「修正後の再レビュー」という3ステップを直列に明示的に呼び出す構造に
+    した。ループにして回数を変数でカウントする実装だと、条件分岐を
+    間違えた場合に暴走するリスクが残るが、この構造なら最大2回のレビュー
+    (+その間の1回の修正)しか物理的に発生し得ない。
+    """
+    ok, feedback = _review_one_file(
+        filename, code, reviewer, reviewer_own_filename, reviewer_own_code, full_plan, org_fingerprint, "1回目のレビュー",
+    )
+    if ok:
+        return True
+
+    fixed_code = _request_fix(filename, code, feedback, owner, full_plan, org_fingerprint, out_dir)
+    if fixed_code is None:
+        return False
+
+    ok, _feedback = _review_one_file(
+        filename, fixed_code, reviewer, reviewer_own_filename, reviewer_own_code, full_plan, org_fingerprint, "修正後の再レビュー",
+    )
+    return ok
+
+
+def _run_review_phase(implemented: list, agreed_plan: list, org_fingerprint: str, out_dir: str) -> None:
+    """実装フェーズで生成された各ファイルを、担当外のメンバーにレビュー
+    させる。`implemented`は`_dispatch_and_save_parallel_tasks`が返す
+    `[{"filename":, "candidate":, "code":}, ...]`(タスクを書いた順、
+    各要素の担当は互いに異なる)。
+
+    仮の判断: レビュー担当は「次の要素の担当メンバー」を円環状(最後の
+    要素の次は先頭に戻る)に割り当てる単純な方式にした。2ファイル・
+    2メンバーの典型的なケースでは「お互いが相手をレビューする」に自然と
+    一致する。ファイル数が3件以上に増えた場合の「誰が誰をレビューするのが
+    最適か」という設計はさらに検討の余地があるが、今回のスコープでは
+    「担当外の誰かが必ずレビューする」ことだけを保証する方式にとどめた。
+    """
+    print()
+    print("[🔎 レビューフェーズ開始: お互いが担当外のファイルをレビューします]")
+
+    full_plan = "\n".join(f"{fn}: {content}" for fn, content in agreed_plan)
+    n = len(implemented)
+    unresolved = []
+
+    for i, entry in enumerate(implemented):
+        reviewer_entry = implemented[(i + 1) % n]
+        ok = _review_and_fix_one_file(
+            filename=entry["filename"], owner=entry["candidate"], code=entry["code"],
+            reviewer=reviewer_entry["candidate"], reviewer_own_filename=reviewer_entry["filename"],
+            reviewer_own_code=reviewer_entry["code"], full_plan=full_plan,
+            org_fingerprint=org_fingerprint, out_dir=out_dir,
+        )
+        if not ok:
+            unresolved.append(entry["filename"])
+
+    print()
+    if unresolved:
+        print(f"[⚠️ 未解決の指摘が残っています: {', '.join(unresolved)}]")
+    else:
+        print("[✅ レビュー完了]")
 
 
 # ---------------------------------------------------------------------------
