@@ -556,7 +556,23 @@ def _prompt_yes_no(question: str) -> bool:
     return answer.strip().lower() in ("y", "yes")
 
 
-def handle_init(force: bool) -> None:
+def _resolve_new_token(custom_passphrase) -> str:
+    if custom_passphrase:
+        return custom_passphrase.strip()
+
+    # 仮の判断: --init=<合言葉> の指定が無い場合は対話的に合言葉の入力を促す。
+    # 空欄のまま(または非対話実行などで入力できない)場合のみ、
+    # 従来通りランダムなトークンを生成する。
+    try:
+        entered = input("合言葉(トークン)を入力してください(空欄でランダム生成): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        entered = ""
+
+    return entered if entered else config.generate_token()
+
+
+def handle_init(force: bool, custom_passphrase=None) -> None:
     existing_token = config.load_token()
 
     if existing_token and not force:
@@ -574,23 +590,31 @@ def handle_init(force: bool) -> None:
             print("キャンセルしました。既存のトークンをそのまま使用します。")
             return
 
-    token = config.generate_token()
-    storage = config.save_token(token)
-    storage_note = "macOS Keychain" if storage == "keychain" else f"平文ファイル({config.CONFIG_FILE})"
+    token = _resolve_new_token(custom_passphrase)
+    config.save_token(token)
     # 仮の判断: --init はトークンの発行・保存のみを行い、そのまま起動はしない。
     # 発行したトークンを他のMacに共有してから `python yoriai.py` (このMac自身も含む)
     # で明示的に起動する、という2段階の操作の方が事故が少ないと判断した。
     print("新しいトークンを発行しました。このトークンを組織のメンバーに共有してください。")
     print(f"トークン: {token}")
-    print(f"保存先: {storage_note}")
+    print(f"保存先: {config.CONFIG_FILE}")
     print("このMacでYoriaiを開始するには: python yoriai.py")
     print("他のMacをこの組織に参加させるには: python yoriai.py --join=<上記のトークン>")
+
+
+# --init が値なしで指定された(合言葉を対話入力する)ことを表す印。
+# 「--initそのものが指定されなかった」(default=None)と区別するために使う。
+_INIT_INTERACTIVE = object()
 
 
 def main():
     parser = argparse.ArgumentParser(description="Yoriai: ローカルLLMエージェントの自動発見・自己紹介カード交換プロトタイプ")
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--init", action="store_true", help="組織を作成する(既にトークンがあれば表示のみ。--forceで再発行)")
+    group.add_argument(
+        "--init", nargs="?", const=_INIT_INTERACTIVE, default=None, metavar="合言葉",
+        help="組織を作成する(既にトークンがあれば表示のみ。--forceで再発行)。"
+             "--init=<合言葉> で好きな文字列を指定でき、省略時は対話入力(空欄ならランダム生成)",
+    )
     group.add_argument("--join", metavar="TOKEN", help="既存の組織のトークンを指定して参加し、そのまま起動する")
     parser.add_argument(
         "--port", type=int, default=DEFAULT_CARD_PORT,
@@ -599,8 +623,9 @@ def main():
     parser.add_argument("--force", action="store_true", help="--init と併用し、既存トークンを確認の上で強制的に再発行する")
     args = parser.parse_args()
 
-    if args.init:
-        handle_init(args.force)
+    if args.init is not None:
+        custom_passphrase = None if args.init is _INIT_INTERACTIVE else args.init
+        handle_init(args.force, custom_passphrase)
         return
 
     if args.join is not None:
@@ -608,9 +633,8 @@ def main():
         if not token:
             logger.error("--join には空でないトークンを指定してください")
             sys.exit(1)
-        storage = config.save_token(token)
-        storage_note = "macOS Keychain" if storage == "keychain" else f"平文ファイル({config.CONFIG_FILE})"
-        logger.info("トークンを%sに保存しました。この組織のエージェントとして起動します。", storage_note)
+        config.save_token(token)
+        logger.info("トークンを設定ファイル(%s)に保存しました。この組織のエージェントとして起動します。", config.CONFIG_FILE)
     else:
         token = config.load_token()
         if not token:
