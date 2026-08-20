@@ -88,7 +88,11 @@ esac
 
 if [[ -n "$DAEMON_INSTALL_SCRIPT" ]]; then
     read -r -p "ログアウト後も動き続けるよう常駐化しますか? [y/N]: " DAEMON_ANSWER < "$TTY_DEV" || true
-    if [[ "${DAEMON_ANSWER,,}" == "y" || "${DAEMON_ANSWER,,}" == "yes" ]]; then
+    # 仮の判断: ${var,,}(小文字変換)はbash 4以降の構文で、macOS標準の
+    # /bin/bash(3.2、ライセンス上の理由で更新されていない)では
+    # "bad substitution" エラーになる。macOS/Linux両対応が要件のため、
+    # bash 3.2でも動く正規表現マッチ(=~)で大文字・小文字どちらも許容する。
+    if [[ "$DAEMON_ANSWER" =~ ^[Yy]([Ee][Ss])?$ ]]; then
         if "$PYTHON_BIN" -c "import config, sys; sys.exit(0 if config.load_token() else 1)" 2>/dev/null; then
             "$DAEMON_INSTALL_SCRIPT" < "$TTY_DEV"
         else
