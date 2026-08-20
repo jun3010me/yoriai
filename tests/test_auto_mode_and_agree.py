@@ -46,6 +46,87 @@ def test_parse_module_breakdown_handles_bullets_and_code_fence():
     ], tasks
 
 
+def test_parse_module_breakdown_groups_nested_function_signatures_under_their_file():
+    """実機で報告された不具合の再現: 設計担当が「ファイル名を見出しとし、
+    その配下に関数シグネチャを箇条書きでぶら下げる」階層的な形式で回答した
+    場合、見出し配下の詳細行(関数シグネチャ)までファイルとして誤認識
+    せず、見出し(ファイル)単位でグルーピングされることを確認する。
+
+    実機では、この誤認識により9項目のフラットなリストとして解析され、
+    本来は関数シグネチャである`load_todos() -> list`が実装依頼の宛先
+    (=ファイル名)として扱われてしまい、cli.pyが一度も実装依頼されない
+    という不具合が発生した。
+    """
+    answer = (
+        "storage.py: ToDoリストをJSONファイルで管理するモジュール\n"
+        "- load_todos() -> list: todos.jsonから読み込んで返す\n"
+        "- save_todos(todos: list) -> None: todos.jsonに保存する\n"
+        "- add_todo(text: str) -> int: 新しいTodoを追加してIDを返す\n"
+        "- complete_todo(id: int) -> bool: 指定IDを完了にする\n"
+        "- delete_todo(id: int) -> bool: 指定IDを削除する\n"
+        "\n"
+        "cli.py: storageモジュールを呼び出すCLI\n"
+        "- storage.add_todo, storage.load_todos, storage.complete_todo, storage.delete_todoを呼び出す\n"
+        "- python cli.py add \"text\" のようなコマンド体系\n"
+    )
+    tasks = yoriai._parse_module_breakdown(answer)
+    filenames = [fn for fn, _content in tasks]
+    assert filenames == ["storage.py", "cli.py"], (
+        f"ファイル名だけが見出しとして拾われるべきですが、関数シグネチャまで"
+        f"ファイルとして誤認識されています: {filenames}"
+    )
+
+    storage_content = dict(tasks)["storage.py"]
+    cli_content = dict(tasks)["cli.py"]
+    assert "load_todos() -> list" in storage_content, storage_content
+    assert "save_todos(todos: list) -> None" in storage_content, storage_content
+    assert "add_todo(text: str) -> int" in storage_content, storage_content
+    assert "storage.add_todo" in cli_content, cli_content
+
+
+def test_parse_module_breakdown_is_not_specific_to_the_todo_example():
+    """ToDoリストというお題に限定されない汎用的な解析であることを、
+    全く異なる構成(電卓アプリ)の例で確認する。
+    """
+    answer = (
+        "calculator.py: 四則演算のロジックを実装\n"
+        "- add(a: float, b: float) -> float: 加算する\n"
+        "- subtract(a: float, b: float) -> float: 減算する\n"
+        "- multiply(a: float, b: float) -> float: 乗算する\n"
+        "- divide(a: float, b: float) -> float: 除算する(0除算はValueErrorを送出)\n"
+        "\n"
+        "display.py: 計算結果の表示を担当\n"
+        "- format_result(value: float) -> str: 計算結果を表示用の文字列に整形する\n"
+        "- calculator.add/subtract/multiply/divideを呼び出して結果をformat_resultで表示する\n"
+    )
+    tasks = yoriai._parse_module_breakdown(answer)
+    filenames = [fn for fn, _content in tasks]
+    assert filenames == ["calculator.py", "display.py"], filenames
+
+    calculator_content = dict(tasks)["calculator.py"]
+    display_content = dict(tasks)["display.py"]
+    assert "add(a: float, b: float) -> float" in calculator_content, calculator_content
+    assert "divide(a: float, b: float) -> float" in calculator_content, calculator_content
+    assert "format_result(value: float) -> str" in display_content, display_content
+    assert "calculator.add/subtract/multiply/divide" in display_content, display_content
+
+
+def test_parse_module_breakdown_still_handles_flat_single_line_format():
+    """階層形式への対応を追加しても、従来通りの1行1ファイル形式(見出しの
+    直後に説明が続く形式)も引き続き正しく解析できることを確認する
+    (退行検知)。
+    """
+    answer = (
+        "storage.py: add_todo(text: str) -> int を実装\n"
+        "cli.py: storage.add_todoを呼び出すCLI\n"
+    )
+    tasks = yoriai._parse_module_breakdown(answer)
+    assert tasks == [
+        ("storage.py", "add_todo(text: str) -> int を実装"),
+        ("cli.py", "storage.add_todoを呼び出すCLI"),
+    ], tasks
+
+
 def _make_card(device_name, model, free_gb):
     return {
         "device_name": device_name,
@@ -68,6 +149,70 @@ def _three_member_snapshot():
             {"card": peer_b, "address": "127.0.0.1", "port": 47122, "via": "mdns", "last_seen": 0},
         ],
     }
+
+
+def test_collaborate_dispatches_exactly_two_files_when_architect_uses_nested_format():
+    """`_parse_module_breakdown`単体のテストだけでなく、
+    `_ask_organization_collaborate`を通しで実行し、設計担当が階層的な
+    回答(ファイル名見出し+ぶら下がる関数シグネチャ)を返した場合でも、
+    実際に問い合わせが飛ぶのはファイル単位(2件)に留まり、関数シグネチャの
+    行が誤って実装依頼の宛先にされないことを確認する
+    (実機では、9項目に誤分割された結果、storage.pyへの依頼と
+    「load_todos() -> list」という架空のファイル名への依頼の2件だけが
+    実行され、cli.pyは一度も実装依頼されなかった)。
+    """
+    original_snapshot = yoriai._fetch_org_snapshot
+    original_stream = yoriai._stream_chat_from_candidate
+
+    nested_breakdown_answer = (
+        "storage.py: ToDoリストをJSONファイルで管理するモジュール\n"
+        "- load_todos() -> list: todos.jsonから読み込んで返す\n"
+        "- save_todos(todos: list) -> None: todos.jsonに保存する\n"
+        "- add_todo(text: str) -> int: 新しいTodoを追加してIDを返す\n"
+        "- complete_todo(id: int) -> bool: 指定IDを完了にする\n"
+        "- delete_todo(id: int) -> bool: 指定IDを削除する\n"
+        "\n"
+        "cli.py: storageモジュールを呼び出すCLI\n"
+        "- storage.add_todo, storage.load_todos, storage.complete_todo, storage.delete_todoを呼び出す\n"
+        "- python cli.py add \"text\" のようなコマンド体系\n"
+    )
+
+    received_requests_log = []
+
+    def fake_stream(candidate, org_fingerprint, messages):
+        label = candidate["label"]
+        request_text = messages[0]["content"]
+        received_requests_log.append((label, request_text))
+        if "ファイルに分割する実装計画" in request_text:
+            yield {"content": nested_breakdown_answer}
+        else:
+            yield {"content": "```python\npass\n```"}
+        yield {"done": True}
+
+    yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False: _three_member_snapshot()
+    yoriai._stream_chat_from_candidate = fake_stream
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_agree_test_")
+    try:
+        yoriai._ask_organization_collaborate(
+            47120, "fingerprint", "ToDoリストのCLIツールを作って", out_dir,
+        )
+
+        # 設計担当への相談を除いた、実装依頼の宛先(ラベル)の集合を確認する。
+        implementation_labels = [
+            label for label, req in received_requests_log
+            if "ファイルに分割する実装計画" not in req
+        ]
+        assert len(implementation_labels) == 2, (
+            f"ファイル数(2件)ちょうどに実装依頼が飛ぶはずです: {received_requests_log}"
+        )
+        assert set(os.listdir(out_dir)) == {"storage.py", "cli.py"}, (
+            f"storage.py/cli.pyの2ファイルだけが保存されるはずです: {os.listdir(out_dir)}"
+        )
+    finally:
+        yoriai._fetch_org_snapshot = original_snapshot
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
 
 
 def test_agree_uses_top_candidate_as_architect_and_propagates_interface_to_implementers():
@@ -250,6 +395,10 @@ def main():
     tests = [
         test_execution_mode_classification_matches_requested_examples,
         test_parse_module_breakdown_handles_bullets_and_code_fence,
+        test_parse_module_breakdown_groups_nested_function_signatures_under_their_file,
+        test_parse_module_breakdown_is_not_specific_to_the_todo_example,
+        test_parse_module_breakdown_still_handles_flat_single_line_format,
+        test_collaborate_dispatches_exactly_two_files_when_architect_uses_nested_format,
         test_agree_uses_top_candidate_as_architect_and_propagates_interface_to_implementers,
         test_agree_aborts_cleanly_when_architect_response_is_unparseable,
         test_implementer_receives_full_plan_even_when_architect_output_is_self_inconsistent,
