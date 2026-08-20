@@ -1197,9 +1197,58 @@ def _fetch_org_snapshot(port: int, org_fingerprint: str, fail_fast: bool = False
         return None
 
 
-def _build_chat_candidate(card: dict, is_self: bool, address: str, port: int):
+# ---------------------------------------------------------------------------
+# タスクの性質に応じた振り分け(フェーズ6・項目1)
+# ---------------------------------------------------------------------------
+
+TASK_TYPE_CODING = "coding"
+TASK_TYPE_GENERAL = "general"
+
+# 仮の判断: 依頼の要件通り、モデルによる高度な分類ではなく単純なキーワード
+# マッチによる簡易分類にとどめる。コードブロック(```や`...`)を含む場合、
+# または以下のいずれかの単語(日本語・英語)を含む場合はコーディング系とみなす。
+_CODE_BLOCK_PATTERN = re.compile(r"```|`[^`\n]+`")
+_CODING_TASK_KEYWORDS = (
+    "コード", "コーディング", "関数", "エラー", "バグ", "実装", "プログラム",
+    "スクリプト", "クラス", "デバッグ", "リファクタ", "アルゴリズム", "コンパイル",
+    "code", "coding", "function", "error", "bug", "debug", "script", "algorithm",
+    "traceback", "stack trace", "exception", "compile", "refactor",
+)
+
+
+def _classify_task(text: str) -> str:
+    """ユーザーの質問文を簡易的に「コーディング系」か「一般」かに分類する。
+
+    仮の判断: タスクの難易度・専門性を厳密に判定するのは今回のスコープ外
+    なので、コーディング系かどうかの二値分類のみを行う。
+    """
+    if _CODE_BLOCK_PATTERN.search(text):
+        return TASK_TYPE_CODING
+    lowered = text.lower()
+    for keyword in _CODING_TASK_KEYWORDS:
+        if keyword.lower() in lowered:
+            return TASK_TYPE_CODING
+    return TASK_TYPE_GENERAL
+
+
+# 仮の判断: コーディング系モデルはほぼ例外なく名前に"coder"を含む
+# (qwen2.5-coder、qwen3-coder、deepseek-coder、opencoderなど)。
+# その他の代表的な派生名も併せて拾う。
+_CODING_MODEL_KEYWORDS = ("coder", "codellama", "starcoder", "codegemma", "codestral")
+
+
+def _is_coding_model(model_name: str) -> bool:
+    lowered = model_name.lower()
+    return any(keyword in lowered for keyword in _CODING_MODEL_KEYWORDS)
+
+
+def _build_chat_candidate(card: dict, is_self: bool, address: str, port: int, task_type: str = TASK_TYPE_GENERAL):
     """自己紹介カードから、チャットの問い合わせ先候補(ロード済みモデルを
     持つメンバー)を作る。ロード済みモデルが無いメンバーはNoneを返す。
+
+    仮の判断: task_typeが「コーディング系」で、かつロード済みモデルの中に
+    コーディング系モデルがあれば、そのモデルを候補の代表モデルとして使う
+    (先頭のモデルではなく)。それ以外は従来通り先頭のモデルを使う。
     """
     loaded = card.get("models", {}).get("loaded", [])
     if not loaded:
@@ -1207,38 +1256,57 @@ def _build_chat_candidate(card: dict, is_self: bool, address: str, port: int):
     label = card.get("device_name", "unknown")
     if is_self:
         label += "(自分)"
+
+    coding_models = [m for m in loaded if _is_coding_model(m)]
+    has_coding_model = bool(coding_models)
+    if task_type == TASK_TYPE_CODING and has_coding_model:
+        model = coding_models[0]
+    else:
+        # 仮の判断: ロード済みモデルが複数ある場合にどれを使うべきかの判断基準が
+        # 他に無いため、単純に先頭のものを使う。
+        model = loaded[0]
+
     return {
         "label": label,
-        # 仮の判断: ロード済みモデルが複数ある場合はどれを使うべきかの判断基準が
-        # まだ無いため、単純に先頭のものを使う。
-        "model": loaded[0],
+        "model": model,
         "free_gb": card.get("memory", {}).get("free_gb"),
         "address": address,
         "port": port,
+        "has_coding_model": has_coding_model,
     }
 
 
-def _select_chat_candidates(self_card: dict, peers: list, local_port: int) -> list:
-    """組織内から問い合わせ候補を集め、空きメモリの多い順に並べて返す。
+def _select_chat_candidates(self_card: dict, peers: list, local_port: int, task_type: str = TASK_TYPE_GENERAL) -> list:
+    """組織内から問い合わせ候補を集め、優先順位をつけて並べて返す。
 
-    仮の判断: フェーズ5では「タスクの難易度に応じた賢い振り分け」はスコープ外
-    のため、単純に「ロード済みモデルがあり、空きメモリが最も多いメンバー」を
-    選ぶだけにする。空きメモリが不明なメンバーは最下位として扱う。自分自身は
-    キッチン(常駐エージェント)がlocalhost:local_portで`/chat`を提供している
+    仮の判断: 「タスクの難易度に応じた賢い振り分け」は依頼の項目1で
+    コーディング系/一般の二値分類のみサポートする。一般タスクはこれまで
+    通り「ロード済みモデルがあり、空きメモリが最も多いメンバー」を選ぶ。
+    コーディング系タスクは、コーディング系モデルを持つメンバーを優先し
+    (その中では空きメモリの多い順)、コーディング系モデルを持つメンバーが
+    誰もいない場合は一般タスクと同じ並び(空きメモリ順のみ)に自然と一致する。
+    空きメモリが不明なメンバーは最下位として扱う。自分自身はキッチン
+    (常駐エージェント)がlocalhost:local_portで`/chat`を提供している
     前提でアドレスを組み立てる。
     """
     candidates = []
-    self_candidate = _build_chat_candidate(self_card, is_self=True, address="localhost", port=local_port)
+    self_candidate = _build_chat_candidate(self_card, is_self=True, address="localhost", port=local_port, task_type=task_type)
     if self_candidate:
         candidates.append(self_candidate)
     for peer in peers:
         candidate = _build_chat_candidate(
-            peer.get("card", {}), is_self=False, address=peer.get("address"), port=peer.get("port"),
+            peer.get("card", {}), is_self=False, address=peer.get("address"), port=peer.get("port"), task_type=task_type,
         )
         if candidate:
             candidates.append(candidate)
 
-    candidates.sort(key=lambda c: c["free_gb"] if c["free_gb"] is not None else -1, reverse=True)
+    if task_type == TASK_TYPE_CODING:
+        candidates.sort(
+            key=lambda c: (c["has_coding_model"], c["free_gb"] if c["free_gb"] is not None else -1),
+            reverse=True,
+        )
+    else:
+        candidates.sort(key=lambda c: c["free_gb"] if c["free_gb"] is not None else -1, reverse=True)
     return candidates
 
 
@@ -1271,6 +1339,15 @@ def _stream_chat_from_candidate(candidate: dict, org_fingerprint: str, messages:
         yield {"error": str(exc)}
 
 
+def _selection_reason_label(task_type: str, top_candidate: dict) -> str:
+    """先頭候補が選ばれた理由を、画面表示用の短いラベルにする。"""
+    if task_type == TASK_TYPE_CODING and top_candidate["has_coding_model"]:
+        return "コーディング系の質問と判断し、コーディング系モデルを優先"
+    if task_type == TASK_TYPE_CODING:
+        return "コーディング系の質問と判断しましたが、コーディング系モデルを持つメンバーがいないため空きメモリの多さで選択"
+    return "空きメモリの多さで選択"
+
+
 def _ask_organization(port: int, org_fingerprint: str, messages: list) -> None:
     """自分のキッチン(常駐エージェント)の`/status`で組織内の候補を集め、順番に
     問い合わせて、失敗したら次に空きメモリが多い候補へ自動でフォールバックしながら
@@ -1282,7 +1359,9 @@ def _ask_organization(port: int, org_fingerprint: str, messages: list) -> None:
     if data is None:
         return  # 案内メッセージは_fetch_org_snapshot内で表示済み
 
-    candidates = _select_chat_candidates(data.get("self", {}), data.get("peers", []), port)
+    latest_question = messages[-1]["content"] if messages else ""
+    task_type = _classify_task(latest_question)
+    candidates = _select_chat_candidates(data.get("self", {}), data.get("peers", []), port, task_type)
 
     if not candidates:
         print("組織内にロード済みモデルを持つメンバーがいません。")
@@ -1290,7 +1369,7 @@ def _ask_organization(port: int, org_fingerprint: str, messages: list) -> None:
 
     for i, candidate in enumerate(candidates):
         if i == 0:
-            print(f"[{candidate['label']} に問い合わせています... (モデル: {candidate['model']})]")
+            print(f"[{_selection_reason_label(task_type, candidate)}: {candidate['label']} に問い合わせています... (モデル: {candidate['model']})]")
         else:
             print(f"[フォールバック: {candidate['label']} に問い合わせています... (モデル: {candidate['model']})]")
 
