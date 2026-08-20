@@ -1098,6 +1098,13 @@ def _run_repl_client(port: int, org_fingerprint: str) -> None:
         except KeyboardInterrupt:
             print()
             break
+        except UnicodeDecodeError:
+            # 仮の判断: 端末側の文字コードの乱れ(IME入力の途中経過や、ターミナルの
+            # 表示崩れなど)で読み取れないバイト列が来ることがある実機での報告により
+            # 発覚した。1行分の入力を読み捨てて対話モード自体は継続させる
+            # (ここでクラッシュさせると常駐サービスは無事でもフロントだけ落ちてしまうため)。
+            print("入力を文字コードとして読み取れませんでした。もう一度入力してください。")
+            continue
 
         if not text:
             continue
