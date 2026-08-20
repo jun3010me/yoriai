@@ -444,6 +444,27 @@ def _execute_tool_call(tool_call: dict) -> str:
 # チャットのプロキシ(Ollama/LM Studioへのストリーミング問い合わせ)
 # ---------------------------------------------------------------------------
 
+# 仮の判断: requestsの`raise_for_status()`はステータス行(例: "400 Client Error:
+# Bad Request for url: ...")しか例外メッセージに含めず、レスポンスボディ
+# (バックエンドが返す具体的な原因メッセージ)は失われてしまう。実機で
+# 「400になるが原因が分からない」という報告があったため、ボディの内容を
+# ログとエラーイベントの両方に残すヘルパーを共通化した。
+def _log_and_build_http_error(base_url: str, resp) -> dict:
+    body_text = resp.text[:2000]  # 万一巨大なエラーページ等が返ってきても肥大化させない
+    detail = body_text
+    try:
+        body_json = resp.json()
+        error_field = body_json.get("error")
+        if isinstance(error_field, dict):
+            detail = error_field.get("message") or body_text
+        elif isinstance(error_field, str):
+            detail = error_field
+    except Exception:
+        pass
+    logger.warning("%s への問い合わせが%dで拒否されました。レスポンス: %s", base_url, resp.status_code, body_text)
+    return {"error": f"{resp.status_code}: {detail}", "status_code": resp.status_code}
+
+
 def _stream_ollama_turn(model: str, messages: list, tools: list):
     """OllamaのネイティブAPI(/api/chat、NDJSONストリーミング)に1往復だけ
     問い合わせ、正規化したイベント({"content": ...} / {"error": ...})を
@@ -457,7 +478,9 @@ def _stream_ollama_turn(model: str, messages: list, tools: list):
             stream=True,
             timeout=(CHAT_CONNECT_TIMEOUT_SEC, CHAT_READ_TIMEOUT_SEC),
         )
-        resp.raise_for_status()
+        if not resp.ok:
+            yield _log_and_build_http_error(OLLAMA_BASE_URL, resp)
+            return
     except Exception as exc:
         yield {"error": str(exc)}
         return
@@ -501,7 +524,9 @@ def _stream_openai_compatible_turn(base_url: str, model: str, messages: list, to
             stream=True,
             timeout=(CHAT_CONNECT_TIMEOUT_SEC, CHAT_READ_TIMEOUT_SEC),
         )
-        resp.raise_for_status()
+        if not resp.ok:
+            yield _log_and_build_http_error(base_url, resp)
+            return
     except Exception as exc:
         yield {"error": str(exc)}
         return
@@ -691,9 +716,21 @@ def stream_chat_completion(model: str, messages: list):
     漏れてしまうことがある(_run_turn_with_leak_detectionで検出)。検出した
     場合は{"tool_call_failed": True}を1回だけyieldしたうえで、ツール無しで
     同じ質問を自動的に再試行する(以降のラウンドもツールは使わない)。
+
+    仮の判断: 上記の「回答に漏れる」パターンとは別に、モデル/バックエンドの
+    組み合わせによっては`tools`パラメータを含めたリクエスト自体をその場で
+    (何も生成せずに)400/422で拒否してくることが実機の報告で見つかった
+    (例: LM Studio上のqwen3-coder-30b)。これも「ツール呼び出しに対応して
+    いない」の一種とみなし、同じくツール無しで自動的に再試行する。
     """
     messages = list(messages)  # 呼び出し元のリストをツール実行の追記で汚さない
     tools = CHAT_TOOLS
+    # 仮の判断: 4xxのうち400(Bad Request)/422(Unprocessable Entity)は
+    # 「リクエストの中身(=toolsパラメータ)が原因で拒否された」可能性が高い
+    # クラスのエラーとみなし、ツール無し再試行の対象にする。401/403/404/429等は
+    # 認証やレート制限など別の問題である可能性が高く、ツールを外しても
+    # 解決しないため対象に含めない。
+    TOOLS_UNSUPPORTED_STATUS_CODES = (400, 422)
 
     for round_num in range(MAX_TOOL_CALL_ROUNDS + 1):
         if model in get_ollama_loaded_models():
@@ -705,8 +742,19 @@ def stream_chat_completion(model: str, messages: list):
 
         tool_calls = []
         leaked = False
+        tools_rejected = False
         for event in _run_turn_with_leak_detection(turn, tools):
             if "error" in event:
+                if tools and event.get("status_code") in TOOLS_UNSUPPORTED_STATUS_CODES:
+                    logger.warning(
+                        "%s がツール付きリクエストを%sで拒否しました"
+                        "(モデルがツール呼び出しに対応していない可能性があります)。"
+                        "ツールなしで再試行します。",
+                        model, event.get("status_code"),
+                    )
+                    tools_rejected = True
+                    yield {"tool_call_failed": True}
+                    break
                 yield event
                 return
             if event.get("tool_call_failed"):
@@ -718,7 +766,7 @@ def stream_chat_completion(model: str, messages: list):
             elif "tool_calls" in event:
                 tool_calls = event["tool_calls"]
 
-        if leaked and tools:
+        if (leaked or tools_rejected) and tools:
             tools = None  # このモデルにはツールを二度とオファーせず、素の会話として再試行する
             continue
 
