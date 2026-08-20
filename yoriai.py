@@ -1408,6 +1408,98 @@ def _ask_organization(port: int, org_fingerprint: str, messages: list) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 複数メンバーへの並列質問(フェーズ6・項目2、"//multi"コマンド)
+# ---------------------------------------------------------------------------
+
+MULTI_QUERY_COMMAND = "//multi"
+# 仮の判断: 依頼文の「空きリソース上位2〜3台」という表現の範囲内で、
+# 上限を3台に固定する(候補がそれより少ない場合は、いる分だけに送る)。
+MULTI_QUERY_TARGET_COUNT = 3
+
+
+def _collect_answer_from_candidate(candidate: dict, org_fingerprint: str, messages: list):
+    """1候補に問い合わせ、回答をすべて集めて文字列として返す
+    (content, error)のタプル。エラー時はcontentが空文字列になる。
+
+    仮の判断: //multi では複数候補への問い合わせを並列に行うため、通常モード
+    のように1文字ずつその場で画面に出す(ライブストリーミング)方式のままだと
+    複数候補の出力が入り交じって読めなくなってしまう。そのため、この関数は
+    ストリーミング自体はバックグラウンドで最後まで受信しきり、完成した
+    回答をまとめて呼び出し元に返す(表示は呼び出し元が候補ごとに区切って行う)。
+    """
+    answer_parts = []
+    error = None
+    for event in _stream_chat_from_candidate(candidate, org_fingerprint, messages):
+        if "error" in event:
+            error = event["error"]
+            break
+        content = event.get("content")
+        if content:
+            answer_parts.append(content)
+        if event.get("done"):
+            break
+    return "".join(answer_parts), error
+
+
+def _ask_organization_multi(port: int, org_fingerprint: str, messages: list) -> None:
+    """`//multi <質問>` 用: 組織内の空きリソース上位複数台(既定3台)に同時に
+    同じ質問を送り、それぞれの回答を完了した順に表示する。
+
+    仮の判断: 通常モードと同じ「タスクの性質に応じた優先順位」で候補を
+    並べたうえで、上位から複数台を選ぶ。会話履歴には、成功した候補のうち
+    優先順位が最も高いものの回答だけをassistantの発言として追記する
+    (全員分の回答を履歴に混ぜると、次の質問時に「会話の前提」が曖昧に
+    なってしまうため)。
+    """
+    data = _fetch_org_snapshot(port, org_fingerprint)
+    if data is None:
+        return
+
+    latest_question = messages[-1]["content"] if messages else ""
+    task_type = _classify_task(latest_question)
+    candidates = _select_chat_candidates(data.get("self", {}), data.get("peers", []), port, task_type)
+
+    if not candidates:
+        print("組織内にロード済みモデルを持つメンバーがいません。")
+        return
+
+    targets = candidates[:MULTI_QUERY_TARGET_COUNT]
+    target_labels = ", ".join(f"{c['label']}(モデル: {c['model']})" for c in targets)
+    print(f"[📡 {_selection_reason_label(task_type, targets[0])}: {len(targets)}台に同時問い合わせしています: {target_labels}]")
+
+    results = [None] * len(targets)
+    print_lock = threading.Lock()
+
+    def worker(index: int, candidate: dict) -> None:
+        # 仮の判断: 複数スレッドが同じmessagesを同時に読むこと自体は安全だが、
+        # 誤って書き換えてしまうバグを将来混入させないよう、念のため
+        # スレッドごとにコピーを渡す。
+        answer, error = _collect_answer_from_candidate(candidate, org_fingerprint, list(messages))
+        results[index] = (candidate, answer, error)
+        with print_lock:
+            print()
+            print(f"--- {candidate['label']} (モデル: {candidate['model']}) ---")
+            if error:
+                print(f"(問い合わせに失敗しました: {error})")
+            else:
+                print(answer if answer else "(応答がありませんでした)")
+
+    threads = [threading.Thread(target=worker, args=(i, c), daemon=True) for i, c in enumerate(targets)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    print()
+
+    # 優先順位が最も高い(targets先頭に近い)候補の中から、最初に成功したものの
+    # 回答だけを会話履歴に残す。
+    for candidate, answer, error in results:
+        if not error and answer:
+            messages.append({"role": "assistant", "content": answer})
+            break
+
+
+# ---------------------------------------------------------------------------
 # エントリーポイント
 # ---------------------------------------------------------------------------
 
@@ -1512,6 +1604,7 @@ def _run_repl_client(port: int, org_fingerprint: str) -> None:
     print()
     print("=== Yoriai 対話モード ===")
     print("組織のメンバーに質問できます。終了するには exit または quit と入力するか、Ctrl+Cを押してください。")
+    print(f"{MULTI_QUERY_COMMAND} <質問文> で、空きリソース上位{MULTI_QUERY_TARGET_COUNT}台に同時に質問できます。")
     print()
 
     # 仮の判断: 会話履歴(messages)はこのセッション内でのみ保持し、終了したら破棄する。
@@ -1538,6 +1631,18 @@ def _run_repl_client(port: int, org_fingerprint: str) -> None:
             continue
         if text.lower() in ("exit", "quit"):
             break
+
+        if text.startswith(MULTI_QUERY_COMMAND):
+            question = text[len(MULTI_QUERY_COMMAND):].strip()
+            if not question:
+                print(f"使い方: {MULTI_QUERY_COMMAND} <質問文>  (例: {MULTI_QUERY_COMMAND} こんにちは)")
+                continue
+            messages.append({"role": "user", "content": question})
+            try:
+                _ask_organization_multi(port, org_fingerprint, messages)
+            except KeyboardInterrupt:
+                print()
+            continue
 
         messages.append({"role": "user", "content": text})
         try:
