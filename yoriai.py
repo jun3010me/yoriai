@@ -316,6 +316,23 @@ CHAT_TOOLS = [WEB_SEARCH_TOOL_SCHEMA]
 # 1つの質問あたりのツール呼び出しラウンド数に上限を設ける。
 MAX_TOOL_CALL_ROUNDS = 3
 
+# 仮の判断: 4xxのうち400(Bad Request)/422(Unprocessable Entity)は
+# 「リクエストの中身が原因で拒否された」ことを示す代表的なクラスのエラーだが、
+# LM Studioなどのバックエンドは、tools付きリクエストが原因のエラー以外にも
+# (モデルのロード失敗・メモリ不足など、tools無し再試行では絶対に解決しない
+# 種類のエラーも含めて)同じ400を返してくることが実機の検証で分かった
+# (例: 「Model loading was stopped due to insufficient system resources」)。
+# ステータスコードだけでは判別できないため、エラーメッセージの本文に
+# ツール/Function Calling関連の語が含まれているかどうかも合わせて確認し、
+# 両方の条件を満たした場合のみ「ツールが原因で拒否された」とみなす。
+TOOLS_UNSUPPORTED_STATUS_CODES = (400, 422)
+_TOOLS_UNSUPPORTED_ERROR_KEYWORDS = ("tool", "function calling", "function_call")
+
+
+def _looks_like_tools_related_error(error_text: str) -> bool:
+    lowered = (error_text or "").lower()
+    return any(keyword in lowered for keyword in _TOOLS_UNSUPPORTED_ERROR_KEYWORDS)
+
 WEB_SEARCH_MAX_RESULTS = 5
 WEB_SEARCH_TIMEOUT_SEC = 10
 WEB_SEARCH_URL = "https://html.duckduckgo.com/html/"
@@ -721,16 +738,14 @@ def stream_chat_completion(model: str, messages: list):
     組み合わせによっては`tools`パラメータを含めたリクエスト自体をその場で
     (何も生成せずに)400/422で拒否してくることが実機の報告で見つかった
     (例: LM Studio上のqwen3-coder-30b)。これも「ツール呼び出しに対応して
-    いない」の一種とみなし、同じくツール無しで自動的に再試行する。
+    いない」の一種とみなし、同じくツール無しで自動的に再試行する。ただし
+    400/422はモデルのロード失敗(メモリ不足など、tools無し再試行では
+    絶対に解決しない別種の原因)でも返ってくることが実機で分かったため、
+    ステータスコードに加えてエラー文にツール関連の語(_looks_like_tools_related_error)
+    が含まれるかどうかも確認したうえで再試行の要否を判断する。
     """
     messages = list(messages)  # 呼び出し元のリストをツール実行の追記で汚さない
     tools = CHAT_TOOLS
-    # 仮の判断: 4xxのうち400(Bad Request)/422(Unprocessable Entity)は
-    # 「リクエストの中身(=toolsパラメータ)が原因で拒否された」可能性が高い
-    # クラスのエラーとみなし、ツール無し再試行の対象にする。401/403/404/429等は
-    # 認証やレート制限など別の問題である可能性が高く、ツールを外しても
-    # 解決しないため対象に含めない。
-    TOOLS_UNSUPPORTED_STATUS_CODES = (400, 422)
 
     for round_num in range(MAX_TOOL_CALL_ROUNDS + 1):
         if model in get_ollama_loaded_models():
@@ -745,16 +760,46 @@ def stream_chat_completion(model: str, messages: list):
         tools_rejected = False
         for event in _run_turn_with_leak_detection(turn, tools):
             if "error" in event:
-                if tools and event.get("status_code") in TOOLS_UNSUPPORTED_STATUS_CODES:
+                status_code = event.get("status_code")
+                # 仮の判断: 「tools無し再試行が発動したかどうか」がログから一目で
+                # 分かるよう、発動する場合・しない場合の両方で明示的にログを出す
+                # (「ロジックが呼ばれたのか、そもそも古いコードのままなのか」の
+                # 切り分けに使えるようにするため)。
+                status_code_matches = status_code in TOOLS_UNSUPPORTED_STATUS_CODES
+                text_looks_tools_related = _looks_like_tools_related_error(event.get("error", ""))
+                if tools and status_code_matches and text_looks_tools_related:
                     logger.warning(
-                        "%s がツール付きリクエストを%sで拒否しました"
-                        "(モデルがツール呼び出しに対応していない可能性があります)。"
-                        "ツールなしで再試行します。",
-                        model, event.get("status_code"),
+                        "[tools無し再試行] %s がツール付きリクエストをステータス%sで"
+                        "拒否しました(エラー文にツール関連の記述が含まれるため、"
+                        "モデルがツール呼び出しに対応していない可能性があります)。"
+                        "同一モデル(%s)へツールなしで再試行します。",
+                        model, status_code, model,
                     )
                     tools_rejected = True
                     yield {"tool_call_failed": True}
                     break
+                if tools and status_code_matches and not text_looks_tools_related:
+                    # 仮の判断: ステータスコードだけを見て機械的にツール無し再試行に
+                    # 突入すると、モデルのロード失敗(メモリ不足など、ツールとは
+                    # 無関係な原因)でも同じ400/422を返すバックエンドがあり、無駄な
+                    # 再試行(=同じ理由でまた失敗するだけの試行)をしてしまうことが
+                    # 実機で見つかった。エラー文にツール/Function Calling関連の
+                    # 語が含まれない場合は「ツールが原因ではない」とみなし、
+                    # 再試行せずそのままエラーとして扱う。
+                    logger.warning(
+                        "[tools無し再試行なし] %s への問い合わせがステータス%sで失敗しましたが、"
+                        "エラー文にツール関連の記述が見つからなかったため、ツールが原因の"
+                        "拒否ではないと判断しました。ツールなし再試行は行わず、"
+                        "このままエラーとして扱います。詳細: %s",
+                        model, status_code, event.get("error"),
+                    )
+                elif tools:
+                    logger.warning(
+                        "[tools無し再試行なし] %s への問い合わせでエラーが発生しましたが、"
+                        "ツールなし再試行の対象(ステータス%s)ではないと判断しました"
+                        "(status_code=%s)。このままエラーとして扱います。",
+                        model, TOOLS_UNSUPPORTED_STATUS_CODES, status_code,
+                    )
                 yield event
                 return
             if event.get("tool_call_failed"):
