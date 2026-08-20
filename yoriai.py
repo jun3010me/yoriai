@@ -1846,10 +1846,12 @@ _MODULE_BREAKDOWN_PROMPT_TEMPLATE = """あなたはソフトウェア設計を�
 
 各ファイルが実装すべき内容には、他のファイルから呼び出される関数のシグネチャ(関数名・引数名・型・戻り値の型)や、やり取りするデータの形式(辞書のキー名など)を具体的に明記してください。担当が異なるファイル同士が正しく連携できるよう、インターフェースの記述は曖昧にせず、できるだけ厳密に書いてください。
 
+重要: 複数のファイルの説明に同じ関数(例: あるファイルが呼び出す、別のファイルが定義する関数)が登場する場合、その関数名・引数名・戻り値の型は、すべてのファイルの説明文で一字一句まったく同じ表記に揃えてください。あるファイルの説明では`add_todo`、別のファイルの説明では`add_task`のように、同じ役割の関数に別々の名前を使うことは厳禁です。
+
 出力は次の形式のみとし、他の説明文や前置き・後書きは一切含めないでください。ファイルごとに1行、「ファイル名: 実装すべき内容(インターフェースの詳細を含む)」という形式で出力してください(2〜4ファイル程度を想定します):
 
 storage.py: <実装すべき内容をここに>
-cli.py: <実装すべき内容をここに>
+cli.py: <実装すべき内容をここに(storage.pyの行と完全に同じ関数名を使うこと)>
 
 依頼内容: {request}
 """
@@ -1857,6 +1859,30 @@ cli.py: <実装すべき内容をここに>
 
 def _build_module_breakdown_prompt(request: str) -> str:
     return _MODULE_BREAKDOWN_PROMPT_TEMPLATE.format(request=request)
+
+
+# 仮の判断: 各ファイルの実装担当には、そのファイル自身の説明行だけでなく、
+# 設計担当が決めた「実装計画全体」もそのまま埋め込んで渡す。担当ファイルの
+# 説明行だけを渡す実装だと、たとえ設計担当の回答内で関数名が一致していても、
+# 実装担当のモデル自身が独自の名前で書き始めてしまうケースを防げない
+# (実機で、storage.py担当とcli.py担当が異なる関数名を使ってしまう不具合が
+# 実際に発生した)。全ファイルの説明を毎回見せることで、担当外のファイルが
+# 期待する関数名にも実装時点で気づける可能性を高める。
+_COLLABORATIVE_IMPLEMENTATION_REQUEST_TEMPLATE = """以下は、組織内の設計担当が決めた複数ファイルの実装計画全体です。ファイル間でインターフェース(関数名・引数・戻り値の型・データ構造)が一致するよう、この計画に記載された関数名やデータ形式を一字一句変えずにそのまま使って実装してください。
+
+【実装計画全体】
+{full_plan}
+
+【あなたが実装を担当するファイル】
+{filename}: {own_content}
+"""
+
+
+def _build_collaborative_implementation_request(filename: str, own_content: str, full_breakdown: list) -> str:
+    full_plan = "\n".join(f"{fn}: {content}" for fn, content in full_breakdown)
+    return _COLLABORATIVE_IMPLEMENTATION_REQUEST_TEMPLATE.format(
+        full_plan=full_plan, filename=filename, own_content=own_content,
+    )
 
 
 def _parse_module_breakdown(text: str) -> list:
@@ -1906,7 +1932,7 @@ def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str,
 
     architect = candidates[0]
     print(
-        f"[🧭 まず {architect['label']} (モデル: {architect['model']}) に"
+        f"[🧭 合意フェーズ開始: まず {architect['label']} (モデル: {architect['model']}) に"
         f"モジュール分割案とインターフェース設計を相談しています...]"
     )
 
@@ -1921,17 +1947,31 @@ def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str,
         print("設計担当から応答が得られませんでした。")
         return
 
+    # 仮の判断: 解析後の内容だけでなく、設計担当の回答そのもの(生テキスト)も
+    # 表示する。パース処理(_parse_module_breakdown)の解釈が意図と異なって
+    # いないか、実機での動作確認時に見比べられるようにするため。
+    print(f"[🧭 {architect['label']} の回答(合意フェーズの結果、そのまま表示)]")
+    print(answer)
+
     tasks = _parse_module_breakdown(answer)
     if not tasks:
-        print("設計担当の回答からファイル分割案を読み取れませんでした。応答内容は次の通りです:")
-        print(answer)
+        print("設計担当の回答からファイル分割案を読み取れませんでした。上記の回答内容を確認してください。")
         return
 
     print(f"[📐 モジュール分割案がまとまりました({len(tasks)}ファイル): {', '.join(f for f, _ in tasks)}]")
     for filename, content in tasks:
         print(f"  - {filename}: {content}")
 
-    _dispatch_and_save_parallel_tasks(tasks, candidates, org_fingerprint, out_dir)
+    # 仮の判断: 各担当への実装依頼には、自分のファイルの説明行だけでなく
+    # 合意フェーズで決まった実装計画全体を埋め込む(理由は
+    # _build_collaborative_implementation_request のコメントを参照)。
+    enriched_tasks = [
+        (filename, _build_collaborative_implementation_request(filename, content, tasks))
+        for filename, content in tasks
+    ]
+
+    print(f"[🔨 実装フェーズ開始: 合意した計画に基づき、{len(enriched_tasks)}件のファイルを異なるメンバーに並行実装させます]")
+    _dispatch_and_save_parallel_tasks(enriched_tasks, candidates, org_fingerprint, out_dir)
 
 
 # ---------------------------------------------------------------------------
