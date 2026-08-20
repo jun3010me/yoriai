@@ -464,6 +464,76 @@ def _stream_lmstudio_turn(model: str, messages: list, tools: list):
     yield {"tool_calls": tool_calls}
 
 
+# 仮の判断: 一部のモデル/バックエンドの組み合わせ(例: LM Studioで一部の
+# DeepSeek系モデルを動かした場合)では、ツール呼び出しが構造化された
+# tool_callsとして返らず、モデル自身の内部的なツール呼び出し記法
+# (DeepSeekのDSML記法 `<｜DSML｜tool_calls>`、Qwen/Hermes系の`<tool_call>`、
+# Mistralの`[TOOL_CALLS]`、Llamaの`<|python_tag|>`など)がそのまま回答本文
+# (content)として画面に漏れてしまうことが実機での報告により見つかった。
+# あらゆる記法を網羅することはできないが、既知の記法に共通する特徴的な
+# 先頭パターンをここで検出する。
+_LEAKED_TOOL_CALL_PATTERN = re.compile(
+    r"<｜|<tool_call>|\[TOOL_CALLS\]|<\|python_tag\|>|<function_call>",
+    re.IGNORECASE,
+)
+# 検出のためにcontentの先頭だけ少量バッファする文字数の上限
+# (既知の記法のうち最長の`<function_call>`(16文字)を確実に含む長さにしている)。
+# ここまで溜めても記法にマッチしなければ、通常のストリーミング応答とみなす。
+_LEAK_PEEK_CHARS = 20
+
+# 仮の判断: 既知の漏れ記法はすべて`<`か`[`で始まる。答えの書き出しの1文字目が
+# それ以外であれば、その時点で「漏れではない」と確定してよい。これにより、
+# 大半の通常の応答では待ち時間なしでストリーミング表示が始まる
+# (バッファはあくまで`<`/`[`から始まる場合の"念のための確認"用)。
+_LEAK_TRIGGER_CHARS = "<["
+
+
+def _run_turn_with_leak_detection(turn, tools: list):
+    """1ターン分の応答イベントを中継しつつ、ツール呼び出しをオファーした
+    ときだけ、先頭のcontentが漏れたツール呼び出し記法でないかを確認する。
+    漏れを検出した場合は、それ以降のcontentを画面に出さずに捨て、代わりに
+    {"tool_call_failed": True} を1回だけyieldする(content/tool_callsの
+    どちらも実質的には返さない)。
+
+    仮の判断: 判定のためにcontentの先頭を少量バッファする間も、元のチャンクの
+    区切り(トークン単位)は保ったままリプレイする。1つの大きな塊に結合して
+    出すと、バッファ分だけ「一括表示」に戻ってしまい、ストリーミング表示という
+    フェーズ5の目的が損なわれるため。
+    """
+    state = "peeking" if tools else "streaming"
+    buffered_chunks = []
+    buffered_text = ""
+    for event in turn:
+        if "content" not in event:
+            yield event
+            continue
+        if state == "streaming":
+            yield event
+            continue
+        if state == "leaked":
+            continue  # 漏れ検出後のcontentは画面に出さず捨てる
+
+        chunk = event["content"]
+        buffered_chunks.append(chunk)
+        buffered_text += chunk
+        if _LEAKED_TOOL_CALL_PATTERN.search(buffered_text):
+            state = "leaked"
+            yield {"tool_call_failed": True}
+            buffered_chunks = []
+            continue
+
+        starts_safely = buffered_text[0] not in _LEAK_TRIGGER_CHARS
+        if starts_safely or len(buffered_text) >= _LEAK_PEEK_CHARS:
+            state = "streaming"
+            for buffered_chunk in buffered_chunks:
+                yield {"content": buffered_chunk}
+            buffered_chunks = []
+
+    if state == "peeking":
+        for buffered_chunk in buffered_chunks:
+            yield {"content": buffered_chunk}
+
+
 def stream_chat_completion(model: str, messages: list):
     """モデル名からOllama/LM Studioどちらにチャットを振るかを決め、正規化された
     ストリーミングイベント({"content": ...} / {"tool_call": <ツール名>} /
@@ -478,24 +548,40 @@ def stream_chat_completion(model: str, messages: list):
     ため、モデルの選定自体は呼び出し元(候補選定ロジック)に任せ、ここでは
     単純に「Ollamaのロード済みモデル一覧に名前があればOllama、なければ
     LM Studio」というバックエンドの振り分けだけを行う。
+
+    仮の判断: バックエンド/モデルの組み合わせによっては、ツール呼び出しの
+    構造化出力に対応しておらず、モデル自身の内部記法がそのまま回答本文に
+    漏れてしまうことがある(_run_turn_with_leak_detectionで検出)。検出した
+    場合は{"tool_call_failed": True}を1回だけyieldしたうえで、ツール無しで
+    同じ質問を自動的に再試行する(以降のラウンドもツールは使わない)。
     """
     messages = list(messages)  # 呼び出し元のリストをツール実行の追記で汚さない
+    tools = CHAT_TOOLS
 
     for round_num in range(MAX_TOOL_CALL_ROUNDS + 1):
         if model in get_ollama_loaded_models():
-            turn = _stream_ollama_turn(model, messages, CHAT_TOOLS)
+            turn = _stream_ollama_turn(model, messages, tools)
         else:
-            turn = _stream_lmstudio_turn(model, messages, CHAT_TOOLS)
+            turn = _stream_lmstudio_turn(model, messages, tools)
 
         tool_calls = []
-        for event in turn:
+        leaked = False
+        for event in _run_turn_with_leak_detection(turn, tools):
             if "error" in event:
                 yield event
                 return
+            if event.get("tool_call_failed"):
+                leaked = True
+                yield event
+                continue
             if "content" in event:
                 yield event
             elif "tool_calls" in event:
                 tool_calls = event["tool_calls"]
+
+        if leaked and tools:
+            tools = None  # このモデルにはツールを二度とオファーせず、素の会話として再試行する
+            continue
 
         if not tool_calls or round_num == MAX_TOOL_CALL_ROUNDS:
             break
@@ -1109,6 +1195,9 @@ def _ask_organization(port: int, org_fingerprint: str, messages: list) -> None:
                 logger.warning("%s への問い合わせに失敗しました: %s", candidate["label"], event["error"])
                 failed = True
                 break
+            if event.get("tool_call_failed"):
+                print("\n[⚠️ このモデルはツール呼び出しの構造化出力に対応していないようです。ツールなしで再試行しています...]")
+                continue
             tool_call_name = event.get("tool_call")
             if tool_call_name == WEB_SEARCH_TOOL_NAME:
                 print("\n[🔍 ウェブ検索しています...]")
