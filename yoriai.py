@@ -805,6 +805,131 @@ def discover_via_tailscale(agent_id: str, org_fingerprint: str, port: int, regis
 
 
 # ---------------------------------------------------------------------------
+# 対話モード(REPL): 組織内メンバーへの問い合わせ
+# ---------------------------------------------------------------------------
+
+def _build_chat_candidate(card: dict, is_self: bool, address: str = None, port: int = None):
+    """自己紹介カードから、チャットの問い合わせ先候補(ロード済みモデルを
+    持つメンバー)を作る。ロード済みモデルが無いメンバーはNoneを返す。
+    """
+    loaded = card.get("models", {}).get("loaded", [])
+    if not loaded:
+        return None
+    label = card.get("device_name", "unknown")
+    if is_self:
+        label += "(自分)"
+    return {
+        "label": label,
+        # 仮の判断: ロード済みモデルが複数ある場合はどれを使うべきかの判断基準が
+        # まだ無いため、単純に先頭のものを使う。
+        "model": loaded[0],
+        "free_gb": card.get("memory", {}).get("free_gb"),
+        "is_self": is_self,
+        "address": address,
+        "port": port,
+    }
+
+
+def _select_chat_candidates(self_card: dict, peers: list) -> list:
+    """組織内から問い合わせ候補を集め、空きメモリの多い順に並べて返す。
+
+    仮の判断: フェーズ5では「タスクの難易度に応じた賢い振り分け」はスコープ外
+    のため、単純に「ロード済みモデルがあり、空きメモリが最も多いメンバー」を
+    選ぶだけにする。空きメモリが不明なメンバーは最下位として扱う。
+    """
+    candidates = []
+    self_candidate = _build_chat_candidate(self_card, is_self=True)
+    if self_candidate:
+        candidates.append(self_candidate)
+    for peer in peers:
+        candidate = _build_chat_candidate(
+            peer.get("card", {}), is_self=False, address=peer.get("address"), port=peer.get("port"),
+        )
+        if candidate:
+            candidates.append(candidate)
+
+    candidates.sort(key=lambda c: c["free_gb"] if c["free_gb"] is not None else -1, reverse=True)
+    return candidates
+
+
+def _stream_chat_from_candidate(candidate: dict, org_fingerprint: str, messages: list):
+    """候補が自分自身ならプロセス内で直接、他のメンバーならHTTP経由(/chat)で
+    問い合わせ、正規化されたストリーミングイベントを順にyieldする。
+    """
+    if candidate["is_self"]:
+        yield from stream_chat_completion(candidate["model"], messages)
+        return
+
+    try:
+        resp = requests.post(
+            f"http://{candidate['address']}:{candidate['port']}/chat",
+            json={"model": candidate["model"], "messages": messages},
+            headers={ORG_FINGERPRINT_HEADER: org_fingerprint},
+            stream=True,
+            timeout=(CHAT_CONNECT_TIMEOUT_SEC, CHAT_READ_TIMEOUT_SEC),
+        )
+        resp.raise_for_status()
+    except Exception as exc:
+        yield {"error": str(exc)}
+        return
+
+    try:
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    except Exception as exc:
+        yield {"error": str(exc)}
+
+
+def _ask_organization(ctx: dict, messages: list) -> None:
+    """組織内のメンバーに順番に問い合わせ、失敗したら次に空きメモリが多い
+    候補へ自動でフォールバックしながら回答をストリーミング表示する。
+
+    成功した場合はassistantの回答を`messages`に追記する(会話履歴の継続)。
+    """
+    self_card = build_profile_card(ctx["agent_id"])
+    peers = ctx["registry"].snapshot()
+    candidates = _select_chat_candidates(self_card, peers)
+
+    if not candidates:
+        print("組織内にロード済みモデルを持つメンバーがいません。")
+        return
+
+    for i, candidate in enumerate(candidates):
+        if i == 0:
+            print(f"[{candidate['label']} に問い合わせています... (モデル: {candidate['model']})]")
+        else:
+            print(f"[フォールバック: {candidate['label']} に問い合わせています... (モデル: {candidate['model']})]")
+
+        answer_parts = []
+        failed = False
+        for event in _stream_chat_from_candidate(candidate, ctx["org_fingerprint"], messages):
+            if "error" in event:
+                logger.warning("%s への問い合わせに失敗しました: %s", candidate["label"], event["error"])
+                failed = True
+                break
+            content = event.get("content")
+            if content:
+                print(content, end="", flush=True)
+                answer_parts.append(content)
+            if event.get("done"):
+                break
+
+        if answer_parts:
+            print()
+            messages.append({"role": "assistant", "content": "".join(answer_parts)})
+            return
+        if not failed:
+            logger.warning("%s から有効な応答が得られませんでした。", candidate["label"])
+
+    print("すべての候補への問い合わせに失敗しました。しばらくしてから再度お試しください。")
+
+
+# ---------------------------------------------------------------------------
 # エントリーポイント
 # ---------------------------------------------------------------------------
 
