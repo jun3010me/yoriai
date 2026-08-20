@@ -8,6 +8,11 @@
 起きた際、ログの文言だけで「ロジックが動いたかどうか」を切り分けられる
 ようにするために追加した。
 
+さらに、ステータスコードだけで再試行の要否を判断すると、モデルのロード
+失敗(メモリ不足)のようなツールと無関係な400/422まで再試行対象に
+含めてしまう不具合が実機で見つかったため、エラー文にツール関連の記述が
+含まれるかどうかも合わせて確認するようにした変更もここで検証している。
+
 使い方: python3 tests/test_tools_fallback_logging.py
 """
 import logging
@@ -41,12 +46,20 @@ def _run_with_capture(fn):
 
 
 def test_tools_rejected_triggers_retry_and_logs_it():
-    """tools付きリクエストが400/422で拒否されたら、同一モデルへツールなしで
-    自動的に再試行し、そのことを示す[tools無し再試行]ログが出ることを確認する。
+    """tools付きリクエストが400/422で拒否され、かつエラー文にツール関連の記述が
+    含まれる場合、同一モデルへツールなしで自動的に再試行し、そのことを示す
+    [tools無し再試行]ログが出ることを確認する。エラー文は実機で実際に報告された
+    ものを使う: 「This model does not support tools/function calling with the
+    current context settings.」
     """
     def fake_turn(base_url, model, messages, tools):
         if tools:
-            yield {"error": "400: some detail", "status_code": 400}
+            yield {
+                "error": "400: Trying to keep the first 32768 tokens when the context the model "
+                          "can handle is only 4096 tokens. This model does not support "
+                          "tools/function calling with the current context settings.",
+                "status_code": 400,
+            }
         else:
             yield {"content": "OK without tools"}
             yield {"tool_calls": []}
@@ -65,6 +78,42 @@ def test_tools_rejected_triggers_retry_and_logs_it():
     )
     assert any(e.get("content") == "OK without tools" for e in events), (
         f"tools無し再試行後の成功応答が得られていません: {events}"
+    )
+
+
+def test_resource_error_does_not_trigger_retry_despite_matching_status_code():
+    """モデルのロード失敗(メモリ不足)のような、ツールとは無関係な原因でも
+    LM Studioは同じ400を返してくることが実機で見つかった。ステータスコードが
+    400であっても、エラー文にツール関連の記述が無ければツールなし再試行を
+    行わず、元のエラーをそのまま伝播することを確認する。エラー文は実機で
+    実際に報告されたものを使う: 「Model loading was stopped due to
+    insufficient system resources.」
+    """
+    def fake_turn(base_url, model, messages, tools):
+        yield {
+            "error": '400: Failed to load model "qwen/qwen3-coder-30b". Error: Model loading was '
+                      "stopped due to insufficient system resources. Continuing to load the model "
+                      "would likely overload your system and cause it to freeze.",
+            "status_code": 400,
+        }
+
+    original = yoriai._stream_openai_compatible_turn
+    yoriai._stream_openai_compatible_turn = fake_turn
+    try:
+        events, logs = _run_with_capture(
+            lambda: list(yoriai.stream_chat_completion("qwen/qwen3-coder-30b", [{"role": "user", "content": "fix bug"}]))
+        )
+    finally:
+        yoriai._stream_openai_compatible_turn = original
+
+    assert not any("[tools無し再試行]" in line for line in logs), (
+        f"ツールと無関係なエラーなのに再試行が発動しています: {logs}"
+    )
+    assert any("[tools無し再試行なし]" in line and "insufficient system resources" in line for line in logs), (
+        f"非発動ログ([tools無し再試行なし])に元のエラー詳細が含まれていません: {logs}"
+    )
+    assert len(events) == 1 and "error" in events[0] and "insufficient system resources" in events[0]["error"], (
+        f"リソース不足エラーがそのまま1件だけ伝播するはずです: {events}"
     )
 
 
@@ -124,6 +173,7 @@ def test_http_error_response_body_is_logged():
 def main():
     tests = [
         test_tools_rejected_triggers_retry_and_logs_it,
+        test_resource_error_does_not_trigger_retry_despite_matching_status_code,
         test_non_tools_status_code_does_not_trigger_retry_and_logs_it,
         test_http_error_response_body_is_logged,
     ]
