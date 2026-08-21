@@ -18,6 +18,7 @@ read_file`)を流用したファイル一覧・内容確認、(3)対象ファイ
 """
 import contextlib
 import io
+import json
 import os
 import shutil
 import sys
@@ -133,16 +134,247 @@ def test_list_project_files_excludes_progress_md():
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
-def test_parse_fix_response_extracts_filename_and_code():
-    answer = "FILE: utils.py\n```python\ndef generate_id():\n    return 1\n```"
-    filename, code = yoriai._parse_fix_response(answer)
-    assert filename == "utils.py"
-    assert code == "def generate_id():\n    return 1\n"
+# ---------------------------------------------------------------------------
+# プロジェクトファイル操作ツール(_resolve_safe_project_path等)
+# ---------------------------------------------------------------------------
+
+def test_resolve_safe_project_path_accepts_flat_filename():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        path, error = yoriai._resolve_safe_project_path(out_dir, "utils.py")
+        assert error is None, error
+        assert path == os.path.join(out_dir, "utils.py")
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
 
 
-def test_parse_fix_response_returns_none_filename_when_missing():
-    filename, code = yoriai._parse_fix_response("```python\npass\n```")
-    assert filename is None
+def test_resolve_safe_project_path_rejects_path_traversal():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        path, error = yoriai._resolve_safe_project_path(out_dir, "../../etc/passwd")
+        assert path is None
+        assert error is not None
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_resolve_safe_project_path_rejects_absolute_path_to_yoriai_itself():
+    """依頼の項目5(最優先の安全要件): Yoriai本体のファイルには絶対に
+    アクセスできないことを確認する。
+    """
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        yoriai_py_path = os.path.abspath(yoriai.__file__)
+        path, error = yoriai._resolve_safe_project_path(out_dir, yoriai_py_path)
+        assert path is None
+        assert error is not None
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_resolve_safe_project_path_rejects_progress_md():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        path, error = yoriai._resolve_safe_project_path(out_dir, yoriai.PROGRESS_FILENAME)
+        assert path is None
+        assert error is not None
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_write_project_file_creates_file_and_reports_syntax_ok():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        result = json.loads(yoriai._write_project_file(out_dir, "utils.py", "def f():\n    return 1\n"))
+        assert result["ok"] is True, result
+        assert result["syntax_ok"] is True, result
+        with open(os.path.join(out_dir, "utils.py"), encoding="utf-8") as f:
+            assert f.read() == "def f():\n    return 1\n"
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_write_project_file_reports_syntax_error_but_still_writes():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        result = json.loads(yoriai._write_project_file(out_dir, "utils.py", "def f(:\n    pass\n"))
+        assert result["ok"] is True, result
+        assert result["syntax_ok"] is False, result
+        assert "syntax_error" in result, result
+        assert os.path.isfile(os.path.join(out_dir, "utils.py"))
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_write_project_file_rejects_path_traversal_and_writes_nothing():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        result = json.loads(yoriai._write_project_file(out_dir, "../outside.py", "malicious = True\n"))
+        assert result["ok"] is False, result
+        assert not os.path.exists(os.path.join(os.path.dirname(out_dir), "outside.py"))
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_move_project_file_renames_within_project_dir():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        with open(os.path.join(out_dir, "utils.py"), "w", encoding="utf-8") as f:
+            f.write("def f():\n    pass\n")
+        result = json.loads(yoriai._move_project_file(out_dir, "utils.py", "helpers.py"))
+        assert result["ok"] is True, result
+        assert not os.path.exists(os.path.join(out_dir, "utils.py"))
+        assert os.path.isfile(os.path.join(out_dir, "helpers.py"))
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_move_project_file_rejects_traversal_in_either_name():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        with open(os.path.join(out_dir, "utils.py"), "w", encoding="utf-8") as f:
+            f.write("def f():\n    pass\n")
+        result = json.loads(yoriai._move_project_file(out_dir, "utils.py", "../../outside.py"))
+        assert result["ok"] is False, result
+        assert os.path.isfile(os.path.join(out_dir, "utils.py")), "拒否された場合、元のファイルはそのまま残るはずです"
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_delete_project_file_logs_to_progress_md_before_deleting():
+    """依頼の項目4: 削除は実行前にPROGRESS.mdへ記録される(=削除後の
+    PROGRESS.mdには必ず記録が残っている)ことを確認する。
+    """
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        tasks = [("utils.py", "説明")]
+        checklist = yoriai._build_task_checklist(tasks)
+        yoriai._write_progress_md(out_dir, "何か作って", tasks, checklist, {})
+        with open(os.path.join(out_dir, "utils.py"), "w", encoding="utf-8") as f:
+            f.write("def f():\n    pass\n")
+
+        result = json.loads(yoriai._delete_project_file(out_dir, "utils.py"))
+        assert result["ok"] is True, result
+        assert not os.path.exists(os.path.join(out_dir, "utils.py"))
+
+        parsed = yoriai._parse_progress_markdown(os.path.join(out_dir, yoriai.PROGRESS_FILENAME))
+        assert len(parsed["changelog"]) == 1, parsed["changelog"]
+        assert "utils.py" in parsed["changelog"][0] and "削除" in parsed["changelog"][0]
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_delete_project_file_rejects_progress_md_itself():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        tasks = [("a.py", "説明")]
+        checklist = yoriai._build_task_checklist(tasks)
+        yoriai._write_progress_md(out_dir, "何か作って", tasks, checklist, {})
+        result = json.loads(yoriai._delete_project_file(out_dir, yoriai.PROGRESS_FILENAME))
+        assert result["ok"] is False, result
+        assert os.path.isfile(os.path.join(out_dir, yoriai.PROGRESS_FILENAME))
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_make_project_directory_creates_subdirectory():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        result = json.loads(yoriai._make_project_directory(out_dir, "sub"))
+        assert result["ok"] is True, result
+        assert os.path.isdir(os.path.join(out_dir, "sub"))
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_list_project_directory_excludes_progress_md():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        for name in ("a.py", "b.py", yoriai.PROGRESS_FILENAME):
+            with open(os.path.join(out_dir, name), "w", encoding="utf-8") as f:
+                f.write("x")
+        result = json.loads(yoriai._list_project_directory(out_dir))
+        assert result["files"] == ["a.py", "b.py"], result
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_parse_run_test_command_allows_only_whitelisted_forms():
+    assert yoriai._parse_run_test_command("python3 test_utils.py") == (["python3", "test_utils.py"], None)
+    assert yoriai._parse_run_test_command("pytest") == (["pytest"], None)
+    assert yoriai._parse_run_test_command("pytest test_utils.py") == (["pytest", "test_utils.py"], None)
+
+    argv, error = yoriai._parse_run_test_command("rm -rf /")
+    assert argv is None
+    assert error is not None
+
+    argv, error = yoriai._parse_run_test_command("python3 a.py; rm -rf /")
+    assert argv is None, "セミコロンを含む文字列はホワイトリストの2トークン形式に一致しないため拒否されるはずです"
+
+
+def test_run_project_test_command_executes_passing_test():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        with open(os.path.join(out_dir, "test_ok.py"), "w", encoding="utf-8") as f:
+            f.write("assert 1 + 1 == 2\nprint('OK')\n")
+        result = json.loads(yoriai._run_project_test_command(out_dir, "python3 test_ok.py"))
+        assert result["ok"] is True, result
+        assert "OK" in result["output"], result
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_run_project_test_command_reports_failure_output():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        with open(os.path.join(out_dir, "test_fail.py"), "w", encoding="utf-8") as f:
+            f.write("assert 1 + 1 == 3, 'broken math'\n")
+        result = json.loads(yoriai._run_project_test_command(out_dir, "python3 test_fail.py"))
+        assert result["ok"] is False, result
+        assert "broken math" in result["output"], result
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_run_project_test_command_rejects_disallowed_command_without_executing():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        marker = os.path.join(out_dir, "should_not_exist")
+        result = json.loads(yoriai._run_project_test_command(out_dir, f"touch {marker}"))
+        assert result["ok"] is False, result
+        assert not os.path.exists(marker), "ホワイトリスト外のコマンドは実行されないはずです"
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_syntax_check_all_python_files_reports_broken_files_only():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        with open(os.path.join(out_dir, "ok.py"), "w", encoding="utf-8") as f:
+            f.write("def f():\n    return 1\n")
+        with open(os.path.join(out_dir, "broken.py"), "w", encoding="utf-8") as f:
+            f.write("def f(:\n    pass\n")
+        with open(os.path.join(out_dir, "notes.txt"), "w", encoding="utf-8") as f:
+            f.write("this is not python (:\n")
+        broken = yoriai._syntax_check_all_python_files(out_dir)
+        assert broken == ["broken.py"], broken
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_execute_project_tool_call_dispatches_to_write_file():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        tool_call = {
+            "id": "call_1", "type": "function",
+            "function": {"name": "write_file", "arguments": {"filename": "a.py", "content": "x = 1\n"}},
+        }
+        result = json.loads(yoriai._execute_project_tool_call(out_dir, tool_call))
+        assert result["ok"] is True, result
+        with open(os.path.join(out_dir, "a.py"), encoding="utf-8") as f:
+            assert f.read() == "x = 1\n"
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -283,69 +515,117 @@ def test_classify_execution_mode_does_not_return_fix_project_without_any_complet
 # _ask_organization_fix_project(統合テスト)
 # ---------------------------------------------------------------------------
 
-def _fake_stream_fix_then_review_ok(candidate, org_fingerprint, messages, offer_read_file_tool=False, **_kwargs):
-    first_content = messages[0]["content"]
-    tool_messages = [m for m in messages if m.get("role") == "tool"]
-    if "改修担当です" in first_content:
-        if len(tool_messages) == 0:
-            yield {"pending_tool_calls": [
-                {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": {"filename": "utils.py"}}},
-            ]}
-            return
-        yield {"content": "FILE: utils.py\n```python\ndef generate_id():\n    return 'fixed-id'\n```"}
-        yield {"done": True}
+def _tool_round(messages):
+    """会話履歴中のtoolメッセージ数(=これまでに完了したツール呼び出し
+    ラウンド数)を返す。フェイクの/chat応答が「次に何をするか」を、
+    単純な会話の長さの数え上げで判断するために使う。
+    """
+    return len([m for m in messages if m.get("role") == "tool"])
+
+
+def _fake_stream_fix_with_tools(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
+    """依頼の動作確認のシナリオ(リネーム→import修正→テスト実行)を
+    模したフェイクの/chat応答。read_file→move_file→write_file→
+    run_test→最終報告、の順にツール呼び出しラウンドを進める。
+    """
+    n = _tool_round(messages)
+    if n == 0:
+        yield {"pending_tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": {"filename": "cli.py"}}},
+        ]}
         return
-    if "レビュー対象" in first_content:
-        yield {"content": "問題なし"}
-        yield {"done": True}
+    if n == 1:
+        yield {"pending_tool_calls": [
+            {"id": "call_2", "type": "function", "function": {
+                "name": "move_file", "arguments": {"old_filename": "utils.py", "new_filename": "helpers.py"},
+            }},
+        ]}
         return
-    yield {"content": "```python\npass\n```"}
+    if n == 2:
+        yield {"pending_tool_calls": [
+            {"id": "call_3", "type": "function", "function": {
+                "name": "write_file",
+                "arguments": {
+                    "filename": "cli.py",
+                    "content": "from helpers import generate_id\n\ndef main():\n    return generate_id()\n",
+                },
+            }},
+        ]}
+        return
+    if n == 3:
+        yield {"pending_tool_calls": [
+            {"id": "call_4", "type": "function", "function": {"name": "run_test", "arguments": {"command": "pytest"}}},
+        ]}
+        return
+    yield {"content": "utils.pyをhelpers.pyにリネームし、cli.pyのimportを修正してテストを実行しました。"}
     yield {"done": True}
 
 
-def test_fix_project_end_to_end_success_updates_file_and_changelog():
-    """依頼の動作確認: 完成済みプロジェクトに修正依頼を送ると、正しい
-    プロジェクトが特定され、対象ファイルだけが修正され、他のファイルには
-    影響が出ないことを確認する。
+def _fake_stream_fix_simple_write(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
+    if _tool_round(messages) == 0:
+        yield {"pending_tool_calls": [
+            {"id": "call_1", "type": "function", "function": {
+                "name": "write_file",
+                "arguments": {"filename": "utils.py", "content": "def generate_id():\n    return 'fixed-id'\n"},
+            }},
+        ]}
+        return
+    yield {"content": "utils.pyのID生成ロジックを修正しました。"}
+    yield {"done": True}
+
+
+def test_fix_project_end_to_end_uses_tools_to_rename_edit_and_test():
+    """依頼の動作確認: 完成済みプロジェクトに「ファイル名をutils.pyから
+    helpers.pyに変更して、それに合わせてimportも直して、テストがあれば
+    実行して確認して」のような依頼を送ると、正しいプロジェクトが特定され、
+    複数のツール(read_file・move_file・write_file・run_test)を使って
+    修正が行われ、無関係なファイルには影響が出ないことを確認する。
     """
     original_snapshot = yoriai._fetch_org_snapshot
     original_stream = yoriai._stream_chat_from_candidate
     yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False: _two_member_snapshot()
-    yoriai._stream_chat_from_candidate = _fake_stream_fix_then_review_ok
+    yoriai._stream_chat_from_candidate = _fake_stream_fix_with_tools
 
     out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
     try:
         projects_root = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME)
         project_dir = _write_completed_project(
             projects_root, "todo-cli-storage-py-2",
-            [("storage.py", "永続化を担当"), ("utils.py", "共通処理を担当。IDの生成関数generate_idを実装する。")],
-            files={"storage.py": "def load():\n    pass\n", "utils.py": "def generate_id():\n    return 1\n"},
+            [("storage.py", "永続化を担当"), ("utils.py", "IDの生成を担当"), ("cli.py", "コマンドライン操作を担当")],
+            files={
+                "storage.py": "def load():\n    pass\n",
+                "utils.py": "def generate_id():\n    return 1\n",
+                "cli.py": "from utils import generate_id\n\ndef main():\n    return generate_id()\n",
+            },
         )
 
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             yoriai._ask_organization_fix_project(
-                47120, "fingerprint", "ID生成のロジックにバグがあるので直して", out_dir,
+                47120, "fingerprint",
+                "ファイル名をutils.pyからhelpers.pyに変更して、それに合わせてimportも直して、テストがあれば実行して確認して",
+                out_dir,
             )
         output = buf.getvalue()
 
         assert project_dir in output, output
-        assert "[✅ utils.py の修正が完了しました" in output, output
+        assert "[✅ 修正が完了しました" in output, output
 
-        with open(os.path.join(project_dir, "utils.py"), encoding="utf-8") as f:
-            utils_content = f.read()
-        assert "fixed-id" in utils_content, utils_content
+        assert not os.path.exists(os.path.join(project_dir, "utils.py")), "リネーム元は残らないはずです"
+        assert os.path.isfile(os.path.join(project_dir, "helpers.py"))
+        with open(os.path.join(project_dir, "cli.py"), encoding="utf-8") as f:
+            cli_content = f.read()
+        assert "from helpers import generate_id" in cli_content, cli_content
 
         with open(os.path.join(project_dir, "storage.py"), encoding="utf-8") as f:
             storage_content = f.read()
         assert storage_content == "def load():\n    pass\n", (
-            f"他のファイル(storage.py)には影響が出ないはずです: {storage_content!r}"
+            f"無関係なファイル(storage.py)には影響が出ないはずです: {storage_content!r}"
         )
 
         parsed = yoriai._parse_progress_markdown(os.path.join(project_dir, yoriai.PROGRESS_FILENAME))
         assert len(parsed["changelog"]) == 1, parsed["changelog"]
-        assert "utils.py" in parsed["changelog"][0]
-        assert "ID生成のロジックにバグがあるので直して" in parsed["changelog"][0]
+        assert "utils.py" in parsed["changelog"][0], parsed["changelog"]
         # 修正がチェックリスト(元の実装計画の完了状態)には影響しないこと。
         assert yoriai._progress_checklist_is_incomplete(parsed["checklist"]) is False
     finally:
@@ -358,7 +638,7 @@ def test_fix_project_explicit_syntax_bypasses_auto_identification():
     original_snapshot = yoriai._fetch_org_snapshot
     original_stream = yoriai._stream_chat_from_candidate
     yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False: _two_member_snapshot()
-    yoriai._stream_chat_from_candidate = _fake_stream_fix_then_review_ok
+    yoriai._stream_chat_from_candidate = _fake_stream_fix_simple_write
 
     out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
     try:
@@ -380,7 +660,9 @@ def test_fix_project_explicit_syntax_bypasses_auto_identification():
         output = buf.getvalue()
 
         assert project_dir in output, output
-        assert "[✅ utils.py の修正が完了しました" in output, output
+        assert "[✅ 修正が完了しました" in output, output
+        with open(os.path.join(project_dir, "utils.py"), encoding="utf-8") as f:
+            assert "fixed-id" in f.read()
     finally:
         yoriai._fetch_org_snapshot = original_snapshot
         yoriai._stream_chat_from_candidate = original_stream
@@ -434,12 +716,21 @@ def test_fix_project_refuses_when_target_project_is_incomplete():
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
-def test_fix_project_rejects_filename_not_in_project():
-    """モデルが存在しない/プロジェクト外のファイル名を返した場合、安全に
-    拒否し、何も書き換えないことを確認する。
+def test_fix_project_end_to_end_rejects_path_traversal_tool_calls():
+    """モデルの応答(悪意ある、または壊れた応答)がプロジェクト外への
+    パスを指定しても、ツール実行の安全対策(_resolve_safe_project_path)
+    により実際には何も書き込まれないことを確認する(依頼の項目2・5)。
     """
-    def fake_stream(candidate, org_fingerprint, messages, offer_read_file_tool=False, **_kwargs):
-        yield {"content": "FILE: ../../etc/passwd\n```\nmalicious\n```"}
+    def fake_stream(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
+        if _tool_round(messages) == 0:
+            yield {"pending_tool_calls": [
+                {"id": "call_1", "type": "function", "function": {
+                    "name": "write_file",
+                    "arguments": {"filename": "../../etc/passwd", "content": "malicious\n"},
+                }},
+            ]}
+            return
+        yield {"content": "書き込みを試みました。"}
         yield {"done": True}
 
     original_snapshot = yoriai._fetch_org_snapshot
@@ -450,36 +741,31 @@ def test_fix_project_rejects_filename_not_in_project():
     out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
     try:
         projects_root = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME)
-        project_dir = _write_completed_project(projects_root, "todo-cli", [("utils.py", "説明")])
+        _write_completed_project(projects_root, "todo-cli", [("utils.py", "説明")])
 
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             yoriai._ask_organization_fix_project(47120, "fingerprint", "todo-cli: 何かを直して", out_dir)
-        output = buf.getvalue()
 
-        assert "修正対象のファイルを特定できませんでした" in output, output
         assert not os.path.exists(os.path.join(out_dir, "etc", "passwd"))
-        parsed = yoriai._parse_progress_markdown(os.path.join(project_dir, yoriai.PROGRESS_FILENAME))
-        assert parsed["changelog"] == [], "書き換えが拒否された場合、更新履歴も追記されないはずです"
+        assert not os.path.exists(os.path.join(os.path.dirname(out_dir), "etc", "passwd"))
     finally:
         yoriai._fetch_org_snapshot = original_snapshot
         yoriai._stream_chat_from_candidate = original_stream
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
-def test_fix_project_records_review_failure_in_changelog_but_still_saves_file():
-    def fake_stream(candidate, org_fingerprint, messages, offer_read_file_tool=False, **_kwargs):
-        first_content = messages[0]["content"]
-        if "改修担当です" in first_content:
-            yield {"content": "FILE: utils.py\n```python\ndef generate_id():\n    return 1\n```"}
-            yield {"done": True}
+def test_fix_project_reports_syntax_errors_remaining_after_fix():
+    def fake_stream(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
+        if _tool_round(messages) == 0:
+            yield {"pending_tool_calls": [
+                {"id": "call_1", "type": "function", "function": {
+                    "name": "write_file",
+                    "arguments": {"filename": "utils.py", "content": "def generate_id(:\n    pass\n"},
+                }},
+            ]}
             return
-        if "レビュー対象" in first_content:
-            yield {"content": "問題あり\nまだ直っていません。"}
-            yield {"done": True}
-            return
-        # 修正依頼(_request_fix)への応答: 何度直しても解決しない状況を再現する。
-        yield {"content": "```python\ndef generate_id():\n    return 1\n```"}
+        yield {"content": "utils.pyを修正しました。"}
         yield {"done": True}
 
     original_snapshot = yoriai._fetch_org_snapshot
@@ -497,27 +783,28 @@ def test_fix_project_records_review_failure_in_changelog_but_still_saves_file():
             yoriai._ask_organization_fix_project(47120, "fingerprint", "todo-cli: バグを直して", out_dir)
         output = buf.getvalue()
 
-        assert "[⚠️ utils.py の修正はレビューを通過しませんでした" in output, output
-        assert os.path.isfile(os.path.join(project_dir, "utils.py")), "レビューに通らなくてもファイルへの反映は行われる"
+        assert "[⚠️ 修正は保存されましたが、構文エラーが残っているファイルがあります: utils.py]" in output, output
+        assert os.path.isfile(os.path.join(project_dir, "utils.py")), "構文エラーがあってもファイルへの反映は行われる"
 
         parsed = yoriai._parse_progress_markdown(os.path.join(project_dir, yoriai.PROGRESS_FILENAME))
         assert len(parsed["changelog"]) == 1
-        assert "レビューを通過しませんでした" in parsed["changelog"][0], parsed["changelog"]
+        assert "構文エラー" in parsed["changelog"][0], parsed["changelog"]
     finally:
         yoriai._fetch_org_snapshot = original_snapshot
         yoriai._stream_chat_from_candidate = original_stream
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
-def test_fix_project_skips_llm_review_but_runs_syntax_check_with_single_member():
-    def fake_stream(candidate, org_fingerprint, messages, offer_read_file_tool=False, **_kwargs):
-        yield {"content": "FILE: utils.py\n```python\ndef generate_id(:\n    pass\n```"}
-        yield {"done": True}
-
+def test_fix_project_works_with_single_member_present():
+    """依頼のコマンド不要化・単純化の一環として、修正依頼はレビュー
+    担当の有無に関係なく1台構成でも動作することを確認する(以前の
+    LLMレビューによる相互チェックは廃止し、機械的な構文チェックのみに
+    一本化したため、担当メンバーが1台か複数台かで挙動が分岐しない)。
+    """
     original_snapshot = yoriai._fetch_org_snapshot
     original_stream = yoriai._stream_chat_from_candidate
     yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False: _one_member_snapshot()
-    yoriai._stream_chat_from_candidate = fake_stream
+    yoriai._stream_chat_from_candidate = _fake_stream_fix_simple_write
 
     out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
     try:
@@ -526,16 +813,83 @@ def test_fix_project_skips_llm_review_but_runs_syntax_check_with_single_member()
 
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            yoriai._ask_organization_fix_project(47120, "fingerprint", "todo-cli: 構文が壊れているので直して", out_dir)
+            yoriai._ask_organization_fix_project(47120, "fingerprint", "todo-cli: バグを直して", out_dir)
         output = buf.getvalue()
 
-        assert "レビュー担当者がいません" in output, output
-        assert "[🔍 構文チェック:" in output, output
-        assert "[⚠️ utils.py の修正はレビューを通過しませんでした" in output, (
-            f"意図的に構文エラーのコードを与えたので、構文チェックで弾かれるはずです: {output}"
-        )
+        assert "[✅ 修正が完了しました" in output, output
     finally:
         yoriai._fetch_org_snapshot = original_snapshot
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_fix_project_end_to_end_delete_records_two_changelog_entries():
+    """delete_fileツールが実行前にPROGRESS.mdへ記録するエントリ(依頼の
+    項目4)と、_ask_organization_fix_project側が最後に記録する修正依頼
+    全体のまとめエントリの、両方が失われず残ることを確認する。
+    """
+    def fake_stream(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
+        if _tool_round(messages) == 0:
+            yield {"pending_tool_calls": [
+                {"id": "call_1", "type": "function", "function": {
+                    "name": "delete_file", "arguments": {"filename": "legacy.py"},
+                }},
+            ]}
+            return
+        yield {"content": "不要になったlegacy.pyを削除しました。"}
+        yield {"done": True}
+
+    original_snapshot = yoriai._fetch_org_snapshot
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False: _two_member_snapshot()
+    yoriai._stream_chat_from_candidate = fake_stream
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        projects_root = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME)
+        project_dir = _write_completed_project(
+            projects_root, "todo-cli", [("utils.py", "説明"), ("legacy.py", "説明")],
+        )
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            yoriai._ask_organization_fix_project(47120, "fingerprint", "todo-cli: legacy.pyを削除して", out_dir)
+
+        assert not os.path.exists(os.path.join(project_dir, "legacy.py"))
+        assert os.path.isfile(os.path.join(project_dir, "utils.py")), "無関係なファイルは残るはずです"
+
+        parsed = yoriai._parse_progress_markdown(os.path.join(project_dir, yoriai.PROGRESS_FILENAME))
+        assert len(parsed["changelog"]) == 2, parsed["changelog"]
+        assert "削除" in parsed["changelog"][0], parsed["changelog"]
+        assert "legacy.pyを削除して" in parsed["changelog"][1], parsed["changelog"]
+    finally:
+        yoriai._fetch_org_snapshot = original_snapshot
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_collect_answer_with_project_tools_stops_at_round_cap():
+    """モデルが延々とツール呼び出しを繰り返すループに陥っても、
+    MAX_PROJECT_TOOL_ROUNDSで確実に打ち切られることを確認する
+    (暴走防止)。
+    """
+    def fake_stream_never_stops(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
+        yield {"pending_tool_calls": [
+            {"id": "call_x", "type": "function", "function": {"name": "list_dir", "arguments": {}}},
+        ]}
+
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._stream_chat_from_candidate = fake_stream_never_stops
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        candidate = {"label": "MacStudio", "model": "m", "address": "127.0.0.1", "port": 47120}
+        content, error = yoriai._collect_answer_with_project_tools(
+            candidate, "fingerprint", [{"role": "user", "content": "何か直して"}], out_dir,
+        )
+        assert content == ""
+        assert error is not None and "上限" in error, error
+    finally:
         yoriai._stream_chat_from_candidate = original_stream
         shutil.rmtree(out_dir, ignore_errors=True)
 
@@ -591,8 +945,25 @@ def main():
         test_progress_markdown_round_trips_changelog,
         test_progress_markdown_changelog_defaults_to_empty_list,
         test_list_project_files_excludes_progress_md,
-        test_parse_fix_response_extracts_filename_and_code,
-        test_parse_fix_response_returns_none_filename_when_missing,
+        test_resolve_safe_project_path_accepts_flat_filename,
+        test_resolve_safe_project_path_rejects_path_traversal,
+        test_resolve_safe_project_path_rejects_absolute_path_to_yoriai_itself,
+        test_resolve_safe_project_path_rejects_progress_md,
+        test_write_project_file_creates_file_and_reports_syntax_ok,
+        test_write_project_file_reports_syntax_error_but_still_writes,
+        test_write_project_file_rejects_path_traversal_and_writes_nothing,
+        test_move_project_file_renames_within_project_dir,
+        test_move_project_file_rejects_traversal_in_either_name,
+        test_delete_project_file_logs_to_progress_md_before_deleting,
+        test_delete_project_file_rejects_progress_md_itself,
+        test_make_project_directory_creates_subdirectory,
+        test_list_project_directory_excludes_progress_md,
+        test_parse_run_test_command_allows_only_whitelisted_forms,
+        test_run_project_test_command_executes_passing_test,
+        test_run_project_test_command_reports_failure_output,
+        test_run_project_test_command_rejects_disallowed_command_without_executing,
+        test_syntax_check_all_python_files_reports_broken_files_only,
+        test_execute_project_tool_call_dispatches_to_write_file,
         test_identify_target_project_matches_unique_high_scoring_project,
         test_identify_target_project_reports_ambiguous_on_tie,
         test_identify_target_project_reports_not_found_when_no_overlap,
@@ -603,14 +974,16 @@ def main():
         test_classify_execution_mode_without_out_dir_never_returns_fix_project,
         test_classify_execution_mode_returns_fix_project_when_project_exists,
         test_classify_execution_mode_does_not_return_fix_project_without_any_completed_project,
-        test_fix_project_end_to_end_success_updates_file_and_changelog,
+        test_fix_project_end_to_end_uses_tools_to_rename_edit_and_test,
         test_fix_project_explicit_syntax_bypasses_auto_identification,
         test_fix_project_reports_ambiguous_candidates_without_modifying_anything,
         test_fix_project_reports_not_found_without_modifying_anything,
         test_fix_project_refuses_when_target_project_is_incomplete,
-        test_fix_project_rejects_filename_not_in_project,
-        test_fix_project_records_review_failure_in_changelog_but_still_saves_file,
-        test_fix_project_skips_llm_review_but_runs_syntax_check_with_single_member,
+        test_fix_project_end_to_end_rejects_path_traversal_tool_calls,
+        test_fix_project_reports_syntax_errors_remaining_after_fix,
+        test_fix_project_works_with_single_member_present,
+        test_fix_project_end_to_end_delete_records_two_changelog_entries,
+        test_collect_answer_with_project_tools_stops_at_round_cap,
         test_resume_project_preserves_changelog_from_a_prior_fix,
     ]
     failures = 0
