@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""対話モードでの複数行編集(上下矢印キーでの行間移動、Enter/Alt+Enterの
+"""対話モードでの複数行編集(上下矢印キーでの行間移動、Enter/Shift+Enterの
 使い分け、Backspace、継続行の見た目)を検証する。
 
 以前は`readline`(1行単位の編集)に依存していたが、readlineは1行内の
@@ -13,6 +13,13 @@ Backspaceといった基本的な編集機能自体はprompt_toolkit本体が提
 ものであり、ライブラリ側で十分にテストされているため、ここでは
 「Yoriaiがこの機能をどう使っているか」(multiline設定・送信キーの
 割り当て・複数行バッファでの実際の編集結果)を検証する。
+
+送信キーの割り当ては「空行で送信」→「Alt+Enterで送信」→「Enterで送信、
+Shift+Enterで改行」の順に変更してきた(詳細な経緯は
+`yoriai._make_repl_key_bindings`のコメントを参照)。このファイルの
+テストは本番と同じ`yoriai._make_repl_key_bindings()`のキー割り当てで
+セッションを作り、Enter/Shift+Enterのキー割り当てそのものの検証は
+tests/test_enter_to_submit.pyで行う。
 
 `prompt_toolkit.input.create_pipe_input`で仮想的なキー入力を送り込み、
 `prompt_toolkit.output.DummyOutput`で実際の画面描画を行わないように
@@ -31,12 +38,17 @@ from prompt_toolkit import PromptSession  # noqa: E402
 from prompt_toolkit.input import create_pipe_input  # noqa: E402
 from prompt_toolkit.output import DummyOutput  # noqa: E402
 
-_SUBMIT = "\x1b\r"  # Alt+Enter(Escapeキーに続けてEnter)
+_SUBMIT = "\r"  # Enterキー単体(送信)
+# Shift+Enter(改行を挿入)を送る際のバイト列。詳細は
+# yoriai._make_repl_key_bindingsのコメントを参照。
+_NEWLINE = "\x1b[27;2;13~"
 
 
 def _read_with_keys(keystrokes: str):
     with create_pipe_input() as pipe_input:
-        session = PromptSession(input=pipe_input, output=DummyOutput())
+        session = PromptSession(
+            input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
+        )
         pipe_input.send_text(keystrokes)
         return yoriai._read_multiline_input(session, yoriai._DoubleInterruptGuard())
 
@@ -56,12 +68,12 @@ def test_continuation_lines_have_no_prefix():
             )
 
 
-def test_enter_inserts_a_newline_instead_of_submitting():
-    """依頼の中核要件: Enterキーは(readline時代のように送信・確定の
-    トリガーにはならず)常に改行を挿入するだけであることを確認する。
-    Alt+Enterを送るまでは入力が確定しない。
+def test_shift_enter_inserts_a_newline_instead_of_submitting():
+    """依頼の中核要件: Shift+Enterは改行を挿入するだけで送信しないことを
+    確認する(Enterで送信されるようになったことに伴い、改行の挿入は
+    Shift+Enterの役割になった)。
     """
-    text, terminate = _read_with_keys("1行目\r2行目" + _SUBMIT)
+    text, terminate = _read_with_keys("1行目" + _NEWLINE + "2行目" + _SUBMIT)
     assert terminate is False
     assert text == "1行目\n2行目", repr(text)
 
@@ -73,7 +85,7 @@ def test_up_arrow_moves_cursor_to_the_previous_line_for_editing():
     「foo」の行末に戻り、「X」を挿入すると「fooX」になるはず(「bar」の
     行はそのまま)。
     """
-    keystrokes = "foo\rbar" + "\x1b[A" + "X" + _SUBMIT
+    keystrokes = "foo" + _NEWLINE + "bar" + "\x1b[A" + "X" + _SUBMIT
     text, terminate = _read_with_keys(keystrokes)
     assert terminate is False
     assert text == "fooX\nbar", repr(text)
@@ -84,7 +96,7 @@ def test_down_arrow_moves_cursor_back_to_the_next_line():
     ことを確認する。
     """
     # foo / bar と入力 → 上矢印で foo の行末へ → 下矢印で bar の行末へ戻る → Y を追記
-    keystrokes = "foo\rbar" + "\x1b[A" + "\x1b[B" + "Y" + _SUBMIT
+    keystrokes = "foo" + _NEWLINE + "bar" + "\x1b[A" + "\x1b[B" + "Y" + _SUBMIT
     text, terminate = _read_with_keys(keystrokes)
     assert terminate is False
     assert text == "foo\nbarY", repr(text)
@@ -95,7 +107,7 @@ def test_backspace_deletes_one_character_within_multiline_buffer():
     削除できることを確認する。「hellox」と入力してBackspaceを押すと
     「hello」になるはず。
     """
-    text, terminate = _read_with_keys("1行目\rhellox\x7f" + _SUBMIT)
+    text, terminate = _read_with_keys("1行目" + _NEWLINE + "hellox\x7f" + _SUBMIT)
     assert terminate is False
     assert text == "1行目\nhello", repr(text)
 
@@ -106,8 +118,8 @@ def test_multiline_japanese_text_has_no_leaked_control_characters():
     紛れ込まないことを確認する。
     """
     keystrokes = (
-        "以下の内容でプロジェクトを作って:\r"
-        "1. storage.pyでデータを保存する\r"
+        "以下の内容でプロジェクトを作って:" + _NEWLINE +
+        "1. storage.pyでデータを保存する" + _NEWLINE +
         "2. cli.pyでコマンドライン操作を行う"
         + _SUBMIT
     )
@@ -136,7 +148,7 @@ def test_editing_an_earlier_line_after_pasting_multiline_text():
     (`\\x1b[F`)を使う。
     """
     keystrokes = (
-        "storage.pyを実装\r"
+        "storage.pyを実装" + _NEWLINE +
         "cli.pyを実装"
         + "\x1b[A"  # 上矢印で「storage.pyを実装」の行へ移動
         + "\x1b[F"  # Endキーでその行の行末へ
@@ -151,7 +163,7 @@ def test_editing_an_earlier_line_after_pasting_multiline_text():
 def main():
     tests = [
         test_continuation_lines_have_no_prefix,
-        test_enter_inserts_a_newline_instead_of_submitting,
+        test_shift_enter_inserts_a_newline_instead_of_submitting,
         test_up_arrow_moves_cursor_to_the_previous_line_for_editing,
         test_down_arrow_moves_cursor_back_to_the_next_line,
         test_backspace_deletes_one_character_within_multiline_buffer,

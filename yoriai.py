@@ -42,6 +42,7 @@ except ImportError:
 import requests
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.key_binding import KeyBindings
 from zeroconf import ServiceBrowser, ServiceInfo, Zeroconf, IPVersion, InterfaceChoice
 
 import config
@@ -3154,6 +3155,58 @@ def _repl_prompt_continuation(width, line_number, is_soft_wrap) -> str:
     return ""
 
 
+# 仮の判断(送信キーをEnter、改行をShift+Enterに変更): 実機で、Alt+Enter
+# (旧送信キー)がSSHクライアント側のショートカットに奪われる不具合が
+# 報告されたことを受け、Claude Code等と同様の配置(Enterで送信、
+# Shift+Enterで改行)に変更した。
+#
+# 技術的な制約: prompt_toolkit(3.0.53時点)には「Shift+Enter」を表す
+# 固有のキー名が存在しない。多くの端末がShift+Enterに対して送るxterm
+# modifyOtherKeys形式のエスケープシーケンス(`\x1b[27;2;13~`)は、
+# prompt_toolkitの入力パーサー(`prompt_toolkit.input.ansi_escape_sequences.
+# ANSI_SEQUENCES`)自体が、キー割り当ての仕組みに渡す前の時点で素の
+# Enterと同じ`Keys.ControlM`に変換してしまうため、`@bindings.add("s-enter")`
+# のような割り当ては存在しない(実際に試すと`ValueError: Invalid key:
+# s-enter`になる)。
+#
+# そこで、Enterキーの共通ハンドラ内で`KeyPress.data`(変換前の生の
+# エスケープシーケンス文字列。`.key`とは別に保持されている)を調べ、
+# Shift+Enterの生シーケンスと一致する場合だけ改行を挿入し、それ以外は
+# 送信として扱う、という方法で区別する。この生シーケンスをそのまま送って
+# くる端末(および、この形式のシーケンス送出が有効化された設定)では
+# Shift+Enterが改行として機能するが、これはterminfoやSSHクライアントの
+# 実装に依存するため、全ての環境で保証されるわけではない。依頼で明示的に
+# 許容された通り、区別できない端末ではShift+Enterも単にEnterと同様に
+# 送信として扱われる(改行を挿入したい場合に単に送信されてしまう)。
+# それでも、送信キー自体が完全に効かなくなるわけではなく、Ctrl+Cを2回
+# 連続で押す「非常口」(`_DoubleInterruptGuard`)は影響を受けず引き続き
+# 確実に機能する。
+_REPL_SHIFT_ENTER_RAW_DATA = "\x1b[27;2;13~"
+
+
+def _make_repl_key_bindings() -> KeyBindings:
+    """対話モードの入力セッション用のキー割り当てを作る。
+
+    仮の判断: `multiline=True`セッションの既定のキー割り当てでは、Enterは
+    常に改行を挿入する(送信にはAlt+Enterが必要)。ここでは独自の"enter"
+    ハンドラを追加し、既定の挙動を上書きする(`PromptSession(key_bindings=..)`
+    で渡したキー割り当ては、既定のキー割り当てより後にマージされ、
+    同じキーに複数の割り当てが一致する場合は最後に一致したものが優先される
+    ため、既定の「Enterで改行」を上書きできる)。
+    """
+    bindings = KeyBindings()
+
+    @bindings.add("enter")
+    def _submit_or_insert_newline(event) -> None:
+        raw_data = event.key_sequence[-1].data if event.key_sequence else ""
+        if raw_data == _REPL_SHIFT_ENTER_RAW_DATA:
+            event.current_buffer.insert_text("\n")
+        else:
+            event.current_buffer.validate_and_handle()
+
+    return bindings
+
+
 def _create_repl_prompt_session() -> PromptSession:
     """対話モードのメッセージ入力用に、複数行編集対応のセッションを1つ
     作る。`_run_repl_client`が起動時に1回だけ作り、以後の全メッセージ
@@ -3166,49 +3219,30 @@ def _create_repl_prompt_session() -> PromptSession:
     前回の入力を引き継ぐ機能)は今回のスコープ外で、プロセス終了とともに
     履歴も破棄される。
     """
-    return PromptSession(history=InMemoryHistory())
+    return PromptSession(history=InMemoryHistory(), key_bindings=_make_repl_key_bindings())
 
 
 def _read_multiline_input(session: PromptSession, interrupt_guard: "_DoubleInterruptGuard") -> tuple:
     """対話モードの1メッセージ分の入力を読み取る。
 
-    仮の判断: `prompt_toolkit`の`multiline=True`セッションを使う。標準の
-    キー割り当てにより、Enterは常に改行を挿入し、Alt+Enter(端末的には
-    Escapeキーに続けてEnter)で入力を確定する。上下矢印キーは、複数行の
-    バッファ内でまだ移動できる行がある間はカーソルをその行へ移動し、
-    バッファの端(最初/最後の行)に達すると入力履歴の呼び出しに切り替わる
-    (`Buffer.auto_up`/`auto_down`の標準動作)。これにより、依頼の
-    「上下矢印で自由に行き来しながら編集できる」という要望に、
-    prompt_toolkit標準の挙動だけで(独自のキー割り当てを追加せずに)
-    対応できる。
+    仮の判断: `prompt_toolkit`の`multiline=True`セッションを使う。
+    `_make_repl_key_bindings`で追加した独自のキー割り当てにより、
+    Enter単体で入力を確定し(送信)、Shift+Enterで改行を挿入する
+    (区別できない端末での既知の制約は`_make_repl_key_bindings`の
+    コメントを参照)。上下矢印キーは、複数行のバッファ内でまだ移動できる
+    行がある間はカーソルをその行へ移動し、バッファの端(最初/最後の行)に
+    達すると入力履歴の呼び出しに切り替わる(`Buffer.auto_up`/`auto_down`の
+    標準動作)。これにより、依頼の「上下矢印で自由に行き来しながら編集
+    できる」という要望に、prompt_toolkit標準の挙動だけで対応できる。
 
-    送信のトリガーは、既存の「空行で送信」から「Alt+Enterで送信」に
-    変更した。複数行バッファ全体を自由に編集できるようになった以上、
-    「空行=送信」のままだと、メッセージの途中に意図的な空行(段落区切り
-    など)を入れられなくなってしまう(空行を打った時点でその場で送信
-    されてしまうため)。Alt+Enterはprompt_toolkitの`multiline=True`
-    セッションにおける標準の確定キーであり、Claude Code等の他のツールの
-    複数行入力とも操作感が近い。
-
-    仮の判断: Windows環境ではAlt+Enterがターミナルアプリ側のフルスクリーン
-    切り替え等に予約されていることが多く、Yoriaiに届く前に横取りされる
-    ことがある。この対策として「Ctrl+Enterへの変更」が依頼されたが、
-    実際には独自のキー割り当てを追加していない。理由は、Ctrl+Enterは
-    VT100系の端末プロトコル(macOS/Linuxの標準的なターミナル)では
-    Enter単体と原理的に区別がつかない(Enterキー自体が"Ctrl+M"と同じ
-    制御コードを送るため)。一方、prompt_toolkit自身のWindows向け入力
-    バックエンド(`prompt_toolkit.input.win32`)は、ネイティブの
-    コンソールAPIがCtrl+Enterを区別して報告できることを利用し、
-    Control-EnterをMeta-Enter(=Alt+Enterと同じ`escape, enter`という
-    キー入力列)に自動変換する処理を最初から内蔵している(該当ソースの
-    コメント: "Turn Control-Enter into META-Enter. (On a vt100 terminal,
-    we cannot detect this combination. But it's really practical on
-    Windows.)")。つまり、Windows上でネイティブのコンソール入力を使う場合、
-    Ctrl+Enterは何もしなくても既にAlt+Enterと同じ「送信」として機能する。
-    このため、Alt+Enterの受付を変更せずそのまま残すだけで、依頼の項目3
-    (Ctrl+Enterに加えてAlt+Enterも使えるようにする)は自然に満たされる。
-    macOS/Linux(Yoriaiが対象とするOS)では、この技術的制約によりCtrl+
-    Enterは利用できないため、Alt+Enterが引き続き唯一の確実な送信キーになる。
+    仮の判断(送信キーの変遷): 「空行で送信」→「Alt+Enterで送信」→
+    「Enterで送信、Shift+Enterで改行」の順に変更してきた。複数行バッファ
+    全体を自由に編集できる以上「空行=送信」は成立しない(空行=段落区切り
+    を入れられなくなる)ため早期に廃止した。続くAlt+Enterは、実機
+    (Windows機からraspi4へのSSH接続)でSSHクライアント側のショートカット
+    に奪われ、対話モードから抜け出せなくなる不具合が報告された。この
+    対策として、Claude Code等と同様の配置(Enterで送信、Shift+Enterで
+    改行)に変更した。
 
     戻り値は`(text, terminate)`のタプル。`terminate`が`True`の場合、
     対話モード自体を終了すべきことを示す(EOF/Ctrl+D、送信内容が
@@ -3226,9 +3260,9 @@ def _read_multiline_input(session: PromptSession, interrupt_guard: "_DoubleInter
     別途バッファの状態を監視する仕組みが必要になり、複雑さに見合わない
     と判断した。
 
-    仮の判断(実機で報告された「非常口」不具合への対応): 送信キー
-    (Alt+Enter/Ctrl+Enter)がSSH経由の接続などで一切機能しない状況では、
-    "exit"/"quit"すら送信できずEOF(Ctrl+D)も反応しないことがあり、
+    仮の判断(実機で報告された「非常口」不具合への対応): 送信キーが
+    SSH経由の接続などで一切機能しない状況では、"exit"/"quit"すら送信
+    できずEOF(Ctrl+D)も反応しないことがあり、
     対話モードから抜け出す手段が無くなる不具合が実機で報告された。この
     ため、`interrupt_guard`(`_DoubleInterruptGuard`)で直前のCtrl+Cから
     `_REPL_DOUBLE_CTRL_C_WINDOW_SEC`秒以内に連続してCtrl+Cが押された
@@ -3267,13 +3301,11 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
     print("=== Yoriai 対話モード ===")
     print("★ Ctrl+Cを2秒以内に2回連続で押すと、状況に関わらずいつでも確実に")
     print("  終了できます(送信キーやexit/quitが効かない場合の非常口です)。")
-    print("終了するには exit または quit とだけ入力してAlt+Enter(Escキーに続けて")
-    print("Enter)を押すか、入力前にCtrl+Dを押す方法もあります。")
-    print("Enterキーは常に改行を挿入します。上下矢印キーで、入力済みの行の間を")
-    print("自由に移動しながら編集できます。入力を送信するにはAlt+Enterを押してください")
-    print("(1行だけの質問も、入力→Alt+Enter、の操作で送信できます。Windowsの")
-    print("ネイティブコンソールをお使いの場合は、Ctrl+Enterでも同じように送信")
-    print("できます)。")
+    print("終了するには exit または quit とだけ入力してEnterを押すか、")
+    print("入力前にCtrl+Dを押す方法もあります。")
+    print("Enterで送信、Shift+Enterで改行を挿入します(1行だけの質問も、")
+    print("入力→Enter、の操作で送信できます)。上下矢印キーで、入力済みの")
+    print("行の間を自由に移動しながら編集できます。")
     print("コマンドを付けずに話しかけると、依頼内容から単発/比較/協業のどのモードで")
     print("問い合わせるかを自動的に判断します(判断理由は[判断: ...]として表示されます)。")
     print(f"{MULTI_QUERY_COMMAND} <質問文> で、自動判定に関わらず必ず空きリソース上位{MULTI_QUERY_TARGET_COUNT}台に同時に質問できます。")

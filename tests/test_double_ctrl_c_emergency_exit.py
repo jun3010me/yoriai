@@ -31,8 +31,8 @@ from prompt_toolkit import PromptSession  # noqa: E402
 from prompt_toolkit.input import create_pipe_input  # noqa: E402
 from prompt_toolkit.output import DummyOutput  # noqa: E402
 
-# Alt+Enter(端末的にはEscapeキーに続けてEnter)を送信する際のバイト列。
-_SUBMIT = "\x1b\r"
+# Enterキー単体(送信)を送信する際のバイト列。
+_SUBMIT = "\r"
 
 
 def test_double_interrupt_guard_does_not_trigger_on_first_press():
@@ -88,7 +88,9 @@ def test_read_multiline_input_terminates_on_double_ctrl_c():
     `_read_multiline_input`が終了を示す`("", True)`を返すことを確認する。
     """
     with create_pipe_input() as pipe_input:
-        session = PromptSession(input=pipe_input, output=DummyOutput())
+        session = PromptSession(
+            input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
+        )
         pipe_input.send_text("\x03\x03")
         text, terminate = yoriai._read_multiline_input(session, yoriai._DoubleInterruptGuard())
     assert terminate is True
@@ -101,7 +103,9 @@ def test_read_multiline_input_single_ctrl_c_does_not_terminate():
     壊れていないこと)。
     """
     with create_pipe_input() as pipe_input:
-        session = PromptSession(input=pipe_input, output=DummyOutput())
+        session = PromptSession(
+            input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
+        )
         pipe_input.send_text("\x03こんにちは" + _SUBMIT)
         text, terminate = yoriai._read_multiline_input(session, yoriai._DoubleInterruptGuard())
     assert terminate is False
@@ -140,7 +144,9 @@ def _run_repl_with_keys(keystrokes: str, ask_single_side_effect=None):
 
     with create_pipe_input() as pipe_input:
         def fake_create_session():
-            return PromptSession(input=pipe_input, output=DummyOutput())
+            return PromptSession(
+                input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
+            )
 
         yoriai._create_repl_prompt_session = fake_create_session
         yoriai._classify_execution_mode = spy_classify

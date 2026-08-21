@@ -8,19 +8,19 @@
 文字と思われる記号が表示されるという報告があった。
 
 `prompt_toolkit`のmultiline対応セッションを採用し、複数行の入力全体を
-1つの編集可能な領域として扱うようにした。標準のキー割り当てにより、
-Enterは常に改行を挿入し、Alt+Enter(Escキーに続けてEnter)で入力を
-確定する(空行での送信という以前の仕様は、この変更に伴い廃止した:
-自由に編集できる複数行バッファでは、途中に意図的な空行=段落区切りを
-入れられる必要があるため)。上下矢印キーによる行間移動そのものの検証は
-tests/test_repl_line_editing.pyで行う。このファイルでは、
-`_read_multiline_input`が返す`(text, terminate)`の契約(送信内容・
-終了判定)を検証する。
+1つの編集可能な領域として扱うようにした。送信のトリガーは「空行で送信」
+→「Alt+Enterで送信」→「Enterで送信、Shift+Enterで改行」の順に変更して
+きた(詳細な経緯は`yoriai._make_repl_key_bindings`のコメントを参照)。
+上下矢印キーによる行間移動そのものの検証はtests/test_repl_line_editing.py、
+Enter/Shift+Enterのキー割り当てそのものの検証はtests/test_enter_to_submit.py
+で行う。このファイルでは、`_read_multiline_input`が返す`(text, terminate)`
+の契約(送信内容・終了判定)を検証する。
 
 `prompt_toolkit.input.create_pipe_input`で仮想的なキー入力を送り込み、
 `prompt_toolkit.output.DummyOutput`で実際の画面描画を行わないように
 した`PromptSession`を使う(prompt_toolkit公式のテスト手法。実際の
-擬似端末を使わずに済む)。
+擬似端末を使わずに済む)。セッションは本番と同じ`yoriai._make_repl_key_bindings()`
+のキー割り当てで作る(本番のEnter/Shift+Enterの挙動を実際に検証するため)。
 
 使い方: python3 tests/test_multiline_input.py
 """
@@ -34,8 +34,12 @@ from prompt_toolkit import PromptSession  # noqa: E402
 from prompt_toolkit.input import create_pipe_input  # noqa: E402
 from prompt_toolkit.output import DummyOutput  # noqa: E402
 
-# Alt+Enter(端末的にはEscapeキーに続けてEnter)を送信する際のバイト列。
-_SUBMIT = "\x1b\r"
+# Enterキー単体(送信)を送信する際のバイト列。
+_SUBMIT = "\r"
+# Shift+Enter(改行を挿入)を送る際のバイト列。一部の端末がShift+Enterに
+# 対して送るxterm modifyOtherKeys形式のエスケープシーケンス。詳細は
+# yoriai._make_repl_key_bindingsのコメントを参照。
+_NEWLINE = "\x1b[27;2;13~"
 
 
 def _read_with_keys(keystrokes: str):
@@ -44,13 +48,15 @@ def _read_with_keys(keystrokes: str):
     戻り値を返す。
     """
     with create_pipe_input() as pipe_input:
-        session = PromptSession(input=pipe_input, output=DummyOutput())
+        session = PromptSession(
+            input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
+        )
         pipe_input.send_text(keystrokes)
         return yoriai._read_multiline_input(session, yoriai._DoubleInterruptGuard())
 
 
 def test_single_line_then_submit_key_sends_as_one_message():
-    """1行だけ書いてAlt+Enterで、正しく1つのメッセージとして送信される
+    """1行だけ書いてEnterで、正しく1つのメッセージとして送信される
     ことを確認する。
     """
     text, terminate = _read_with_keys("富士山の標高は?" + _SUBMIT)
@@ -59,12 +65,12 @@ def test_single_line_then_submit_key_sends_as_one_message():
 
 
 def test_multiple_lines_typed_then_submit_key_are_joined():
-    """複数行の文章を1行ずつ手打ちし(Enterで改行を挿入)、最後に
-    Alt+Enterで送信されることを確認する。
+    """複数行の文章を1行ずつ手打ちし(Shift+Enterで改行を挿入)、最後に
+    Enterで送信されることを確認する。
     """
     text, terminate = _read_with_keys(
-        "以下の内容でプロジェクトを作って:\r"
-        "1. storage.pyでデータを保存する\r"
+        "以下の内容でプロジェクトを作って:" + _NEWLINE +
+        "1. storage.pyでデータを保存する" + _NEWLINE +
         "2. cli.pyでコマンドライン操作を行う"
         + _SUBMIT
     )
@@ -78,12 +84,15 @@ def test_multiple_lines_typed_then_submit_key_are_joined():
 
 def test_pasted_multiline_text_delivered_as_rapid_successive_keys():
     """エディタ等から複数行の文章をコピーして貼り付けた場合を再現する。
-    貼り付けは実装上、端末から見ると高速な連続キー入力(行ごとに改行が
-    Enterとして解釈される)として届く。
+    貼り付けは実装上、端末から見ると高速な連続キー入力として届く(行区切りが
+    Shift+Enterのバイト列で表現される場合を再現する。素のEnter=送信と
+    区別できない端末からの貼り付けでは、行の途中で送信されてしまう
+    ことは依頼で許容された既知の制約であり、ここでは区別できる場合の
+    挙動を検証する)。
     """
     pasted = (
-        "ToDoリストのCLIツールを作って。\r"
-        "storage.pyでデータの保存・読み込みを、\r"
+        "ToDoリストのCLIツールを作って。" + _NEWLINE +
+        "storage.pyでデータの保存・読み込みを、" + _NEWLINE +
         "cli.pyでコマンドライン操作を担当する形にしたい。"
     )
     text, terminate = _read_with_keys(pasted + _SUBMIT)
@@ -97,10 +106,10 @@ def test_pasted_multiline_text_delivered_as_rapid_successive_keys():
 
 def test_blank_line_no_longer_sends_and_can_be_part_of_the_message():
     """依頼の設計変更: 以前は空行が送信のトリガーだったが、現在は
-    Alt+Enterのみが送信のトリガーであり、空行(段落区切り)はメッセージ
+    Enterのみが送信のトリガーであり、空行(段落区切り)はメッセージ
     本文の一部としてそのまま含められることを確認する。
     """
-    text, terminate = _read_with_keys("1段落目\r\r2段落目" + _SUBMIT)
+    text, terminate = _read_with_keys("1段落目" + _NEWLINE + _NEWLINE + "2段落目" + _SUBMIT)
     assert terminate is False
     assert text == "1段落目\n\n2段落目", repr(text)
 
@@ -131,13 +140,13 @@ def test_exit_as_part_of_a_longer_message_is_treated_as_message_content():
     """'exit'が単独の送信内容ではなく、他の行と一緒に送信された場合は、
     メッセージ本文の一部として扱われることを確認する。
     """
-    text, terminate = _read_with_keys("以下の手順を実行して:\rexit" + _SUBMIT)
+    text, terminate = _read_with_keys("以下の手順を実行して:" + _NEWLINE + "exit" + _SUBMIT)
     assert terminate is False
     assert text == "以下の手順を実行して:\nexit", repr(text)
 
 
 def test_empty_submission_does_nothing_and_waits_for_more_input():
-    """何も入力せずにAlt+Enterを押した場合、何もせず次の入力を待ち、
+    """何も入力せずにEnterを押した場合、何もせず次の入力を待ち、
     続けて入力した内容が送信されることを確認する。
     """
     text, terminate = _read_with_keys(_SUBMIT + "こんにちは" + _SUBMIT)

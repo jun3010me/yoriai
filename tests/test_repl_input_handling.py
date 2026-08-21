@@ -28,8 +28,8 @@ from prompt_toolkit import PromptSession  # noqa: E402
 from prompt_toolkit.input import create_pipe_input  # noqa: E402
 from prompt_toolkit.output import DummyOutput  # noqa: E402
 
-# Alt+Enter(端末的にはEscapeキーに続けてEnter)を送信する際のバイト列。
-_SUBMIT = "\x1b\r"
+# Enterキー単体(送信)を送信する際のバイト列。
+_SUBMIT = "\r"
 
 
 def _run_repl_with_keys(keystrokes: str):
@@ -60,7 +60,9 @@ def _run_repl_with_keys(keystrokes: str):
 
     with create_pipe_input() as pipe_input:
         def fake_create_session():
-            return PromptSession(input=pipe_input, output=DummyOutput())
+            return PromptSession(
+                input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
+            )
 
         yoriai._create_repl_prompt_session = fake_create_session
         yoriai._classify_execution_mode = spy_classify
@@ -85,7 +87,7 @@ def _run_repl_with_keys(keystrokes: str):
 
 
 def test_empty_submission_does_nothing_and_reprompts():
-    """何も入力せずAlt+Enterのみ押した場合、何も処理されず(モード判定にすら
+    """何も入力せずEnterのみ押した場合、何も処理されず(モード判定にすら
     進まず)、続けて次の入力を待つことを確認する。
     """
     output, calls = _run_repl_with_keys(_SUBMIT + "exit" + _SUBMIT)
