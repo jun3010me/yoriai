@@ -62,15 +62,14 @@ def _fake_stream_ok(candidate, org_fingerprint, messages):
     yield {"done": True}
 
 
-def test_incomplete_plan_is_reported_honestly_when_a_file_is_skipped():
-    """実機で報告された不具合の再現: 4ファイル構成の計画に対して、
-    候補が3台しか無いためconfig.pyが実装フェーズで実際にスキップされる
-    (_dispatch_and_save_parallel_tasksが割り当てられる分だけ実行する
-    仕様により、先頭からstorage.py/cli.py/utils.pyの3件だけが実装される)。
-    このとき、実装できた3ファイルの相互レビューは全て「問題なし」に
-    なるにもかかわらず、最終的な報告は「✅ レビュー完了」ではなく、
-    config.pyの実装・レビューが未完了である旨を正直に報告することを
-    確認する。
+def test_queue_ensures_all_tasks_complete_even_with_fewer_members_than_tasks():
+    """タスクキュー方式導入前は、4ファイル構成の計画に対して候補が3台しか
+    無い場合、config.pyが実装フェーズで実際にスキップされたまま
+    「✅ レビュー完了」と表示されてしまう不具合が実機で報告されていた
+    (このテストは元々その不具合の再現用だった)。タスクキュー方式導入後は、
+    手が空いたメンバーに次のタスクが割り当てられるため、候補が3台しか
+    無くても最終的に4ファイルすべてが実装・レビューされ、タスク
+    チェックリストが正しく「✅ 全タスク完了」になることを確認する。
     """
     original_snapshot = yoriai._fetch_org_snapshot
     original_stream = yoriai._stream_chat_from_candidate
@@ -84,30 +83,20 @@ def test_incomplete_plan_is_reported_honestly_when_a_file_is_skipped():
             yoriai._ask_organization_collaborate(47120, "fingerprint", "4つのモジュールに分かれたツールを作って", out_dir)
         output = buf.getvalue()
 
-        # config.pyは実際に実装フェーズに到達していない(保存もされていない)こと。
+        # タスクキュー方式により、3台のメンバーしかいなくても4ファイル
+        # すべてが最終的に実装されるはず(切り捨てが起きない)。
         project_dir = os.path.join(out_dir, "projects", yoriai._generate_project_name("4つのモジュールに分かれたツールを作って"))
         saved_files = set(os.listdir(project_dir)) if os.path.isdir(project_dir) else set()
-        assert "config.py" not in saved_files, (
-            f"config.pyは候補不足でスキップされるはずです: {saved_files}"
+        assert saved_files == {"storage.py", "cli.py", "utils.py", "config.py"}, (
+            f"候補が3台でも、キューにより4ファイルすべてが実装されるはずです: {saved_files}"
         )
-        assert saved_files == {"storage.py", "cli.py", "utils.py"}, saved_files
     finally:
         yoriai._fetch_org_snapshot = original_snapshot
         yoriai._stream_chat_from_candidate = original_stream
         shutil.rmtree(out_dir, ignore_errors=True)
 
-    # 最終的な報告は「未完了」であり、「✅ 全タスク完了」ではないこと。
-    assert "全タスク完了" not in output, (
-        f"config.pyが未完了なのに完了扱いになっています: {output}"
-    )
-    assert "⚠️ 未完了のタスクが残っています" in output, output
-    assert "config.py の実装" in output, output
-    assert "config.py のレビュー" in output, output
-    # 完了しているはずの3ファイルは、未完了リストに含まれないこと。
-    for done_file in ("storage.py", "cli.py", "utils.py"):
-        assert f"{done_file} の実装" not in output.rsplit("未完了のタスクが残っています", 1)[-1], (
-            f"{done_file}は完了しているはずなので未完了リストに出てはいけません: {output}"
-        )
+    assert "⚠️ 未完了のタスクが残っています" not in output, output
+    assert "[✅ 全タスク完了" in output, output
 
 
 def test_complete_plan_reports_all_tasks_done():
@@ -144,8 +133,23 @@ def test_complete_plan_reports_all_tasks_done():
 
 
 def test_checklist_shown_at_each_phase_transition():
-    """タスクリストの状態が、実装フェーズ前後・最終確認時にそれぞれ
-    画面表示されることを確認する(依頼の「都度表示」要件)。
+    """タスクリストの状態が、合意フェーズ直後(初期状態)と最終確認時に
+    画面表示されることに加え、タスクキュー方式導入後は実装フェーズ中の
+    進捗も(バッチでの全件再表示ではなく)タスクが割り当てられるたびに
+    逐次表示されることを確認する(依頼の「都度表示」要件)。
+
+    タスクキュー方式導入前は「実装フェーズ完了後」にチェックリスト全体を
+    再表示していたため、このテストは表示回数が3回以上であることを
+    確認していた。導入後は、実装フェーズ中の進捗はチェックリストの
+    バッチ再表示ではなく[📋 タスクキュー: ...]/[🙌 ...の手が空いたため...]
+    という個別のタスク割り当てメッセージで都度表示されるようになった
+    ため、チェックリスト全体の表示回数は2回(初期状態・最終確認)になる。
+
+    メンバーごとに1スレッドの並行処理のため、「誰の何番目の割り当てか」
+    (📋 = そのメンバーにとって最初のタスク / 🙌 = 手が空いて次のタスクを
+    受け取った)はスレッドのスケジューリングにより実行のたびに変わりうる。
+    そのため両メッセージの内訳ではなく、合計件数(=タスク総数)が固定である
+    ことだけを検証する。
     """
     original_snapshot = yoriai._fetch_org_snapshot
     original_stream = yoriai._stream_chat_from_candidate
@@ -163,8 +167,12 @@ def test_checklist_shown_at_each_phase_transition():
         yoriai._stream_chat_from_candidate = original_stream
         shutil.rmtree(out_dir, ignore_errors=True)
 
-    # 少なくとも3回(初期状態・実装後・最終確認)は表示されるはず。
-    assert output.count("[📝 タスク状況(組織が自ら立てた計画)]") >= 3, output
+    # 少なくとも2回(初期状態・最終確認)はチェックリスト全体が表示されるはず。
+    assert output.count("[📝 タスク状況(組織が自ら立てた計画)]") >= 2, output
+    # 実装フェーズ中は、タスクが割り当てられるたびに個別メッセージ
+    # (📋 または 🙌)で進捗が都度表示されるはず(合計でタスク総数=4件ぶん)。
+    assignment_messages = output.count("[📋 タスクキュー:") + output.count("の手が空いたため、次のタスク")
+    assert assignment_messages == 4, output
 
 
 def test_build_task_checklist_creates_two_tasks_per_file():
@@ -191,7 +199,7 @@ def main():
     tests = [
         test_build_task_checklist_creates_two_tasks_per_file,
         test_incomplete_task_labels_only_returns_non_completed,
-        test_incomplete_plan_is_reported_honestly_when_a_file_is_skipped,
+        test_queue_ensures_all_tasks_complete_even_with_fewer_members_than_tasks,
         test_complete_plan_reports_all_tasks_done,
         test_checklist_shown_at_each_phase_transition,
     ]

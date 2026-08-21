@@ -1790,18 +1790,21 @@ def _extract_code_from_answer(answer: str) -> str:
 def _dispatch_and_save_parallel_tasks(tasks: list, candidates: list, org_fingerprint: str, out_dir: str) -> list:
     """タスク(ファイル名, 依頼内容)のリストを、優先順位順に並べた候補へ先頭から
     1対1で割り当て、同時に問い合わせて各回答からコード部分を抽出し、
-    out_dir 配下にファイル名で保存する。`//parallel`(手動指定)と協業モード・
-    `//agree`(合意フェーズ後の並行実装)の両方から共通して使われる下請け関数。
+    out_dir 配下にファイル名で保存する。`//parallel`(手動指定)専用の
+    下請け関数(協業モード・`//agree`は、タスク数がメンバー数を超えても
+    全タスクを実装できるタスクキュー方式`_run_collaborative_task_queue`を
+    別途使う)。
 
     保存に成功したタスクについて、`[{"filename":, "candidate":, "code":}, ...]`
-    (タスクを書いた順)を返す。この戻り値は、協業モードのレビューフェーズ
-    (`_run_review_phase`)が「どのメンバーがどのファイルを実装したか」を
-    知るために使う。`//parallel`(手動指定)側は戻り値を使わない。
+    (タスクを書いた順)を返す。`//parallel`(手動指定)側は戻り値を使わない。
 
     仮の判断:
     - 割り当ては「タスクを書いた順」と「優先順位順に並べた候補」を先頭から
       1対1で対応させるだけの単純な方式にした。特定のメンバーを名指しで
-      選ぶ構文は今回のスコープ外。
+      選ぶ構文は今回のスコープ外。タスク数が候補数を超える場合は、超えた
+      分をスキップする(`//parallel`はユーザー自身がファイル名・割り当てを
+      明示的に指定するコマンドであり、キュー方式による自動繰り越しは
+      今回のスコープ外とした)。
     - 各タスクは独立した1回きりのやりとりとして扱い、対話モードの会話履歴
       (messages)には追加しない(結果はファイル保存が主目的で、後続の会話の
       前提として扱うべき性質のものではないため)。
@@ -2139,9 +2142,10 @@ def _incomplete_task_labels(checklist: list) -> list:
 def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str, out_dir: str) -> None:
     """「〇〇を作って」のような制作依頼用: まず優先順位が最も高い1台に
     モジュール分割案とインターフェース設計を相談し(合意フェーズ)、
-    その結果を`_dispatch_and_save_parallel_tasks`で異なるメンバーに
-    並行実装させ(実装フェーズ)、最後にお互いが担当外のファイルを
-    レビューし合う(レビューフェーズ、`_run_review_phase`)。
+    その結果をタスクキュー方式(`_run_collaborative_task_queue`)で異なる
+    メンバーに実装・相互レビューさせる。タスク数がメンバー数を超えても、
+    メンバーの手が空くたびに次のタスクが割り当てられるため、最終的に
+    全タスクが実装される。
 
     仮の判断:
     - 「設計担当」の選び方は他の候補選びと同じ優先順位ロジック
@@ -2199,14 +2203,6 @@ def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str,
     checklist = _build_task_checklist(tasks)
     print(_format_task_checklist(checklist))
 
-    # 仮の判断: 各担当への実装依頼には、自分のファイルの説明行だけでなく
-    # 合意フェーズで決まった実装計画全体を埋め込む(理由は
-    # _build_collaborative_implementation_request のコメントを参照)。
-    enriched_tasks = [
-        (filename, _build_collaborative_implementation_request(filename, content, tasks))
-        for filename, content in tasks
-    ]
-
     # 仮の判断: 生成物はYoriai本体と混ざらないよう、projects/<プロジェクト名>/
     # というサブディレクトリにまとめる。プロジェクト名は依頼文から簡易的に
     # 生成し、同名の既存プロジェクトがあれば連番で衝突を避ける。
@@ -2215,34 +2211,11 @@ def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str,
     project_dir = _resolve_project_dir(projects_root, project_name)
     print(f"[📁 生成物の保存先: {project_dir}]")
 
-    for filename, _content in tasks:
-        _set_task_status(checklist, filename, "impl", _TASK_STATUS_IN_PROGRESS)
-
-    print(f"[🔨 実装フェーズ開始: 合意した計画に基づき、{len(enriched_tasks)}件のファイルを異なるメンバーに並行実装させます]")
-    implemented = _dispatch_and_save_parallel_tasks(enriched_tasks, candidates, org_fingerprint, project_dir)
-
-    # 仮の判断: 「実装済み」かどうかは_dispatch_and_save_parallel_tasksの
-    # 戻り値(実際に保存できたファイルの一覧)だけを根拠にする。候補不足で
-    # そもそも問い合わせが飛ばなかったファイル(実機で報告されたconfig.py
-    # スキップのようなケース)や、問い合わせが失敗したファイルは、この時点で
-    # 「実装中」のままステータスが更新されず残る(=最終チェックで検出される)。
-    implemented_filenames = {entry["filename"] for entry in implemented}
-    for filename, _content in tasks:
-        if filename in implemented_filenames:
-            _set_task_status(checklist, filename, "impl", _TASK_STATUS_COMPLETED)
-    print(_format_task_checklist(checklist))
-
-    # 仮の判断: レビューフェーズは「お互いが担当外のファイルをレビューする」
-    # 前提のため、実装に成功したファイルが2件以上無いと成立しない
-    # (1件しか実装できなかった場合、担当外のレビュー担当が存在しない)。
-    if len(implemented) >= 2:
-        for entry in implemented:
-            _set_task_status(checklist, entry["filename"], "review", _TASK_STATUS_IN_PROGRESS)
-        resolved_filenames = _run_review_phase(implemented, tasks, org_fingerprint, project_dir)
-        for filename in resolved_filenames:
-            _set_task_status(checklist, filename, "review", _TASK_STATUS_COMPLETED)
-    else:
-        print(f"[🔎 レビューフェーズはスキップします: 相互レビューを行うには実装済みファイルが2件以上必要です(保存先: {project_dir})]")
+    # 仮の判断: タスク数がメンバー数を超える場合に「超過分は切り捨てる」
+    # 従来の実装(_dispatch_and_save_parallel_tasksの1:1固定割り当て)を
+    # やめ、タスクキュー方式(_run_collaborative_task_queue)で全タスクが
+    # 最終的に実装されるようにした。詳しくは同関数のコメントを参照。
+    _run_collaborative_task_queue(tasks, candidates, org_fingerprint, project_dir, checklist)
 
     # 【最重要】組織自身が立てた計画のうち、1つでも未完了のタスクが残って
     # いる場合は「✅ レビュー完了」を名乗らず、何が終わっていないかを
@@ -2473,60 +2446,170 @@ def _review_and_fix_one_file(
     return ok
 
 
-def _run_review_phase(implemented: list, agreed_plan: list, org_fingerprint: str, out_dir: str) -> list:
-    """実装フェーズで生成された各ファイルを、担当外のメンバーにレビュー
-    させる。`implemented`は`_dispatch_and_save_parallel_tasks`が返す
-    `[{"filename":, "candidate":, "code":}, ...]`(タスクを書いた順、
-    各要素の担当は互いに異なる)。
+# ---------------------------------------------------------------------------
+# タスクキュー方式による実装・レビュー
+# ---------------------------------------------------------------------------
+#
+# 以前は「メンバー数ぶんだけタスクを実行し、超過分は切り捨てる」実装
+# だった(_dispatch_and_save_parallel_tasksの1:1固定割り当てと、静的な
+# 円環割り当てで1回だけレビューする旧_run_review_phase)。合意フェーズが
+# 提案したファイル数がメンバー数を超えると、超過分は永遠に実装されない
+# (タスクチェックリストの追加調査で見つかった不具合の温床でもあった)。
+# タスクを待ち行列(キュー)として扱い、メンバーの実装+レビューが完了
+# するたびに次のタスクを割り当てる方式に変更し、メンバー数に関わらず
+# 最終的に全タスクが実装されるようにした。
 
-    レビューの結果「問題なし」に到達したファイル名のリストを返す
-    (呼び出し元の`_ask_organization_collaborate`が、組織全体のタスク
-    チェックリストのうち「レビュー」タスクを完了扱いにするために使う)。
+def _estimate_task_weight(content: str) -> int:
+    """依頼文(合意フェーズがそのファイルについて書いた説明)の長さを、
+    タスクの「重さ(実装の複雑さ)」の簡易的な代理指標として使う。
 
-    仮の判断: レビュー担当は「次の要素の担当メンバー」を円環状(最後の
-    要素の次は先頭に戻る)に割り当てる単純な方式にした。2ファイル・
-    2メンバーの典型的なケースでは「お互いが相手をレビューする」に自然と
-    一致する。ファイル数が3件以上に増えた場合の「誰が誰をレビューするのが
-    最適か」という設計はさらに検討の余地があるが、今回のスコープでは
-    「担当外の誰かが必ずレビューする」ことだけを保証する方式にとどめた。
-
-    このメッセージ末尾の「✅ レビュー完了」/「⚠️ 未解決の指摘が残って
-    います」は、あくまで**このレビューフェーズが処理した範囲(=実装まで
-    たどり着いたファイル)についての結論**である。合意フェーズで計画
-    されたファイルのうち、候補不足等でそもそも実装フェーズに到達しな
-    かったファイル(依頼で報告された、config.pyが実装されないまま
-    スキップされていた不具合のようなケース)はこの関数からは見えない。
-    組織全体として本当に全タスクが完了したかどうかの最終判定は、
-    呼び出し元がタスクチェックリストで別途行う。
+    仮の判断: 依頼文の複雑さを厳密に見積もるには本来LLMへの追加の
+    問い合わせが必要になるが、それではタスクの割り当て順序を決める
+    ためだけに追加のネットワーク往復が発生してしまう。説明文が長い
+    ファイルほど、実装すべき関数シグネチャやデータ形式の記述が多く
+    実装により時間がかかるだろう、という単純な仮定に基づく。依頼に
+    明記された「簡易的に推定」という方針に沿った実装。
     """
-    print()
-    print("[🔎 レビューフェーズ開始: お互いが担当外のファイルをレビューします]")
+    return len(content)
 
-    full_plan = "\n".join(f"{fn}: {content}" for fn, content in agreed_plan)
-    n = len(implemented)
-    unresolved = []
-    resolved = []
 
-    for i, entry in enumerate(implemented):
-        reviewer_entry = implemented[(i + 1) % n]
-        ok = _review_and_fix_one_file(
-            filename=entry["filename"], owner=entry["candidate"], code=entry["code"],
-            reviewer=reviewer_entry["candidate"], reviewer_own_filename=reviewer_entry["filename"],
-            reviewer_own_code=reviewer_entry["code"], full_plan=full_plan,
-            org_fingerprint=org_fingerprint, out_dir=out_dir,
-        )
-        if ok:
-            resolved.append(entry["filename"])
-        else:
-            unresolved.append(entry["filename"])
+def _run_collaborative_task_queue(
+    tasks: list, candidates: list, org_fingerprint: str, project_dir: str, checklist: list,
+) -> None:
+    """合意フェーズで確定した全タスクを待ち行列(キュー)として扱い、
+    メンバーの実装+レビューが完了するたびに次のタスクを割り当てながら
+    処理する。メンバー数がタスク数より少なくても、最終的に全タスクが
+    実装される。
 
-    print()
-    if unresolved:
-        print(f"[⚠️ 未解決の指摘が残っています: {', '.join(unresolved)} (保存先: {out_dir})]")
-    else:
-        print(f"[✅ レビュー完了(今回レビュー対象の{n}ファイル、保存先: {out_dir})]")
+    仮の判断:
+    - タスクは`_estimate_task_weight`による「重さ」の降順に並べたものを
+      キューとする。`candidates`は`_select_chat_candidates`が既に空き
+      メモリの多い順に並べているため、キューの先頭(最も重いタスク)から
+      順に、空きメモリの多いメンバーへ初期割り当てされる形になる
+      (「空きメモリが多いメンバーには重いタスクを優先的に割り当てる」
+      という依頼の要件に対応)。2巡目以降は、手が空いたメンバーがその
+      時点でキューの先頭(残りの中で最も重いタスク)を取る。
+    - メンバーは1人1スレッドの「ワーカー」として動作し、キューが空に
+      なるまで「タスクを取る→実装→(担当外の別メンバーに)レビューを
+      依頼→(必要なら)修正→再レビュー」を繰り返す。実装+レビューの
+      両方が(合否に関わらず)完了して初めて、そのメンバーは次のタスクを
+      取れる(依頼の「実装が完了し、レビューも通ったら、次のタスクを
+      割り当てる」という要件)。
+    - レビュー担当は「自分以外の最初のメンバー」という単純な固定選択に
+      した。レビュー依頼(問い合わせ1回)は、レビュー担当が自分自身の
+      キュー処理で別のタスクを実装中であってもブロックせずに送られる。
+      レビュー担当が参考にする「自分の担当ファイル」は、その時点までに
+      そのメンバーが最後に完了させたファイルを使う(まだ何も完了させて
+      いない場合はその旨をプロンプトに書く)。
+    - メンバーが1台しかいない場合、担当外のレビュー担当を選べないため、
+      そのファイルのレビューはスキップする(実装だけは行う)。この場合
+      「レビュー」タスクはタスクチェックリスト上「未完了」のまま残り、
+      最終チェックで検出される。
+    """
+    full_plan = "\n".join(f"{fn}: {content}" for fn, content in tasks)
+    remaining = sorted(tasks, key=lambda t: _estimate_task_weight(t[1]), reverse=True)
 
-    return resolved
+    queue_lock = threading.Lock()
+    print_lock = threading.Lock()
+    latest_completed = {}  # candidate_label -> (filename, code)
+
+    def pop_next():
+        with queue_lock:
+            if not remaining:
+                return None
+            task = remaining.pop(0)
+            return task, list(remaining)
+
+    def pick_reviewer(implementer):
+        for c in candidates:
+            if c["label"] != implementer["label"]:
+                return c
+        return None
+
+    def worker(candidate):
+        is_first = True
+        while True:
+            popped = pop_next()
+            if popped is None:
+                return
+            (filename, content), remaining_after = popped
+
+            with print_lock:
+                remaining_desc = ", ".join(fn for fn, _ in remaining_after) if remaining_after else "なし"
+                if is_first:
+                    print(
+                        f"[📋 タスクキュー: {candidate['label']} に {filename} を割り当てました "
+                        f"(残り{len(remaining_after)}件: {remaining_desc})]"
+                    )
+                else:
+                    print(
+                        f"[🙌 {candidate['label']} の手が空いたため、次のタスク {filename} を割り当てます "
+                        f"(残り{len(remaining_after)}件: {remaining_desc})]"
+                    )
+            is_first = False
+
+            _set_task_status(checklist, filename, "impl", _TASK_STATUS_IN_PROGRESS)
+            request_text = _build_collaborative_implementation_request(filename, content, tasks)
+            answer, error = _collect_answer_from_candidate(
+                candidate, org_fingerprint, [{"role": "user", "content": request_text}],
+            )
+            with print_lock:
+                print()
+                print(f"--- {filename} ← {candidate['label']} (モデル: {candidate['model']}) ---")
+                if error or not answer:
+                    print(f"(問い合わせに失敗しました: {error or '応答なし'})")
+                else:
+                    print(answer)
+
+            if error or not answer:
+                logger.warning(
+                    "%s の実装に失敗しました(担当: %s): %s", filename, candidate["label"], error or "応答なし",
+                )
+                # 実装できなかったファイルはタスクリスト上「未完了」のまま残り、
+                # 最終チェックで検出される。このメンバーは次のタスクへ進む。
+                continue
+
+            code = _extract_code_from_answer(answer)
+            os.makedirs(project_dir, exist_ok=True)
+            dest_path = os.path.join(project_dir, filename)
+            with open(dest_path, "w", encoding="utf-8") as f:
+                f.write(code)
+            with print_lock:
+                print(f"[💾 {dest_path} に保存しました (担当: {candidate['label']})]")
+            _set_task_status(checklist, filename, "impl", _TASK_STATUS_COMPLETED)
+
+            reviewer = pick_reviewer(candidate)
+            if reviewer is None:
+                with print_lock:
+                    print(f"[⚠️ {filename} のレビュー担当者がいません(メンバーが1台のみのため、レビューはスキップされます)]")
+                continue
+
+            with queue_lock:
+                reviewer_own = latest_completed.get(reviewer["label"])
+            if reviewer_own:
+                reviewer_own_filename, reviewer_own_code = reviewer_own
+            else:
+                reviewer_own_filename = "(まだ担当ファイルがありません)"
+                reviewer_own_code = "(まだ実装したファイルがありません)"
+
+            _set_task_status(checklist, filename, "review", _TASK_STATUS_IN_PROGRESS)
+            ok = _review_and_fix_one_file(
+                filename=filename, owner=candidate, code=code,
+                reviewer=reviewer, reviewer_own_filename=reviewer_own_filename, reviewer_own_code=reviewer_own_code,
+                full_plan=full_plan, org_fingerprint=org_fingerprint, out_dir=project_dir,
+            )
+            if ok:
+                _set_task_status(checklist, filename, "review", _TASK_STATUS_COMPLETED)
+
+            with queue_lock:
+                latest_completed[candidate["label"]] = (filename, code)
+
+    print(f"[📋 タスクキュー方式で実装フェーズを開始します: {len(tasks)}件のタスクを{len(candidates)}台のメンバーで処理します]")
+    threads = [threading.Thread(target=worker, args=(c,), daemon=True) for c in candidates]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
 
 # ---------------------------------------------------------------------------
