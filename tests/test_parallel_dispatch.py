@@ -137,7 +137,7 @@ def _with_patched_dispatch(snapshot_fn, response_by_label, fn):
     original_snapshot = yoriai._fetch_org_snapshot
     original_stream = yoriai._stream_chat_from_candidate
 
-    def fake_stream(candidate, org_fingerprint, messages):
+    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
         expected_substring, canned_answer = response_by_label[candidate["label"]]
         actual_request = messages[0]["content"]
         assert expected_substring in actual_request, (

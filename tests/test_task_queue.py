@@ -36,7 +36,7 @@ def _candidate(label, model):
     return {"label": label, "model": model, "address": "127.0.0.1", "port": 47120}
 
 
-def _fake_stream_ok(candidate, org_fingerprint, messages):
+def _fake_stream_ok(candidate, org_fingerprint, messages, **_kwargs):
     """実装依頼には空実装のコードを、レビュー依頼には常に「問題なし」を返す。"""
     text = messages[0]["content"]
     if "レビュー対象" in text:

@@ -53,7 +53,7 @@ _FOUR_FILE_BREAKDOWN_ANSWER = (
 )
 
 
-def _fake_stream_ok(candidate, org_fingerprint, messages):
+def _fake_stream_ok(candidate, org_fingerprint, messages, **_kwargs):
     request_text = messages[0]["content"]
     if "ファイルに分割する実装計画" in request_text:
         yield {"content": _FOUR_FILE_BREAKDOWN_ANSWER}

@@ -179,7 +179,7 @@ def test_collaborate_dispatches_exactly_two_files_when_architect_uses_nested_for
 
     received_requests_log = []
 
-    def fake_stream(candidate, org_fingerprint, messages):
+    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
         label = candidate["label"]
         request_text = messages[0]["content"]
         received_requests_log.append((label, request_text))
@@ -241,7 +241,7 @@ def test_agree_uses_top_candidate_as_architect_and_propagates_interface_to_imple
     # 記録する。
     received_requests_log = []
 
-    def fake_stream(candidate, org_fingerprint, messages):
+    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
         label = candidate["label"]
         request_text = messages[0]["content"]
         received_requests_log.append((label, request_text))
@@ -321,7 +321,7 @@ def test_agree_aborts_cleanly_when_architect_response_is_unparseable():
 
     call_count = {"n": 0}
 
-    def fake_stream(candidate, org_fingerprint, messages):
+    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
         call_count["n"] += 1
         yield {"content": "すみません、うまく分割案を作れませんでした。"}
         yield {"done": True}
@@ -367,7 +367,7 @@ def test_implementer_receives_full_plan_even_when_architect_output_is_self_incon
 
     received_requests_log = []
 
-    def fake_stream(candidate, org_fingerprint, messages):
+    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
         label = candidate["label"]
         request_text = messages[0]["content"]
         received_requests_log.append((label, request_text))
@@ -384,11 +384,17 @@ def test_implementer_receives_full_plan_even_when_architect_output_is_self_incon
     try:
         yoriai._ask_organization_collaborate(47120, "fingerprint", "ToDoリストのCLIツールを作って", out_dir)
 
-        # レビューフェーズでもjunnoMac-miniへの問い合わせが発生するため、
-        # 実装依頼特有の文言で絞り込む。
+        # 仮の判断: タスクキュー方式では、cli.pyの実装担当がどのメンバーに
+        # なるかはワーカースレッドの実行順序に左右され、必ずしも
+        # junnoMac-miniになるとは限らない(候補が3台・タスクが2件のため、
+        # 手が空いたメンバーが両方のタスクを処理することもありうる)。
+        # そのため、担当者のラベルではなく「あなたが実装を担当するファイル」
+        # セクションでcli.pyが指定されている実装依頼、という内容そのもので
+        # 絞り込む(レビューフェーズの問い合わせはこの文言を含まないため、
+        # 混同しない)。
         cli_requests = [
-            req for label, req in received_requests_log
-            if label == "junnoMac-mini" and "あなたが実装を担当するファイル" in req
+            req for _label, req in received_requests_log
+            if "あなたが実装を担当するファイル】\ncli.py:" in req
         ]
         assert len(cli_requests) == 1, received_requests_log
         cli_request = cli_requests[0]
