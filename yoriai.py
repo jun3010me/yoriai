@@ -2403,10 +2403,13 @@ PROGRESS_FILENAME = "PROGRESS.md"
 _PROGRESS_SECTION_REQUEST = "## 元の依頼"
 _PROGRESS_SECTION_PLAN = "## モジュール分割案"
 _PROGRESS_SECTION_CHECKLIST = "## タスク状況"
+_PROGRESS_SECTION_AUTO_RESUME_COUNT = "## 自動再開の試行回数"
 _PROGRESS_SECTION_REVIEW = "## 直近のレビュー指摘"
 
 
-def _format_progress_markdown(request: str, tasks: list, checklist: list, review_feedback: dict) -> str:
+def _format_progress_markdown(
+    request: str, tasks: list, checklist: list, review_feedback: dict, auto_resume_count: int = 0,
+) -> str:
     """PROGRESS.mdの内容を組み立てる。
 
     仮の判断: 「モジュール分割案」セクションは、既存の設計担当への
@@ -2415,6 +2418,13 @@ def _format_progress_markdown(request: str, tasks: list, checklist: list, review
     `_parse_module_breakdown`がそのまま解析できるため、再開時
     (`_parse_progress_markdown`)に新しいパーサーを書き起こす必要がなく、
     書き込み・読み込みの両方で実績のある同じコードを再利用できる。
+
+    仮の判断: 「自動再開の試行回数」も、この試行回数だけを内容とする
+    シンプルなセクションとしてPROGRESS.mdに直接記録する(別ファイルや
+    JSON等の付随データファイルは持たせない)。read_fileツール・
+    PROGRESS.md全体で踏襲している「ディスク上の実際の状態を正として
+    扱う」方針により、対話モードのプロセスを再起動しても試行回数の
+    記録が失われないようにするため。
     """
     lines = ["# プロジェクト進行状況", "", _PROGRESS_SECTION_REQUEST, "", request, ""]
     lines.append(_PROGRESS_SECTION_PLAN)
@@ -2425,6 +2435,10 @@ def _format_progress_markdown(request: str, tasks: list, checklist: list, review
     lines.append(_PROGRESS_SECTION_CHECKLIST)
     lines.append("")
     lines.extend(_format_checklist_lines(checklist))
+    lines.append("")
+    lines.append(_PROGRESS_SECTION_AUTO_RESUME_COUNT)
+    lines.append("")
+    lines.append(str(auto_resume_count))
     lines.append("")
     if review_feedback:
         lines.append(_PROGRESS_SECTION_REVIEW)
@@ -2437,9 +2451,11 @@ def _format_progress_markdown(request: str, tasks: list, checklist: list, review
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
-def _write_progress_md(project_dir: str, request: str, tasks: list, checklist: list, review_feedback: dict) -> None:
+def _write_progress_md(
+    project_dir: str, request: str, tasks: list, checklist: list, review_feedback: dict, auto_resume_count: int = 0,
+) -> None:
     os.makedirs(project_dir, exist_ok=True)
-    content = _format_progress_markdown(request, tasks, checklist, review_feedback)
+    content = _format_progress_markdown(request, tasks, checklist, review_feedback, auto_resume_count)
     with open(os.path.join(project_dir, PROGRESS_FILENAME), "w", encoding="utf-8") as f:
         f.write(content)
 
@@ -2499,11 +2515,24 @@ def _parse_checklist_markdown(text: str) -> list:
     return checklist
 
 
+def _parse_auto_resume_count(text: str) -> int:
+    """「自動再開の試行回数」セクションの内容を整数として読み取る。
+    セクションが無い(旧バージョンのPROGRESS.md)・内容が数値として
+    解釈できない場合は、まだ1回も自動再開を試みていないとみなして
+    `0`を返す。
+    """
+    section = _extract_progress_section(text, _PROGRESS_SECTION_AUTO_RESUME_COUNT).strip()
+    try:
+        return int(section)
+    except ValueError:
+        return 0
+
+
 def _parse_progress_markdown(path: str):
-    """PROGRESS.mdを読み込み、`{"request":, "tasks":, "checklist":}`の
-    辞書として返す。ファイルが存在しない・想定した形式で解析できない
-    場合は`None`を返す(呼び出し元は、そのプロジェクトの再開を
-    スキップすべきというシグナルとして扱う)。
+    """PROGRESS.mdを読み込み、`{"request":, "tasks":, "checklist":,
+    "auto_resume_count":}`の辞書として返す。ファイルが存在しない・
+    想定した形式で解析できない場合は`None`を返す(呼び出し元は、
+    そのプロジェクトの再開をスキップすべきというシグナルとして扱う)。
     """
     try:
         with open(path, encoding="utf-8") as f:
@@ -2516,7 +2545,10 @@ def _parse_progress_markdown(path: str):
     checklist = _parse_checklist_markdown(_extract_progress_section(text, _PROGRESS_SECTION_CHECKLIST))
     if not tasks or not checklist:
         return None
-    return {"request": request, "tasks": tasks, "checklist": checklist}
+    return {
+        "request": request, "tasks": tasks, "checklist": checklist,
+        "auto_resume_count": _parse_auto_resume_count(text),
+    }
 
 
 def _progress_checklist_is_incomplete(checklist: list) -> bool:
@@ -2633,10 +2665,16 @@ def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str,
 
     _run_collaborative_project(request, tasks, checklist, candidates, org_fingerprint, project_dir, tasks)
 
+    # 仮の判断: 自動再開(有限の上限付き)は、この「新規の協業モード実行」
+    # 直後にのみトリガーする。手動`//resume-all`(_run_resume_all)からは
+    # 呼ばない(依頼の要件5: 手動実行はこの試行回数カウンタと無関係に
+    # 何度でもできるようにする、という区別を素直に実装するため)。
+    _maybe_auto_resume(project_dir, port, org_fingerprint)
+
 
 def _run_collaborative_project(
     request: str, tasks: list, checklist: list, candidates: list, org_fingerprint: str,
-    project_dir: str, tasks_to_queue: list,
+    project_dir: str, tasks_to_queue: list, auto_resume_count: int = 0,
 ) -> None:
     """タスクキュー方式による実装・レビューを実行し、その間PROGRESS.mdを
     更新し続ける。新規プロジェクト(`_ask_organization_collaborate`)・
@@ -2645,13 +2683,19 @@ def _run_collaborative_project(
     `tasks`は計画全体(PROGRESS.mdの「モジュール分割案」に書き出す対象)、
     `tasks_to_queue`は実際にタスクキューへ投入する対象(新規作成時は
     `tasks`と同じ、再開時は未完了だったファイルだけの部分集合)。
+
+    `auto_resume_count`(自動再開の試行回数)は、この関数自身は増減させず、
+    呼び出し元(`_maybe_auto_resume`)から渡された値をそのままPROGRESS.mdに
+    書き戻すだけの、素通しの値として扱う。新規プロジェクトでは既定値の
+    `0`のまま、手動`//resume-all`(`_resume_project`)経由ではディスク上の
+    既存の値がそのまま渡ってくる。
     """
     review_feedback = {}
     progress_lock = threading.Lock()
 
     def write_progress():
         with progress_lock:
-            _write_progress_md(project_dir, request, tasks, checklist, review_feedback)
+            _write_progress_md(project_dir, request, tasks, checklist, review_feedback, auto_resume_count)
 
     write_progress()
     if tasks_to_queue:
@@ -3162,7 +3206,7 @@ def _run_collaborative_task_queue(
 RESUME_ALL_COMMAND = "//resume-all"
 
 
-def _resume_project(project_dir: str, port: int, org_fingerprint: str) -> bool:
+def _resume_project(project_dir: str, port: int, org_fingerprint: str, auto_resume_count: int = None) -> bool:
     """1つのプロジェクトディレクトリのPROGRESS.mdを読み込み、未完了の
     ファイルだけを対象にタスクキュー方式を再開する。PROGRESS.mdが
     読み取れない、組織に問い合わせできない等で再開自体を開始できな
@@ -3170,6 +3214,12 @@ def _resume_project(project_dir: str, port: int, org_fingerprint: str) -> bool:
     最後まで行えた場合は`True`を返す。「全タスクが完了したか」は
     呼び出し元がディスク上の状態を`_find_incomplete_projects`で
     再確認して判断する)。
+
+    `auto_resume_count`は既定で`None`(=PROGRESS.mdに記録されている
+    値をそのまま使う、つまり変更しない)。手動`//resume-all`
+    (`_run_resume_all`)はこの既定のまま呼び出すため、自動再開の
+    試行回数カウンタには一切触れない(依頼の要件5)。自動再開
+    (`_maybe_auto_resume`)だけが、増分後の値を明示的に渡す。
     """
     progress_path = os.path.join(project_dir, PROGRESS_FILENAME)
     parsed = _parse_progress_markdown(progress_path)
@@ -3178,6 +3228,8 @@ def _resume_project(project_dir: str, port: int, org_fingerprint: str) -> bool:
         return False
 
     request, tasks, checklist = parsed["request"], parsed["tasks"], parsed["checklist"]
+    if auto_resume_count is None:
+        auto_resume_count = parsed["auto_resume_count"]
     tasks_to_queue = _pending_tasks_from_checklist(tasks, checklist)
     if not tasks_to_queue:
         print(f"[{project_dir}] 未完了のタスクは見つかりませんでした。")
@@ -3196,8 +3248,59 @@ def _resume_project(project_dir: str, port: int, org_fingerprint: str) -> bool:
         f"[🔁 {project_dir} を再開します: 未完了{len(tasks_to_queue)}件"
         f" ({', '.join(fn for fn, _ in tasks_to_queue)})]"
     )
-    _run_collaborative_project(request, tasks, checklist, candidates, org_fingerprint, project_dir, tasks_to_queue)
+    _run_collaborative_project(
+        request, tasks, checklist, candidates, org_fingerprint, project_dir, tasks_to_queue, auto_resume_count,
+    )
     return True
+
+
+# 仮の判断: 未完了で終わった協業モードを、ユーザーの確認を挟まずに
+# 自動的に再開できる上限回数。既存の「1ファイルあたりレビュー往復は
+# 最大2回まで」という暴走防止の仕組み(内側の歯止め)とは独立した、
+# プロジェクト単位での外側の歯止め。依頼で明示された「3回」を定数として
+# 固定する(無制限に自動で回り続けることは絶対に避けたいという要件)。
+_AUTO_RESUME_MAX_ATTEMPTS = 3
+
+
+def _maybe_auto_resume(project_dir: str, port: int, org_fingerprint: str) -> None:
+    """協業モードの1回分の実行(新規実行、またはこの関数自身による
+    自動再開)が終わった直後に呼ばれる。プロジェクトがまだ未完了で、
+    自動再開の試行回数(PROGRESS.mdに記録済み)が上限未満であれば、
+    ユーザーの確認を挟まず自動的にもう一度そのプロジェクトを再開する
+    (既存の`_resume_project`をそのまま使う)。上限に達している場合は、
+    その旨をはっきりと報告して停止する。
+
+    仮の判断: 試行回数はPROGRESS.md自身から呼び出しのたびに読み直す
+    (メモリ上の引数として引き継がない)。read_fileツール・PROGRESS.md
+    全体で踏襲している「ディスク上の実際の状態を正として扱う」方針に
+    沿ったもので、対話モードのプロセスを再起動しても試行回数の記録が
+    失われない。`_resume_project`に渡す増分後の試行回数は、
+    `_run_collaborative_project`の最初の`write_progress()`呼び出しで
+    即座にディスクへ書き込まれるため、この関数自身が別途書き込む
+    必要はない。
+
+    再帰呼び出しで次の試行を行う設計にしているが、上限(3回)により
+    再帰の深さは物理的に3を超えない。
+    """
+    parsed = _parse_progress_markdown(os.path.join(project_dir, PROGRESS_FILENAME))
+    if parsed is None or not _progress_checklist_is_incomplete(parsed["checklist"]):
+        return
+
+    attempt_count = parsed["auto_resume_count"]
+    if attempt_count >= _AUTO_RESUME_MAX_ATTEMPTS:
+        print(
+            f"[⛔ {project_dir}: 自動再開の上限({_AUTO_RESUME_MAX_ATTEMPTS}回)に達しました。"
+            "これ以上の自動再開は行いません。人間の確認が必要です]"
+        )
+        return
+
+    next_attempt = attempt_count + 1
+    print(
+        f"[🔁 {project_dir}: 未完了のタスクが残っているため、自動的に再開します"
+        f"(試行 {next_attempt}/{_AUTO_RESUME_MAX_ATTEMPTS})]"
+    )
+    if _resume_project(project_dir, port, org_fingerprint, auto_resume_count=next_attempt):
+        _maybe_auto_resume(project_dir, port, org_fingerprint)
 
 
 def _run_resume_all(port: int, org_fingerprint: str, out_dir: str) -> None:
@@ -3695,6 +3798,111 @@ def _create_background_job_runner() -> "_BackgroundJobRunner":
 _BACKGROUND_QUEUED_NOTICE = "[⏳ 実行中の処理があるため、この依頼は完了後に順番にバックグラウンドで処理されます]"
 
 
+# ---------------------------------------------------------------------------
+# 起動時の案内文(見た目の改善)
+# ---------------------------------------------------------------------------
+#
+# 対話モードの起動時の見た目を、Claude Code等のツールに近い洗練された
+# 印象にしたいという依頼を受けた。(1)シンプルなASCIIアートのロゴ、
+# (2)情報量の多かった説明文を階層立てて簡潔に整理、(3)検出済みの
+# メンバー数の表示、(4)色付け(ただし色に対応しない環境でも崩れない)、
+# を実装する。
+
+_ANSI_RESET = "\x1b[0m"
+_ANSI_BOLD = "\x1b[1m"
+_ANSI_DIM = "\x1b[2m"
+_ANSI_CYAN = "\x1b[36m"
+
+
+def _supports_ansi_color() -> bool:
+    """色付け(ANSIエスケープシーケンス)を使ってよいかどうかを判定する。
+
+    仮の判断: (1)`NO_COLOR`環境変数(色付けを無効化する事実上の標準、
+    https://no-color.org/ )が設定されている、(2)`TERM=dumb`(色を含む
+    高度な端末制御シーケンスに対応しない最小構成の端末)、(3)標準出力が
+    端末に直接つながっていない(ファイルやパイプにリダイレクトされて
+    いる、`isatty()`が偽)、のいずれかに該当する場合は色付けを無効にする。
+    これにより、色に対応しない・対応するかどうか不明な環境でも、
+    エスケープシーケンスの断片がそのまま表示されて崩れることがない
+    (依頼の「色が使えない環境でも崩れずに表示できるようにしてほしい」
+    という要件への対応)。
+    """
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("TERM") == "dumb":
+        return False
+    try:
+        return sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+def _ansi(text: str, *codes: str, use_color: bool) -> str:
+    if not use_color or not codes:
+        return text
+    return "".join(codes) + text + _ANSI_RESET
+
+
+_YORIAI_TAGLINE = "ローカルLLMエージェントの自律組織"
+
+
+def _count_org_members(port: int, org_fingerprint: str):
+    """起動時の案内文に表示するためだけの、ベストエフォートなメンバー数
+    (自分を含む)取得。`handle_chat`が起動時に`fail_fast=True`で疎通
+    確認済みのため、通常はここでも成功する。万が一失敗しても
+    `_fetch_org_snapshot`が案内を表示するだけで例外は投げないため、
+    対話モードの起動そのものは妨げない(`None`を返し、案内文側で
+    「取得できませんでした」という表示に切り替える)。
+    """
+    data = _fetch_org_snapshot(port, org_fingerprint)
+    if data is None:
+        return None
+    return len(data.get("peers", [])) + 1
+
+
+def _format_member_count_line(member_count) -> str:
+    if member_count is None:
+        return "(組織のメンバー数を取得できませんでした)"
+    return f"🟢 {member_count}台のメンバーが接続中(自分を含む)"
+
+
+def _format_startup_banner(out_dir: str, member_count, use_color: bool) -> str:
+    """対話モード起動時に表示する案内文を組み立てる。
+
+    仮の判断: ロゴは装飾を抑えたシンプルな1行のワードマークにとどめた
+    (依頼の「凝りすぎず」という要件、および複数行の文字絵は半角/全角
+    文字が混在すると実機ごとのフォント幅の差異で見た目が崩れやすい
+    ため)。以前は1行1トピックの長い説明文が並んでいたが、「基本操作」
+    「コマンド」の2つの見出しの下にまとめることで、階層立てて簡潔に
+    整理した。
+    """
+    lines = [
+        _ansi("Y O R I A I  ·  寄合", _ANSI_BOLD, _ANSI_CYAN, use_color=use_color),
+        _ansi(_YORIAI_TAGLINE, _ANSI_DIM, use_color=use_color),
+        _format_member_count_line(member_count),
+        "",
+        _ansi("基本操作", _ANSI_BOLD, use_color=use_color),
+        "  Enterで送信、Shift+Enterで改行",
+        "  上下矢印キーで、入力済みの行を自由に編集できます",
+        "  exit・quit の送信、または入力前のCtrl+Dで終了",
+        "  " + _ansi("★", _ANSI_BOLD, use_color=use_color)
+        + " Ctrl+Cを2秒以内に2回連続で押すと、状況に関わらずいつでも確実に終了できます",
+        "    (送信キーやexit/quitが効かない場合の非常口です)",
+        "",
+        _ansi("コマンド", _ANSI_BOLD, use_color=use_color),
+        "  (コマンドを付けずに話しかけると、単発/比較/協業のどのモードかを自動判断します)",
+        f"  {MULTI_QUERY_COMMAND} <質問文>: 空きリソース上位{MULTI_QUERY_TARGET_COUNT}台に同時に質問",
+        f"  {AGREE_COMMAND} <制作依頼>: 事前すり合わせを経て協業モードで実装",
+        f"  {PARALLEL_QUERY_COMMAND} <ファイル名1>:<依頼1> | ...: ファイル・依頼を手動指定して並行実装",
+        f"  {RESUME_ALL_COMMAND}: 未完了プロジェクトを検出して再開",
+        "",
+        f"生成物の保存先: {os.path.join(out_dir, PROJECTS_SUBDIR_NAME)}/<プロジェクト名>/",
+        "協業モード・//parallel・//resume-allはバックグラウンドで処理され、",
+        "処理中も次の依頼を入力できます。",
+    ]
+    return "\n".join(lines)
+
+
 def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
     # 仮の判断: 対話モード全体を`patch_stdout()`で包む。バックグラウンド
     # ジョブ(協業モード等)がメインスレッドの入力待ち中にprint()する際、
@@ -3714,34 +3922,8 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
     # 消えてしまう不具合が実際に発生した。
     with create_app_session(), patch_stdout():
         print()
-        print("=== Yoriai 対話モード ===")
-        print("★ Ctrl+Cを2秒以内に2回連続で押すと、状況に関わらずいつでも確実に")
-        print("  終了できます(送信キーやexit/quitが効かない場合の非常口です)。")
-        print("終了するには exit または quit とだけ入力してEnterを押すか、")
-        print("入力前にCtrl+Dを押す方法もあります。")
-        print("Enterで送信、Shift+Enterで改行を挿入します(1行だけの質問も、")
-        print("入力→Enter、の操作で送信できます)。上下矢印キーで、入力済みの")
-        print("行の間を自由に移動しながら編集できます。")
-        print("コマンドを付けずに話しかけると、依頼内容から単発/比較/協業のどのモードで")
-        print("問い合わせるかを自動的に判断します(判断理由は[判断: ...]として表示されます)。")
-        print(f"{MULTI_QUERY_COMMAND} <質問文> で、自動判定に関わらず必ず空きリソース上位{MULTI_QUERY_TARGET_COUNT}台に同時に質問できます。")
-        print(
-            f"{AGREE_COMMAND} <制作依頼> で、自動判定に関わらず必ず事前すり合わせ(合意フェーズ)を経て並行実装させます"
-            f"(生成物は{os.path.join(out_dir, PROJECTS_SUBDIR_NAME)}/<プロジェクト名>/に保存されます)。"
-        )
-        print(
-            f"{PARALLEL_QUERY_COMMAND} <ファイル名1>:<依頼1> | <ファイル名2>:<依頼2> ... で、"
-            f"割り振り内容を自分で指定し、異なる依頼を異なるメンバーに同時に振り分け、"
-            f"回答からコードを抽出して{out_dir}に保存できます。"
-        )
-        print(
-            f"{RESUME_ALL_COMMAND} で、{os.path.join(out_dir, PROJECTS_SUBDIR_NAME)}/以下の未完了プロジェクトを"
-            f"全て検出し、未完了のタスクだけを対象に順番に再開します。"
-        )
-        print(
-            "協業モード・//parallel・//resume-allはバックグラウンドで処理され、"
-            "処理中も引き続き次の依頼を入力できます(進行ログはそのまま画面に流れます)。"
-        )
+        member_count = _count_org_members(port, org_fingerprint)
+        print(_format_startup_banner(out_dir, member_count, _supports_ansi_color()))
         print()
 
         # 仮の判断: 会話履歴(messages)はこのセッション内でのみ保持し、終了したら破棄する。
