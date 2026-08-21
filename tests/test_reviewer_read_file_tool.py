@@ -121,6 +121,49 @@ def test_read_project_file_fresh_rejects_path_traversal():
         shutil.rmtree(outer_dir, ignore_errors=True)
 
 
+def test_truncate_file_content_leaves_short_content_unchanged():
+    content, truncated = yoriai._truncate_file_content("hello", limit=100)
+    assert content == "hello"
+    assert truncated is False
+
+
+def test_truncate_file_content_truncates_long_content():
+    content, truncated = yoriai._truncate_file_content("x" * 200, limit=100)
+    assert content == "x" * 100
+    assert truncated is True
+
+
+def test_read_project_file_fresh_truncates_large_files():
+    """調査依頼への対応: 複雑な依頼(HTML/CSS学習サイト等)で1ファイルの
+    サイズが大きい場合に、read_fileがその内容を丸ごと返すとトークン
+    使用量が膨らむ問題への対策(_FILE_CONTENT_TRUNCATE_CHARSによる上限)
+    を確認する。
+    """
+    out_dir = tempfile.mkdtemp(prefix="yoriai_read_file_test_")
+    try:
+        big_content = "a" * (yoriai._FILE_CONTENT_TRUNCATE_CHARS + 500)
+        with open(os.path.join(out_dir, "big.html"), "w", encoding="utf-8") as f:
+            f.write(big_content)
+        result = json.loads(yoriai._read_project_file_fresh(out_dir, "big.html"))
+        assert result["exists"] is True, result
+        assert len(result["content"]) == yoriai._FILE_CONTENT_TRUNCATE_CHARS, len(result["content"])
+        assert result["truncated"] is True, result
+        assert "message" in result, result
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_read_project_file_fresh_does_not_truncate_small_files():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_read_file_test_")
+    try:
+        with open(os.path.join(out_dir, "small.py"), "w", encoding="utf-8") as f:
+            f.write("def f():\n    pass\n")
+        result = json.loads(yoriai._read_project_file_fresh(out_dir, "small.py"))
+        assert "truncated" not in result, result
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
 def test_stream_chat_completion_yields_pending_tool_calls_for_client_tool_without_executing():
     """`stream_chat_completion`が、client_tool_namesに含まれるツール
     (read_file)が要求されたラウンドでは、自前で実行(_execute_tool_call)
@@ -285,6 +328,41 @@ def test_review_one_file_uses_read_file_powered_review_answer():
     assert captured["tag"] == "cli.py", captured
 
 
+def test_review_one_file_truncates_large_reviewer_own_code_in_prompt():
+    """調査依頼への対応: レビュー担当自身の担当ファイル(参考として
+    プロンプトに直接埋め込まれる`reviewer_own_code`)が大きい場合も、
+    read_file経由のファイルと同じくトークン使用量対策で切り詰められる
+    ことを確認する。一方、レビュー対象そのもの(`code`)は切り詰めず
+    全体をそのままプロンプトに含めることも合わせて確認する。
+    """
+    captured = {}
+
+    def fake_collect(candidate, org_fingerprint, messages, out_dir, print_lock=None, tag=None):
+        captured["prompt"] = messages[0]["content"]
+        return "問題なし", None
+
+    original = yoriai._collect_review_answer_with_read_file
+    yoriai._collect_review_answer_with_read_file = fake_collect
+    try:
+        big_own_code = "b" * (yoriai._FILE_CONTENT_TRUNCATE_CHARS + 500)
+        review_target_code = "z" * (yoriai._FILE_CONTENT_TRUNCATE_CHARS + 500)
+        yoriai._review_one_file(
+            "app.py", review_target_code, _member("junnoMac-mini", "qwen2.5-coder-14b"),
+            "index.html", big_own_code, "実装計画", "fingerprint", "1回目のレビュー", "/tmp/some-project-dir",
+        )
+    finally:
+        yoriai._collect_review_answer_with_read_file = original
+
+    prompt = captured["prompt"]
+    assert prompt.count("b") == yoriai._FILE_CONTENT_TRUNCATE_CHARS, (
+        "reviewer_own_codeは上限文字数までに切り詰められるはずです"
+    )
+    assert "省略" in prompt, prompt
+    assert prompt.count("z") == len(review_target_code), (
+        "レビュー対象そのもの(code)は切り詰めずに全体を渡すはずです"
+    )
+
+
 def test_collect_review_answer_with_read_file_shows_read_progress_message():
     """依頼の動作確認要件(ツール呼び出しのログが確認できる)を検証する。"""
     def fake_stream(candidate, org_fingerprint, messages, offer_read_file_tool=False, **_kwargs):
@@ -325,10 +403,15 @@ def main():
         test_read_project_file_fresh_reports_missing_file_as_not_implemented,
         test_read_project_file_fresh_reflects_file_created_after_first_check,
         test_read_project_file_fresh_rejects_path_traversal,
+        test_truncate_file_content_leaves_short_content_unchanged,
+        test_truncate_file_content_truncates_long_content,
+        test_read_project_file_fresh_truncates_large_files,
+        test_read_project_file_fresh_does_not_truncate_small_files,
         test_stream_chat_completion_yields_pending_tool_calls_for_client_tool_without_executing,
         test_collect_review_answer_with_read_file_rereads_disk_between_rounds,
         test_collect_review_answer_with_read_file_caps_at_max_calls,
         test_review_one_file_uses_read_file_powered_review_answer,
+        test_review_one_file_truncates_large_reviewer_own_code_in_prompt,
         test_collect_review_answer_with_read_file_shows_read_progress_message,
     ]
     failures = 0

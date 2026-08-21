@@ -1828,6 +1828,27 @@ def _collect_answer_from_candidate(candidate: dict, org_fingerprint: str, messag
     return "".join(answer_parts), error
 
 
+# 仮の判断: 複雑な依頼(HTML/CSSの学習サイト等)では、1ファイルの中身が
+# 数万文字に達することがあり、read_fileでその内容をそのまま返すと、1回の
+# レビュー・修正セッションの中で複数ファイルを読むだけで会話全体の
+# トークン使用量が大きく膨らむことが実機の報告で判明した。/chatは毎回
+# それまでのやり取り全体を送信し直すステートレスな設計のため、読み込んだ
+# ファイルが大きいほど、以降の各ラウンドの送信量にそのまま積み上がる。
+# 内容を丸ごと握りつぶすと判断材料が失われてしまうため、削除ではなく
+# 「先頭からこの文字数までに切り詰め、切り詰めたことを明示する」形で
+# 上限を設ける。読みたい範囲を絞り込む機能(read_fileへのオフセット指定
+# 等)までは今回のスコープ外とし、まずは無条件の上限による歯止めのみを
+# 入れた。
+_FILE_CONTENT_TRUNCATE_CHARS = 12000
+
+
+def _truncate_file_content(content: str, limit: int = _FILE_CONTENT_TRUNCATE_CHARS) -> tuple:
+    """`(切り詰め後の内容, 切り詰めたかどうか)`を返す。"""
+    if len(content) <= limit:
+        return content, False
+    return content[:limit], True
+
+
 def _read_project_file_fresh(out_dir: str, filename: str) -> str:
     """read_fileツールの応答本体。呼び出された「その瞬間」に`out_dir`配下を
     ディスクから直接読み直して結果を作る(依頼発行時や前回のラウンド時点の
@@ -1854,7 +1875,16 @@ def _read_project_file_fresh(out_dir: str, filename: str) -> str:
             content = f.read()
     except Exception as exc:
         return json.dumps({"filename": filename, "exists": False, "message": f"読み取りに失敗しました: {exc}"}, ensure_ascii=False)
-    return json.dumps({"filename": filename, "exists": True, "content": content}, ensure_ascii=False)
+
+    truncated_content, was_truncated = _truncate_file_content(content)
+    result = {"filename": filename, "exists": True, "content": truncated_content}
+    if was_truncated:
+        result["truncated"] = True
+        result["message"] = (
+            f"ファイルサイズが大きいため、先頭{_FILE_CONTENT_TRUNCATE_CHARS}文字のみを返しています"
+            "(トークン使用量を抑えるための制限です)。"
+        )
+    return json.dumps(result, ensure_ascii=False)
 
 
 def _collect_review_answer_with_read_file(
@@ -3364,9 +3394,20 @@ def _review_one_file(
     read_fileが実際に呼ばれた瞬間にout_dirを読み直すため、このレビューの
     開始後に他のワーカースレッドが完成させたファイルも正しく反映される
     (_collect_review_answer_with_read_file参照)。
+
+    仮の判断: `reviewer_own_code`(参考として見せるだけの、レビュー対象
+    ではないファイル)は、read_file経由の他ファイルと同じ理由
+    (トークン使用量対策)で`_truncate_file_content`により上限を設ける。
+    レビュー対象そのものである`code`は、トークン量に関わらず常に全体を
+    見せる(切り詰めた不完全な内容で合否を判断させるのは本末転倒なため)。
     """
+    truncated_reviewer_own_code, reviewer_own_truncated = _truncate_file_content(reviewer_own_code)
+    if reviewer_own_truncated:
+        truncated_reviewer_own_code += (
+            f"\n... (以下省略。トークン使用量を抑えるため先頭{_FILE_CONTENT_TRUNCATE_CHARS}文字のみ表示)"
+        )
     _print_tagged(print_lock, filename, f"[🔎 {round_label}] {reviewer['label']} が {filename} をレビューしています...")
-    prompt = _build_review_prompt(filename, code, reviewer_own_filename, reviewer_own_code, full_plan)
+    prompt = _build_review_prompt(filename, code, reviewer_own_filename, truncated_reviewer_own_code, full_plan)
     answer, error = _collect_review_answer_with_read_file(
         reviewer, org_fingerprint, [{"role": "user", "content": prompt}], out_dir,
         print_lock=print_lock, tag=filename,
