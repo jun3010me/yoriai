@@ -347,7 +347,10 @@ def test_run_project_test_command_rejects_disallowed_command_without_executing()
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
-def test_syntax_check_all_python_files_reports_broken_files_only():
+def test_syntax_check_all_files_reports_broken_files_only():
+    """未対応の拡張子(notes.txt)はスキップされ、"broken"扱いにはならない
+    ことも合わせて確認する(言語非依存化に伴う名称・挙動の更新)。
+    """
     out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
     try:
         with open(os.path.join(out_dir, "ok.py"), "w", encoding="utf-8") as f:
@@ -356,7 +359,7 @@ def test_syntax_check_all_python_files_reports_broken_files_only():
             f.write("def f(:\n    pass\n")
         with open(os.path.join(out_dir, "notes.txt"), "w", encoding="utf-8") as f:
             f.write("this is not python (:\n")
-        broken = yoriai._syntax_check_all_python_files(out_dir)
+        broken = yoriai._syntax_check_all_files(out_dir)
         assert broken == ["broken.py"], broken
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -962,7 +965,7 @@ def main():
         test_run_project_test_command_executes_passing_test,
         test_run_project_test_command_reports_failure_output,
         test_run_project_test_command_rejects_disallowed_command_without_executing,
-        test_syntax_check_all_python_files_reports_broken_files_only,
+        test_syntax_check_all_files_reports_broken_files_only,
         test_execute_project_tool_call_dispatches_to_write_file,
         test_identify_target_project_matches_unique_high_scoring_project,
         test_identify_target_project_reports_ambiguous_on_tie,
