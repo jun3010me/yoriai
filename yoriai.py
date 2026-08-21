@@ -3084,16 +3084,20 @@ def run_agent(token: str, port: int) -> None:
 # 参照。ARM環境(Raspberry Pi 4)向けの事前確認(ネイティブ依存の有無)も
 # そちらに記録している。
 _REPL_PROMPT = "Yoriai> "
-# 仮の判断: 継続行(2行目以降)であることが一目で分かるよう、"..."系の
-# プロンプトにする。幅を"Yoriai> "(半角8文字相当)にできるだけ合わせている。
-_REPL_CONTINUATION_PROMPT = "...  "
 
 
 def _repl_prompt_continuation(width, line_number, is_soft_wrap) -> str:
-    """prompt_toolkitの`prompt_continuation`コールバック。2行目以降の
-    行番号を表示する行にも、常に同じ継続プロンプトを返す。
+    """prompt_toolkitの`prompt_continuation`コールバック。
+
+    仮の判断: 2行目以降にも`...`のようなプレフィックスを付けていた時期が
+    あったが、これは以前(readlineベースの実装時代)、まだ入力途中である
+    ことを示すための工夫だった。`prompt_toolkit`のmultiline編集に切り替え
+    た後は、複数行の入力欄自体が視覚的に自明であり(Claude Code等の
+    一般的な複数行入力欄と同様)、かえって見た目のノイズになるという
+    フィードバックを受けて空文字列(プレフィックス無し)にした。1行目の
+    プロンプト(`_REPL_PROMPT`)はそのまま維持する。
     """
-    return _REPL_CONTINUATION_PROMPT
+    return ""
 
 
 def _create_repl_prompt_session() -> PromptSession:
@@ -3131,6 +3135,26 @@ def _read_multiline_input(session: PromptSession) -> tuple:
     されてしまうため)。Alt+Enterはprompt_toolkitの`multiline=True`
     セッションにおける標準の確定キーであり、Claude Code等の他のツールの
     複数行入力とも操作感が近い。
+
+    仮の判断: Windows環境ではAlt+Enterがターミナルアプリ側のフルスクリーン
+    切り替え等に予約されていることが多く、Yoriaiに届く前に横取りされる
+    ことがある。この対策として「Ctrl+Enterへの変更」が依頼されたが、
+    実際には独自のキー割り当てを追加していない。理由は、Ctrl+Enterは
+    VT100系の端末プロトコル(macOS/Linuxの標準的なターミナル)では
+    Enter単体と原理的に区別がつかない(Enterキー自体が"Ctrl+M"と同じ
+    制御コードを送るため)。一方、prompt_toolkit自身のWindows向け入力
+    バックエンド(`prompt_toolkit.input.win32`)は、ネイティブの
+    コンソールAPIがCtrl+Enterを区別して報告できることを利用し、
+    Control-EnterをMeta-Enter(=Alt+Enterと同じ`escape, enter`という
+    キー入力列)に自動変換する処理を最初から内蔵している(該当ソースの
+    コメント: "Turn Control-Enter into META-Enter. (On a vt100 terminal,
+    we cannot detect this combination. But it's really practical on
+    Windows.)")。つまり、Windows上でネイティブのコンソール入力を使う場合、
+    Ctrl+Enterは何もしなくても既にAlt+Enterと同じ「送信」として機能する。
+    このため、Alt+Enterの受付を変更せずそのまま残すだけで、依頼の項目3
+    (Ctrl+Enterに加えてAlt+Enterも使えるようにする)は自然に満たされる。
+    macOS/Linux(Yoriaiが対象とするOS)では、この技術的制約によりCtrl+
+    Enterは利用できないため、Alt+Enterが引き続き唯一の確実な送信キーになる。
 
     戻り値は`(text, terminate)`のタプル。`terminate`が`True`の場合、
     対話モード自体を終了すべきことを示す(EOF/Ctrl+D、または送信内容が
@@ -3176,7 +3200,9 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
     print("Alt+Enter(Escキーに続けてEnter)を押すか、入力前にCtrl+Dを押してください。")
     print("Enterキーは常に改行を挿入します。上下矢印キーで、入力済みの行の間を")
     print("自由に移動しながら編集できます。入力を送信するにはAlt+Enterを押してください")
-    print("(1行だけの質問も、入力→Alt+Enter、の操作で送信できます)。")
+    print("(1行だけの質問も、入力→Alt+Enter、の操作で送信できます。Windowsの")
+    print("ネイティブコンソールをお使いの場合は、Ctrl+Enterでも同じように送信")
+    print("できます)。")
     print("コマンドを付けずに話しかけると、依頼内容から単発/比較/協業のどのモードで")
     print("問い合わせるかを自動的に判断します(判断理由は[判断: ...]として表示されます)。")
     print(f"{MULTI_QUERY_COMMAND} <質問文> で、自動判定に関わらず必ず空きリソース上位{MULTI_QUERY_TARGET_COUNT}台に同時に質問できます。")

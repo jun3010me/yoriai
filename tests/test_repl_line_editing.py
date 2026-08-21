@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """対話モードでの複数行編集(上下矢印キーでの行間移動、Enter/Alt+Enterの
-使い分け、Backspace)を検証する。
+使い分け、Backspace、継続行の見た目)を検証する。
 
 以前は`readline`(1行単位の編集)に依存していたが、readlineは1行内の
 カーソル移動にしか対応しておらず、上下矢印キーで前の行に戻って編集する
@@ -39,6 +39,21 @@ def _read_with_keys(keystrokes: str):
         session = PromptSession(input=pipe_input, output=DummyOutput())
         pipe_input.send_text(keystrokes)
         return yoriai._read_multiline_input(session)
+
+
+def test_continuation_lines_have_no_prefix():
+    """依頼の改善2: 2行目以降に"..."のようなプレフィックスを付けず、
+    プレーンな見た目(カーソルだけが次の行に移る)にすることを確認する。
+    以前は`readline`ベースの実装で「まだ入力途中である」ことを示すための
+    "...  "というプレフィックスを使っていたが、`prompt_toolkit`の
+    multiline編集では複数行入力欄であること自体が視覚的に自明なため、
+    プレフィックスを廃止した(1行目のプロンプト"Yoriai> "は維持する)。
+    """
+    for line_number in (0, 1, 5):
+        for is_soft_wrap in (False, True):
+            assert yoriai._repl_prompt_continuation(80, line_number, is_soft_wrap) == "", (
+                f"line_number={line_number}, is_soft_wrap={is_soft_wrap}"
+            )
 
 
 def test_enter_inserts_a_newline_instead_of_submitting():
@@ -135,6 +150,7 @@ def test_editing_an_earlier_line_after_pasting_multiline_text():
 
 def main():
     tests = [
+        test_continuation_lines_have_no_prefix,
         test_enter_inserts_a_newline_instead_of_submitting,
         test_up_arrow_moves_cursor_to_the_previous_line_for_editing,
         test_down_arrow_moves_cursor_back_to_the_next_line,
