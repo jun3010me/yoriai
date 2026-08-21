@@ -125,7 +125,7 @@ def test_collaborate_saves_generated_files_under_projects_subdir_only():
             assert "Yoriai本体" in f.read(), "本体のconfig.pyが上書きされています"
 
         project_dir = os.path.join(out_dir, "projects", "todo-cli")
-        assert set(os.listdir(project_dir)) == {"storage.py", "cli.py"}, os.listdir(project_dir)
+        assert set(os.listdir(project_dir)) == {"storage.py", "cli.py", "PROGRESS.md"}, os.listdir(project_dir)
     finally:
         yoriai._fetch_org_snapshot = original_snapshot
         yoriai._stream_chat_from_candidate = original_stream
@@ -149,8 +149,8 @@ def test_collaborate_does_not_overwrite_existing_project_on_rerun():
 
         projects_root = os.path.join(out_dir, "projects")
         assert set(os.listdir(projects_root)) == {"todo-cli", "todo-cli-2"}, os.listdir(projects_root)
-        assert set(os.listdir(os.path.join(projects_root, "todo-cli"))) == {"storage.py", "cli.py"}
-        assert set(os.listdir(os.path.join(projects_root, "todo-cli-2"))) == {"storage.py", "cli.py"}
+        assert set(os.listdir(os.path.join(projects_root, "todo-cli"))) == {"storage.py", "cli.py", "PROGRESS.md"}
+        assert set(os.listdir(os.path.join(projects_root, "todo-cli-2"))) == {"storage.py", "cli.py", "PROGRESS.md"}
     finally:
         yoriai._fetch_org_snapshot = original_snapshot
         yoriai._stream_chat_from_candidate = original_stream

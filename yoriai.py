@@ -12,6 +12,7 @@ import locale
 import logging
 import os
 import platform
+import queue
 import re
 import socket
 import subprocess
@@ -41,8 +42,10 @@ except ImportError:
 
 import requests
 from prompt_toolkit import PromptSession
+from prompt_toolkit.application import create_app_session
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.patch_stdout import patch_stdout
 from zeroconf import ServiceBrowser, ServiceInfo, Zeroconf, IPVersion, InterfaceChoice
 
 import config
@@ -2369,16 +2372,191 @@ def _set_task_status(checklist: list, filename: str, kind: str, status: str) -> 
             return
 
 
+def _format_checklist_lines(checklist: list) -> list:
+    return [f"{_TASK_STATUS_SYMBOLS[task['status']]} {task['label']}" for task in checklist]
+
+
 def _format_task_checklist(checklist: list) -> str:
-    lines = ["[📝 タスク状況(組織が自ら立てた計画)]"]
-    for task in checklist:
-        symbol = _TASK_STATUS_SYMBOLS[task["status"]]
-        lines.append(f"{symbol} {task['label']}")
-    return "\n".join(lines)
+    return "\n".join(["[📝 タスク状況(組織が自ら立てた計画)]"] + _format_checklist_lines(checklist))
 
 
 def _incomplete_task_labels(checklist: list) -> list:
     return [task["label"] for task in checklist if task["status"] != _TASK_STATUS_COMPLETED]
+
+
+# ---------------------------------------------------------------------------
+# 進行状況の永続化(PROGRESS.md)
+# ---------------------------------------------------------------------------
+#
+# 協業モードは合意フェーズ→タスクキュー方式による実装・レビューと複数の
+# フェーズにまたがり、実機では数分単位の時間がかかることもある。途中で
+# プロセスが終了した場合(--chatを再起動した、非常口で強制終了した等)、
+# それまでの進行状況(元の依頼・確定した計画・タスクの状態・直近の
+# レビュー指摘)が失われ、最初からやり直すしかなかった。read_fileツール
+# (実装依頼元がディスク上のファイルを都度読み直す設計)と同じ「ディスク上の
+# 実際の状態を正として扱う」方針に基づき、プロジェクトディレクトリに
+# PROGRESS.mdを作成・更新し続けることで、後から(`//resume-all`等で)
+# 未完了タスクだけを対象に再開できるようにする。
+
+PROGRESS_FILENAME = "PROGRESS.md"
+
+_PROGRESS_SECTION_REQUEST = "## 元の依頼"
+_PROGRESS_SECTION_PLAN = "## モジュール分割案"
+_PROGRESS_SECTION_CHECKLIST = "## タスク状況"
+_PROGRESS_SECTION_REVIEW = "## 直近のレビュー指摘"
+
+
+def _format_progress_markdown(request: str, tasks: list, checklist: list, review_feedback: dict) -> str:
+    """PROGRESS.mdの内容を組み立てる。
+
+    仮の判断: 「モジュール分割案」セクションは、既存の設計担当への
+    問い合わせ結果を表示する際と同じ`f"{filename}: {content}"`という
+    フラットな1行1ファイル形式で書き出す。この形式は既存の
+    `_parse_module_breakdown`がそのまま解析できるため、再開時
+    (`_parse_progress_markdown`)に新しいパーサーを書き起こす必要がなく、
+    書き込み・読み込みの両方で実績のある同じコードを再利用できる。
+    """
+    lines = ["# プロジェクト進行状況", "", _PROGRESS_SECTION_REQUEST, "", request, ""]
+    lines.append(_PROGRESS_SECTION_PLAN)
+    lines.append("")
+    for filename, content in tasks:
+        lines.append(f"{filename}: {content}")
+    lines.append("")
+    lines.append(_PROGRESS_SECTION_CHECKLIST)
+    lines.append("")
+    lines.extend(_format_checklist_lines(checklist))
+    lines.append("")
+    if review_feedback:
+        lines.append(_PROGRESS_SECTION_REVIEW)
+        lines.append("")
+        for filename, feedback in review_feedback.items():
+            lines.append(f"### {filename}")
+            lines.append("")
+            lines.append(feedback)
+            lines.append("")
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def _write_progress_md(project_dir: str, request: str, tasks: list, checklist: list, review_feedback: dict) -> None:
+    os.makedirs(project_dir, exist_ok=True)
+    content = _format_progress_markdown(request, tasks, checklist, review_feedback)
+    with open(os.path.join(project_dir, PROGRESS_FILENAME), "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def _extract_progress_section(text: str, heading: str) -> str:
+    """`text`(PROGRESS.md全体)から、`heading`(例: "## モジュール分割案")の
+    直後から次の"## "見出し(または末尾)までの本文を取り出す。見出しが
+    見つからない場合は空文字列を返す。
+    """
+    lines = text.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip() == heading:
+            start = i + 1
+            break
+    if start is None:
+        return ""
+    end = len(lines)
+    for i in range(start, len(lines)):
+        if lines[i].startswith("## "):
+            end = i
+            break
+    return "\n".join(lines[start:end]).strip("\n")
+
+
+# 仮の判断: チェックリストの各行のラベルは`_build_task_checklist`が
+# `f"{filename} の実装"`/`f"{filename} のレビュー"`という固定の形式で
+# 生成しており、PROGRESS.mdにもこの形式のまま書き出される。再開時は、
+# この形式を逆算してfilename/kindを復元する(新しい機械可読フォーマットを
+# 別途持たせるのではなく、人間にも読めるこの文言をそのまま構造化データの
+# 源として再利用する)。
+_CHECKLIST_LABEL_PATTERN = re.compile(r"^(.+) の(実装|レビュー)$")
+_CHECKLIST_KIND_FROM_JA = {"実装": "impl", "レビュー": "review"}
+_CHECKLIST_STATUS_FROM_SYMBOL = {v: k for k, v in _TASK_STATUS_SYMBOLS.items()}
+
+
+def _parse_checklist_markdown(text: str) -> list:
+    checklist = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        symbol, sep, rest = line.partition(" ")
+        if not sep:
+            continue
+        status = _CHECKLIST_STATUS_FROM_SYMBOL.get(symbol)
+        if status is None:
+            continue
+        match = _CHECKLIST_LABEL_PATTERN.match(rest)
+        if not match:
+            continue
+        filename, kind_ja = match.groups()
+        checklist.append({
+            "filename": filename, "kind": _CHECKLIST_KIND_FROM_JA[kind_ja],
+            "label": rest, "status": status,
+        })
+    return checklist
+
+
+def _parse_progress_markdown(path: str):
+    """PROGRESS.mdを読み込み、`{"request":, "tasks":, "checklist":}`の
+    辞書として返す。ファイルが存在しない・想定した形式で解析できない
+    場合は`None`を返す(呼び出し元は、そのプロジェクトの再開を
+    スキップすべきというシグナルとして扱う)。
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return None
+
+    request = _extract_progress_section(text, _PROGRESS_SECTION_REQUEST).strip()
+    tasks = _parse_module_breakdown(_extract_progress_section(text, _PROGRESS_SECTION_PLAN))
+    checklist = _parse_checklist_markdown(_extract_progress_section(text, _PROGRESS_SECTION_CHECKLIST))
+    if not tasks or not checklist:
+        return None
+    return {"request": request, "tasks": tasks, "checklist": checklist}
+
+
+def _progress_checklist_is_incomplete(checklist: list) -> bool:
+    return any(task["status"] != _TASK_STATUS_COMPLETED for task in checklist)
+
+
+def _pending_tasks_from_checklist(tasks: list, checklist: list) -> list:
+    """`tasks`(全ファイル)のうち、チェックリスト上いずれかのタスク
+    (実装・レビュー)が未完了のファイルだけを返す。
+
+    仮の判断: 再開の粒度はファイル単位とする。実装は完了しているが
+    レビューだけが未完了のファイルも、既存のタスクキュー方式
+    (`_run_collaborative_task_queue`)にそのまま乗せて実装からやり直す
+    (「レビューだけを再開する」という専用の経路は用意しない)。実装
+    済みのコードが再度実装し直されるのは無駄ではあるが、既存の
+    タスクキュー方式・レビューフェーズを変更せずにそのまま再利用できる
+    (依頼の「既存のタスクキュー方式・レビューフェーズをそのまま使い」
+    という要件に沿う)。
+    """
+    incomplete_filenames = {
+        task["filename"] for task in checklist if task["status"] != _TASK_STATUS_COMPLETED
+    }
+    return [(filename, content) for filename, content in tasks if filename in incomplete_filenames]
+
+
+def _find_incomplete_projects(out_dir: str) -> list:
+    """`<out_dir>/projects/`配下で、PROGRESS.mdのチェックリストに未完了の
+    タスクが残っているプロジェクトディレクトリの一覧を返す(ディスク上の
+    実際の状態を正として扱う。呼び出し側で状態をキャッシュしない)。
+    """
+    projects_root = os.path.join(out_dir, PROJECTS_SUBDIR_NAME)
+    if not os.path.isdir(projects_root):
+        return []
+    incomplete = []
+    for name in sorted(os.listdir(projects_root)):
+        project_dir = os.path.join(projects_root, name)
+        parsed = _parse_progress_markdown(os.path.join(project_dir, PROGRESS_FILENAME))
+        if parsed is not None and _progress_checklist_is_incomplete(parsed["checklist"]):
+            incomplete.append(project_dir)
+    return incomplete
 
 
 def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str, out_dir: str) -> None:
@@ -2453,11 +2631,38 @@ def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str,
     project_dir = _resolve_project_dir(projects_root, project_name)
     print(f"[📁 生成物の保存先: {project_dir}]")
 
-    # 仮の判断: タスク数がメンバー数を超える場合に「超過分は切り捨てる」
-    # 従来の実装(_dispatch_and_save_parallel_tasksの1:1固定割り当て)を
-    # やめ、タスクキュー方式(_run_collaborative_task_queue)で全タスクが
-    # 最終的に実装されるようにした。詳しくは同関数のコメントを参照。
-    _run_collaborative_task_queue(tasks, candidates, org_fingerprint, project_dir, checklist)
+    _run_collaborative_project(request, tasks, checklist, candidates, org_fingerprint, project_dir, tasks)
+
+
+def _run_collaborative_project(
+    request: str, tasks: list, checklist: list, candidates: list, org_fingerprint: str,
+    project_dir: str, tasks_to_queue: list,
+) -> None:
+    """タスクキュー方式による実装・レビューを実行し、その間PROGRESS.mdを
+    更新し続ける。新規プロジェクト(`_ask_organization_collaborate`)・
+    再開(`_resume_project`)の両方から共通で呼ばれる。
+
+    `tasks`は計画全体(PROGRESS.mdの「モジュール分割案」に書き出す対象)、
+    `tasks_to_queue`は実際にタスクキューへ投入する対象(新規作成時は
+    `tasks`と同じ、再開時は未完了だったファイルだけの部分集合)。
+    """
+    review_feedback = {}
+    progress_lock = threading.Lock()
+
+    def write_progress():
+        with progress_lock:
+            _write_progress_md(project_dir, request, tasks, checklist, review_feedback)
+
+    write_progress()
+    if tasks_to_queue:
+        # 仮の判断: タスク数がメンバー数を超える場合に「超過分は切り捨てる」
+        # 従来の実装(_dispatch_and_save_parallel_tasksの1:1固定割り当て)を
+        # やめ、タスクキュー方式(_run_collaborative_task_queue)で全タスクが
+        # 最終的に実装されるようにした。詳しくは同関数のコメントを参照。
+        _run_collaborative_task_queue(
+            tasks_to_queue, candidates, org_fingerprint, project_dir, checklist,
+            on_update=write_progress, review_feedback=review_feedback,
+        )
 
     # 【最重要】組織自身が立てた計画のうち、1つでも未完了のタスクが残って
     # いる場合は「✅ レビュー完了」を名乗らず、何が終わっていないかを
@@ -2472,6 +2677,7 @@ def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str,
         print(f"[⚠️ 未完了のタスクが残っています: {', '.join(incomplete_labels)}]")
     else:
         print(f"[✅ 全タスク完了 (保存先: {project_dir})]")
+    write_progress()
 
 
 # ---------------------------------------------------------------------------
@@ -2710,9 +2916,10 @@ def _request_fix(
 def _review_and_fix_one_file(
     filename: str, owner: dict, code: str, reviewer: dict, reviewer_own_filename: str, reviewer_own_code: str,
     full_plan: str, org_fingerprint: str, out_dir: str, print_lock: threading.Lock = None,
-) -> bool:
-    """1ファイル分のレビュー→(必要なら)修正→再レビューを行い、最終的に
-    「問題なし」になったかどうかを返す。
+) -> tuple:
+    """1ファイル分のレビュー→(必要なら)修正→再レビューを行い、
+    (最終的に「問題なし」になったかどうか, 未解決の場合の指摘内容)を返す
+    (問題なしの場合、指摘内容は`None`)。
 
     仮の判断: ループではなく「1回目のレビュー」→「(問題があれば)修正」→
     「修正後の再レビュー」という3ステップを直列に明示的に呼び出す構造に
@@ -2727,21 +2934,26 @@ def _review_and_fix_one_file(
     `print_lock`(タスクキュー方式専用)を渡すと、このファイルに関する
     レビュー・修正の全出力に`filename`のタグが付き、他のワーカー
     スレッドの出力と混ざらないよう1ブロックずつまとめて出力される。
+
+    仮の判断(PROGRESS.md用): 最終的に未解決だった指摘内容も呼び出し元に
+    返すようにした(以前は合否のみ`bool`で返していた)。PROGRESS.mdの
+    「直近のレビュー指摘」セクションに、未完了のファイルがなぜ未完了
+    なのかを記録するために必要になったための変更。
     """
     ok, feedback = _check_and_review_one_round(
         filename, code, reviewer, reviewer_own_filename, reviewer_own_code, full_plan, org_fingerprint, "1回目のレビュー", out_dir, print_lock,
     )
     if ok:
-        return True
+        return True, None
 
     fixed_code = _request_fix(filename, code, feedback, owner, full_plan, org_fingerprint, out_dir, print_lock)
     if fixed_code is None:
-        return False
+        return False, feedback
 
-    ok, _feedback = _check_and_review_one_round(
+    ok, feedback = _check_and_review_one_round(
         filename, fixed_code, reviewer, reviewer_own_filename, reviewer_own_code, full_plan, org_fingerprint, "修正後の再レビュー", out_dir, print_lock,
     )
-    return ok
+    return ok, (None if ok else feedback)
 
 
 # ---------------------------------------------------------------------------
@@ -2773,6 +2985,7 @@ def _estimate_task_weight(content: str) -> int:
 
 def _run_collaborative_task_queue(
     tasks: list, candidates: list, org_fingerprint: str, project_dir: str, checklist: list,
+    on_update: callable = None, review_feedback: dict = None,
 ) -> None:
     """合意フェーズで確定した全タスクを待ち行列(キュー)として扱い、
     メンバーの実装+レビューが完了するたびに次のタスクを割り当てながら
@@ -2803,6 +3016,14 @@ def _run_collaborative_task_queue(
       そのファイルのレビューはスキップする(実装だけは行う)。この場合
       「レビュー」タスクはタスクチェックリスト上「未完了」のまま残り、
       最終チェックで検出される。
+
+    `on_update`(PROGRESS.md永続化用)を渡すと、チェックリストの状態が
+    変わるたび(実装・レビューの開始/完了)に呼び出される。`review_feedback`
+    (dict、`{filename: 指摘内容}`)を渡すと、レビューが未解決のまま
+    終わったファイルの最新の指摘内容がそこに記録され、解決すれば
+    (再レビューが「問題なし」になれば)そのファイルのエントリは削除される。
+    どちらも`None`の場合(既存の呼び出し元・テストとの互換性のため)は
+    何もしない。
     """
     full_plan = "\n".join(f"{fn}: {content}" for fn, content in tasks)
     remaining = sorted(tasks, key=lambda t: _estimate_task_weight(t[1]), reverse=True)
@@ -2848,6 +3069,8 @@ def _run_collaborative_task_queue(
             is_first = False
 
             _set_task_status(checklist, filename, "impl", _TASK_STATUS_IN_PROGRESS)
+            if on_update:
+                on_update()
             request_text = _build_collaborative_implementation_request(filename, content, tasks)
             answer, error = _collect_answer_from_candidate(
                 candidate, org_fingerprint, [{"role": "user", "content": request_text}],
@@ -2879,6 +3102,8 @@ def _run_collaborative_task_queue(
                 f.write(code)
             _print_tagged(print_lock, filename, f"[💾 {dest_path} に保存しました (担当: {candidate['label']})]")
             _set_task_status(checklist, filename, "impl", _TASK_STATUS_COMPLETED)
+            if on_update:
+                on_update()
 
             reviewer = pick_reviewer(candidate)
             if reviewer is None:
@@ -2897,13 +3122,23 @@ def _run_collaborative_task_queue(
                 reviewer_own_code = "(まだ実装したファイルがありません)"
 
             _set_task_status(checklist, filename, "review", _TASK_STATUS_IN_PROGRESS)
-            ok = _review_and_fix_one_file(
+            if on_update:
+                on_update()
+            ok, feedback = _review_and_fix_one_file(
                 filename=filename, owner=candidate, code=code,
                 reviewer=reviewer, reviewer_own_filename=reviewer_own_filename, reviewer_own_code=reviewer_own_code,
                 full_plan=full_plan, org_fingerprint=org_fingerprint, out_dir=project_dir, print_lock=print_lock,
             )
             if ok:
                 _set_task_status(checklist, filename, "review", _TASK_STATUS_COMPLETED)
+            if review_feedback is not None:
+                with queue_lock:
+                    if ok:
+                        review_feedback.pop(filename, None)
+                    else:
+                        review_feedback[filename] = feedback
+            if on_update:
+                on_update()
 
             with queue_lock:
                 latest_completed[candidate["label"]] = (filename, code)
@@ -2914,6 +3149,97 @@ def _run_collaborative_task_queue(
         t.start()
     for t in threads:
         t.join()
+
+
+# ---------------------------------------------------------------------------
+# 未完了プロジェクトの再開(「巡回モード」・`//resume-all`)
+# ---------------------------------------------------------------------------
+#
+# PROGRESS.mdにより、途中で終了したプロジェクトの状態がディスク上に
+# 残るようになった。この状態を使って、未完了のタスクだけを対象に
+# タスクキュー方式・レビューフェーズを再開する。
+
+RESUME_ALL_COMMAND = "//resume-all"
+
+
+def _resume_project(project_dir: str, port: int, org_fingerprint: str) -> bool:
+    """1つのプロジェクトディレクトリのPROGRESS.mdを読み込み、未完了の
+    ファイルだけを対象にタスクキュー方式を再開する。PROGRESS.mdが
+    読み取れない、組織に問い合わせできない等で再開自体を開始できな
+    かった場合は`False`を返す(タスクの一部が未完了のまま処理自体は
+    最後まで行えた場合は`True`を返す。「全タスクが完了したか」は
+    呼び出し元がディスク上の状態を`_find_incomplete_projects`で
+    再確認して判断する)。
+    """
+    progress_path = os.path.join(project_dir, PROGRESS_FILENAME)
+    parsed = _parse_progress_markdown(progress_path)
+    if parsed is None:
+        print(f"[⚠️ {progress_path} を読み取れなかったため、このプロジェクトの再開をスキップします]")
+        return False
+
+    request, tasks, checklist = parsed["request"], parsed["tasks"], parsed["checklist"]
+    tasks_to_queue = _pending_tasks_from_checklist(tasks, checklist)
+    if not tasks_to_queue:
+        print(f"[{project_dir}] 未完了のタスクは見つかりませんでした。")
+        return True
+
+    data = _fetch_org_snapshot(port, org_fingerprint)
+    if data is None:
+        print(f"[⚠️ {project_dir}] 組織への問い合わせに失敗したため、再開をスキップします。")
+        return False
+    candidates = _select_chat_candidates(data.get("self", {}), data.get("peers", []), port, TASK_TYPE_CODING)
+    if not candidates:
+        print(f"[⚠️ {project_dir}] 組織内にロード済みモデルを持つメンバーがいないため、再開をスキップします。")
+        return False
+
+    print(
+        f"[🔁 {project_dir} を再開します: 未完了{len(tasks_to_queue)}件"
+        f" ({', '.join(fn for fn, _ in tasks_to_queue)})]"
+    )
+    _run_collaborative_project(request, tasks, checklist, candidates, org_fingerprint, project_dir, tasks_to_queue)
+    return True
+
+
+def _run_resume_all(port: int, org_fingerprint: str, out_dir: str) -> None:
+    """`./projects/`配下で未完了のPROGRESS.mdを持つプロジェクトを全て
+    検出し、順番に(1つずつ)再開する「巡回モード」。
+
+    仮の判断: 複数プロジェクトを並行に処理するのではなく、1つずつ順番に
+    処理する。プロジェクトをまたいで並行実行すると、同じ組織のメンバーを
+    複数のプロジェクトが同時に取り合うことになり、`_run_collaborative_
+    task_queue`が前提とする「1プロジェクト内でメンバーを取り合う」設計を
+    プロジェクトをまたいで多重に組み合わせることになって複雑さが増す
+    (依頼でも「1つずつ、または可能な範囲で並行して」と、順次処理は
+    明示的に許容されている)。この巡回モード自体は、対話モードの
+    バックグラウンドジョブとして実行される(`_run_repl_client`参照)ため、
+    処理中もユーザーは他の依頼を入力できる。
+    """
+    incomplete_projects = _find_incomplete_projects(out_dir)
+    if not incomplete_projects:
+        print("[未完了のプロジェクトは見つかりませんでした]")
+        return
+
+    print(f"[🔁 巡回モード開始: 未完了のプロジェクトが{len(incomplete_projects)}件見つかりました]")
+    for project_dir in incomplete_projects:
+        print(f"  - {project_dir}")
+
+    for project_dir in incomplete_projects:
+        _resume_project(project_dir, port, org_fingerprint)
+
+    # 仮の判断: 依頼の「全て完了したら[✅ ...]とまとめて報告する」という
+    # 文言はそのまま使うが、実際に全プロジェクトが完了したかどうかは
+    # ディスク上の状態を再確認したうえで判定する。既存のタスクチェック
+    # リストの最終チェックと同じ方針(「✅ 完了」を安易に名乗らず、正直に
+    # 未完了を報告する)を、複数プロジェクトをまたいだこのモードでも
+    # 踏襲する。
+    print()
+    still_incomplete = _find_incomplete_projects(out_dir)
+    if still_incomplete:
+        print(f"[⚠️ 巡回モード終了: {len(still_incomplete)}件のプロジェクトが未完了のまま残っています]")
+        for project_dir in still_incomplete:
+            print(f"  - {project_dir}")
+    else:
+        print("[✅ 全プロジェクトの未完了タスクが完了しました]")
 
 
 # ---------------------------------------------------------------------------
@@ -3296,105 +3622,208 @@ def _read_multiline_input(session: PromptSession, interrupt_guard: "_DoubleInter
         return text, False
 
 
+# 仮の判断(バックグラウンド実行): 以前は`//agree`・自動判定された協業
+# モード・`//parallel`・`//resume-all`のいずれも、対話モードのメイン
+# スレッドで同期的に(=完了するまで次の入力を受け付けずに)実行して
+# いた。協業モードは合意フェーズ→タスクキュー方式による実装・レビューと
+# 複数のフェーズにまたがり、実機では数分単位の時間がかかることがある。
+# その間、次の依頼を入力できないのはClaude Code等のツールの体験と比べて
+# 不便という指摘を受け、これらの時間のかかる処理を専用のバックグラウンド
+# スレッドに投げ、メインスレッドの入力ループを一切ブロックしないように
+# 変更した。
+class _BackgroundJobRunner:
+    """対話モードの時間のかかる処理(協業モード・`//parallel`・
+    `//resume-all`)を、入力ループをブロックしない1本のバックグラウンド
+    スレッドで順番に(FIFOで)実行する。
+
+    仮の判断: 複数のジョブを真に並列実行するのではなく、あくまで
+    「メインスレッド(入力受付)をブロックしない」ことだけを目的とした
+    設計にした。複数の協業モードのジョブを同時に走らせても、同じ組織の
+    メンバー(LLMバックエンド)を取り合うだけで実質的な高速化にはならない
+    上、タスクキューやチェックリストの状態を複数のジョブが同時に触る
+    ことによる競合のリスクが増える。ジョブを1本のキューで順番に処理する
+    方式なら、この手の競合を作り込む余地が無い。
+
+    仮の判断: 単発質問(`_ask_organization`)・比較質問(`//multi`、
+    `_ask_organization_multi`)はこのジョブキューに乗せず、これまで通り
+    メインスレッドで同期的に実行する。これらは対話モードの会話履歴
+    (`messages`)を共有・追記する仕組みになっており、もし非同期化すると
+    「1件目の処理が終わる前に2件目のユーザー発言が`messages`に追記され、
+    1件目の応答がその2件目宛の質問であるかのように扱われてしまう」
+    という会話の順序が壊れる不具合を生みかねない。これらのモードは
+    協業モードほど長時間かからないことが多く、依頼が主な動機として
+    挙げていたのも協業モードの長時間ブロックだったため、非同期化の
+    対象を長時間かかる・会話履歴を共有しないモードに絞った。
+    """
+
+    def __init__(self):
+        self._queue = queue.Queue()
+        self._pending_lock = threading.Lock()
+        self._pending = 0
+        self._worker = threading.Thread(target=self._run, daemon=True)
+        self._worker.start()
+
+    def submit(self, job: callable, queued_notice: str = None) -> None:
+        with self._pending_lock:
+            already_busy = self._pending > 0
+            self._pending += 1
+        if already_busy and queued_notice:
+            print(queued_notice)
+        self._queue.put(job)
+
+    def _run(self) -> None:
+        while True:
+            job = self._queue.get()
+            try:
+                job()
+            except Exception:
+                logger.exception("バックグラウンドジョブの実行中にエラーが発生しました")
+            finally:
+                with self._pending_lock:
+                    self._pending -= 1
+                self._queue.task_done()
+
+    def join(self) -> None:
+        """キューに投入した全ジョブの完了を待つ(主にテスト用)。"""
+        self._queue.join()
+
+
+def _create_background_job_runner() -> "_BackgroundJobRunner":
+    return _BackgroundJobRunner()
+
+
+_BACKGROUND_QUEUED_NOTICE = "[⏳ 実行中の処理があるため、この依頼は完了後に順番にバックグラウンドで処理されます]"
+
+
 def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
-    print()
-    print("=== Yoriai 対話モード ===")
-    print("★ Ctrl+Cを2秒以内に2回連続で押すと、状況に関わらずいつでも確実に")
-    print("  終了できます(送信キーやexit/quitが効かない場合の非常口です)。")
-    print("終了するには exit または quit とだけ入力してEnterを押すか、")
-    print("入力前にCtrl+Dを押す方法もあります。")
-    print("Enterで送信、Shift+Enterで改行を挿入します(1行だけの質問も、")
-    print("入力→Enter、の操作で送信できます)。上下矢印キーで、入力済みの")
-    print("行の間を自由に移動しながら編集できます。")
-    print("コマンドを付けずに話しかけると、依頼内容から単発/比較/協業のどのモードで")
-    print("問い合わせるかを自動的に判断します(判断理由は[判断: ...]として表示されます)。")
-    print(f"{MULTI_QUERY_COMMAND} <質問文> で、自動判定に関わらず必ず空きリソース上位{MULTI_QUERY_TARGET_COUNT}台に同時に質問できます。")
-    print(
-        f"{AGREE_COMMAND} <制作依頼> で、自動判定に関わらず必ず事前すり合わせ(合意フェーズ)を経て並行実装させます"
-        f"(生成物は{os.path.join(out_dir, PROJECTS_SUBDIR_NAME)}/<プロジェクト名>/に保存されます)。"
-    )
-    print(
-        f"{PARALLEL_QUERY_COMMAND} <ファイル名1>:<依頼1> | <ファイル名2>:<依頼2> ... で、"
-        f"割り振り内容を自分で指定し、異なる依頼を異なるメンバーに同時に振り分け、"
-        f"回答からコードを抽出して{out_dir}に保存できます。"
-    )
-    print()
+    # 仮の判断: 対話モード全体を`patch_stdout()`で包む。バックグラウンド
+    # ジョブ(協業モード等)がメインスレッドの入力待ち中にprint()する際、
+    # このコンテキストが無いと出力が入力中の行を破壊してしまう
+    # (prompt_toolkit公式が「別スレッドから安全にprintする」ために提供する
+    # 仕組み)。
+    #
+    # 仮の判断: `patch_stdout()`は、内部で`prompt_toolkit`の(プロセス
+    # 全体で共有される)既定の`AppSession`が持つ`Output`オブジェクトへ
+    # 書き込む。既定の`AppSession`はプロセス内で使い回される単一の
+    # インスタンスであり、一度作られると(その時点の`sys.stdout`を
+    # 元に)出力先を固定してしまうため、`create_app_session()`で
+    # この呼び出し専用の新しい`AppSession`を作ってから`patch_stdout()`を
+    # 使う。これが無いと、テストのように同一プロセス内で`_run_repl_client`
+    # (や`sys.stdout`の差し替え)を複数回呼び出した場合、2回目以降の
+    # 出力が最初の呼び出し時点の(既に閉じられた)出力先に書き込まれて
+    # 消えてしまう不具合が実際に発生した。
+    with create_app_session(), patch_stdout():
+        print()
+        print("=== Yoriai 対話モード ===")
+        print("★ Ctrl+Cを2秒以内に2回連続で押すと、状況に関わらずいつでも確実に")
+        print("  終了できます(送信キーやexit/quitが効かない場合の非常口です)。")
+        print("終了するには exit または quit とだけ入力してEnterを押すか、")
+        print("入力前にCtrl+Dを押す方法もあります。")
+        print("Enterで送信、Shift+Enterで改行を挿入します(1行だけの質問も、")
+        print("入力→Enter、の操作で送信できます)。上下矢印キーで、入力済みの")
+        print("行の間を自由に移動しながら編集できます。")
+        print("コマンドを付けずに話しかけると、依頼内容から単発/比較/協業のどのモードで")
+        print("問い合わせるかを自動的に判断します(判断理由は[判断: ...]として表示されます)。")
+        print(f"{MULTI_QUERY_COMMAND} <質問文> で、自動判定に関わらず必ず空きリソース上位{MULTI_QUERY_TARGET_COUNT}台に同時に質問できます。")
+        print(
+            f"{AGREE_COMMAND} <制作依頼> で、自動判定に関わらず必ず事前すり合わせ(合意フェーズ)を経て並行実装させます"
+            f"(生成物は{os.path.join(out_dir, PROJECTS_SUBDIR_NAME)}/<プロジェクト名>/に保存されます)。"
+        )
+        print(
+            f"{PARALLEL_QUERY_COMMAND} <ファイル名1>:<依頼1> | <ファイル名2>:<依頼2> ... で、"
+            f"割り振り内容を自分で指定し、異なる依頼を異なるメンバーに同時に振り分け、"
+            f"回答からコードを抽出して{out_dir}に保存できます。"
+        )
+        print(
+            f"{RESUME_ALL_COMMAND} で、{os.path.join(out_dir, PROJECTS_SUBDIR_NAME)}/以下の未完了プロジェクトを"
+            f"全て検出し、未完了のタスクだけを対象に順番に再開します。"
+        )
+        print(
+            "協業モード・//parallel・//resume-allはバックグラウンドで処理され、"
+            "処理中も引き続き次の依頼を入力できます(進行ログはそのまま画面に流れます)。"
+        )
+        print()
 
-    # 仮の判断: 会話履歴(messages)はこのセッション内でのみ保持し、終了したら破棄する。
-    # 次回起動時に前回の会話を引き継ぐ機能は今回のスコープ外。
-    messages = []
-    session = _create_repl_prompt_session()
-    # 仮の判断: 入力編集中・組織への問い合わせ中(応答待ち)のどちらで
-    # Ctrl+Cが発生しても「2回連続」を正しく検出できるよう、対話モードの
-    # セッションを通じて1つのインスタンスを使い回す(_DoubleInterruptGuard
-    # の定義コメントを参照)。
-    interrupt_guard = _DoubleInterruptGuard()
-    while True:
-        text, terminate = _read_multiline_input(session, interrupt_guard)
-        if terminate:
-            break
-
-        if text.startswith(AGREE_COMMAND):
-            request = text[len(AGREE_COMMAND):].strip()
-            if not request:
-                print(f"使い方: {AGREE_COMMAND} <制作依頼>  (例: {AGREE_COMMAND} ToDoリストのCLIツールを作って)")
-                continue
-            try:
-                _ask_organization_collaborate(port, org_fingerprint, request, out_dir)
-            except KeyboardInterrupt:
-                if _handle_repl_command_interrupt(interrupt_guard):
-                    break
-            continue
-
-        if text.startswith(PARALLEL_QUERY_COMMAND):
-            command_text = text[len(PARALLEL_QUERY_COMMAND):].strip()
-            try:
-                _ask_organization_parallel(port, org_fingerprint, command_text, out_dir)
-            except KeyboardInterrupt:
-                if _handle_repl_command_interrupt(interrupt_guard):
-                    break
-            continue
-
-        if text.startswith(MULTI_QUERY_COMMAND):
-            question = text[len(MULTI_QUERY_COMMAND):].strip()
-            if not question:
-                print(f"使い方: {MULTI_QUERY_COMMAND} <質問文>  (例: {MULTI_QUERY_COMMAND} こんにちは)")
-                continue
-            messages.append({"role": "user", "content": question})
-            try:
-                _ask_organization_multi(port, org_fingerprint, messages)
-            except KeyboardInterrupt:
-                if _handle_repl_command_interrupt(interrupt_guard):
-                    break
-            continue
-
-        # 仮の判断: 明示コマンド(//agree・//parallel・//multi)のいずれにも
-        # 一致しない通常の入力は、依頼文の内容から実行モードを自動判定する。
-        # 判定根拠は既存のメンバー選定理由の表示と同じスタイルで
-        # 「[判断: ...]」として一言添える。
-        mode = _classify_execution_mode(text)
-        print(f"[判断: {_execution_mode_reason_label(mode)}]")
-
-        if mode == EXECUTION_MODE_COLLABORATE:
-            try:
-                _ask_organization_collaborate(port, org_fingerprint, text, out_dir)
-            except KeyboardInterrupt:
-                if _handle_repl_command_interrupt(interrupt_guard):
-                    break
-            continue
-
-        messages.append({"role": "user", "content": text})
-        try:
-            if mode == EXECUTION_MODE_COMPARE:
-                _ask_organization_multi(port, org_fingerprint, messages)
-            else:
-                _ask_organization(port, org_fingerprint, messages)
-        except KeyboardInterrupt:
-            if _handle_repl_command_interrupt(interrupt_guard):
+        # 仮の判断: 会話履歴(messages)はこのセッション内でのみ保持し、終了したら破棄する。
+        # 次回起動時に前回の会話を引き継ぐ機能は今回のスコープ外。
+        messages = []
+        session = _create_repl_prompt_session()
+        # 仮の判断: 入力編集中・組織への問い合わせ中(応答待ち)のどちらで
+        # Ctrl+Cが発生しても「2回連続」を正しく検出できるよう、対話モードの
+        # セッションを通じて1つのインスタンスを使い回す(_DoubleInterruptGuard
+        # の定義コメントを参照)。
+        interrupt_guard = _DoubleInterruptGuard()
+        job_runner = _create_background_job_runner()
+        while True:
+            text, terminate = _read_multiline_input(session, interrupt_guard)
+            if terminate:
                 break
-            continue
 
-    print("対話モードを終了します。")
+            if text.startswith(RESUME_ALL_COMMAND):
+                job_runner.submit(
+                    lambda: _run_resume_all(port, org_fingerprint, out_dir),
+                    queued_notice=_BACKGROUND_QUEUED_NOTICE,
+                )
+                continue
+
+            if text.startswith(AGREE_COMMAND):
+                request = text[len(AGREE_COMMAND):].strip()
+                if not request:
+                    print(f"使い方: {AGREE_COMMAND} <制作依頼>  (例: {AGREE_COMMAND} ToDoリストのCLIツールを作って)")
+                    continue
+                job_runner.submit(
+                    lambda request=request: _ask_organization_collaborate(port, org_fingerprint, request, out_dir),
+                    queued_notice=_BACKGROUND_QUEUED_NOTICE,
+                )
+                continue
+
+            if text.startswith(PARALLEL_QUERY_COMMAND):
+                command_text = text[len(PARALLEL_QUERY_COMMAND):].strip()
+                job_runner.submit(
+                    lambda command_text=command_text: _ask_organization_parallel(port, org_fingerprint, command_text, out_dir),
+                    queued_notice=_BACKGROUND_QUEUED_NOTICE,
+                )
+                continue
+
+            if text.startswith(MULTI_QUERY_COMMAND):
+                question = text[len(MULTI_QUERY_COMMAND):].strip()
+                if not question:
+                    print(f"使い方: {MULTI_QUERY_COMMAND} <質問文>  (例: {MULTI_QUERY_COMMAND} こんにちは)")
+                    continue
+                messages.append({"role": "user", "content": question})
+                try:
+                    _ask_organization_multi(port, org_fingerprint, messages)
+                except KeyboardInterrupt:
+                    if _handle_repl_command_interrupt(interrupt_guard):
+                        break
+                continue
+
+            # 仮の判断: 明示コマンド(//agree・//parallel・//multi・
+            # //resume-all)のいずれにも一致しない通常の入力は、依頼文の
+            # 内容から実行モードを自動判定する。判定根拠は既存のメンバー
+            # 選定理由の表示と同じスタイルで「[判断: ...]」として一言添える。
+            mode = _classify_execution_mode(text)
+            print(f"[判断: {_execution_mode_reason_label(mode)}]")
+
+            if mode == EXECUTION_MODE_COLLABORATE:
+                job_runner.submit(
+                    lambda text=text: _ask_organization_collaborate(port, org_fingerprint, text, out_dir),
+                    queued_notice=_BACKGROUND_QUEUED_NOTICE,
+                )
+                continue
+
+            messages.append({"role": "user", "content": text})
+            try:
+                if mode == EXECUTION_MODE_COMPARE:
+                    _ask_organization_multi(port, org_fingerprint, messages)
+                else:
+                    _ask_organization(port, org_fingerprint, messages)
+            except KeyboardInterrupt:
+                if _handle_repl_command_interrupt(interrupt_guard):
+                    break
+                continue
+
+        print("対話モードを終了します。")
 
 
 def handle_chat(port: int, out_dir: str) -> None:

@@ -212,8 +212,8 @@ def test_collaborate_dispatches_exactly_two_files_when_architect_uses_nested_for
         # 保存される(プロジェクト名は依頼文から自動生成されるため、実際の
         # 生成ロジックを呼んで期待値を求める)。
         project_dir = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME, yoriai._generate_project_name("ToDoリストのCLIツールを作って"))
-        assert set(os.listdir(project_dir)) == {"storage.py", "cli.py"}, (
-            f"storage.py/cli.pyの2ファイルだけが保存されるはずです: {os.listdir(project_dir)}"
+        assert set(os.listdir(project_dir)) == {"storage.py", "cli.py", "PROGRESS.md"}, (
+            f"storage.py/cli.py/PROGRESS.mdの3件だけが保存されるはずです: {os.listdir(project_dir)}"
         )
     finally:
         yoriai._fetch_org_snapshot = original_snapshot

@@ -59,11 +59,12 @@ def test_no_issues_resolves_on_first_round_without_fix_request():
 
     out_dir = tempfile.mkdtemp(prefix="yoriai_review_test_")
     try:
-        ok = _call_review_and_fix("def add_todo(text):\n    return 1\n", fake_stream, out_dir)
+        ok, feedback = _call_review_and_fix("def add_todo(text):\n    return 1\n", fake_stream, out_dir)
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
 
     assert ok is True
+    assert feedback is None
     assert fix_calls["n"] == 0, "問題なしの場合は修正依頼を送らないはずです"
 
 
@@ -88,13 +89,14 @@ def test_issue_found_then_fixed_resolves_on_rereview():
 
     out_dir = tempfile.mkdtemp(prefix="yoriai_review_test_")
     try:
-        ok = _call_review_and_fix("def add_todo(text):\n    pass\n", fake_stream, out_dir)
+        ok, feedback = _call_review_and_fix("def add_todo(text):\n    pass\n", fake_stream, out_dir)
         with open(os.path.join(out_dir, "storage.py"), encoding="utf-8") as f:
             saved = f.read()
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
 
     assert ok is True
+    assert feedback is None
     assert fix_calls["n"] == 1
     assert review_round["n"] == 2
     assert "return 1" in saved, f"修正版が保存されていません: {saved!r}"
@@ -118,11 +120,12 @@ def test_issue_persists_after_two_rounds_gives_up_without_third_review():
 
     out_dir = tempfile.mkdtemp(prefix="yoriai_review_test_")
     try:
-        ok = _call_review_and_fix("def add_todo(text):\n    pass\n", fake_stream, out_dir)
+        ok, feedback = _call_review_and_fix("def add_todo(text):\n    pass\n", fake_stream, out_dir)
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
 
     assert ok is False
+    assert feedback == "まだ直っていません。", repr(feedback)
     assert review_round["n"] == 2, f"3回目のレビューは行われないはずです(実際: {review_round['n']}回)"
     assert fix_calls["n"] == 1
 
@@ -154,13 +157,14 @@ def test_syntax_error_is_caught_before_any_llm_review_call():
 
     out_dir = tempfile.mkdtemp(prefix="yoriai_review_test_")
     try:
-        ok = _call_review_and_fix(broken_code, fake_stream, out_dir)
+        ok, feedback = _call_review_and_fix(broken_code, fake_stream, out_dir)
         with open(os.path.join(out_dir, "storage.py"), encoding="utf-8") as f:
             saved = f.read()
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
 
     assert ok is True
+    assert feedback is None
     assert llm_review_calls["n"] == 1, (
         f"構文エラーのある初回はLLMレビューを呼ばずに弾かれ、修正後の再レビューだけが行われるはずです: {llm_review_calls}"
     )
@@ -178,7 +182,7 @@ def test_syntax_check_skipped_for_non_python_filename():
     yoriai._stream_chat_from_candidate = fake_stream
     out_dir = tempfile.mkdtemp(prefix="yoriai_review_test_")
     try:
-        ok = yoriai._review_and_fix_one_file(
+        ok, feedback = yoriai._review_and_fix_one_file(
             filename="README.md", owner=_OWNER, code="これはMarkdownで、Pythonとしては構文エラーです\n",
             reviewer=_REVIEWER, reviewer_own_filename="cli.py", reviewer_own_code="import storage\n",
             full_plan=_FULL_PLAN, org_fingerprint="fingerprint", out_dir=out_dir,
@@ -188,6 +192,7 @@ def test_syntax_check_skipped_for_non_python_filename():
         shutil.rmtree(out_dir, ignore_errors=True)
 
     assert ok is True
+    assert feedback is None
 
 
 def main():
