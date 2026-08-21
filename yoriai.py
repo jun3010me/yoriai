@@ -905,45 +905,105 @@ class PeerRegistry:
     アクセスされる共有ストア。--status コマンドが問い合わせる `/status`
     エンドポイントの情報源になる。
 
-    仮の判断: mDNSは「見えなくなった」イベント(remove_service)があるので
-    即座に取り除けるが、Tailscale経由はそのようなイベントが無く定期スキャンの
-    結果でしか判断できない。そのため、Tailscale経由で見つけたピアは
+    仮の判断: 同一LAN内かつ同じTailnetにいるデバイスは、mDNSとTailscaleの
+    両方の経路で発見されうる。実機で、この場合に同一デバイスが`--status`に
+    2件の別メンバーとして表示され、協業モードのメンバー数カウントにも
+    影響する不具合が報告された。原因は、以前の実装が発見経路ごとの
+    `agent_id`(プロセス起動のたびにランダム生成され、永続化されない)を
+    キーにしていたため、本来同一のはずのデバイスでも、常駐エージェントの
+    再起動などでこの値がずれると別々のエントリとして扱われてしまうこと
+    だった。そのため、自己紹介カードの`device_name`(短いホスト名)を
+    デバイスの一意な識別子とみなし、これをキーにして統合する
+    (依頼で挙げられた「hostname、または何らかの一意な識別子」の案を採用)。
+    同一`device_name`が複数経路で見えている場合、経路ごとの発見情報を
+    `via_paths`にまとめて保持し、実際に問い合わせに使うアドレス・ポートは
+    `_VIA_PRIORITY`の優先順位(mDNSを優先。同一LAN内での直接発見であり、
+    Tailscale経由のポーリングより低遅延・低コストと考えられるため)で選ぶ。
+
+    mDNSは「見えなくなった」イベント(remove_service)があるので即座に
+    取り除けるが、Tailscale経由はそのようなイベントが無く定期スキャンの
+    結果でしか判断できない。そのため、Tailscale経由の発見情報は
     「直近のスキャンで見つからなかったら消す」という形で間接的に古い情報を
-    掃除している(sync_tailscale)。同じピアがmDNSでも見えている場合は
-    Tailscale側のスキャン結果に関わらず残す。
+    掃除している(sync_tailscale)。片方の経路の情報だけが消えても、
+    もう片方の経路でまだ見えている限りデバイス自体はエントリに残る。
     """
+
+    # 仮の判断: 同一デバイスが複数経路で見えている場合に、実際の接続先として
+    # どちらを優先するかの順位。mDNS(同一LAN内)を優先する。
+    _VIA_PRIORITY = ("mDNS", "Tailscale")
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._peers = {}  # agent_id -> {"card", "via", "address", "port", "last_seen"}
+        # device_name -> {via: {"agent_id":, "card":, "address":, "port":, "last_seen":}}
+        self._peers = {}
 
     def upsert(self, agent_id: str, card: dict, via: str, address: str, port: int) -> None:
+        # 仮の判断: device_nameが取得できない(壊れたカード等)場合の
+        # フォールバックとしてagent_idをそのままキーに使う。
+        device_name = card.get("device_name") or agent_id
         with self._lock:
-            self._peers[agent_id] = {
+            entry = self._peers.setdefault(device_name, {})
+            entry[via] = {
+                "agent_id": agent_id,
                 "card": card,
-                "via": via,
                 "address": address,
                 "port": port,
                 "last_seen": time.time(),
             }
 
     def remove(self, agent_id: str) -> None:
+        """mDNSの`remove_service`イベント(=このメソッドの唯一の呼び出し元)に
+        対応する。指定した`agent_id`のmDNS側の発見情報だけを取り除く。
+        同じデバイスがTailscale経由でまだ見えている場合は、そちらの情報が
+        残っている限りデバイス自体のエントリは消えない。
+
+        仮の判断: mDNS・Tailscale両方の経路は、同一デバイス・同一プロセスで
+        あれば同じ`agent_id`を報告する。そのため、経路を区別せず
+        `agent_id`だけで一致判定すると、mDNS側が見えなくなっただけなのに
+        Tailscale側の発見情報まで一緒に消えてしまう(実際にこの実装で
+        テストが失敗し発覚した)。呼び出し元がmDNSの`remove_service`に
+        限られることを踏まえ、"mDNS"経路だけを対象に一致判定する。
+        """
         with self._lock:
-            self._peers.pop(agent_id, None)
+            for device_name, via_paths in list(self._peers.items()):
+                mdns_info = via_paths.get("mDNS")
+                if mdns_info is not None and mdns_info["agent_id"] == agent_id:
+                    del via_paths["mDNS"]
+                if not via_paths:
+                    del self._peers[device_name]
 
     def sync_tailscale(self, found_agent_ids) -> None:
         found_agent_ids = set(found_agent_ids)
         with self._lock:
-            stale = [
-                agent_id for agent_id, info in self._peers.items()
-                if info["via"] == "Tailscale" and agent_id not in found_agent_ids
-            ]
-            for agent_id in stale:
-                del self._peers[agent_id]
+            for device_name, via_paths in list(self._peers.items()):
+                tailscale_info = via_paths.get("Tailscale")
+                if tailscale_info is not None and tailscale_info["agent_id"] not in found_agent_ids:
+                    del via_paths["Tailscale"]
+                if not via_paths:
+                    del self._peers[device_name]
 
     def snapshot(self) -> list:
+        """デバイス(device_name)ごとに1件へ統合したスナップショットを返す。
+        `via`には実際に見えている経路をすべて含む(例: `["mDNS", "Tailscale"]`)。
+        接続先(`card`/`address`/`port`)は`_VIA_PRIORITY`で最優先の経路の
+        ものを使う。`last_seen`は経路間で最新のものを使う。
+        """
         with self._lock:
-            return list(self._peers.values())
+            result = []
+            for via_paths in self._peers.values():
+                if not via_paths:
+                    continue
+                present_vias = [v for v in self._VIA_PRIORITY if v in via_paths]
+                present_vias += [v for v in via_paths if v not in self._VIA_PRIORITY]
+                primary = via_paths[present_vias[0]]
+                result.append({
+                    "card": primary["card"],
+                    "via": present_vias,
+                    "address": primary["address"],
+                    "port": primary["port"],
+                    "last_seen": max(info["last_seen"] for info in via_paths.values()),
+                })
+            return result
 
 
 # ---------------------------------------------------------------------------
@@ -2928,7 +2988,10 @@ def handle_status(port: int) -> None:
         return
 
     for i, peer in enumerate(peers, start=2):
-        label = f"({peer.get('via', 'unknown')}経由)"
+        # 仮の判断: 同一デバイスが複数経路(mDNS・Tailscale)で見えている場合、
+        # 両方の経路を併記する(例: "(mDNS経由 / Tailscale経由)")。
+        via_list = peer.get("via") or ["unknown"]
+        label = f"({' / '.join(f'{v}経由' for v in via_list)})"
         print(_format_status_member(peer.get("card", {}), i, label, peer.get("last_seen")))
         print()
 
