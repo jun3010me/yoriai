@@ -8,6 +8,7 @@
 import argparse
 import ast
 import json
+import locale
 import logging
 import os
 import platform
@@ -23,6 +24,20 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from html.parser import HTMLParser as _HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# 仮の判断: `readline`モジュールをimportするだけで、以降の`input()`呼び出しが
+# GNU readline(macOSではlibedit)による行編集(矢印キーでのカーソル移動、
+# Backspace、Ctrl+A/E、上下矢印での入力履歴)を使うようになる(CPython標準の
+# 既知の挙動で、`readline`の関数を明示的に呼ぶ必要はない)。実機で「対話モード
+# で矢印キーを押すと`^[[D`のようなエスケープシーケンスがそのまま入力されて
+# しまう」という報告があり、原因は`readline`が一度もimportされていなかった
+# ことだった。Windowsや一部の最小構成Pythonには`readline`が無いことがあるが、
+# その場合でも`input()`自体は行編集機能なしで動作し続けるため、try/exceptで
+# 握りつぶして対話モード全体には影響しないようにしている。
+try:
+    import readline  # noqa: F401
+except ImportError:
+    pass
 
 import requests
 from zeroconf import ServiceBrowser, ServiceInfo, Zeroconf, IPVersion, InterfaceChoice
@@ -2813,6 +2828,19 @@ _INIT_INTERACTIVE = object()
 
 
 def main():
+    # 仮の判断: `readline`(macOSではlibedit)による行編集は、C言語レベルの
+    # ロケール設定(`setlocale`)に従って多バイト文字(日本語の全角文字等)を
+    # 1文字単位で正しく扱うかどうかが変わる。CPythonは起動時に自動でシステムの
+    # ロケールを`setlocale(LC_ALL, "")`しないため、環境変数(LANG/LC_ALL)で
+    # UTF-8系ロケールが指定されていても、明示的に呼ばないとCライブラリ側が
+    # 反映しないことがある。呼び出しに失敗しても(ロケールが未生成の環境など)
+    # 対話モード自体は行編集機能が多少不安定になるだけで動作は継続できるため、
+    # 例外は握りつぶす。
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
+
     # 仮の判断: input()が使う文字コードはOSのロケール設定(LANG/LC_ALL)に依存する。
     # ラズパイなどでシステムロケールがUTF-8になっていない(C/POSIXのままなど)環境では、
     # 端末側は自分のロケール(通常UTF-8)で正しく描画・送信しているにもかかわらず、
