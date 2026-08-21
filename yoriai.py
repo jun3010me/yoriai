@@ -1954,6 +1954,55 @@ def _parse_module_breakdown(text: str) -> list:
     ]
 
 
+# 仮の判断: 協業モードの生成物をYoriai本体(yoriai.py・config.py等)と
+# 同じディレクトリに置くと、どれが本体でどれが生成物か見分けにくく、
+# 生成物のファイル名がYoriai本体のファイル名(config.py等)と衝突する
+# リスクもある。そのため、生成物は必ず「<--dirで指定したディレクトリ>/
+# projects/<プロジェクト名>/」というサブディレクトリにまとめる。
+PROJECTS_SUBDIR_NAME = "projects"
+
+# プロジェクト名に使うトークンとして、依頼文中のASCII英数字のまとまり
+# (ToDo、CLI、API等、日本語の依頼文に埋め込まれた英語表現)を拾う。
+_PROJECT_NAME_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9]+")
+_PROJECT_NAME_MAX_TOKENS = 4
+_PROJECT_NAME_MAX_LENGTH = 40
+_DEFAULT_PROJECT_NAME = "project"
+
+
+def _generate_project_name(request: str) -> str:
+    """依頼文から簡易的なプロジェクト名を生成する。
+
+    仮の判断: 依頼文の内容を厳密に要約するには本来LLMへの問い合わせが
+    必要になるが、それではプロジェクト名を決めるためだけに追加の
+    ネットワーク往復が発生してしまう。依頼文には「ToDoリスト」
+    「CLIツール」のように英語表現がそのまま埋め込まれていることが多い
+    ため、ASCII英数字のまとまりを拾ってハイフンで連結するだけの簡易的な
+    変換にとどめた(依頼に明記された「厳密な命名規則は不要」という方針
+    に沿っている)。英語表現が全く含まれない依頼文の場合は
+    `_DEFAULT_PROJECT_NAME`(+一意化のための連番、`_resolve_project_dir`側で
+    付与)にフォールバックする。
+    """
+    tokens = [t.lower() for t in _PROJECT_NAME_TOKEN_PATTERN.findall(request) if len(t) >= 2]
+    name = "-".join(tokens[:_PROJECT_NAME_MAX_TOKENS]) if tokens else _DEFAULT_PROJECT_NAME
+    return name[:_PROJECT_NAME_MAX_LENGTH]
+
+
+def _resolve_project_dir(projects_root: str, name: str) -> str:
+    """`projects_root`配下に、`name`をベースにした未使用のディレクトリパスを
+    決める。既に同名のディレクトリが存在する場合、既存の生成物を上書き
+    しないよう`<name>-2`、`<name>-3`、...のように連番を振る。
+    """
+    candidate = os.path.join(projects_root, name)
+    if not os.path.exists(candidate):
+        return candidate
+    suffix = 2
+    while True:
+        candidate = os.path.join(projects_root, f"{name}-{suffix}")
+        if not os.path.exists(candidate):
+            return candidate
+        suffix += 1
+
+
 def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str, out_dir: str) -> None:
     """「〇〇を作って」のような制作依頼用: まず優先順位が最も高い1台に
     モジュール分割案とインターフェース設計を相談し(合意フェーズ)、
@@ -2018,17 +2067,25 @@ def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str,
         for filename, content in tasks
     ]
 
+    # 仮の判断: 生成物はYoriai本体と混ざらないよう、projects/<プロジェクト名>/
+    # というサブディレクトリにまとめる。プロジェクト名は依頼文から簡易的に
+    # 生成し、同名の既存プロジェクトがあれば連番で衝突を避ける。
+    projects_root = os.path.join(out_dir, PROJECTS_SUBDIR_NAME)
+    project_name = _generate_project_name(request)
+    project_dir = _resolve_project_dir(projects_root, project_name)
+    print(f"[📁 生成物の保存先: {project_dir}]")
+
     print(f"[🔨 実装フェーズ開始: 合意した計画に基づき、{len(enriched_tasks)}件のファイルを異なるメンバーに並行実装させます]")
-    implemented = _dispatch_and_save_parallel_tasks(enriched_tasks, candidates, org_fingerprint, out_dir)
+    implemented = _dispatch_and_save_parallel_tasks(enriched_tasks, candidates, org_fingerprint, project_dir)
 
     # 仮の判断: レビューフェーズは「お互いが担当外のファイルをレビューする」
     # 前提のため、実装に成功したファイルが2件以上無いと成立しない
     # (1件しか実装できなかった場合、担当外のレビュー担当が存在しない)。
     if len(implemented) < 2:
-        print("[🔎 レビューフェーズはスキップします: 相互レビューを行うには実装済みファイルが2件以上必要です]")
+        print(f"[🔎 レビューフェーズはスキップします: 相互レビューを行うには実装済みファイルが2件以上必要です(保存先: {project_dir})]")
         return
 
-    _run_review_phase(implemented, tasks, org_fingerprint, out_dir)
+    _run_review_phase(implemented, tasks, org_fingerprint, project_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -2218,9 +2275,9 @@ def _run_review_phase(implemented: list, agreed_plan: list, org_fingerprint: str
 
     print()
     if unresolved:
-        print(f"[⚠️ 未解決の指摘が残っています: {', '.join(unresolved)}]")
+        print(f"[⚠️ 未解決の指摘が残っています: {', '.join(unresolved)} (保存先: {out_dir})]")
     else:
-        print("[✅ レビュー完了]")
+        print(f"[✅ レビュー完了 (保存先: {out_dir})]")
 
 
 # ---------------------------------------------------------------------------
@@ -2384,7 +2441,8 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
     print("問い合わせるかを自動的に判断します(判断理由は[判断: ...]として表示されます)。")
     print(f"{MULTI_QUERY_COMMAND} <質問文> で、自動判定に関わらず必ず空きリソース上位{MULTI_QUERY_TARGET_COUNT}台に同時に質問できます。")
     print(
-        f"{AGREE_COMMAND} <制作依頼> で、自動判定に関わらず必ず事前すり合わせ(合意フェーズ)を経て並行実装させます。"
+        f"{AGREE_COMMAND} <制作依頼> で、自動判定に関わらず必ず事前すり合わせ(合意フェーズ)を経て並行実装させます"
+        f"(生成物は{os.path.join(out_dir, PROJECTS_SUBDIR_NAME)}/<プロジェクト名>/に保存されます)。"
     )
     print(
         f"{PARALLEL_QUERY_COMMAND} <ファイル名1>:<依頼1> | <ファイル名2>:<依頼2> ... で、"
@@ -2674,7 +2732,11 @@ def main():
     parser.add_argument("--force", action="store_true", help="--init と併用し、既存トークンを確認の上で強制的に再発行する")
     parser.add_argument(
         "--dir", dest="out_dir", default=".", metavar="DIR",
-        help=f"--chat と併用し、{PARALLEL_QUERY_COMMAND}・{AGREE_COMMAND}・協業モードで保存するファイルの保存先ディレクトリ(既定値: カレントディレクトリ)",
+        help=(
+            f"--chat と併用し、{PARALLEL_QUERY_COMMAND}・{AGREE_COMMAND}・協業モードで保存するファイルの"
+            f"保存先ディレクトリ(既定値: カレントディレクトリ)。{AGREE_COMMAND}・協業モードの生成物は"
+            f"この配下の{PROJECTS_SUBDIR_NAME}/<プロジェクト名>/にまとめて保存される"
+        ),
     )
     args = parser.parse_args()
 

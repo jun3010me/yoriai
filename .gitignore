@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 .venv/
+
+# 協業モード(//agree・自動判定される協業モード)の生成物。
+# Yoriai本体のGit管理下に誤って混ざらないようにする。
+projects/
