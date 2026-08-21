@@ -7,6 +7,7 @@
 
 import argparse
 import ast
+import datetime
 import json
 import locale
 import logging
@@ -1169,17 +1170,27 @@ class CardRequestHandler(BaseHTTPRequestHandler):
         model = body.get("model")
         messages = body.get("messages", [])
 
-        # 仮の判断: レビュー依頼元が明示的にread_fileツールの提供を要求
-        # してきた場合のみ、このリクエスト限定でオファーする(通常のチャット・
-        # 実装依頼にはoffer_read_file_toolが含まれないため、read_fileツール
-        # 自体が存在しないのと同じになる)。read_fileはこのプロセス
-        # (レビュー担当自身のキッチン)では実行せず、呼び出し元(実装依頼元、
-        # プロジェクトのファイルへの実際のアクセス権を持つ側)に実行を
+        # 仮の判断: 依頼元が明示的にread_fileツール(レビュー専用)または
+        # プロジェクトツール一式(修正依頼専用、read_file+ファイル作成・
+        # 移動・削除・ディレクトリ作成・一覧表示・テスト実行)の提供を
+        # 要求してきた場合のみ、このリクエスト限定でオファーする(通常の
+        # チャットにはどちらのフラグも含まれないため、これらのツール自体が
+        # 存在しないのと同じになる)。どちらのツールも、このプロセス
+        # (レビュー担当・修正担当自身のキッチン)では実行せず、呼び出し元
+        # (プロジェクトのファイルへの実際のアクセス権を持つ側)に実行を
         # 委ねる(client_tool_names)。詳細はREAD_FILE_TOOL_NAME定義部の
         # コメントを参照。
         offer_read_file_tool = bool(body.get("offer_read_file_tool"))
-        extra_tools = [READ_FILE_TOOL_SCHEMA] if offer_read_file_tool else None
-        client_tool_names = {READ_FILE_TOOL_NAME} if offer_read_file_tool else None
+        offer_project_tools = bool(body.get("offer_project_tools"))
+        if offer_project_tools:
+            extra_tools = PROJECT_TOOLS_SCHEMAS
+            client_tool_names = PROJECT_TOOLS_CLIENT_NAMES
+        elif offer_read_file_tool:
+            extra_tools = [READ_FILE_TOOL_SCHEMA]
+            client_tool_names = {READ_FILE_TOOL_NAME}
+        else:
+            extra_tools = None
+            client_tool_names = None
 
         # 仮の判断: 応答は事前にサイズが分からないストリーミングなので
         # Content-Lengthは付けず、NDJSON(1行1イベントのJSON)として都度書き出す。
@@ -1647,17 +1658,25 @@ def _select_chat_candidates(self_card: dict, peers: list, local_port: int, task_
     return candidates
 
 
-def _stream_chat_from_candidate(candidate: dict, org_fingerprint: str, messages: list, offer_read_file_tool: bool = False):
+def _stream_chat_from_candidate(
+    candidate: dict, org_fingerprint: str, messages: list,
+    offer_read_file_tool: bool = False, offer_project_tools: bool = False,
+):
     """候補(自分自身を含む)のキッチンにHTTP経由(/chat)で問い合わせ、
     正規化されたストリーミングイベントを順にyieldする。
 
     `offer_read_file_tool=True`を渡すと、相手のキッチンはこのリクエスト
-    限定でread_fileツールをオファーする。ただしread_fileの実行結果は
-    相手のキッチンではなく呼び出し元がこの応答ストリームを見て自分で
-    作る必要がある(詳細はREAD_FILE_TOOL_NAME定義コメントを参照)。
+    限定でread_fileツールをオファーする。`offer_project_tools=True`を
+    渡すと、read_fileに加えてファイル作成・移動・削除・ディレクトリ作成・
+    一覧表示・テスト実行のツール一式をオファーする(既存プロジェクトへの
+    修正依頼専用、より広い権限のツール束)。どちらも実行結果は相手の
+    キッチンではなく呼び出し元がこの応答ストリームを見て自分で作る必要が
+    ある(詳細はREAD_FILE_TOOL_NAME定義コメントを参照)。
     """
     body = {"model": candidate["model"], "messages": messages}
-    if offer_read_file_tool:
+    if offer_project_tools:
+        body["offer_project_tools"] = True
+    elif offer_read_file_tool:
         body["offer_read_file_tool"] = True
     try:
         resp = requests.post(
@@ -1915,6 +1934,415 @@ def _collect_review_answer_with_read_file(
     # _review_one_file側は「問い合わせに失敗した」扱いとして「問題あり」に
     # 倒す(安全側)。
     return "", f"read_fileの往復回数が上限({MAX_READ_FILE_CALLS_PER_REVIEW}回)に達しました"
+
+
+# ---------------------------------------------------------------------------
+# プロジェクトファイル操作ツール(既存プロジェクトへの修正依頼専用)
+# ---------------------------------------------------------------------------
+#
+# 仮の判断: read_fileと同じ「実行はモデルのキッチンプロセスではなく、
+# プロジェクトの実ファイルにアクセスできる呼び出し元が行う
+# (client_tool_names)」という設計をそのまま踏襲し、ファイル作成・移動・
+# 削除・ディレクトリ作成・一覧表示・テスト実行を追加する。Claude Codeの
+# Bashツールのような「任意のシェルコマンドを実行できる」形は避け、用途を
+# 絞った専用ツールのみを提供する。
+
+def _resolve_safe_project_path(project_dir: str, filename: str) -> tuple:
+    """`(絶対パス, エラーメッセージ)`を返す。`project_dir`直下の、
+    ディレクトリ区切りを含まないフラットなファイル名だけを許可する
+    (依頼の項目2・5: パストラバーサル対策と、Yoriai本体・他プロジェクトへの
+    アクセスを絶対に許さないための唯一の入口)。この関数を経由しない限り
+    以下のツールはどれも実際のファイルパスを作らないため、モデルからの
+    入力がどのような文字列であってもproject_dirの外に出ることはない。
+
+    仮の判断: PROGRESS.mdはYoriai自身が状態管理に使うファイルであり、
+    モデルが自由に書き換えたり消したりできてしまうと、進行状況の
+    永続化・巡回モード・自動再開の前提が壊れる。そのため名前で明示的に
+    弾く。
+    """
+    name = (filename or "").strip()
+    if not name:
+        return None, "ファイル名が指定されていません。"
+    if os.path.basename(name) != name or name in (".", ".."):
+        return None, f"'{name}' はディレクトリを含む名前のため使用できません(プロジェクト直下のファイル名のみ指定してください)。"
+    if name == PROGRESS_FILENAME:
+        return None, "PROGRESS.mdはYoriai自身が管理するファイルのため、このツールでは操作できません。"
+    return os.path.join(project_dir, name), None
+
+
+LIST_DIR_TOOL_NAME = "list_dir"
+LIST_DIR_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": LIST_DIR_TOOL_NAME,
+        "description": "このプロジェクトディレクトリ直下にあるファイルの一覧を取得する。",
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
+
+WRITE_FILE_TOOL_NAME = "write_file"
+WRITE_FILE_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": WRITE_FILE_TOOL_NAME,
+        "description": (
+            "このプロジェクトディレクトリ直下に、指定した内容でファイルを新規作成・上書きする。"
+            "既存ファイルの一部だけを直したい場合も、read_fileで現在の中身を確認したうえで"
+            "ファイル全体の新しい内容をここに渡すこと(差分ではなく全体を渡す)。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "filename": {"type": "string", "description": "書き込むファイル名(例: utils.py)"},
+                "content": {"type": "string", "description": "ファイルの新しい中身(ファイル全体)"},
+            },
+            "required": ["filename", "content"],
+        },
+    },
+}
+
+MOVE_FILE_TOOL_NAME = "move_file"
+MOVE_FILE_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": MOVE_FILE_TOOL_NAME,
+        "description": "このプロジェクトディレクトリ直下のファイルの名前を変更(移動)する。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "old_filename": {"type": "string", "description": "変更前のファイル名"},
+                "new_filename": {"type": "string", "description": "変更後のファイル名"},
+            },
+            "required": ["old_filename", "new_filename"],
+        },
+    },
+}
+
+DELETE_FILE_TOOL_NAME = "delete_file"
+DELETE_FILE_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": DELETE_FILE_TOOL_NAME,
+        "description": "このプロジェクトディレクトリ直下のファイルを削除する。取り消せない操作なので、本当に不要なファイルにのみ使うこと。",
+        "parameters": {
+            "type": "object",
+            "properties": {"filename": {"type": "string", "description": "削除するファイル名"}},
+            "required": ["filename"],
+        },
+    },
+}
+
+MAKE_DIRECTORY_TOOL_NAME = "make_directory"
+MAKE_DIRECTORY_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": MAKE_DIRECTORY_TOOL_NAME,
+        "description": "このプロジェクトディレクトリ直下にサブディレクトリを作成する。",
+        "parameters": {
+            "type": "object",
+            "properties": {"dirname": {"type": "string", "description": "作成するディレクトリ名"}},
+            "required": ["dirname"],
+        },
+    },
+}
+
+RUN_TEST_TOOL_NAME = "run_test"
+RUN_TEST_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": RUN_TEST_TOOL_NAME,
+        "description": (
+            "プロジェクトディレクトリ内でテストを実行して動作を確認する。実行できるコマンドは"
+            "'python3 <ファイル名>'・'pytest'・'pytest <ファイル名>'のみに限定されており、"
+            "それ以外の任意のコマンドは実行できない。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "実行するコマンド(例: python3 test_utils.py)"},
+            },
+            "required": ["command"],
+        },
+    },
+}
+
+# 仮の判断: read_fileも含めて「このプロジェクトディレクトリの中だけを
+# 対象にした、用途を絞ったツール」としてまとめて1つの束(offer_project_tools)
+# にする。既存のレビューフェーズ(offer_read_file_tool、read_file単体のみ)
+# とは別の、修正依頼専用のより広い権限のツール束として明確に分離する。
+PROJECT_TOOLS_SCHEMAS = [
+    READ_FILE_TOOL_SCHEMA, LIST_DIR_TOOL_SCHEMA, WRITE_FILE_TOOL_SCHEMA,
+    MOVE_FILE_TOOL_SCHEMA, DELETE_FILE_TOOL_SCHEMA, MAKE_DIRECTORY_TOOL_SCHEMA,
+    RUN_TEST_TOOL_SCHEMA,
+]
+PROJECT_TOOLS_CLIENT_NAMES = {
+    READ_FILE_TOOL_NAME, LIST_DIR_TOOL_NAME, WRITE_FILE_TOOL_NAME,
+    MOVE_FILE_TOOL_NAME, DELETE_FILE_TOOL_NAME, MAKE_DIRECTORY_TOOL_NAME,
+    RUN_TEST_TOOL_NAME,
+}
+
+
+def _list_project_directory(project_dir: str) -> str:
+    return json.dumps({"files": _list_project_files(project_dir)}, ensure_ascii=False)
+
+
+def _write_project_file(project_dir: str, filename: str, content) -> str:
+    """ファイルを書き込む。`.py`ファイルの場合、書き込み直後に機械的な
+    構文チェックを行い、結果をそのままモデルへの返り値に含める(依頼の
+    「構文チェックを通してから」を、複数ファイルを自由に操作できる
+    このツール群では「書いた直後にその場でフィードバックし、モデル自身が
+    次のラウンドで直せるようにする」形で満たす。最終的な安全網として、
+    _ask_organization_fix_project側でも修正完了後にプロジェクト全体の
+    構文チェックを別途行う)。
+    """
+    safe_path, error = _resolve_safe_project_path(project_dir, filename)
+    if error:
+        return json.dumps({"ok": False, "message": error}, ensure_ascii=False)
+    text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+    try:
+        with open(safe_path, "w", encoding="utf-8") as f:
+            f.write(text)
+    except Exception as exc:
+        return json.dumps({"ok": False, "message": f"書き込みに失敗しました: {exc}"}, ensure_ascii=False)
+    result = {"ok": True, "filename": os.path.basename(safe_path)}
+    if safe_path.endswith(".py"):
+        syntax_ok, syntax_detail = _check_python_syntax(text)
+        result["syntax_ok"] = syntax_ok
+        if not syntax_ok:
+            result["syntax_error"] = syntax_detail
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _move_project_file(project_dir: str, old_filename: str, new_filename: str) -> str:
+    old_path, old_error = _resolve_safe_project_path(project_dir, old_filename)
+    if old_error:
+        return json.dumps({"ok": False, "message": old_error}, ensure_ascii=False)
+    new_path, new_error = _resolve_safe_project_path(project_dir, new_filename)
+    if new_error:
+        return json.dumps({"ok": False, "message": new_error}, ensure_ascii=False)
+    if not os.path.isfile(old_path):
+        return json.dumps({"ok": False, "message": f"{old_filename} が見つかりません。"}, ensure_ascii=False)
+    try:
+        os.replace(old_path, new_path)
+    except Exception as exc:
+        return json.dumps({"ok": False, "message": f"移動に失敗しました: {exc}"}, ensure_ascii=False)
+    return json.dumps(
+        {"ok": True, "old_filename": os.path.basename(old_path), "new_filename": os.path.basename(new_path)},
+        ensure_ascii=False,
+    )
+
+
+def _delete_project_file(project_dir: str, filename: str, print_lock: threading.Lock = None, tag: str = None) -> str:
+    """ファイルを削除する。依頼の項目4に対応するため、実際に削除する前に
+    PROGRESS.mdの更新履歴へ記録し、画面にも明確なログを出す(削除は
+    取り消せない操作のため、実行後の記録では遅い)。
+    """
+    safe_path, error = _resolve_safe_project_path(project_dir, filename)
+    if error:
+        return json.dumps({"ok": False, "message": error}, ensure_ascii=False)
+    if not os.path.isfile(safe_path):
+        return json.dumps({"ok": False, "message": f"{filename} が見つかりません。"}, ensure_ascii=False)
+    safe_name = os.path.basename(safe_path)
+
+    progress_path = os.path.join(project_dir, PROGRESS_FILENAME)
+    parsed = _parse_progress_markdown(progress_path)
+    if parsed is not None:
+        today = datetime.date.today().isoformat()
+        changelog = list(parsed["changelog"])
+        changelog.append(f"- {today}: {safe_name} を削除")
+        _write_progress_md(
+            project_dir, parsed["request"], parsed["tasks"], parsed["checklist"],
+            review_feedback={}, auto_resume_count=parsed["auto_resume_count"], changelog=changelog,
+        )
+    _print_tagged(print_lock, tag or "ツール実行", f"[🗑️ {safe_name} を削除します]")
+
+    try:
+        os.remove(safe_path)
+    except Exception as exc:
+        return json.dumps({"ok": False, "message": f"削除に失敗しました: {exc}"}, ensure_ascii=False)
+    return json.dumps({"ok": True, "filename": safe_name}, ensure_ascii=False)
+
+
+def _make_project_directory(project_dir: str, dirname: str) -> str:
+    safe_path, error = _resolve_safe_project_path(project_dir, dirname)
+    if error:
+        return json.dumps({"ok": False, "message": error}, ensure_ascii=False)
+    try:
+        os.makedirs(safe_path, exist_ok=True)
+    except Exception as exc:
+        return json.dumps({"ok": False, "message": f"ディレクトリの作成に失敗しました: {exc}"}, ensure_ascii=False)
+    return json.dumps({"ok": True, "dirname": os.path.basename(safe_path)}, ensure_ascii=False)
+
+
+# 仮の判断: 依頼の項目3(「テスト実行コマンドも、実行できるコマンドの種類を
+# ホワイトリスト形式で限定」)への対応。'python3 <ファイル名>'・'pytest'・
+# 'pytest <ファイル名>'の3パターンのみを許可し、それ以外の文字列は
+# 一切実行しない。shell=Trueは使わず引数リストのまま渡すため、
+# ';'や'&&'のようなシェル特殊文字を含む文字列を渡されても素朴に
+# トークン分割されるだけでシェルには解釈されない(コマンドインジェクション対策)。
+_RUN_TEST_TIMEOUT_SEC = 30
+_RUN_TEST_MAX_OUTPUT_CHARS = 4000
+
+
+def _parse_run_test_command(command: str) -> tuple:
+    """`(argv, エラーメッセージ)`を返す。"""
+    parts = (command or "").split()
+    if not parts:
+        return None, "コマンドが指定されていません。"
+    if parts[0] == "python3" and len(parts) == 2:
+        return parts, None
+    if parts[0] == "pytest" and len(parts) <= 2:
+        return parts, None
+    return None, (
+        "実行できるコマンドは 'python3 <ファイル名>' または "
+        "'pytest' / 'pytest <ファイル名>' のみです。"
+    )
+
+
+def _run_project_test_command(project_dir: str, command: str) -> str:
+    argv, error = _parse_run_test_command(command)
+    if error:
+        return json.dumps({"ok": False, "message": error}, ensure_ascii=False)
+    if len(argv) == 2:
+        safe_path, path_error = _resolve_safe_project_path(project_dir, argv[1])
+        if path_error:
+            return json.dumps({"ok": False, "message": path_error}, ensure_ascii=False)
+        if not os.path.isfile(safe_path):
+            return json.dumps({"ok": False, "message": f"{argv[1]} が見つかりません。"}, ensure_ascii=False)
+    try:
+        result = subprocess.run(
+            argv, cwd=project_dir, capture_output=True, text=True, timeout=_RUN_TEST_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        return json.dumps({"ok": False, "message": f"実行が{_RUN_TEST_TIMEOUT_SEC}秒でタイムアウトしました。"}, ensure_ascii=False)
+    except FileNotFoundError:
+        return json.dumps({"ok": False, "message": f"'{argv[0]}' コマンドが見つかりませんでした。"}, ensure_ascii=False)
+    output = (result.stdout or "") + (result.stderr or "")
+    return json.dumps({
+        "ok": result.returncode == 0, "returncode": result.returncode,
+        "output": output[:_RUN_TEST_MAX_OUTPUT_CHARS],
+    }, ensure_ascii=False)
+
+
+def _execute_project_tool_call(
+    project_dir: str, tool_call: dict, print_lock: threading.Lock = None, tag: str = None,
+) -> str:
+    """1つのtool_call(OpenAI互換形式)を、プロジェクトツールとして実行し、
+    モデルに返す結果をJSON文字列として返す。
+    """
+    tag = tag or "ツール実行"
+    function = tool_call.get("function", {})
+    name = function.get("name", "")
+    arguments = function.get("arguments", {})
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments) if arguments else {}
+        except json.JSONDecodeError:
+            arguments = {}
+    if not isinstance(arguments, dict):
+        arguments = {}
+
+    if name == READ_FILE_TOOL_NAME:
+        filename = arguments.get("filename", "")
+        _print_tagged(print_lock, tag, f"[📖 {filename or '他のファイル'} を読みに行っています...]")
+        return _read_project_file_fresh(project_dir, filename)
+    if name == LIST_DIR_TOOL_NAME:
+        _print_tagged(print_lock, tag, "[📂 ファイル一覧を確認しています...]")
+        return _list_project_directory(project_dir)
+    if name == WRITE_FILE_TOOL_NAME:
+        filename = arguments.get("filename", "")
+        _print_tagged(print_lock, tag, f"[✏️ {filename or '(不明なファイル)'} を書き込んでいます...]")
+        return _write_project_file(project_dir, filename, arguments.get("content", ""))
+    if name == MOVE_FILE_TOOL_NAME:
+        old_filename = arguments.get("old_filename", "")
+        new_filename = arguments.get("new_filename", "")
+        _print_tagged(print_lock, tag, f"[📦 {old_filename} を {new_filename} に変更しています...]")
+        return _move_project_file(project_dir, old_filename, new_filename)
+    if name == DELETE_FILE_TOOL_NAME:
+        return _delete_project_file(project_dir, arguments.get("filename", ""), print_lock, tag)
+    if name == MAKE_DIRECTORY_TOOL_NAME:
+        dirname = arguments.get("dirname", "")
+        _print_tagged(print_lock, tag, f"[📁 {dirname} ディレクトリを作成しています...]")
+        return _make_project_directory(project_dir, dirname)
+    if name == RUN_TEST_TOOL_NAME:
+        command = arguments.get("command", "")
+        _print_tagged(print_lock, tag, f"[🧪 {command} を実行しています...]")
+        return _run_project_test_command(project_dir, command)
+    return json.dumps({"ok": False, "message": f"未知のツールです: {name}"}, ensure_ascii=False)
+
+
+# 仮の判断: rename→import修正→テスト実行のような複数手順が必要な
+# 修正依頼に対応するため、read_file専用のMAX_READ_FILE_CALLS_PER_REVIEW
+# (3回)より多くのラウンドを許容する。それでも無制限にはせず、暴走防止の
+# 上限を設ける。
+MAX_PROJECT_TOOL_ROUNDS = 12
+
+
+def _collect_answer_with_project_tools(
+    candidate: dict, org_fingerprint: str, messages: list, project_dir: str,
+    print_lock: threading.Lock = None, tag: str = None,
+):
+    """既存プロジェクトへのファイル操作・テスト実行ツール群を提供しながら
+    1つの回答を集める。`_collect_review_answer_with_read_file`と同じ
+    「/chatはステートレスなので、ツール実行結果を足したmessagesで再度
+    /chatを呼び直せば会話を継続できる」という設計を踏襲するが、read_file
+    単体ではなく複数種類のツールを1つのループで扱えるように汎化した。
+    `(content, error)`のタプルを返す。
+    """
+    messages = list(messages)
+    for _round_num in range(MAX_PROJECT_TOOL_ROUNDS):
+        answer_parts = []
+        pending_tool_calls = None
+        error = None
+        for event in _stream_chat_from_candidate(candidate, org_fingerprint, messages, offer_project_tools=True):
+            if "error" in event:
+                error = event["error"]
+                break
+            if "pending_tool_calls" in event:
+                pending_tool_calls = event["pending_tool_calls"]
+                break
+            content = event.get("content")
+            if content:
+                answer_parts.append(content)
+            if event.get("done"):
+                break
+
+        if error:
+            return "", error
+        if not pending_tool_calls:
+            return "".join(answer_parts), None
+
+        messages.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
+        for tool_call in pending_tool_calls:
+            result = _execute_project_tool_call(project_dir, tool_call, print_lock, tag or candidate["label"])
+            messages.append({"role": "tool", "content": result, "tool_call_id": tool_call.get("id")})
+
+    return "", f"ツール呼び出しの往復回数が上限({MAX_PROJECT_TOOL_ROUNDS}回)に達しました"
+
+
+def _syntax_check_all_python_files(project_dir: str) -> list:
+    """プロジェクトディレクトリ直下の`.py`ファイルすべてに機械的な構文
+    チェックを行い、構文エラーが残っているファイル名のリストを返す。
+
+    仮の判断: 個々の`write_file`呼び出し直後の即時フィードバックに加えて、
+    修正セッション全体が終わった後にプロジェクト全体を最終確認する
+    安全網として用意した(モデルが「直したつもり」でも別のファイルへの
+    影響を見落とす可能性があるため)。`_list_project_files`と同じく
+    直下のファイルのみを対象とする(サブディレクトリ内は対象外)。
+    """
+    broken = []
+    for filename in _list_project_files(project_dir):
+        if not filename.endswith(".py"):
+            continue
+        try:
+            with open(os.path.join(project_dir, filename), "r", encoding="utf-8") as f:
+                code = f.read()
+        except Exception:
+            continue
+        ok, _detail = _check_python_syntax(code)
+        if not ok:
+            broken.append(filename)
+    return broken
 
 
 def _ask_organization_multi(port: int, org_fingerprint: str, messages: list) -> None:
@@ -2405,10 +2833,12 @@ _PROGRESS_SECTION_PLAN = "## モジュール分割案"
 _PROGRESS_SECTION_CHECKLIST = "## タスク状況"
 _PROGRESS_SECTION_AUTO_RESUME_COUNT = "## 自動再開の試行回数"
 _PROGRESS_SECTION_REVIEW = "## 直近のレビュー指摘"
+_PROGRESS_SECTION_CHANGELOG = "## 更新履歴"
 
 
 def _format_progress_markdown(
     request: str, tasks: list, checklist: list, review_feedback: dict, auto_resume_count: int = 0,
+    changelog: list = None,
 ) -> str:
     """PROGRESS.mdの内容を組み立てる。
 
@@ -2425,6 +2855,11 @@ def _format_progress_markdown(
     PROGRESS.md全体で踏襲している「ディスク上の実際の状態を正として
     扱う」方針により、対話モードのプロセスを再起動しても試行回数の
     記録が失われないようにするため。
+
+    仮の判断: 「更新履歴」(既存プロジェクトへの修正依頼の記録)も、
+    `"- YYYY-MM-DD: <内容> (<ファイル名>)"`という行の単純なリストとして
+    記録する。新しいエントリは末尾に追記されるだけで、既存のエントリを
+    書き換えることはない(`_ask_organization_fix_project`参照)。
     """
     lines = ["# プロジェクト進行状況", "", _PROGRESS_SECTION_REQUEST, "", request, ""]
     lines.append(_PROGRESS_SECTION_PLAN)
@@ -2448,14 +2883,20 @@ def _format_progress_markdown(
             lines.append("")
             lines.append(feedback)
             lines.append("")
+    if changelog:
+        lines.append(_PROGRESS_SECTION_CHANGELOG)
+        lines.append("")
+        lines.extend(changelog)
+        lines.append("")
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
 def _write_progress_md(
     project_dir: str, request: str, tasks: list, checklist: list, review_feedback: dict, auto_resume_count: int = 0,
+    changelog: list = None,
 ) -> None:
     os.makedirs(project_dir, exist_ok=True)
-    content = _format_progress_markdown(request, tasks, checklist, review_feedback, auto_resume_count)
+    content = _format_progress_markdown(request, tasks, checklist, review_feedback, auto_resume_count, changelog)
     with open(os.path.join(project_dir, PROGRESS_FILENAME), "w", encoding="utf-8") as f:
         f.write(content)
 
@@ -2528,10 +2969,14 @@ def _parse_auto_resume_count(text: str) -> int:
         return 0
 
 
+def _parse_changelog_markdown(text: str) -> list:
+    return [line for line in text.splitlines() if line.strip()]
+
+
 def _parse_progress_markdown(path: str):
     """PROGRESS.mdを読み込み、`{"request":, "tasks":, "checklist":,
-    "auto_resume_count":}`の辞書として返す。ファイルが存在しない・
-    想定した形式で解析できない場合は`None`を返す(呼び出し元は、
+    "auto_resume_count":, "changelog":}`の辞書として返す。ファイルが
+    存在しない・想定した形式で解析できない場合は`None`を返す(呼び出し元は、
     そのプロジェクトの再開をスキップすべきというシグナルとして扱う)。
     """
     try:
@@ -2548,6 +2993,7 @@ def _parse_progress_markdown(path: str):
     return {
         "request": request, "tasks": tasks, "checklist": checklist,
         "auto_resume_count": _parse_auto_resume_count(text),
+        "changelog": _parse_changelog_markdown(_extract_progress_section(text, _PROGRESS_SECTION_CHANGELOG)),
     }
 
 
@@ -2674,7 +3120,7 @@ def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str,
 
 def _run_collaborative_project(
     request: str, tasks: list, checklist: list, candidates: list, org_fingerprint: str,
-    project_dir: str, tasks_to_queue: list, auto_resume_count: int = 0,
+    project_dir: str, tasks_to_queue: list, auto_resume_count: int = 0, changelog: list = None,
 ) -> None:
     """タスクキュー方式による実装・レビューを実行し、その間PROGRESS.mdを
     更新し続ける。新規プロジェクト(`_ask_organization_collaborate`)・
@@ -2684,18 +3130,21 @@ def _run_collaborative_project(
     `tasks_to_queue`は実際にタスクキューへ投入する対象(新規作成時は
     `tasks`と同じ、再開時は未完了だったファイルだけの部分集合)。
 
-    `auto_resume_count`(自動再開の試行回数)は、この関数自身は増減させず、
-    呼び出し元(`_maybe_auto_resume`)から渡された値をそのままPROGRESS.mdに
-    書き戻すだけの、素通しの値として扱う。新規プロジェクトでは既定値の
-    `0`のまま、手動`//resume-all`(`_resume_project`)経由ではディスク上の
-    既存の値がそのまま渡ってくる。
+    `auto_resume_count`(自動再開の試行回数)・`changelog`(既存プロジェクト
+    への修正依頼の更新履歴)は、この関数自身は変更せず、呼び出し元から
+    渡された値をそのままPROGRESS.mdに書き戻すだけの、素通しの値として
+    扱う。新規プロジェクトでは既定値(`0`・空)のまま、手動`//resume-all`
+    (`_resume_project`)経由ではディスク上の既存の値がそのまま渡って
+    くる。これが無いと、修正依頼で追記した更新履歴が、その後の
+    (無関係な)`//resume-all`によるPROGRESS.mdの書き換えで消えてしまう。
     """
+    changelog = list(changelog) if changelog else []
     review_feedback = {}
     progress_lock = threading.Lock()
 
     def write_progress():
         with progress_lock:
-            _write_progress_md(project_dir, request, tasks, checklist, review_feedback, auto_resume_count)
+            _write_progress_md(project_dir, request, tasks, checklist, review_feedback, auto_resume_count, changelog)
 
     write_progress()
     if tasks_to_queue:
@@ -3230,6 +3679,7 @@ def _resume_project(project_dir: str, port: int, org_fingerprint: str, auto_resu
     request, tasks, checklist = parsed["request"], parsed["tasks"], parsed["checklist"]
     if auto_resume_count is None:
         auto_resume_count = parsed["auto_resume_count"]
+    changelog = parsed["changelog"]
     tasks_to_queue = _pending_tasks_from_checklist(tasks, checklist)
     if not tasks_to_queue:
         print(f"[{project_dir}] 未完了のタスクは見つかりませんでした。")
@@ -3249,7 +3699,8 @@ def _resume_project(project_dir: str, port: int, org_fingerprint: str, auto_resu
         f" ({', '.join(fn for fn, _ in tasks_to_queue)})]"
     )
     _run_collaborative_project(
-        request, tasks, checklist, candidates, org_fingerprint, project_dir, tasks_to_queue, auto_resume_count,
+        request, tasks, checklist, candidates, org_fingerprint, project_dir, tasks_to_queue,
+        auto_resume_count, changelog,
     )
     return True
 
@@ -3346,6 +3797,272 @@ def _run_resume_all(port: int, org_fingerprint: str, out_dir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 既存プロジェクトへの修正依頼(`//fix`)
+# ---------------------------------------------------------------------------
+#
+# これまでの協業モードは「新規のプロジェクトをゼロから作る」ことしか
+# できず、既に完成したプロジェクトに対して「ここを直して」という
+# 修正依頼を送る手段が無かった。Claude CodeにおけるRead/Glob/Grep/Edit
+# のような、既存ファイルに対する検索・部分修正の仕組みを導入する。
+#
+# 対象は「完成済み」(タスクチェックリストが全項目✅)のプロジェクトに
+# 限定する。未完了のプロジェクトは、既存の`//resume-all`(未完了タスクの
+# 続きを実装する仕組み)の役割であり、両者を混同すると「未完了タスクの
+# 続きを実装する」のか「完成済みの実装を書き換える」のかが曖昧になる。
+# この制約により、修正依頼を処理する時点でそのプロジェクトの
+# `review_feedback`(直近のレビュー指摘)は必ず空である(タスクキュー
+# 方式は、あるファイルのレビューが完了した瞬間にそのファイルの指摘を
+# 消すため、全項目✅の時点で指摘は残っていない)ことも保証され、
+# 修正依頼のPROGRESS.md更新が既存の指摘を誤って消してしまうことも無い。
+
+FIX_PROJECT_COMMAND = "//fix"
+
+
+def _char_bigrams(text: str) -> set:
+    normalized = text.lower()
+    if len(normalized) < 2:
+        return set()
+    return {normalized[i:i + 2] for i in range(len(normalized) - 1)}
+
+
+def _text_similarity_score(a: str, b: str) -> int:
+    """2つの文字列の類似度を、文字2-gram(バイグラム)の共通数で簡易的に
+    スコア化する。
+
+    仮の判断: 日本語は分かち書き(単語の区切り)が無いため、形態素解析
+    ライブラリを新たに追加せずに大まかな重なりを見る手法として、文字
+    単位のn-gramを使う。英数字の識別子(例: "generate_id")の部分一致も
+    自然に拾える(バイグラムは文字種を問わず作れるため)という利点もある。
+    """
+    return len(_char_bigrams(a) & _char_bigrams(b))
+
+
+# 仮の判断: この点数未満の重なりしか無い場合は「一致する候補が無い」と
+# みなす。文字バイグラムの共通数という単純な指標のため、依頼文と
+# プロジェクトの要約が何らかの形で具体的に関連していることを示すための
+# 最低限のしきい値として設定した(厳密な根拠のある値ではなく、依頼の
+# 「判定に自信が持てない場合は確認する」という要件を安全側に倒すための
+# 目安)。
+_PROJECT_MATCH_MIN_SCORE = 2
+
+
+def _project_summary_text(parsed: dict) -> str:
+    return parsed["request"] + "\n" + "\n".join(f"{fn}: {content}" for fn, content in parsed["tasks"])
+
+
+def _identify_target_project(request_text: str, out_dir: str) -> tuple:
+    """依頼文と、`./projects/`以下の完成済み(全タスク✅)プロジェクトの
+    PROGRESS.md(元の依頼・モジュール分割案)を照合し、どのプロジェクトに
+    ついての依頼かを判定する。
+
+    戻り値は`(status, project_dirs)`のタプル。
+    - `status == "matched"`: `project_dirs == [project_dir]`
+      (1件に絞り込めた)
+    - `status == "ambiguous"`: `project_dirs == [project_dir, ...]`
+      (複数の候補が同点で並んだ)
+    - `status == "not_found"`: `project_dirs == []`
+      (完成済みプロジェクトが無い、またはどれとも十分に一致しなかった)
+    """
+    projects_root = os.path.join(out_dir, PROJECTS_SUBDIR_NAME)
+    if not os.path.isdir(projects_root):
+        return "not_found", []
+
+    scored = []
+    for name in sorted(os.listdir(projects_root)):
+        project_dir = os.path.join(projects_root, name)
+        parsed = _parse_progress_markdown(os.path.join(project_dir, PROGRESS_FILENAME))
+        if parsed is None or _progress_checklist_is_incomplete(parsed["checklist"]):
+            continue
+        score = _text_similarity_score(request_text, _project_summary_text(parsed))
+        scored.append((score, project_dir))
+
+    if not scored:
+        return "not_found", []
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    top_score = scored[0][0]
+    if top_score < _PROJECT_MATCH_MIN_SCORE:
+        return "not_found", []
+
+    top_candidates = [project_dir for score, project_dir in scored if score == top_score]
+    if len(top_candidates) == 1:
+        return "matched", top_candidates
+    return "ambiguous", top_candidates
+
+
+def _resolve_explicit_fix_target(request_text: str, out_dir: str) -> tuple:
+    """`//fix <プロジェクト名>: <修正依頼>`という明示指定の構文を試みる。
+    コロンより前の部分が既存プロジェクトのディレクトリ名と一致すれば
+    `(project_dir, 残りの依頼文)`を返す。一致しなければ`(None,
+    request_text)`を返し、呼び出し元に自動判定(`_identify_target_
+    project`)させる。
+    """
+    if ":" not in request_text:
+        return None, request_text
+    prefix, _sep, rest = request_text.partition(":")
+    prefix = prefix.strip()
+    if not prefix:
+        return None, request_text
+    candidate_dir = os.path.join(out_dir, PROJECTS_SUBDIR_NAME, prefix)
+    if os.path.isfile(os.path.join(candidate_dir, PROGRESS_FILENAME)):
+        return candidate_dir, rest.strip()
+    return None, request_text
+
+
+def _list_project_files(project_dir: str) -> list:
+    """プロジェクトディレクトリ内の、PROGRESS.md以外のファイル名一覧を
+    ソート済みで返す。
+    """
+    if not os.path.isdir(project_dir):
+        return []
+    return sorted(
+        name for name in os.listdir(project_dir)
+        if name != PROGRESS_FILENAME and os.path.isfile(os.path.join(project_dir, name))
+    )
+
+
+# 仮の判断: 依頼の項目2(既存のread_fileツールの仕組みを流用し、
+# プロジェクト内の全ファイルを確認できるようにする)への対応として、
+# 「プロジェクト内でのファイル操作・テスト実行ツール」の追加に伴い、
+# 修正担当はread_fileだけでなくlist_dir・write_file・move_file・
+# delete_file・make_directory・run_testも自由に使い、複数ファイル・
+# 複数手順にまたがる修正(リネーム→import修正→テスト実行、等)を1回の
+# 依頼の中で完結できるようにした(_collect_answer_with_project_tools)。
+# 以前の「FILE: <ファイル名> + コードブロック1つだけを解析して1ファイルを
+# 上書きする」設計は、複数ファイルにまたがる修正を表現できないため廃止した。
+_FIX_REQUEST_TOOL_PROMPT_TEMPLATE = """あなたはこのプロジェクトの改修担当です。以下はこのプロジェクトの実装計画全体と、現在保存されているファイルの一覧です。
+
+【実装計画全体】
+{full_plan}
+
+【現在保存されているファイル一覧】
+{file_list}
+
+【ユーザーからの修正依頼】
+{request}
+
+以下のツールを使って、このプロジェクトディレクトリ内のファイルに直接修正を加えてください。
+- read_file: 既存ファイルの中身を確認する
+- list_dir: ファイル一覧を確認する
+- write_file: ファイルを新規作成・上書きする(部分修正の場合も、まずread_fileで現在の中身を確認したうえでファイル全体を書き直すこと)
+- move_file: ファイル名を変更(移動)する
+- make_directory: サブディレクトリを作成する
+- delete_file: 不要になったファイルを削除する(取り消せないため、本当に不要な場合のみ使うこと)
+- run_test: プロジェクト内のテストを実行して動作を確認する('python3 <ファイル名>' または 'pytest' のみ)
+
+関連するファイル(import元・import先など)がある場合は、read_fileで確認したうえで、必要なファイルすべてに修正を反映してください。修正が完了したら、最後にツールを呼び出さずに、何をどう変更したかを簡潔な日本語の文章で報告してください。
+"""
+
+
+def _ask_organization_fix_project(port: int, org_fingerprint: str, request_text: str, out_dir: str) -> None:
+    """既存の完成済みプロジェクトへの修正依頼を処理する。
+
+    仮の判断:
+    - プロジェクトの特定は、まず`//fix <プロジェクト名>: <依頼>`という
+      明示指定を試み、それが無ければ依頼文とPROGRESS.mdの内容を照合する
+      自動判定(`_identify_target_project`)に委ねる。複数の候補が拮抗
+      した場合・十分な一致が無い場合はユーザーに確認を求め、その場で
+      推測して処理を進めることはしない。
+    - 修正の実行は、実装担当のモデル自身にプロジェクトツール一式
+      (`_collect_answer_with_project_tools`)を使わせて行う。Yoriai側で
+      「修正が必要なファイル」を先読みして決め打ちする実装は避けた
+      (担当外のファイルとの連携まで踏まえた判断は、モデル自身が実際の
+      コードを見てから行う方が確実なため、既存のレビューフェーズと
+      同じ設計思想を踏襲した)。
+    - 修正完了後、プロジェクト内の全`.py`ファイルに機械的な構文チェックを
+      行う(`_syntax_check_all_python_files`)。個々の`write_file`呼び出し
+      直後にも同じ構文チェックの結果がその場でモデルへの返り値として
+      返るため、モデル自身が気づいて直せる機会もある。1台構成でLLMに
+      よる相互レビューができない状況でも、この機械的なチェックだけは
+      必ず行われる(依頼の「既存の構文チェック...フェーズを通してから
+      反映する」という要件への対応)。
+    """
+    explicit_project_dir, request = _resolve_explicit_fix_target(request_text, out_dir)
+    if explicit_project_dir:
+        project_dir = explicit_project_dir
+    else:
+        status, candidate_dirs = _identify_target_project(request_text, out_dir)
+        if status == "not_found":
+            print(
+                "[⚠️ 修正依頼の対象となるプロジェクトが見つかりませんでした。"
+                "新規の依頼として作成したい場合は、通常の会話や"
+                f"{AGREE_COMMAND}をお使いください]"
+            )
+            return
+        if status == "ambiguous":
+            names = ", ".join(os.path.basename(d) for d in candidate_dirs)
+            example = os.path.basename(candidate_dirs[0])
+            print(f"[❓ 複数のプロジェクトが候補に挙がりました: {names}]")
+            print(f"どのプロジェクトのことでしょうか? {FIX_PROJECT_COMMAND} {example}: {request_text} のように、プロジェクト名を付けて教えてください。")
+            return
+        project_dir = candidate_dirs[0]
+        request = request_text
+
+    parsed = _parse_progress_markdown(os.path.join(project_dir, PROGRESS_FILENAME))
+    if parsed is None:
+        print(f"[⚠️ {project_dir} のPROGRESS.mdを読み取れなかったため、修正を中断します]")
+        return
+    if _progress_checklist_is_incomplete(parsed["checklist"]):
+        print(
+            f"[⚠️ {project_dir} はまだ未完了のタスクが残っています。"
+            f"先に{RESUME_ALL_COMMAND}で完了させてから修正を依頼してください]"
+        )
+        return
+
+    print(f"[🔧 対象プロジェクトを特定しました: {project_dir}]")
+
+    tasks = parsed["tasks"]
+    full_plan = "\n".join(f"{fn}: {content}" for fn, content in tasks)
+    file_list = _list_project_files(project_dir)
+    if not file_list:
+        print(f"[⚠️ {project_dir} にファイルが見つからないため、修正を中断します]")
+        return
+
+    data = _fetch_org_snapshot(port, org_fingerprint)
+    if data is None:
+        return
+    candidates = _select_chat_candidates(data.get("self", {}), data.get("peers", []), port, TASK_TYPE_CODING)
+    if not candidates:
+        print("組織内にロード済みモデルを持つメンバーがいません。")
+        return
+
+    implementer = candidates[0]
+    print(f"[🔧 {implementer['label']} (モデル: {implementer['model']}) に修正を依頼しています...]")
+    prompt = _FIX_REQUEST_TOOL_PROMPT_TEMPLATE.format(
+        full_plan=full_plan, file_list="\n".join(file_list), request=request,
+    )
+    summary, error = _collect_answer_with_project_tools(
+        implementer, org_fingerprint, [{"role": "user", "content": prompt}], project_dir,
+    )
+    if error:
+        print(f"修正の問い合わせに失敗しました: {error}")
+        return
+    if summary:
+        print(summary)
+
+    broken_files = _syntax_check_all_python_files(project_dir)
+
+    # 仮の判断: delete_fileツールが修正セッション中にPROGRESS.mdを既に
+    # 更新している可能性がある(依頼の項目4)ため、ここでは最初に読み込んだ
+    # parsedを使い回さず、ディスク上の最新の状態を読み直してから
+    # changelogに1件追記する(その更新履歴を上書きで消してしまわないため)。
+    latest_parsed = _parse_progress_markdown(os.path.join(project_dir, PROGRESS_FILENAME)) or parsed
+    today = datetime.date.today().isoformat()
+    note = "" if not broken_files else f"(構文エラーが残っています: {', '.join(broken_files)})"
+    changelog = list(latest_parsed["changelog"])
+    changelog.append(f"- {today}: {request.strip()}{note}")
+    _write_progress_md(
+        project_dir, latest_parsed["request"], latest_parsed["tasks"], latest_parsed["checklist"],
+        review_feedback={}, auto_resume_count=latest_parsed["auto_resume_count"], changelog=changelog,
+    )
+
+    if not broken_files:
+        print(f"[✅ 修正が完了しました (プロジェクト: {project_dir})]")
+    else:
+        print(f"[⚠️ 修正は保存されましたが、構文エラーが残っているファイルがあります: {', '.join(broken_files)}]")
+
+
+# ---------------------------------------------------------------------------
 # 実行モードの自動判定(コマンド不要化)
 # ---------------------------------------------------------------------------
 #
@@ -3357,6 +4074,7 @@ def _run_resume_all(port: int, org_fingerprint: str, out_dir: str) -> None:
 EXECUTION_MODE_SINGLE = "single"
 EXECUTION_MODE_COMPARE = "compare"
 EXECUTION_MODE_COLLABORATE = "collaborate"
+EXECUTION_MODE_FIX_PROJECT = "fix_project"
 
 # 仮の判断: 「作って」等、まとまった制作物を要求するキーワードを協業モードの
 # 判定に使う。「書いて」は1つの関数・スニペットの依頼でも使われがちなため、
@@ -3370,16 +4088,43 @@ _COMPARE_MODE_KEYWORDS = (
     "複数の案", "複数の意見", "見比べ", "どう思う", "案を出して", "案がほしい",
 )
 
+# 仮の判断: 既存プロジェクトへの修正依頼と読み取れる表現を判定に使う。
+# 「作って」と異なりほぼ確実に既存の何かを対象にした表現であるため、
+# 誤判定のリスクは低いと判断した。ただし、既存プロジェクトが1件も
+# 無い場合にまでこのモードへ倒すと空振りになるため、
+# `_classify_execution_mode`側で`out_dir`にプロジェクトが実在する
+# 場合にのみこの判定を有効にする。
+_FIX_PROJECT_MODE_KEYWORDS = ("直して", "修正して", "直したい", "修正したい", "なおして")
 
-def _classify_execution_mode(text: str) -> str:
-    """依頼文から実行モード(単発/比較/協業)を判定する。
 
-    仮の判断: キーワードベースの単純な判定にとどめる。協業系キーワード
-    (「作って」等)を最優先で確認し、次に比較系キーワード(「意見を聞かせて」等)を
-    確認する。「作ってほしいものについて意見を聞かせて」のような複合的な
-    依頼文の優先順位は今回のスコープでは厳密には詰めない。どちらにも
-    該当しなければ単発モードとする。
+def _has_any_completed_projects(out_dir: str) -> bool:
+    projects_root = os.path.join(out_dir, PROJECTS_SUBDIR_NAME)
+    if not os.path.isdir(projects_root):
+        return False
+    for name in os.listdir(projects_root):
+        progress_path = os.path.join(projects_root, name, PROGRESS_FILENAME)
+        parsed = _parse_progress_markdown(progress_path)
+        if parsed is not None and not _progress_checklist_is_incomplete(parsed["checklist"]):
+            return True
+    return False
+
+
+def _classify_execution_mode(text: str, out_dir: str = None) -> str:
+    """依頼文から実行モード(単発/比較/協業/既存プロジェクトの修正)を
+    判定する。
+
+    仮の判断: キーワードベースの単純な判定にとどめる。既存プロジェクトへの
+    修正依頼キーワード(「直して」等)を最優先で確認するが、これは
+    `out_dir`が渡され、かつ完成済みのプロジェクトが実際に1件以上
+    存在する場合のみ有効にする(`out_dir`省略時はこの判定を行わない。
+    既存の呼び出し元・テストとの後方互換のための既定値)。次に協業系
+    キーワード(「作って」等)、その次に比較系キーワード(「意見を聞かせて」等)を
+    確認する。どれにも該当しなければ単発モードとする。
     """
+    if out_dir is not None:
+        for keyword in _FIX_PROJECT_MODE_KEYWORDS:
+            if keyword in text and _has_any_completed_projects(out_dir):
+                return EXECUTION_MODE_FIX_PROJECT
     for keyword in _COLLABORATE_MODE_KEYWORDS:
         if keyword in text:
             return EXECUTION_MODE_COLLABORATE
@@ -3394,6 +4139,8 @@ def _execution_mode_reason_label(mode: str) -> str:
         return "制作依頼と判断し、事前すり合わせを行います"
     if mode == EXECUTION_MODE_COMPARE:
         return "複数の意見を求めていると判断し、複数メンバーに問い合わせます"
+    if mode == EXECUTION_MODE_FIX_PROJECT:
+        return "既存プロジェクトへの修正依頼と判断し、対象プロジェクトを特定します"
     return "単発の質問と判断しました"
 
 
@@ -3970,11 +4717,13 @@ def _format_startup_banner(out_dir: str, member_count, use_color: bool) -> str:
         "  (コマンドを付けずに話しかけると、単発/比較/協業のどのモードかを自動判断します)",
         f"  {MULTI_QUERY_COMMAND} <質問文>: 空きリソース上位{MULTI_QUERY_TARGET_COUNT}台に同時に質問",
         f"  {AGREE_COMMAND} <制作依頼>: 事前すり合わせを経て協業モードで実装",
+        f"  {FIX_PROJECT_COMMAND} <修正依頼>: 完成済みプロジェクトの一部を修正(プロジェクト名を",
+        f"    先頭に付けて{FIX_PROJECT_COMMAND} <プロジェクト名>: <修正依頼>のように明示指定も可能)",
         f"  {PARALLEL_QUERY_COMMAND} <ファイル名1>:<依頼1> | ...: ファイル・依頼を手動指定して並行実装",
         f"  {RESUME_ALL_COMMAND}: 未完了プロジェクトを検出して再開",
         "",
         f"生成物の保存先: {os.path.join(out_dir, PROJECTS_SUBDIR_NAME)}/<プロジェクト名>/",
-        "協業モード・//parallel・//resume-allはバックグラウンドで処理され、",
+        "協業モード・//fix・//parallel・//resume-allはバックグラウンドで処理され、",
         "処理中も次の依頼を入力できます。",
     ]
     return "\n".join(lines)
@@ -4042,6 +4791,20 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                 )
                 continue
 
+            if text.startswith(FIX_PROJECT_COMMAND):
+                fix_request = text[len(FIX_PROJECT_COMMAND):].strip()
+                if not fix_request:
+                    print(
+                        f"使い方: {FIX_PROJECT_COMMAND} <修正依頼>  "
+                        f"(例: {FIX_PROJECT_COMMAND} ID生成のロジックにバグがあるので直して)"
+                    )
+                    continue
+                job_runner.submit(
+                    lambda fix_request=fix_request: _ask_organization_fix_project(port, org_fingerprint, fix_request, out_dir),
+                    queued_notice=_BACKGROUND_QUEUED_NOTICE,
+                )
+                continue
+
             if text.startswith(PARALLEL_QUERY_COMMAND):
                 command_text = text[len(PARALLEL_QUERY_COMMAND):].strip()
                 job_runner.submit(
@@ -4063,16 +4826,23 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                         break
                 continue
 
-            # 仮の判断: 明示コマンド(//agree・//parallel・//multi・
+            # 仮の判断: 明示コマンド(//agree・//fix・//parallel・//multi・
             # //resume-all)のいずれにも一致しない通常の入力は、依頼文の
             # 内容から実行モードを自動判定する。判定根拠は既存のメンバー
             # 選定理由の表示と同じスタイルで「[判断: ...]」として一言添える。
-            mode = _classify_execution_mode(text)
+            mode = _classify_execution_mode(text, out_dir)
             print(f"[判断: {_execution_mode_reason_label(mode)}]")
 
             if mode == EXECUTION_MODE_COLLABORATE:
                 job_runner.submit(
                     lambda text=text: _ask_organization_collaborate(port, org_fingerprint, text, out_dir),
+                    queued_notice=_BACKGROUND_QUEUED_NOTICE,
+                )
+                continue
+
+            if mode == EXECUTION_MODE_FIX_PROJECT:
+                job_runner.submit(
+                    lambda text=text: _ask_organization_fix_project(port, org_fingerprint, text, out_dir),
                     queued_notice=_BACKGROUND_QUEUED_NOTICE,
                 )
                 continue

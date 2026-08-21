@@ -130,9 +130,9 @@ def _run_repl_with_keys(keystrokes: str, ask_collaborate_side_effect=None, ask_s
         yoriai._ask_organization_parallel = original_ask_parallel
         yoriai._run_resume_all = original_resume_all
 
-    def spy_classify(text):
+    def spy_classify(text, out_dir=None):
         calls["classify"] += 1
-        return original_classify(text)
+        return original_classify(text, out_dir)
 
     def stub_ask(*args, **kwargs):
         calls["ask_single"] += 1
