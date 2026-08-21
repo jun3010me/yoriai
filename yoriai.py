@@ -2433,10 +2433,86 @@ def run_agent(token: str, port: int) -> None:
         server.shutdown()
 
 
+# 仮の判断: 継続入力中(まだ空行を入力していない、複数行メッセージの
+# 2行目以降)であることが一目で分かるよう、"..."系のプロンプトにする。
+# 幅を"Yoriai> "(半角8文字相当)にできるだけ合わせている。
+_REPL_FIRST_LINE_PROMPT = "Yoriai> "
+_REPL_CONTINUATION_PROMPT = "...  "
+
+
+def _read_multiline_input() -> tuple:
+    """対話モードの1メッセージ分の入力を読み取る。
+
+    仮の判断: 「1行入力してEnterを押した時点ではまだ送信しない」
+    「空行(Enterのみ)が来たら、それまでの行をすべて連結して1メッセージ
+    として確定する」という仕様にした。エディタ等から複数行の文章を
+    貼り付けた場合、各行の改行がそれぞれ別々のEnterとして届くため、
+    「1行=即送信」のままだと文章が意図せず分割送信されてしまう
+    (実機で報告された不具合)。空行を明示的な区切りにすることで、
+    1行だけの質問(1行入力→空行で即送信、という2回の操作)にも、
+    複数行の文章(貼り付け・複数行の手入力→最後に空行で送信)にも
+    同じ操作感で対応できる。
+
+    戻り値は`(text, terminate)`のタプル。`terminate`が`True`の場合、
+    対話モード自体を終了すべきことを示す(EOF、入力前(まだ何も
+    入力していない状態)でのCtrl+C、または最初の1行として単独で
+    入力された"exit"/"quit")。`terminate`が`False`の場合、`text`が
+    確定したメッセージ本文(空にはならない)。
+
+    仮の判断: "exit"/"quit"による終了判定は、複数行入力の最初の1行
+    (まだ他の行を1行も入力していない状態)として、それ単体で入力された
+    場合にのみ有効にする。継続入力中(2行目以降)に"exit"とだけ書かれた
+    行が来ても、それはメッセージ本文の一部として扱う(空行が来るまで
+    送信を待つ)。
+    """
+    lines = []
+    while True:
+        prompt = _REPL_FIRST_LINE_PROMPT if not lines else _REPL_CONTINUATION_PROMPT
+        try:
+            raw = input(prompt)
+        except EOFError:
+            print()
+            return "", True
+        except KeyboardInterrupt:
+            print()
+            if not lines:
+                # 仮の判断: まだ何も入力していない状態でのCtrl+Cは、
+                # 対話モード自体を終了する(従来通りの挙動)。
+                return "", True
+            # 継続入力中のCtrl+Cは、そのメッセージ全体を破棄して
+            # 最初の入力待ちに戻る(対話モード自体は終了しない)。
+            lines = []
+            continue
+        except UnicodeDecodeError:
+            # 仮の判断: 端末側の文字コードの乱れ(IME入力の途中経過や、ターミナルの
+            # 表示崩れなど)で読み取れないバイト列が来ることがある実機での報告により
+            # 発覚した。この1行だけ読み捨て、それまでの入力内容は保ったまま
+            # 続けて入力を待つ(ここでクラッシュさせると常駐サービスは無事でも
+            # フロントだけ落ちてしまうため)。
+            print("入力を文字コードとして読み取れませんでした。もう一度入力してください。")
+            continue
+
+        if not lines and raw.strip().lower() in ("exit", "quit"):
+            return "", True
+
+        if raw.strip() == "":
+            if not lines:
+                # まだ何も入力していない状態での空Enterは、何もせず
+                # 次の入力を待つ(従来通りの挙動)。
+                continue
+            return "\n".join(lines).strip(), False
+
+        lines.append(raw)
+
+
 def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
     print()
     print("=== Yoriai 対話モード ===")
-    print("組織のメンバーに質問できます。終了するには exit または quit と入力するか、Ctrl+Cを押してください。")
+    print("組織のメンバーに質問できます。終了するには exit または quit とだけ入力するか、")
+    print("入力前(何も入力していない状態)でCtrl+Cを押してください。")
+    print("1行入力してEnterを押しただけではまだ送信されません。空行(Enterのみ)を")
+    print("入力した時点で、それまでの行をすべて連結して1つのメッセージとして送信します")
+    print("(1行だけの質問は、入力→Enter→もう一度Enter、の2回の操作で送信できます)。")
     print("コマンドを付けずに話しかけると、依頼内容から単発/比較/協業のどのモードで")
     print("問い合わせるかを自動的に判断します(判断理由は[判断: ...]として表示されます)。")
     print(f"{MULTI_QUERY_COMMAND} <質問文> で、自動判定に関わらず必ず空きリソース上位{MULTI_QUERY_TARGET_COUNT}台に同時に質問できます。")
@@ -2455,25 +2531,8 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
     # 次回起動時に前回の会話を引き継ぐ機能は今回のスコープ外。
     messages = []
     while True:
-        try:
-            text = input("Yoriai> ").strip()
-        except EOFError:
-            print()
-            break
-        except KeyboardInterrupt:
-            print()
-            break
-        except UnicodeDecodeError:
-            # 仮の判断: 端末側の文字コードの乱れ(IME入力の途中経過や、ターミナルの
-            # 表示崩れなど)で読み取れないバイト列が来ることがある実機での報告により
-            # 発覚した。1行分の入力を読み捨てて対話モード自体は継続させる
-            # (ここでクラッシュさせると常駐サービスは無事でもフロントだけ落ちてしまうため)。
-            print("入力を文字コードとして読み取れませんでした。もう一度入力してください。")
-            continue
-
-        if not text:
-            continue
-        if text.lower() in ("exit", "quit"):
+        text, terminate = _read_multiline_input()
+        if terminate:
             break
 
         if text.startswith(AGREE_COMMAND):
