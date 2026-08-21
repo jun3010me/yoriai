@@ -15,6 +15,7 @@ import os
 import platform
 import queue
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -2083,8 +2084,9 @@ RUN_TEST_TOOL_SCHEMA = {
         "name": RUN_TEST_TOOL_NAME,
         "description": (
             "プロジェクトディレクトリ内でテストを実行して動作を確認する。実行できるコマンドは"
-            "'python3 <ファイル名>'・'pytest'・'pytest <ファイル名>'のみに限定されており、"
-            "それ以外の任意のコマンドは実行できない。"
+            "'python3 <ファイル名>'・'pytest'・'pytest <ファイル名>'・'node <ファイル名>'・"
+            "'gcc <Cファイル名> -o <出力ファイル名>'(コンパイル)・'./<出力ファイル名>'"
+            "(コンパイル済みファイルの実行)のみに限定されており、それ以外の任意のコマンドは実行できない。"
         ),
         "parameters": {
             "type": "object",
@@ -2117,13 +2119,13 @@ def _list_project_directory(project_dir: str) -> str:
 
 
 def _write_project_file(project_dir: str, filename: str, content) -> str:
-    """ファイルを書き込む。`.py`ファイルの場合、書き込み直後に機械的な
-    構文チェックを行い、結果をそのままモデルへの返り値に含める(依頼の
-    「構文チェックを通してから」を、複数ファイルを自由に操作できる
-    このツール群では「書いた直後にその場でフィードバックし、モデル自身が
-    次のラウンドで直せるようにする」形で満たす。最終的な安全網として、
-    _ask_organization_fix_project側でも修正完了後にプロジェクト全体の
-    構文チェックを別途行う)。
+    """ファイルを書き込む。書き込み直後に、拡張子に応じた機械的な構文
+    チェック(`_check_file_syntax`、言語非依存)を行い、結果をそのまま
+    モデルへの返り値に含める(依頼の「構文チェックを通してから」を、
+    複数ファイルを自由に操作できるこのツール群では「書いた直後にその場で
+    フィードバックし、モデル自身が次のラウンドで直せるようにする」形で
+    満たす。最終的な安全網として、_ask_organization_fix_project側でも
+    修正完了後にプロジェクト全体の構文チェックを別途行う)。
     """
     safe_path, error = _resolve_safe_project_path(project_dir, filename)
     if error:
@@ -2135,11 +2137,14 @@ def _write_project_file(project_dir: str, filename: str, content) -> str:
     except Exception as exc:
         return json.dumps({"ok": False, "message": f"書き込みに失敗しました: {exc}"}, ensure_ascii=False)
     result = {"ok": True, "filename": os.path.basename(safe_path)}
-    if safe_path.endswith(".py"):
-        syntax_ok, syntax_detail = _check_python_syntax(text)
-        result["syntax_ok"] = syntax_ok
-        if not syntax_ok:
-            result["syntax_error"] = syntax_detail
+    status, detail = _check_file_syntax(os.path.basename(safe_path), text, file_path=safe_path)
+    if status == "ok":
+        result["syntax_ok"] = True
+    elif status == "error":
+        result["syntax_ok"] = False
+        result["syntax_error"] = detail
+    else:  # skipped
+        result["syntax_check_skipped"] = detail
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -2214,6 +2219,19 @@ _RUN_TEST_TIMEOUT_SEC = 30
 _RUN_TEST_MAX_OUTPUT_CHARS = 4000
 
 
+# 仮の判断: 依頼の項目3(言語ごとにホワイトリストを切り替える)への対応。
+# Python(python3/pytest)に加えて、JavaScript(node)・C言語(gccによる
+# コンパイル→コンパイル済みバイナリの実行、の2段階)を許可する。C言語は
+# 「コンパイル」と「実行」が別コマンドのため、Bashのようなシェル連結
+# (&&等)を使わず、モデルにrun_testを2回呼んでもらう設計にした
+# (shell=Trueを使わない既存方針を維持するため)。
+_RUN_TEST_WHITELIST_HELP = (
+    "実行できるコマンドは 'python3 <ファイル名>' / 'pytest' / 'pytest <ファイル名>' / "
+    "'node <ファイル名>' / 'gcc <Cファイル名> -o <出力ファイル名>' / "
+    "'./<出力ファイル名>' のみです。"
+)
+
+
 def _parse_run_test_command(command: str) -> tuple:
     """`(argv, エラーメッセージ)`を返す。"""
     parts = (command or "").split()
@@ -2223,22 +2241,49 @@ def _parse_run_test_command(command: str) -> tuple:
         return parts, None
     if parts[0] == "pytest" and len(parts) <= 2:
         return parts, None
-    return None, (
-        "実行できるコマンドは 'python3 <ファイル名>' または "
-        "'pytest' / 'pytest <ファイル名>' のみです。"
-    )
+    if parts[0] == "node" and len(parts) == 2:
+        return parts, None
+    if parts[0] == "gcc" and len(parts) == 4 and parts[2] == "-o":
+        return parts, None
+    if len(parts) == 1 and parts[0].startswith("./") and len(parts[0]) > 2:
+        return parts, None
+    return None, _RUN_TEST_WHITELIST_HELP
 
 
 def _run_project_test_command(project_dir: str, command: str) -> str:
     argv, error = _parse_run_test_command(command)
     if error:
         return json.dumps({"ok": False, "message": error}, ensure_ascii=False)
-    if len(argv) == 2:
-        safe_path, path_error = _resolve_safe_project_path(project_dir, argv[1])
+
+    # 仮の判断: コマンドの種類ごとに「どの引数がファイル名で、実行前に
+    # 実在を要求するか」が異なる(python3/node/pytestは実在必須の1引数、
+    # gccは入力(実在必須)と出力(これから作る、実在不要)の2引数、
+    # './<出力>'は自分自身が実在必須のファイル名)。どの場合も
+    # `_resolve_safe_project_path`によるパストラバーサル対策は必ず通す。
+    if argv[0].startswith("./"):
+        exe_name = argv[0][2:]
+        safe_exe_path, path_error = _resolve_safe_project_path(project_dir, exe_name)
         if path_error:
             return json.dumps({"ok": False, "message": path_error}, ensure_ascii=False)
-        if not os.path.isfile(safe_path):
-            return json.dumps({"ok": False, "message": f"{argv[1]} が見つかりません。"}, ensure_ascii=False)
+        if not os.path.isfile(safe_exe_path):
+            return json.dumps(
+                {"ok": False, "message": f"{exe_name} が見つかりません(先にコンパイルしてください)。"},
+                ensure_ascii=False,
+            )
+        argv = [safe_exe_path]
+        filename_positions = []
+    elif argv[0] == "gcc":
+        filename_positions = [(1, True), (3, False)]
+    else:
+        filename_positions = [(1, True)] if len(argv) == 2 else []
+
+    for index, must_exist in filename_positions:
+        safe_path, path_error = _resolve_safe_project_path(project_dir, argv[index])
+        if path_error:
+            return json.dumps({"ok": False, "message": path_error}, ensure_ascii=False)
+        if must_exist and not os.path.isfile(safe_path):
+            return json.dumps({"ok": False, "message": f"{argv[index]} が見つかりません。"}, ensure_ascii=False)
+
     try:
         result = subprocess.run(
             argv, cwd=project_dir, capture_output=True, text=True, timeout=_RUN_TEST_TIMEOUT_SEC,
@@ -2247,6 +2292,8 @@ def _run_project_test_command(project_dir: str, command: str) -> str:
         return json.dumps({"ok": False, "message": f"実行が{_RUN_TEST_TIMEOUT_SEC}秒でタイムアウトしました。"}, ensure_ascii=False)
     except FileNotFoundError:
         return json.dumps({"ok": False, "message": f"'{argv[0]}' コマンドが見つかりませんでした。"}, ensure_ascii=False)
+    except PermissionError:
+        return json.dumps({"ok": False, "message": f"'{argv[0]}' を実行する権限がありません。"}, ensure_ascii=False)
     output = (result.stdout or "") + (result.stderr or "")
     return json.dumps({
         "ok": result.returncode == 0, "returncode": result.returncode,
@@ -2350,9 +2397,12 @@ def _collect_answer_with_project_tools(
     return "", f"ツール呼び出しの往復回数が上限({MAX_PROJECT_TOOL_ROUNDS}回)に達しました"
 
 
-def _syntax_check_all_python_files(project_dir: str) -> list:
-    """プロジェクトディレクトリ直下の`.py`ファイルすべてに機械的な構文
-    チェックを行い、構文エラーが残っているファイル名のリストを返す。
+def _syntax_check_all_files(project_dir: str) -> list:
+    """プロジェクトディレクトリ直下の全ファイルに、拡張子に応じた機械的な
+    構文チェック(`_check_file_syntax`、言語非依存)を行い、構文エラーが
+    残っているファイル名のリストを返す(対応していない拡張子・スキップ
+    されたファイルはこのリストに含めない。あくまで「確実に壊れている」と
+    判定できたものだけを報告する)。
 
     仮の判断: 個々の`write_file`呼び出し直後の即時フィードバックに加えて、
     修正セッション全体が終わった後にプロジェクト全体を最終確認する
@@ -2362,15 +2412,14 @@ def _syntax_check_all_python_files(project_dir: str) -> list:
     """
     broken = []
     for filename in _list_project_files(project_dir):
-        if not filename.endswith(".py"):
-            continue
+        path = os.path.join(project_dir, filename)
         try:
-            with open(os.path.join(project_dir, filename), "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 code = f.read()
         except Exception:
             continue
-        ok, _detail = _check_python_syntax(code)
-        if not ok:
+        status, _detail = _check_file_syntax(filename, code, file_path=path)
+        if status == "error":
             broken.append(filename)
     return broken
 
@@ -2633,21 +2682,110 @@ AGREE_COMMAND = "//agree"
 # (`_parse_module_breakdown`)はそれも扱えるようにしてある。
 _MODULE_BREAKDOWN_PROMPT_TEMPLATE = """あなたはソフトウェア設計を担当します。以下の依頼を、複数人で分担して実装できるよう、複数のファイルに分割する実装計画を考えてください。
 
+{language_instruction}
+
 各ファイルが実装すべき内容には、他のファイルから呼び出される関数のシグネチャ(関数名・引数名・型・戻り値の型)や、やり取りするデータの形式(辞書のキー名など)を具体的に明記してください。担当が異なるファイル同士が正しく連携できるよう、インターフェースの記述は曖昧にせず、できるだけ厳密に書いてください。
 
 重要: 複数のファイルの説明に同じ関数(例: あるファイルが呼び出す、別のファイルが定義する関数)が登場する場合、その関数名・引数名・戻り値の型は、すべてのファイルの説明文で一字一句まったく同じ表記に揃えてください。あるファイルの説明では`add_todo`、別のファイルの説明では`add_task`のように、同じ役割の関数に別々の名前を使うことは厳禁です。
 
-出力は次の形式のみとし、他の説明文や前置き・後書きは一切含めないでください。ファイルごとに1行、「ファイル名: 実装すべき内容(インターフェースの詳細を含む)」という形式で出力してください(2〜4ファイル程度を想定します):
+出力は次の形式のみとし、他の説明文や前置き・後書きは一切含めないでください。ファイルごとに1行、「ファイル名: 実装すべき内容(インターフェースの詳細を含む)」という形式で出力してください(2〜4ファイル程度を想定します。ファイル名の拡張子は、上で指定した言語に合わせてください):
 
-storage.py: <実装すべき内容をここに>
-cli.py: <実装すべき内容をここに(storage.pyの行と完全に同じ関数名を使うこと)>
+<ファイル名1>: <実装すべき内容をここに>
+<ファイル名2>: <実装すべき内容をここに(<ファイル名1>の行と完全に同じ関数名を使うこと)>
 
 依頼内容: {request}
 """
 
+# 仮の判断: 依頼の項目1(合意フェーズでの言語判定)への対応。ユーザーが
+# 依頼文中で言語・技術を明示した場合はそれを最優先で設計担当への指示に
+# 埋め込む。明示が無い場合、「どんな依頼にどの言語が最適か」という判断は
+# 単純なキーワード判定では対応しきれないほど曖昧なため(既存の
+# _classify_execution_mode等とは性質が異なる)、Yoriai側で分類器を持たず
+# 設計担当(LLM)自身の判断に委ねる。
+#
+# 以前は例として"storage.py"/"cli.py"という具体的なPython向けファイル名を
+# プロンプトに直接書いていたが、これが設計担当をPython風のファイル分割に
+# 引きずってしまう一因になっていた(具体例は指示文以上にモデルの出力を
+# 支配しやすい)ため、`<ファイル名1>`のような言語非依存のプレースホルダーに
+# 置き換えた。
+_EXPLICIT_LANGUAGE_KEYWORDS = (
+    # 長い/具体的なキーワードほど先に判定する
+    # (例: "JavaScript"は"Java"の判定より先に確認する)。
+    ("C++", "C++"),
+    ("C言語", "C"),
+    ("HTML", "HTML/CSS/JavaScript"),
+    ("CSS", "HTML/CSS/JavaScript"),
+    ("JavaScript", "HTML/CSS/JavaScript"),
+    ("Java", "Java"),
+    ("Python", "Python"),
+    ("Go言語", "Go"),
+    ("Rust", "Rust"),
+    ("Ruby", "Ruby"),
+    ("PHP", "PHP"),
+)
+
+
+def _detect_requested_language(request_text: str) -> str:
+    """依頼文中に明示的な言語・技術の指定があれば、その表記を返す。
+    無ければ空文字列を返す(この場合、設計担当自身の判断に委ねる)。
+    """
+    lowered = (request_text or "").lower()
+    for keyword, label in _EXPLICIT_LANGUAGE_KEYWORDS:
+        if keyword.lower() in lowered:
+            return label
+    return ""
+
 
 def _build_module_breakdown_prompt(request: str) -> str:
-    return _MODULE_BREAKDOWN_PROMPT_TEMPLATE.format(request=request)
+    requested_language = _detect_requested_language(request)
+    if requested_language:
+        language_instruction = (
+            f"必ず{requested_language}を使って実装してください。ファイルの拡張子もこの言語に合わせてください。"
+        )
+    else:
+        language_instruction = (
+            "依頼内容から、実装に最も適した言語・技術を判断してください"
+            "(Pythonとは限りません。HTML/CSS/JavaScript・C言語等、依頼の内容に応じて適切なものを選んでください)。"
+            "ファイルの拡張子もその言語に合わせてください。"
+        )
+    return _MODULE_BREAKDOWN_PROMPT_TEMPLATE.format(request=request, language_instruction=language_instruction)
+
+
+# 仮の判断: PROGRESS.mdに記録する「使用言語」は、依頼文から推測した言語
+# (_detect_requested_language、設計担当への「ヒント」に過ぎない)ではなく、
+# 実際に設計担当が提案したファイルの拡張子から逆算する。依頼文の推測と
+# 設計担当の実際の応答が食い違う可能性は排除できないため、「実際に何が
+# 生成されるか」を正とすることで、記録された言語設定と実ファイルとの
+# 食い違いを防ぐ。
+_EXTENSION_TO_LANGUAGE = {
+    ".py": "Python",
+    ".html": "HTML/CSS/JavaScript", ".htm": "HTML/CSS/JavaScript",
+    ".css": "HTML/CSS/JavaScript", ".js": "HTML/CSS/JavaScript",
+    ".c": "C", ".h": "C",
+    ".cpp": "C++", ".cc": "C++", ".hpp": "C++",
+    ".java": "Java",
+    ".go": "Go",
+    ".rs": "Rust",
+    ".rb": "Ruby",
+    ".php": "PHP",
+}
+
+
+def _infer_language_from_tasks(tasks: list) -> str:
+    """モジュール分割案のファイル名一覧から、使用言語を逆算する。複数の
+    言語にまたがる拡張子が混在する場合は、重複を除いて登場順に連結する
+    (例: index.html/style.css/app.jsが混在する典型的な構成は、まとめて
+    "HTML/CSS/JavaScript"という1つのラベルに集約される)。認識できる
+    拡張子が1つも無い場合は、この機能追加より前からの既定挙動(構文
+    チェックは常にPythonとして扱っていた)を踏襲し"Python"を返す。
+    """
+    labels = []
+    for filename, _content in tasks:
+        _root, ext = os.path.splitext(filename)
+        label = _EXTENSION_TO_LANGUAGE.get(ext.lower())
+        if label and label not in labels:
+            labels.append(label)
+    return "/".join(labels) if labels else "Python"
 
 
 # 仮の判断: 各ファイルの実装担当には、そのファイル自身の説明行だけでなく、
@@ -2859,6 +2997,7 @@ def _incomplete_task_labels(checklist: list) -> list:
 PROGRESS_FILENAME = "PROGRESS.md"
 
 _PROGRESS_SECTION_REQUEST = "## 元の依頼"
+_PROGRESS_SECTION_LANGUAGE = "## 使用言語"
 _PROGRESS_SECTION_PLAN = "## モジュール分割案"
 _PROGRESS_SECTION_CHECKLIST = "## タスク状況"
 _PROGRESS_SECTION_AUTO_RESUME_COUNT = "## 自動再開の試行回数"
@@ -2868,7 +3007,7 @@ _PROGRESS_SECTION_CHANGELOG = "## 更新履歴"
 
 def _format_progress_markdown(
     request: str, tasks: list, checklist: list, review_feedback: dict, auto_resume_count: int = 0,
-    changelog: list = None,
+    changelog: list = None, language: str = "",
 ) -> str:
     """PROGRESS.mdの内容を組み立てる。
 
@@ -2890,8 +3029,21 @@ def _format_progress_markdown(
     `"- YYYY-MM-DD: <内容> (<ファイル名>)"`という行の単純なリストとして
     記録する。新しいエントリは末尾に追記されるだけで、既存のエントリを
     書き換えることはない(`_ask_organization_fix_project`参照)。
+
+    仮の判断: 「使用言語」は、合意フェーズが確定したモジュール分割案の
+    ファイル拡張子から導出した値(`_infer_language_from_tasks`)を渡す
+    (依頼側で明示された言語と、実際に生成されたファイルが食い違う
+    リスクを避けるため、常に「実際のファイル」を正とする)。空文字列
+    (旧バージョンのPROGRESS.mdや、この節を省きたい呼び出し元)の場合は
+    この節自体を出力しない(既存の「直近のレビュー指摘」等と同じ、
+    値が無ければ節ごと省略する方針)。
     """
     lines = ["# プロジェクト進行状況", "", _PROGRESS_SECTION_REQUEST, "", request, ""]
+    if language:
+        lines.append(_PROGRESS_SECTION_LANGUAGE)
+        lines.append("")
+        lines.append(language)
+        lines.append("")
     lines.append(_PROGRESS_SECTION_PLAN)
     lines.append("")
     for filename, content in tasks:
@@ -2923,10 +3075,12 @@ def _format_progress_markdown(
 
 def _write_progress_md(
     project_dir: str, request: str, tasks: list, checklist: list, review_feedback: dict, auto_resume_count: int = 0,
-    changelog: list = None,
+    changelog: list = None, language: str = "",
 ) -> None:
     os.makedirs(project_dir, exist_ok=True)
-    content = _format_progress_markdown(request, tasks, checklist, review_feedback, auto_resume_count, changelog)
+    content = _format_progress_markdown(
+        request, tasks, checklist, review_feedback, auto_resume_count, changelog, language,
+    )
     with open(os.path.join(project_dir, PROGRESS_FILENAME), "w", encoding="utf-8") as f:
         f.write(content)
 
@@ -3004,10 +3158,17 @@ def _parse_changelog_markdown(text: str) -> list:
 
 
 def _parse_progress_markdown(path: str):
-    """PROGRESS.mdを読み込み、`{"request":, "tasks":, "checklist":,
-    "auto_resume_count":, "changelog":}`の辞書として返す。ファイルが
-    存在しない・想定した形式で解析できない場合は`None`を返す(呼び出し元は、
-    そのプロジェクトの再開をスキップすべきというシグナルとして扱う)。
+    """PROGRESS.mdを読み込み、`{"request":, "language":, "tasks":,
+    "checklist":, "auto_resume_count":, "changelog":}`の辞書として返す。
+    ファイルが存在しない・想定した形式で解析できない場合は`None`を返す
+    (呼び出し元は、そのプロジェクトの再開をスキップすべきというシグナル
+    として扱う)。
+
+    仮の判断: `language`は、この節が無い旧バージョンのPROGRESS.mdでは
+    空文字列になる(この機能追加より前に作られた既存プロジェクトを
+    エラー扱いにしない後方互換のため)。空文字列の場合、構文チェック・
+    run_testのホワイトリストはファイルの拡張子で判定するため実害は無く、
+    `_ask_organization_fix_project`のプロンプトでは「不明」として扱う。
     """
     try:
         with open(path, encoding="utf-8") as f:
@@ -3022,6 +3183,7 @@ def _parse_progress_markdown(path: str):
         return None
     return {
         "request": request, "tasks": tasks, "checklist": checklist,
+        "language": _extract_progress_section(text, _PROGRESS_SECTION_LANGUAGE).strip(),
         "auto_resume_count": _parse_auto_resume_count(text),
         "changelog": _parse_changelog_markdown(_extract_progress_section(text, _PROGRESS_SECTION_CHANGELOG)),
     }
@@ -3124,6 +3286,13 @@ def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str,
     for filename, content in tasks:
         print(f"  - {filename}: {content}")
 
+    # 仮の判断: 依頼の項目1(言語判定の結果をPROGRESS.mdに明記する)への
+    # 対応。実際に設計担当が提案したファイルの拡張子から言語を逆算する
+    # (_infer_language_from_tasks、依頼文からの推測ではなく実際のファイルを
+    # 正とする理由は同関数のコメントを参照)。
+    language = _infer_language_from_tasks(tasks)
+    print(f"[🗂️ 使用言語と判断しました: {language}]")
+
     # 仮の判断: 合意フェーズがまとめた計画は、組織自身が生み出したもので
     # あっても、確定した瞬間に「必ず完遂すべきタスクリスト」として固定する。
     # 依頼で明示された前提(「組織側が4つ必要だと判断した以上、その4つを
@@ -3139,7 +3308,9 @@ def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str,
     project_dir = _resolve_project_dir(projects_root, project_name)
     print(f"[📁 生成物の保存先: {project_dir}]")
 
-    _run_collaborative_project(request, tasks, checklist, candidates, org_fingerprint, project_dir, tasks)
+    _run_collaborative_project(
+        request, tasks, checklist, candidates, org_fingerprint, project_dir, tasks, language=language,
+    )
 
     # 仮の判断: 自動再開(有限の上限付き)は、この「新規の協業モード実行」
     # 直後にのみトリガーする。手動`//resume-all`(_run_resume_all)からは
@@ -3151,6 +3322,7 @@ def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str,
 def _run_collaborative_project(
     request: str, tasks: list, checklist: list, candidates: list, org_fingerprint: str,
     project_dir: str, tasks_to_queue: list, auto_resume_count: int = 0, changelog: list = None,
+    language: str = "",
 ) -> None:
     """タスクキュー方式による実装・レビューを実行し、その間PROGRESS.mdを
     更新し続ける。新規プロジェクト(`_ask_organization_collaborate`)・
@@ -3161,12 +3333,13 @@ def _run_collaborative_project(
     `tasks`と同じ、再開時は未完了だったファイルだけの部分集合)。
 
     `auto_resume_count`(自動再開の試行回数)・`changelog`(既存プロジェクト
-    への修正依頼の更新履歴)は、この関数自身は変更せず、呼び出し元から
-    渡された値をそのままPROGRESS.mdに書き戻すだけの、素通しの値として
-    扱う。新規プロジェクトでは既定値(`0`・空)のまま、手動`//resume-all`
-    (`_resume_project`)経由ではディスク上の既存の値がそのまま渡って
-    くる。これが無いと、修正依頼で追記した更新履歴が、その後の
-    (無関係な)`//resume-all`によるPROGRESS.mdの書き換えで消えてしまう。
+    への修正依頼の更新履歴)・`language`(使用言語)は、この関数自身は
+    変更せず、呼び出し元から渡された値をそのままPROGRESS.mdに書き戻すだけの、
+    素通しの値として扱う。新規プロジェクトでは既定値(`0`・空・空文字列)の
+    まま、手動`//resume-all`(`_resume_project`)経由ではディスク上の既存の
+    値がそのまま渡ってくる。これが無いと、修正依頼で追記した更新履歴や、
+    合意フェーズで決まった使用言語が、その後の(無関係な)`//resume-all`に
+    よるPROGRESS.mdの書き換えで消えてしまう。
     """
     changelog = list(changelog) if changelog else []
     review_feedback = {}
@@ -3174,7 +3347,9 @@ def _run_collaborative_project(
 
     def write_progress():
         with progress_lock:
-            _write_progress_md(project_dir, request, tasks, checklist, review_feedback, auto_resume_count, changelog)
+            _write_progress_md(
+                project_dir, request, tasks, checklist, review_feedback, auto_resume_count, changelog, language,
+            )
 
     write_progress()
     if tasks_to_queue:
@@ -3312,6 +3487,52 @@ def _check_python_syntax(code: str) -> tuple:
     return True, ""
 
 
+# 仮の判断: 依頼の項目2(言語非依存の構文チェック)への対応。プロジェクト
+# 全体の「使用言語」設定ではなく、ファイル単体の拡張子で振り分ける
+# (1つのプロジェクトにHTML/CSS/JavaScriptのように複数の拡張子が混在する
+# ことが普通にあり得るため、ファイル単位の判定の方が実態に即している)。
+_GCC_SYNTAX_CHECK_TIMEOUT_SEC = 15
+
+
+def _check_file_syntax(filename: str, code: str, file_path: str = None) -> tuple:
+    """`(status, detail)`を返す。`status`は次のいずれか:
+    - `"ok"`: 構文チェックを行い、問題が無かった
+    - `"error"`: 構文チェックを行い、問題が見つかった(`detail`にエラー内容)
+    - `"skipped"`: この拡張子には対応していない、またはチェックに必要な
+      ツール(gcc等)が実機に無いためスキップした(`detail`にその理由)
+
+    仮の判断: C言語の構文チェック(`gcc -fsyntax-only`)は実際のファイルを
+    読ませる必要があるため`file_path`(ディスク上の実パス)を使う。
+    呼び出し元がまだファイルを保存していない場合(`file_path`が`None`)は
+    チェックできないため、エラーにはせずスキップとして扱う。
+    """
+    if filename.endswith(".py"):
+        ok, detail = _check_python_syntax(code)
+        return ("ok" if ok else "error"), detail
+    if filename.endswith((".html", ".css", ".js")):
+        # 仮の判断: 依頼の「可能であれば軽量ライブラリで簡易チェック、
+        # 難しければスキップしその旨を明示する」という許容に従った。
+        # 標準ライブラリのhtml.parserは壊れたマークアップにも寛容で
+        # 構文エラーを検出できず、CSS/JS向けのパーサーは標準ライブラリに
+        # 存在しないため、新たな依存を追加せずスキップを選んだ。
+        return "skipped", "この種類のファイル(HTML/CSS/JavaScript)の構文チェックには対応していません。"
+    if filename.endswith(".c"):
+        gcc_path = shutil.which("gcc") or shutil.which("cc")
+        if not gcc_path or not file_path:
+            return "skipped", "gcc(またはcc)が見つからないため、構文チェックをスキップしました。"
+        try:
+            result = subprocess.run(
+                [gcc_path, "-fsyntax-only", file_path],
+                capture_output=True, text=True, timeout=_GCC_SYNTAX_CHECK_TIMEOUT_SEC,
+            )
+        except Exception as exc:
+            return "skipped", f"構文チェックの実行に失敗したためスキップしました: {exc}"
+        if result.returncode == 0:
+            return "ok", ""
+        return "error", (result.stderr or result.stdout or "コンパイルエラーが発生しました").strip()
+    return "skipped", "この言語の構文チェックには対応していません。"
+
+
 # ---------------------------------------------------------------------------
 # 並行実行中のスレッドの出力が入り乱れないようにするための共通処理
 # ---------------------------------------------------------------------------
@@ -3357,23 +3578,25 @@ def _check_and_review_one_round(
     """1回分の「構文チェック→(通れば)内容レビュー」を実行し、
     (問題なしかどうか, 指摘内容)を返す。
 
-    仮の判断: 構文チェックは`.py`で終わるファイルにのみ適用する
-    (`ast.parse`はPython専用のため、他言語のファイルに適用すると
-    正しいコードを誤って構文エラー扱いしてしまう)。`.py`以外の
-    ファイルは構文チェックをスキップし、これまで通りLLMによる内容
-    レビューだけを行う。
+    仮の判断: 構文チェックはファイルの拡張子に応じて`_check_file_syntax`
+    が振り分ける(対応していない拡張子・ツールが実機に無い場合は
+    スキップされる)。この時点で`code`は既にディスク(`out_dir/filename`)に
+    保存済みのため、C言語のコンパイルチェックのように実ファイルを必要と
+    する言語にも対応できる。
     """
-    if filename.endswith(".py"):
-        syntax_ok, syntax_detail = _check_python_syntax(code)
-        if syntax_ok:
-            _print_tagged(print_lock, filename, "[🔍 構文チェック: OK]")
-        else:
-            _print_tagged(print_lock, filename, f"[❌ 構文チェック: {syntax_detail}]")
-            # 仮の判断: 構文エラーがある場合は、LLMによる内容レビューを
-            # 待たずに即座に「問題あり」として扱う。構文が壊れている
-            # コードをLLMに読ませて内容の妥当性を判断させても意味が無く、
-            # 機械的に検出できるエラーは機械的に弾く方が速く確実。
-            return False, f"構文エラーがあります: {syntax_detail}"
+    file_path = os.path.join(out_dir, filename)
+    status, detail = _check_file_syntax(filename, code, file_path=file_path)
+    if status == "ok":
+        _print_tagged(print_lock, filename, "[🔍 構文チェック: OK]")
+    elif status == "error":
+        _print_tagged(print_lock, filename, f"[❌ 構文チェック: {detail}]")
+        # 仮の判断: 構文エラーがある場合は、LLMによる内容レビューを
+        # 待たずに即座に「問題あり」として扱う。構文が壊れている
+        # コードをLLMに読ませて内容の妥当性を判断させても意味が無く、
+        # 機械的に検出できるエラーは機械的に弾く方が速く確実。
+        return False, f"構文エラーがあります: {detail}"
+    else:  # skipped
+        _print_tagged(print_lock, filename, f"[⏭️ 構文チェック: スキップ({detail})]")
 
     return _review_one_file(
         filename, code, reviewer, reviewer_own_filename, reviewer_own_code, full_plan, org_fingerprint, round_label, out_dir, print_lock,
@@ -3721,6 +3944,12 @@ def _resume_project(project_dir: str, port: int, org_fingerprint: str, auto_resu
     if auto_resume_count is None:
         auto_resume_count = parsed["auto_resume_count"]
     changelog = parsed["changelog"]
+    # 仮の判断: この機能追加より前に作られたPROGRESS.md(「使用言語」の
+    # 節が無い)を再開する場合、記録されている値は空文字列になる。せっかく
+    # tasksの拡張子から言語を逆算できるので、その場で補完して以降の
+    # PROGRESS.mdに書き戻す(既存プロジェクトを再開するたびに、言語設定が
+    # 後から自然に付与される)。
+    language = parsed["language"] or _infer_language_from_tasks(tasks)
     tasks_to_queue = _pending_tasks_from_checklist(tasks, checklist)
     if not tasks_to_queue:
         print(f"[{project_dir}] 未完了のタスクは見つかりませんでした。")
@@ -3741,7 +3970,7 @@ def _resume_project(project_dir: str, port: int, org_fingerprint: str, auto_resu
     )
     _run_collaborative_project(
         request, tasks, checklist, candidates, org_fingerprint, project_dir, tasks_to_queue,
-        auto_resume_count, changelog,
+        auto_resume_count, changelog, language,
     )
     return True
 
@@ -3973,6 +4202,9 @@ def _list_project_files(project_dir: str) -> list:
 # 上書きする」設計は、複数ファイルにまたがる修正を表現できないため廃止した。
 _FIX_REQUEST_TOOL_PROMPT_TEMPLATE = """あなたはこのプロジェクトの改修担当です。以下はこのプロジェクトの実装計画全体と、現在保存されているファイルの一覧です。
 
+【このプロジェクトの使用言語】
+{language}
+
 【実装計画全体】
 {full_plan}
 
@@ -3989,7 +4221,7 @@ _FIX_REQUEST_TOOL_PROMPT_TEMPLATE = """あなたはこのプロジェクトの�
 - move_file: ファイル名を変更(移動)する
 - make_directory: サブディレクトリを作成する
 - delete_file: 不要になったファイルを削除する(取り消せないため、本当に不要な場合のみ使うこと)
-- run_test: プロジェクト内のテストを実行して動作を確認する('python3 <ファイル名>' または 'pytest' のみ)
+- run_test: プロジェクト内のテストを実行して動作を確認する(このプロジェクトの言語に応じて、'python3 <ファイル名>'・'pytest'・'node <ファイル名>'・'gcc <ファイル名> -o <出力名>'・'./<出力名>' のいずれかのみ使用可能)
 
 関連するファイル(import元・import先など)がある場合は、read_fileで確認したうえで、必要なファイルすべてに修正を反映してください。修正が完了したら、最後にツールを呼び出さずに、何をどう変更したかを簡潔な日本語の文章で報告してください。
 """
@@ -4010,13 +4242,19 @@ def _ask_organization_fix_project(port: int, org_fingerprint: str, request_text:
       (担当外のファイルとの連携まで踏まえた判断は、モデル自身が実際の
       コードを見てから行う方が確実なため、既存のレビューフェーズと
       同じ設計思想を踏襲した)。
-    - 修正完了後、プロジェクト内の全`.py`ファイルに機械的な構文チェックを
-      行う(`_syntax_check_all_python_files`)。個々の`write_file`呼び出し
-      直後にも同じ構文チェックの結果がその場でモデルへの返り値として
-      返るため、モデル自身が気づいて直せる機会もある。1台構成でLLMに
-      よる相互レビューができない状況でも、この機械的なチェックだけは
-      必ず行われる(依頼の「既存の構文チェック...フェーズを通してから
-      反映する」という要件への対応)。
+    - 修正完了後、プロジェクト内の全ファイルに、拡張子に応じた機械的な
+      構文チェックを行う(`_syntax_check_all_files`、言語非依存)。個々の
+      `write_file`呼び出し直後にも同じ構文チェックの結果がその場で
+      モデルへの返り値として返るため、モデル自身が気づいて直せる機会も
+      ある。1台構成でLLMによる相互レビューができない状況でも、この
+      機械的なチェックだけは必ず行われる(依頼の「既存の構文チェック...
+      フェーズを通してから反映する」という要件への対応)。
+    - 依頼の項目4: PROGRESS.mdに記録されている、このプロジェクトの
+      使用言語をプロンプトに埋め込み、担当メンバーがどの言語・拡張子で
+      作業すべきかを常に意識できるようにする(旧バージョンのPROGRESS.md
+      で言語の記録が無い場合は、モジュール分割案のファイル拡張子から
+      その場で逆算する。`_resume_project`と同じ「読み込み時に補完する」
+      考え方)。
     """
     explicit_project_dir, request = _resolve_explicit_fix_target(request_text, out_dir)
     if explicit_project_dir:
@@ -4053,6 +4291,7 @@ def _ask_organization_fix_project(port: int, org_fingerprint: str, request_text:
     print(f"[🔧 対象プロジェクトを特定しました: {project_dir}]")
 
     tasks = parsed["tasks"]
+    language = parsed["language"] or _infer_language_from_tasks(tasks)
     full_plan = "\n".join(f"{fn}: {content}" for fn, content in tasks)
     file_list = _list_project_files(project_dir)
     if not file_list:
@@ -4070,7 +4309,7 @@ def _ask_organization_fix_project(port: int, org_fingerprint: str, request_text:
     implementer = candidates[0]
     print(f"[🔧 {implementer['label']} (モデル: {implementer['model']}) に修正を依頼しています...]")
     prompt = _FIX_REQUEST_TOOL_PROMPT_TEMPLATE.format(
-        full_plan=full_plan, file_list="\n".join(file_list), request=request,
+        full_plan=full_plan, file_list="\n".join(file_list), request=request, language=language,
     )
     summary, error = _collect_answer_with_project_tools(
         implementer, org_fingerprint, [{"role": "user", "content": prompt}], project_dir,
@@ -4081,7 +4320,7 @@ def _ask_organization_fix_project(port: int, org_fingerprint: str, request_text:
     if summary:
         print(summary)
 
-    broken_files = _syntax_check_all_python_files(project_dir)
+    broken_files = _syntax_check_all_files(project_dir)
 
     # 仮の判断: delete_fileツールが修正セッション中にPROGRESS.mdを既に
     # 更新している可能性がある(依頼の項目4)ため、ここでは最初に読み込んだ
@@ -4095,6 +4334,7 @@ def _ask_organization_fix_project(port: int, org_fingerprint: str, request_text:
     _write_progress_md(
         project_dir, latest_parsed["request"], latest_parsed["tasks"], latest_parsed["checklist"],
         review_feedback={}, auto_resume_count=latest_parsed["auto_resume_count"], changelog=changelog,
+        language=latest_parsed["language"] or language,
     )
 
     if not broken_files:
