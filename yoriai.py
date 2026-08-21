@@ -333,19 +333,29 @@ CHAT_TOOLS = [WEB_SEARCH_TOOL_SCHEMA]
 # ファイル読み取りツール(協業モードのレビュー専用)
 # ---------------------------------------------------------------------------
 #
-# 仮の判断: web_searchはインターネット上のどこからでも実行できるが、
-# read_fileは「合意フェーズで生成中のプロジェクトのファイル」という、
-# 実装依頼元(組織内でその協業を開始したメンバー)のローカルディスク上に
-# しか存在しない情報を返す必要がある。レビュー依頼は別のメンバー(別プロセス、
-# 多くの場合は別の物理マシン)の/chatエンドポイントへのHTTPリクエストとして
-# 送られるため、そのメンバー自身のローカルディスクを読んでも目的のファイルは
-# 存在しない。そこで、read_fileはCHAT_TOOLS(常時全リクエストで有効な
-# ツール)には含めず、レビュー依頼のリクエストボディに実装依頼元が直接
-# 埋め込んだ「その時点でプロジェクトに実際に保存されているファイルの中身
-# (available_files: {ファイル名: 中身})」を参照して答える、リクエスト
-# スコープの追加ツールとして実装した。これにより、レビュー担当のメンバーが
-# 実際にネットワーク越しにファイルを取りに行く必要はなく、レビュー依頼と
-# 同じ1回のHTTPリクエストの中で完結する。
+# 仮の判断(実機で発見された不具合を受けての設計変更): 当初は、レビュー
+# 依頼のリクエストボディに実装依頼元が「その時点でプロジェクトに実際に
+# 保存されているファイルの中身」をavailable_filesとして直接埋め込み、
+# read_fileの実行(_execute_tool_call)はレビュー担当自身のプロセス内で
+# その辞書を参照するだけ、という設計にしていた。しかしこの方式では、
+# available_filesを埋め込む(=リクエストを送信する)タイミングのスナップ
+# ショットが固定されてしまい、LLMの応答生成中(read_fileが実際に呼ばれる
+# までの間)に他のワーカースレッドが新しいファイルを完成させても、その
+# 更新がレビュー担当には一切反映されない不具合が実機で見つかった
+# (2回目のレビュー時点で実際には完成していたconfig.pyが「存在しない」と
+# 誤判定され、無駄にレビュー往復の上限を使い切ってタスクが未完了のまま
+# 打ち切られた)。
+#
+# 修正後は、read_fileを「レビュー担当のプロセス内では実行しない、
+# 呼び出し元(実装依頼元)が引き取って実行するツール」として扱う。
+# stream_chat_completionは、モデルがread_fileを呼び出そうとした時点で
+# 実行はせず{"pending_tool_calls": [...]}をyieldして処理を打ち切り、
+# それを受け取った実装依頼元(_collect_review_answer_with_read_file)が
+# その場でout_dirを読み直して結果を作り、会話を継続する新しい/chat
+# リクエストとして送り返す。/chatはそもそも1回ごとに会話履歴
+# (messages)を丸ごと送るステートレスな設計になっているため、この
+# 「続きから再開する」やり取りは自然に実現できる。この方式により、
+# read_fileが実際に呼ばれた瞬間の最新のディスクの状態を都度反映できる。
 READ_FILE_TOOL_NAME = "read_file"
 READ_FILE_TOOL_SCHEMA = {
     "type": "function",
@@ -494,49 +504,16 @@ def web_search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS) -> list:
     return results
 
 
-def _execute_read_file_tool_call(arguments: dict, tool_context: dict) -> str:
-    """read_fileツールの呼び出しを実行する。`tool_context`は
-    `stream_chat_completion`の1回の実行(=レビュー1回)を通じて共有される
-    辞書で、`available_files`(実装依頼元が埋め込んだ{ファイル名: 中身})と
-    `read_file_call_count`(この実行内での累積呼び出し回数)を保持する。
-
-    仮の判断: 呼び出し回数の上限はtool_context自体(呼び出しをまたいで
-    同一オブジェクトが再利用される)にカウンタを持たせて管理する。
-    stream_chat_completionは1回のHTTPリクエスト(=レビュー1回)ごとに
-    新しいtool_contextを作るため、レビューをまたいで上限が引き継がれる
-    ことはない。
-    """
-    filename = arguments.get("filename", "")
-    available_files = (tool_context or {}).get("available_files") or {}
-
-    call_count = (tool_context or {}).get("read_file_call_count", 0)
-    if call_count >= MAX_READ_FILE_CALLS_PER_REVIEW:
-        return json.dumps({
-            "error": (
-                f"ファイル読み取りツールの呼び出し回数が上限({MAX_READ_FILE_CALLS_PER_REVIEW}回)"
-                "に達しました。これまでに確認した内容をもとに判断してください。"
-            ),
-        }, ensure_ascii=False)
-    if tool_context is not None:
-        tool_context["read_file_call_count"] = call_count + 1
-
-    if filename not in available_files:
-        # 仮の判断: 依頼の項目4に対応。存在しないファイル名を指定された
-        # 場合は、例外を投げたりエラー扱いにしたりせず、「まだ実装されて
-        # いない」という情報自体をモデルへの正常な回答として返す。
-        return json.dumps({
-            "filename": filename, "exists": False,
-            "message": "そのファイルはまだ存在しません(未実装です)。",
-        }, ensure_ascii=False)
-
-    return json.dumps({"filename": filename, "exists": True, "content": available_files[filename]}, ensure_ascii=False)
-
-
-def _execute_tool_call(tool_call: dict, tool_context: dict = None) -> str:
+def _execute_tool_call(tool_call: dict) -> str:
     """モデルからのtool_call(OpenAI互換形式)を実行し、モデルに返す結果を
-    JSON文字列として返す。`tool_context`はread_fileのようなリクエスト
-    スコープの追加ツールが参照する情報(available_files等)を渡すための
-    ものであり、CHAT_TOOLS(web_search)の実行では使わない。
+    JSON文字列として返す。
+
+    仮の判断: read_file(協業モードのレビュー専用)はここでは実行しない。
+    stream_chat_completionは、read_fileが要求されたラウンドではこの関数を
+    呼ばずに{"pending_tool_calls": ...}をyieldして処理を呼び出し元に
+    委ねる(理由はREAD_FILE_TOOL_NAME定義部のコメントを参照)。この関数は
+    web_searchのように「どのメンバーのプロセスで実行しても結果が変わらない」
+    ツールだけを扱う。
     """
     function = tool_call.get("function", {})
     name = function.get("name")
@@ -553,9 +530,6 @@ def _execute_tool_call(tool_call: dict, tool_context: dict = None) -> str:
         query = arguments.get("query", "")
         results = web_search(query)
         return json.dumps({"query": query, "results": results}, ensure_ascii=False)
-
-    if name == READ_FILE_TOOL_NAME:
-        return _execute_read_file_tool_call(arguments, tool_context)
 
     return json.dumps({"error": f"不明なツールです: {name}"}, ensure_ascii=False)
 
@@ -812,10 +786,11 @@ def _run_turn_with_leak_detection(turn, tools: list):
             yield {"content": buffered_chunk}
 
 
-def stream_chat_completion(model: str, messages: list, extra_tools: list = None, tool_context: dict = None):
+def stream_chat_completion(model: str, messages: list, extra_tools: list = None, client_tool_names: set = None):
     """モデル名からOllama/LM Studio/MLX-LMのどれにチャットを振るかを決め、
     正規化されたストリーミングイベント({"content": ...} / {"tool_call": <ツール名>} /
-    {"done": True} / {"error": ...})を順にyieldする。
+    {"pending_tool_calls": [...]} / {"done": True} / {"error": ...})を順に
+    yieldする。
 
     モデルがツール(既定ではweb_searchのみ)の呼び出しを要求した場合は、
     ここでツールを実行して結果を会話履歴に追加し、モデルに再度問い合わせる
@@ -824,9 +799,19 @@ def stream_chat_completion(model: str, messages: list, extra_tools: list = None,
 
     `extra_tools`(協業モードのレビュー専用read_file等)を渡すと、常時
     有効なCHAT_TOOLSに加えてこのリクエストだけ追加のツールをオファーする。
-    `tool_context`は、その追加ツールの実行(`_execute_tool_call`)に必要な
-    リクエストスコープの情報(read_fileのavailable_files等)を渡すための
-    辞書で、CHAT_TOOLS(web_search)の実行には使わない。
+
+    `client_tool_names`に名前が含まれるツールは、ここでは実行しない
+    (`_execute_tool_call`を呼ばない)。代わりに、そのツールが要求された
+    ラウンドで{"pending_tool_calls": [そのラウンドの全tool_calls]}を
+    yieldしてジェネレータを終了し、実行を呼び出し元に委ねる。read_file
+    (協業モードのレビュー専用)がこれに該当する: プロジェクトのファイルは
+    実装依頼元のローカルディスクにしかなく、このジェネレータを実行している
+    プロセス(レビュー担当自身のキッチン)では正しい結果を返せないため。
+    呼び出し元(実装依頼元)は、pending_tool_callsを受け取ったら自分で
+    実行し、結果を会話履歴に追加した新しいメッセージ列で改めて
+    /chatを呼び直すことで会話を継続する(/chatはメッセージ履歴を毎回
+    丸ごと送るステートレスな設計のため、この「続きから再開する」やり取りが
+    自然に行える)。
 
     仮の判断: フェーズ5では「タスクの難易度に応じた賢い振り分け」はスコープ外の
     ため、モデルの選定自体は呼び出し元(候補選定ロジック)に任せ、ここでは
@@ -927,15 +912,22 @@ def stream_chat_completion(model: str, messages: list, extra_tools: list = None,
         if not tool_calls or round_num == MAX_TOOL_CALL_ROUNDS:
             break
 
+        # 仮の判断: このラウンドのtool_callsに1つでもclient_tool_names該当
+        # (read_file等)が含まれる場合、ここでは一切実行せずラウンド全体を
+        # 呼び出し元に渡して終了する。1ラウンドでweb_searchとread_fileが
+        # 混在するようなケースの部分実行は複雑さの割に実利が薄いため扱わず、
+        # 呼び出し元側にラウンド全体の実行を委ねる単純な設計にした。
+        if client_tool_names and any(
+            tool_call.get("function", {}).get("name", "") in client_tool_names for tool_call in tool_calls
+        ):
+            yield {"pending_tool_calls": tool_calls}
+            return
+
         messages.append({"role": "assistant", "content": "", "tool_calls": tool_calls})
         for tool_call in tool_calls:
             tool_name = tool_call.get("function", {}).get("name", "")
-            # 仮の判断: 呼び出し元(協業モードのレビュー画面表示)が「何を
-            # 読みに行こうとしているか」を具体的に表示できるよう、ツール名に
-            # 加えて引数もそのままyieldする(後方互換: 既存の呼び出し元は
-            # tool_call_argumentsキーを無視するだけでよい)。
             yield {"tool_call": tool_name, "tool_call_arguments": tool_call.get("function", {}).get("arguments", "")}
-            result = _execute_tool_call(tool_call, tool_context=tool_context)
+            result = _execute_tool_call(tool_call)
             messages.append({
                 "role": "tool",
                 "content": result,
@@ -1171,14 +1163,17 @@ class CardRequestHandler(BaseHTTPRequestHandler):
         model = body.get("model")
         messages = body.get("messages", [])
 
-        # 仮の判断: レビュー依頼元が「その時点でプロジェクトに実際に保存
-        # されているファイルの中身」をリクエストボディに直接埋め込んで
-        # 送ってきた場合のみ、read_fileツールをこのリクエスト限定で
-        # オファーする(通常のチャット・実装依頼にはavailable_filesが
-        # 含まれないため、read_fileツール自体が存在しないのと同じになる)。
-        available_files = body.get("available_files")
-        extra_tools = [READ_FILE_TOOL_SCHEMA] if available_files else None
-        tool_context = {"available_files": available_files, "read_file_call_count": 0} if available_files else None
+        # 仮の判断: レビュー依頼元が明示的にread_fileツールの提供を要求
+        # してきた場合のみ、このリクエスト限定でオファーする(通常のチャット・
+        # 実装依頼にはoffer_read_file_toolが含まれないため、read_fileツール
+        # 自体が存在しないのと同じになる)。read_fileはこのプロセス
+        # (レビュー担当自身のキッチン)では実行せず、呼び出し元(実装依頼元、
+        # プロジェクトのファイルへの実際のアクセス権を持つ側)に実行を
+        # 委ねる(client_tool_names)。詳細はREAD_FILE_TOOL_NAME定義部の
+        # コメントを参照。
+        offer_read_file_tool = bool(body.get("offer_read_file_tool"))
+        extra_tools = [READ_FILE_TOOL_SCHEMA] if offer_read_file_tool else None
+        client_tool_names = {READ_FILE_TOOL_NAME} if offer_read_file_tool else None
 
         # 仮の判断: 応答は事前にサイズが分からないストリーミングなので
         # Content-Lengthは付けず、NDJSON(1行1イベントのJSON)として都度書き出す。
@@ -1189,7 +1184,7 @@ class CardRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
         try:
-            for event in stream_chat_completion(model, messages, extra_tools=extra_tools, tool_context=tool_context):
+            for event in stream_chat_completion(model, messages, extra_tools=extra_tools, client_tool_names=client_tool_names):
                 self.wfile.write(json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n")
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
@@ -1646,17 +1641,18 @@ def _select_chat_candidates(self_card: dict, peers: list, local_port: int, task_
     return candidates
 
 
-def _stream_chat_from_candidate(candidate: dict, org_fingerprint: str, messages: list, available_files: dict = None):
+def _stream_chat_from_candidate(candidate: dict, org_fingerprint: str, messages: list, offer_read_file_tool: bool = False):
     """候補(自分自身を含む)のキッチンにHTTP経由(/chat)で問い合わせ、
     正規化されたストリーミングイベントを順にyieldする。
 
-    `available_files`(協業モードのレビュー専用、{ファイル名: 中身})を
-    渡すと、相手のキッチンはこのリクエスト限定でread_fileツールを
-    オファーする(詳細はREAD_FILE_TOOL_SCHEMAの定義コメントを参照)。
+    `offer_read_file_tool=True`を渡すと、相手のキッチンはこのリクエスト
+    限定でread_fileツールをオファーする。ただしread_fileの実行結果は
+    相手のキッチンではなく呼び出し元がこの応答ストリームを見て自分で
+    作る必要がある(詳細はREAD_FILE_TOOL_NAME定義コメントを参照)。
     """
     body = {"model": candidate["model"], "messages": messages}
-    if available_files:
-        body["available_files"] = available_files
+    if offer_read_file_tool:
+        body["offer_read_file_tool"] = True
     try:
         resp = requests.post(
             f"http://{candidate['address']}:{candidate['port']}/chat",
@@ -1775,7 +1771,7 @@ def _extract_read_file_tool_filename(tool_call_arguments) -> str:
     return ""
 
 
-def _collect_answer_from_candidate(candidate: dict, org_fingerprint: str, messages: list, available_files: dict = None):
+def _collect_answer_from_candidate(candidate: dict, org_fingerprint: str, messages: list):
     """1候補に問い合わせ、回答をすべて集めて文字列として返す
     (content, error)のタプル。エラー時はcontentが空文字列になる。
 
@@ -1784,30 +1780,116 @@ def _collect_answer_from_candidate(candidate: dict, org_fingerprint: str, messag
     複数候補の出力が入り交じって読めなくなってしまう。そのため、この関数は
     ストリーミング自体はバックグラウンドで最後まで受信しきり、完成した
     回答をまとめて呼び出し元に返す(表示は呼び出し元が候補ごとに区切って行う)。
-
-    `available_files`を渡した場合(レビュー依頼専用)、相手がread_file
-    ツールを呼び出した様子だけは(依頼の「ツール呼び出しのログが確認できる」
-    という動作確認要件に対応するため)例外的にその場で画面表示する。
-    web_search等その他のツールは、この関数の従来の挙動(画面表示は
-    呼び出し元に委ねる)を変えないよう、ここでは表示しない。
     """
     answer_parts = []
     error = None
-    for event in _stream_chat_from_candidate(candidate, org_fingerprint, messages, available_files=available_files):
+    for event in _stream_chat_from_candidate(candidate, org_fingerprint, messages):
         if "error" in event:
             error = event["error"]
             break
-        if event.get("tool_call") == READ_FILE_TOOL_NAME:
-            filename = _extract_read_file_tool_filename(event.get("tool_call_arguments"))
-            target = filename or "他のファイル"
-            print(f"\n[📖 {candidate['label']} が {target} を読みに行っています...]")
-            continue
         content = event.get("content")
         if content:
             answer_parts.append(content)
         if event.get("done"):
             break
     return "".join(answer_parts), error
+
+
+def _read_project_file_fresh(out_dir: str, filename: str) -> str:
+    """read_fileツールの応答本体。呼び出された「その瞬間」に`out_dir`配下を
+    ディスクから直接読み直して結果を作る(依頼発行時や前回のラウンド時点の
+    古いスナップショットを使い回さない)。
+
+    仮の判断: `filename`はモデルが自由な文字列として指定してくる値のため、
+    `os.path.basename`でディレクトリ部分を取り除いたうえで`out_dir`配下
+    としてのみ解決する(`../../etc/passwd`のようなパストラバーサルで
+    プロジェクト外のファイルを読ませられないようにする安全対策)。
+    """
+    safe_name = os.path.basename(filename or "")
+    path = os.path.join(out_dir, safe_name) if safe_name else None
+    if not safe_name or not os.path.isfile(path):
+        # 仮の判断: 依頼の項目4に対応。存在しないファイル名を指定された
+        # 場合は、例外を投げたりエラー扱いにしたりせず、「まだ実装されて
+        # いない」という情報自体をモデルへの正常な回答として返す。
+        return json.dumps({
+            "filename": filename, "exists": False,
+            "message": "そのファイルはまだ存在しません(未実装です)。",
+        }, ensure_ascii=False)
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception as exc:
+        return json.dumps({"filename": filename, "exists": False, "message": f"読み取りに失敗しました: {exc}"}, ensure_ascii=False)
+    return json.dumps({"filename": filename, "exists": True, "content": content}, ensure_ascii=False)
+
+
+def _collect_review_answer_with_read_file(candidate: dict, org_fingerprint: str, messages: list, out_dir: str):
+    """レビュー専用: read_fileツールの呼び出しには、実装依頼元である
+    自分自身がその場で`out_dir`を読み直して応答し、会話を継続する
+    (candidateのキッチンプロセスにはread_fileを実行させない)。
+    (content, error)のタプルを返す。
+
+    仮の判断: /chatはメッセージ履歴(messages)を毎回丸ごと送るステート
+    レスな設計のため、「read_fileの結果を会話に追加した新しいmessagesで
+    もう一度/chatを呼ぶ」だけで、モデルからは1つの連続した会話として
+    見える。この呼び出しごとにout_dirを読み直す(_read_project_file_fresh)
+    ため、前回のラウンド以降に他のワーカースレッドが完成させたファイルも
+    正しく反映される。
+    """
+    messages = list(messages)
+    read_file_calls_used = 0
+
+    # 仮の判断: read_fileの実行が許されるのは最大MAX_READ_FILE_CALLS_PER_REVIEW
+    # 回だが、それを使い切った後に「上限に達しました」という通知を送った
+    # ラウンドの次にも、モデルが最終回答を返すための1往復が必要になる。
+    # そのため往復の総ラウンド数には+2の余裕を持たせる(上限到達の通知を
+    # 受け取ってさらにもう一度read_fileを試みても弾かれるだけなので、
+    # 実質的にはこの範囲で必ず終息する)。
+    for _round_num in range(MAX_READ_FILE_CALLS_PER_REVIEW + 2):
+        answer_parts = []
+        pending_tool_calls = None
+        error = None
+        for event in _stream_chat_from_candidate(candidate, org_fingerprint, messages, offer_read_file_tool=True):
+            if "error" in event:
+                error = event["error"]
+                break
+            if "pending_tool_calls" in event:
+                pending_tool_calls = event["pending_tool_calls"]
+                break
+            content = event.get("content")
+            if content:
+                answer_parts.append(content)
+            if event.get("done"):
+                break
+
+        if error:
+            return "", error
+        if not pending_tool_calls:
+            return "".join(answer_parts), None
+
+        messages.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
+        for tool_call in pending_tool_calls:
+            tool_name = tool_call.get("function", {}).get("name", "")
+            if tool_name == READ_FILE_TOOL_NAME and read_file_calls_used < MAX_READ_FILE_CALLS_PER_REVIEW:
+                read_file_calls_used += 1
+                filename = _extract_read_file_tool_filename(tool_call.get("function", {}).get("arguments"))
+                print(f"\n[📖 {candidate['label']} が {filename or '他のファイル'} を読みに行っています...]")
+                result = _read_project_file_fresh(out_dir, filename)
+            else:
+                result = json.dumps({
+                    "error": (
+                        f"ファイル読み取りツールの呼び出し回数が上限({MAX_READ_FILE_CALLS_PER_REVIEW}回)"
+                        "に達しました。これまでに確認した内容をもとに判断してください。"
+                    ),
+                }, ensure_ascii=False)
+            messages.append({"role": "tool", "content": result, "tool_call_id": tool_call.get("id")})
+
+    # 仮の判断: 上限ラウンドに達してもモデルがまだread_fileを呼び続けようと
+    # した場合、暴走防止のためここで打ち切る。この経路に到達した場合、
+    # _review_one_file側は「問い合わせに失敗した」扱いとして「問題あり」に
+    # 倒す(安全側)。
+    return "", f"read_fileの往復回数が上限({MAX_READ_FILE_CALLS_PER_REVIEW}回)に達しました"
 
 
 def _ask_organization_multi(port: int, org_fingerprint: str, messages: list) -> None:
@@ -2479,33 +2561,6 @@ def _check_python_syntax(code: str) -> tuple:
     return True, ""
 
 
-def _snapshot_available_files(out_dir: str) -> dict:
-    """その時点で`out_dir`(プロジェクトの保存先)配下に実際に保存されている
-    ファイルの{ファイル名: 中身}を返す。read_fileツールが参照できる
-    「実際に存在するファイル」の範囲を表す。
-
-    仮の判断: 実装計画に登場するファイル名の一覧ではなく、実際にディスク上に
-    存在するファイルをそのまま使う。これにより、まだ実装フェーズに到達
-    していない(=キューでまだ割り当てられていない)ファイルを指定された
-    場合、自然に「存在しない」扱いになり、依頼の項目4(未実装ファイルへの
-    問い合わせに「まだ実装されていません」と返す)を追加のタスク一覧管理
-    無しで実現できる。
-    """
-    available = {}
-    if not os.path.isdir(out_dir):
-        return available
-    for name in os.listdir(out_dir):
-        path = os.path.join(out_dir, name)
-        if not os.path.isfile(path):
-            continue
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                available[name] = f.read()
-        except Exception:
-            continue  # 読めなかったファイルは単に読み取り対象から除く
-    return available
-
-
 def _check_and_review_one_round(
     filename: str, code: str, reviewer: dict, reviewer_own_filename: str, reviewer_own_code: str,
     full_plan: str, org_fingerprint: str, round_label: str, out_dir: str,
@@ -2547,12 +2602,14 @@ def _review_one_file(
     レビュー担当には、自分の担当ファイル(reviewer_own_*)をプロンプトに
     直接埋め込むことに加えて、read_fileツールでプロジェクト内の任意の
     ファイル(その時点で実際に保存済みのもの)を確認できるようにする。
+    read_fileが実際に呼ばれた瞬間にout_dirを読み直すため、このレビューの
+    開始後に他のワーカースレッドが完成させたファイルも正しく反映される
+    (_collect_review_answer_with_read_file参照)。
     """
     print(f"[🔎 {round_label}] {reviewer['label']} が {filename} をレビューしています...")
     prompt = _build_review_prompt(filename, code, reviewer_own_filename, reviewer_own_code, full_plan)
-    available_files = _snapshot_available_files(out_dir)
-    answer, error = _collect_answer_from_candidate(
-        reviewer, org_fingerprint, [{"role": "user", "content": prompt}], available_files=available_files,
+    answer, error = _collect_review_answer_with_read_file(
+        reviewer, org_fingerprint, [{"role": "user", "content": prompt}], out_dir,
     )
     if error or not answer:
         message = error or "応答がありませんでした"

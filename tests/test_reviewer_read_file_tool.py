@@ -1,35 +1,42 @@
 #!/usr/bin/env python3
 """レビュー担当が、必要に応じて他のファイルの実際の中身をread_fileツールで
-確認できる機能を検証する。
+確認できる機能(および、そのfreshness修正)を検証する。
 
 実機で、cli.pyのレビュー時に「storage.pyがconfig.pyを正しく使っているか
-確認できない」という指摘が出た件を受けた改善。従来はレビュー担当自身が
-担当したファイルの中身だけをプロンプトに埋め込んでいたが(伝聞情報)、
-これに加えてread_fileという関数呼び出し(function calling)の選択肢を
-与え、モデル自身が必要と判断した場合に実際のファイルの中身を取得できる
-ようにした。
+確認できない」という指摘が出た件を受けて、レビュー担当にread_fileという
+関数呼び出し(function calling)の選択肢を与える機能を最初に追加した。
+その最初の実装は、レビュー依頼のリクエストボディに「その時点でプロジェクト
+に実際に保存されているファイルの中身」を丸ごとスナップショットとして
+埋め込み、read_fileの実行(_execute_tool_call)はレビュー担当自身の
+プロセス内でそのスナップショットを参照するだけ、という設計だった。
 
-仮の判断(アーキテクチャ上の制約): プロジェクトの生成物は、その協業を
-開始したメンバー(実装依頼元)のローカルディスクにしか存在しない。一方、
-レビュー依頼は別のメンバー(多くの場合は別の物理マシン)の/chat
-エンドポイントへのHTTPリクエストとして送られ、read_fileツールの実行
-(`_execute_tool_call`)はそのレビュー担当自身のプロセス内で行われる。
-そのため、read_fileはCHAT_TOOLS(常時有効なグローバルなツール)には
-含めず、実装依頼元がレビュー依頼のリクエストボディに直接「その時点で
-実際に保存されているファイルの中身」(available_files)を埋め込み、
-レビュー担当側はそのリクエストの中で完結してファイルを「読む」(実際には
-ネットワーク越しの追加の往復無しに、渡された辞書を参照するだけ)方式に
-した。この設計により、新しいサーバーエンドポイントや、実装依頼元自身の
-外部アドレスをレビュー担当に知らせる仕組みを新設せずに済んでいる。
+しかしこれには不具合があった: スナップショットは依頼発行(=リクエスト
+送信)の瞬間に固定されてしまうため、LLMの応答生成中(read_fileが実際に
+呼ばれるまでの間、ローカルLLMでは数秒〜数十秒かかりうる)に他のワーカー
+スレッドが新しいファイルを完成させても、その更新が一切反映されない。
+実機で、2回目のレビュー(修正後の再レビュー)の時点では実際には既に
+完成していたconfig.pyが「存在しない」と誤判定され、無駄にレビュー往復の
+上限を使い切ってタスクが未完了のまま打ち切られる不具合が報告された。
 
-このファイルでは、(1)ツール本体の実行(`_execute_read_file_tool_call`)、
-(2)実装依頼元がその時点のプロジェクトの中身を集める
-(`_snapshot_available_files`)、(3)`stream_chat_completion`の実際の
-ツール呼び出しループを通しての実行(モデルがread_fileを呼び、結果を
-踏まえて最終判定を出す一連の流れ)、(4)レビュー依頼を送る側
-(`_review_one_file`)がavailable_filesを正しく組み立てて渡していること、
-(5)呼び出し側(`_collect_answer_from_candidate`)がread_fileの呼び出しを
-画面に表示すること、を検証する。
+修正後は、read_fileを「レビュー担当のプロセス内では実行しない、
+呼び出し元(実装依頼元、プロジェクトの実際のファイルへのアクセス権を
+持つ側)が引き取って実行するツール」として再設計した:
+- `stream_chat_completion`は、read_file(client_tool_namesに含まれる
+  ツール)が要求されたラウンドでは実行せず`{"pending_tool_calls": [...]}`
+  をyieldして処理を打ち切り、呼び出し元に実行を委ねる。
+- 実装依頼元の`_collect_review_answer_with_read_file`が、pending_tool_calls
+  を受け取ったら`_read_project_file_fresh`でその瞬間のout_dirを直接
+  読み直し、結果を会話履歴に追加した新しいmessagesで/chatを呼び直す
+  (/chatは毎回messages全体を送るステートレスな設計のため、この
+  「続きから再開する」やり取りが自然に行える)。
+
+このファイルでは、(1)`_read_project_file_fresh`本体(存在するファイル・
+存在しないファイル・パストラバーサル対策)、(2)`stream_chat_completion`が
+read_fileの要求されたラウンドで実行を打ち切りpending_tool_callsを
+yieldすること、(3)`_collect_review_answer_with_read_file`が実際に
+呼び出し間でout_dirを読み直す(freshnessの回帰再現)こと、
+(4)呼び出し回数の上限、(5)`_review_one_file`との結線、(6)画面表示、
+を検証する。
 
 使い方: python3 tests/test_reviewer_read_file_tool.py
 """
@@ -49,196 +56,257 @@ def _member(label, model):
     return {"label": label, "model": model, "address": "127.0.0.1", "port": 47120}
 
 
-def test_execute_read_file_tool_call_returns_content_for_existing_file():
-    tool_context = {"available_files": {"storage.py": "def add_todo():\n    pass\n"}, "read_file_call_count": 0}
-    result = json.loads(yoriai._execute_read_file_tool_call({"filename": "storage.py"}, tool_context))
-    assert result == {"filename": "storage.py", "exists": True, "content": "def add_todo():\n    pass\n"}, result
-    assert tool_context["read_file_call_count"] == 1, tool_context
-
-
-def test_execute_read_file_tool_call_reports_missing_file_as_not_implemented():
-    """依頼の項目4: 存在しないファイル名を指定された場合、エラーにはせず
-    「まだ実装されていません」という情報を正常な回答として返すことを確認する。
-    """
-    tool_context = {"available_files": {"storage.py": "..."}, "read_file_call_count": 0}
-    result = json.loads(yoriai._execute_read_file_tool_call({"filename": "config.py"}, tool_context))
-    assert result["exists"] is False, result
-    assert "まだ存在しません" in result["message"], result
-
-
-def test_execute_read_file_tool_call_is_capped_at_three_calls_per_review():
-    """依頼の項目5: 1回のレビュー(=tool_contextを共有する1回の
-    stream_chat_completion実行)につき、read_fileの呼び出しは最大3回までに
-    制限されることを確認する。
-    """
-    tool_context = {"available_files": {"storage.py": "code"}, "read_file_call_count": 0}
-    for _ in range(3):
-        result = json.loads(yoriai._execute_read_file_tool_call({"filename": "storage.py"}, tool_context))
-        assert "error" not in result, result
-
-    fourth = json.loads(yoriai._execute_read_file_tool_call({"filename": "storage.py"}, tool_context))
-    assert "error" in fourth, fourth
-    assert "上限" in fourth["error"], fourth
-    assert tool_context["read_file_call_count"] == 3, (
-        f"上限到達後もカウンタが増え続けているべきではありません: {tool_context}"
-    )
-
-
-def test_execute_tool_call_dispatches_read_file_by_name_with_json_string_arguments():
-    """LM Studio(OpenAI互換)ではtool_call.function.argumentsがJSON文字列で
-    来ることが多いため、この形式でも正しくfilenameを取り出せることを確認する。
-    """
-    tool_context = {"available_files": {"cli.py": "import storage\n"}, "read_file_call_count": 0}
-    tool_call = {"function": {"name": "read_file", "arguments": json.dumps({"filename": "cli.py"})}}
-    result = json.loads(yoriai._execute_tool_call(tool_call, tool_context=tool_context))
-    assert result == {"filename": "cli.py", "exists": True, "content": "import storage\n"}, result
-
-
-def test_snapshot_available_files_reads_all_files_in_out_dir():
+def test_read_project_file_fresh_returns_content_for_existing_file():
     out_dir = tempfile.mkdtemp(prefix="yoriai_read_file_test_")
     try:
         with open(os.path.join(out_dir, "storage.py"), "w", encoding="utf-8") as f:
             f.write("def add_todo():\n    pass\n")
-        with open(os.path.join(out_dir, "cli.py"), "w", encoding="utf-8") as f:
-            f.write("import storage\n")
-
-        snapshot = yoriai._snapshot_available_files(out_dir)
-        assert snapshot == {
-            "storage.py": "def add_todo():\n    pass\n",
-            "cli.py": "import storage\n",
-        }, snapshot
+        result = json.loads(yoriai._read_project_file_fresh(out_dir, "storage.py"))
+        assert result == {"filename": "storage.py", "exists": True, "content": "def add_todo():\n    pass\n"}, result
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
-def test_snapshot_available_files_returns_empty_dict_for_missing_directory():
-    assert yoriai._snapshot_available_files("/no/such/directory/at/all") == {}
-
-
-def test_stream_chat_completion_executes_read_file_and_lets_model_revise_answer():
-    """`stream_chat_completion`の実際のツール呼び出しループを通して、
-    (1)モデルがread_fileを呼び出す、(2)ツールの実行結果(実際のファイルの
-    中身)が会話履歴に追加されて次のラウンドに渡る、(3)モデルがその内容を
-    踏まえて最終的な回答を返す、という一連の流れを検証する
-    (依頼の動作確認: 「レビュアーが実際にstorage.pyを読みに行く様子が
-    確認でき、その結果、より根拠のある判定に変わる」を模擬する)。
-
-    実機のOllama/LM Studio/MLX-LMに接続できない環境のため、ワイヤレベルの
-    ターン関数(`_stream_openai_compatible_turn`)を差し替える
-    (tests/test_tools_fallback_logging.pyと同じ手法)。
+def test_read_project_file_fresh_reports_missing_file_as_not_implemented():
+    """依頼の項目4: 存在しないファイル名を指定された場合、エラーにはせず
+    「まだ実装されていません」という情報を正常な回答として返すことを確認する。
     """
-    rounds = {"n": 0}
-    seen_tool_messages = []
+    out_dir = tempfile.mkdtemp(prefix="yoriai_read_file_test_")
+    try:
+        result = json.loads(yoriai._read_project_file_fresh(out_dir, "config.py"))
+        assert result["exists"] is False, result
+        assert "まだ存在しません" in result["message"], result
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
 
+
+def test_read_project_file_fresh_reflects_file_created_after_first_check():
+    """バグ1の直接の回帰再現: 1回目の呼び出し時点では存在しなかった
+    ファイルが、その後(同じレビューの往復の間に)完成した場合、
+    再度呼び出すと最新の内容が正しく反映されることを確認する
+    (依頼発行時に固定したスナップショットを使い回さないことの検証)。
+    """
+    out_dir = tempfile.mkdtemp(prefix="yoriai_read_file_test_")
+    try:
+        first = json.loads(yoriai._read_project_file_fresh(out_dir, "config.py"))
+        assert first["exists"] is False, first
+
+        # 別スレッド(実装フェーズのワーカー)がこのタイミングでファイルを完成させる想定。
+        with open(os.path.join(out_dir, "config.py"), "w", encoding="utf-8") as f:
+            f.write("DB_PATH = 'todos.json'\n")
+
+        second = json.loads(yoriai._read_project_file_fresh(out_dir, "config.py"))
+        assert second == {"filename": "config.py", "exists": True, "content": "DB_PATH = 'todos.json'\n"}, second
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_read_project_file_fresh_rejects_path_traversal():
+    """モデルが../等を含むファイル名を指定しても、out_dir外のファイルを
+    読めないことを確認する(os.path.basenameによる安全対策)。
+    """
+    outer_dir = tempfile.mkdtemp(prefix="yoriai_read_file_outer_")
+    out_dir = os.path.join(outer_dir, "project")
+    os.makedirs(out_dir)
+    try:
+        secret_path = os.path.join(outer_dir, "secret.txt")
+        with open(secret_path, "w", encoding="utf-8") as f:
+            f.write("SECRET")
+
+        result = json.loads(yoriai._read_project_file_fresh(out_dir, "../secret.txt"))
+        assert result["exists"] is False, (
+            f"out_dir外のファイルを読めてしまっています(パストラバーサル対策の不備): {result}"
+        )
+    finally:
+        shutil.rmtree(outer_dir, ignore_errors=True)
+
+
+def test_stream_chat_completion_yields_pending_tool_calls_for_client_tool_without_executing():
+    """`stream_chat_completion`が、client_tool_namesに含まれるツール
+    (read_file)が要求されたラウンドでは、自前で実行(_execute_tool_call)
+    せずに{"pending_tool_calls": ...}をyieldして即座に終了することを
+    確認する。実機のOllama/LM Studio/MLX-LMに接続できない環境のため、
+    ワイヤレベルのターン関数(`_stream_openai_compatible_turn`)を差し替える。
+    """
     def fake_turn(base_url, model, messages, tools):
-        rounds["n"] += 1
-        if rounds["n"] == 1:
-            # 1ラウンド目: モデルはstorage.pyの中身を確認したいと判断する。
-            tool_names = {t["function"]["name"] for t in (tools or [])}
-            assert yoriai.READ_FILE_TOOL_NAME in tool_names, f"read_fileツールがオファーされていません: {tools}"
-            yield {
-                "tool_calls": [
-                    {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": {"filename": "storage.py"}}},
-                ],
-            }
-            return
-        # 2ラウンド目: ツール実行結果(storage.pyの実際の中身)が会話履歴に
-        # 追加されているはずなので、それを踏まえた最終回答を返す。
-        tool_messages = [m for m in messages if m.get("role") == "tool"]
-        seen_tool_messages.extend(tool_messages)
-        yield {"content": "問題なし(storage.pyの中身を確認し、config.pyの使い方が正しいことを確認しました)"}
-        yield {"tool_calls": []}
+        tool_names = {t["function"]["name"] for t in (tools or [])}
+        assert yoriai.READ_FILE_TOOL_NAME in tool_names, f"read_fileツールがオファーされていません: {tools}"
+        yield {
+            "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": {"filename": "storage.py"}}},
+            ],
+        }
 
     original = yoriai._stream_openai_compatible_turn
     yoriai._stream_openai_compatible_turn = fake_turn
     try:
-        tool_context = {"available_files": {"storage.py": "def add_todo():\n    from config import DB_PATH\n"}, "read_file_call_count": 0}
         events = list(yoriai.stream_chat_completion(
             "some-review-model",
             [{"role": "user", "content": "cli.pyをレビューしてください"}],
             extra_tools=[yoriai.READ_FILE_TOOL_SCHEMA],
-            tool_context=tool_context,
+            client_tool_names={yoriai.READ_FILE_TOOL_NAME},
         ))
     finally:
         yoriai._stream_openai_compatible_turn = original
 
-    tool_call_events = [e for e in events if e.get("tool_call") == yoriai.READ_FILE_TOOL_NAME]
-    assert len(tool_call_events) == 1, f"read_fileのtool_callイベントが1回だけ観測されるはずです: {events}"
-
-    assert len(seen_tool_messages) == 1, f"2ラウンド目にツール実行結果が1件渡っているはずです: {seen_tool_messages}"
-    tool_result = json.loads(seen_tool_messages[0]["content"])
-    assert tool_result["exists"] is True
-    assert "DB_PATH" in tool_result["content"], (
-        f"storage.pyの実際の中身がツール結果として渡っているはずです: {tool_result}"
+    assert len(events) == 1 and "pending_tool_calls" in events[0], (
+        f"read_file要求時はpending_tool_callsを1件だけyieldして終了するはずです: {events}"
     )
-
-    final_contents = [e["content"] for e in events if "content" in e]
-    assert any("問題なし" in c for c in final_contents), (
-        f"storage.pyの中身を確認した後、最終的な判定が返るはずです: {events}"
-    )
-    assert tool_context["read_file_call_count"] == 1, tool_context
+    assert events[0]["pending_tool_calls"][0]["function"]["name"] == "read_file"
+    # {"done": True}は出ない(呼び出し元が実行するまで、このラウンドは未完了のため)。
 
 
-def test_review_one_file_passes_project_directory_snapshot_as_available_files():
-    """`_review_one_file`が、レビュー依頼を送る際にout_dir配下の実際の
-    ファイル一式をavailable_filesとして組み立てて渡していることを確認する
-    (レビュー担当は自分の担当ファイルだけでなく、プロジェクト内の任意の
-    ファイルを読めるべきという依頼の趣旨に対応)。
+def test_collect_review_answer_with_read_file_rereads_disk_between_rounds():
+    """バグ1の本丸: `_collect_review_answer_with_read_file`が、1回目の
+    read_file呼び出しと2回目の呼び出しの間に他のスレッドが完成させた
+    ファイルを、都度ディスクから読み直すことで正しく反映することを確認する。
+    実機のOllama/LM Studio/MLX-LMに接続できない環境のため、
+    `_stream_chat_from_candidate`を差し替えてメンバーを模擬する。
     """
-    captured = {}
-
-    def fake_stream(candidate, org_fingerprint, messages, available_files=None, **_kwargs):
-        captured["available_files"] = available_files
-        yield {"content": "問題なし"}
-        yield {"done": True}
-
+    call_log = []
     out_dir = tempfile.mkdtemp(prefix="yoriai_read_file_test_")
-    try:
-        with open(os.path.join(out_dir, "storage.py"), "w", encoding="utf-8") as f:
-            f.write("def add_todo():\n    pass\n")
-        with open(os.path.join(out_dir, "cli.py"), "w", encoding="utf-8") as f:
-            f.write("import storage\n")
 
-        original_stream = yoriai._stream_chat_from_candidate
-        yoriai._stream_chat_from_candidate = fake_stream
-        try:
-            yoriai._review_one_file(
-                "cli.py", "import storage\n", _member("junnoMac-mini", "qwen2.5-coder-14b"),
-                "cli.py", "import storage\n", "実装計画", "fingerprint", "1回目のレビュー", out_dir,
-            )
-        finally:
-            yoriai._stream_chat_from_candidate = original_stream
-    finally:
-        shutil.rmtree(out_dir, ignore_errors=True)
-
-    assert captured["available_files"] == {
-        "storage.py": "def add_todo():\n    pass\n",
-        "cli.py": "import storage\n",
-    }, captured
-
-
-def test_collect_answer_from_candidate_shows_read_file_progress_message():
-    """依頼の動作確認要件(ツール呼び出しのログが確認できる)を検証する。
-    read_fileのtool_callイベントを受け取った際、対象のファイル名を含む
-    進捗メッセージが画面に表示されることを確認する。
-    """
-    def fake_stream(candidate, org_fingerprint, messages, available_files=None, **_kwargs):
-        yield {"tool_call": yoriai.READ_FILE_TOOL_NAME, "tool_call_arguments": json.dumps({"filename": "storage.py"})}
-        yield {"content": "問題なし"}
+    def fake_stream(candidate, org_fingerprint, messages, offer_read_file_tool=False, **_kwargs):
+        call_log.append(len(messages))
+        tool_messages = [m for m in messages if m.get("role") == "tool"]
+        if len(tool_messages) == 0:
+            # 1回目: config.pyの中身を確認したい(この時点ではまだ存在しない)。
+            yield {"pending_tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": {"filename": "config.py"}}},
+            ]}
+            return
+        if len(tool_messages) == 1:
+            first_result = json.loads(tool_messages[0]["content"])
+            assert first_result["exists"] is False, f"1回目の時点ではconfig.pyはまだ存在しないはずです: {first_result}"
+            # ここで、別のワーカースレッドが1回目の呼び出しの直後に
+            # config.pyを完成させた、という状況を決定的に模擬する
+            # (実際のディスク書き込みを、次のread_file呼び出しより
+            # 前に行う点だけが重要で、実時間の経過そのものは本質ではない)。
+            with open(os.path.join(out_dir, "config.py"), "w", encoding="utf-8") as f:
+                f.write("DB_PATH = 'todos.json'\n")
+            yield {"pending_tool_calls": [
+                {"id": "call_2", "type": "function", "function": {"name": "read_file", "arguments": {"filename": "config.py"}}},
+            ]}
+            return
+        second_result = json.loads(tool_messages[1]["content"])
+        assert second_result["exists"] is True, f"2回目の時点では既に完成しているはずです: {second_result}"
+        assert "DB_PATH" in second_result["content"]
+        yield {"content": "問題なし(config.pyの内容を確認しました)"}
         yield {"done": True}
 
     original_stream = yoriai._stream_chat_from_candidate
     yoriai._stream_chat_from_candidate = fake_stream
     try:
+        answer, error = yoriai._collect_review_answer_with_read_file(
+            _member("junnoMac-mini", "qwen2.5-coder-14b"), "fingerprint",
+            [{"role": "user", "content": "cli.pyをレビューしてください"}], out_dir,
+        )
+    finally:
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+    assert error is None, error
+    assert "問題なし" in answer, answer
+    assert len(call_log) == 3, f"初回+2回のread_file往復で合計3回/chatを呼ぶはずです: {call_log}"
+
+
+def test_collect_review_answer_with_read_file_caps_at_max_calls():
+    """1回のレビューにつきread_fileの呼び出しは最大3回までで、それ以上は
+    上限メッセージが返り、実際のディスク読み取り(_read_project_file_fresh)
+    は行われないことを確認する。モデルは4回目の要求が上限メッセージで
+    返ってきたことを踏まえて、そこで最終回答を出す(現実的なモデルの
+    振る舞いを模擬する)。
+    """
+    read_calls = {"n": 0}
+    original_read = yoriai._read_project_file_fresh
+
+    def counting_read(out_dir, filename):
+        read_calls["n"] += 1
+        return original_read(out_dir, filename)
+
+    def fake_stream(candidate, org_fingerprint, messages, offer_read_file_tool=False, **_kwargs):
+        tool_messages = [m for m in messages if m.get("role") == "tool"]
+        if len(tool_messages) < 4:
+            # 4回目まではリクエストしてみる(上限3回を超える)。
+            yield {"pending_tool_calls": [
+                {"id": f"call_{len(tool_messages)}", "type": "function", "function": {"name": "read_file", "arguments": {"filename": "storage.py"}}},
+            ]}
+            return
+        # 4回目の要求が上限メッセージで返ってきたので、それを踏まえて最終回答を出す。
+        yield {"content": "問題なし"}
+        yield {"done": True}
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_read_file_test_")
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._stream_chat_from_candidate = fake_stream
+    yoriai._read_project_file_fresh = counting_read
+    try:
+        answer, error = yoriai._collect_review_answer_with_read_file(
+            _member("junnoMac-mini", "qwen2.5-coder-14b"), "fingerprint",
+            [{"role": "user", "content": "storage.pyをレビューしてください"}], out_dir,
+        )
+    finally:
+        yoriai._stream_chat_from_candidate = original_stream
+        yoriai._read_project_file_fresh = original_read
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+    assert read_calls["n"] == 3, f"実際のディスク読み取りは最大3回までのはずです: {read_calls}"
+    assert error is None, error
+    assert "問題なし" in answer, answer
+
+
+def test_review_one_file_uses_read_file_powered_review_answer():
+    """`_review_one_file`が`_collect_review_answer_with_read_file`
+    (out_dirを都度読み直す経路)を使ってレビューを依頼していることを確認する。
+    """
+    captured = {}
+
+    def fake_collect(candidate, org_fingerprint, messages, out_dir):
+        captured["out_dir"] = out_dir
+        captured["prompt"] = messages[0]["content"]
+        return "問題なし", None
+
+    original = yoriai._collect_review_answer_with_read_file
+    yoriai._collect_review_answer_with_read_file = fake_collect
+    try:
+        ok, feedback = yoriai._review_one_file(
+            "cli.py", "import storage\n", _member("junnoMac-mini", "qwen2.5-coder-14b"),
+            "cli.py", "import storage\n", "実装計画", "fingerprint", "1回目のレビュー", "/tmp/some-project-dir",
+        )
+    finally:
+        yoriai._collect_review_answer_with_read_file = original
+
+    assert ok is True and feedback == "", (ok, feedback)
+    assert captured["out_dir"] == "/tmp/some-project-dir", captured
+    assert "cli.py" in captured["prompt"], captured
+
+
+def test_collect_review_answer_with_read_file_shows_read_progress_message():
+    """依頼の動作確認要件(ツール呼び出しのログが確認できる)を検証する。"""
+    def fake_stream(candidate, org_fingerprint, messages, offer_read_file_tool=False, **_kwargs):
+        tool_messages = [m for m in messages if m.get("role") == "tool"]
+        if not tool_messages:
+            yield {"pending_tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": json.dumps({"filename": "storage.py"})}},
+            ]}
+            return
+        yield {"content": "問題なし"}
+        yield {"done": True}
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_read_file_test_")
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._stream_chat_from_candidate = fake_stream
+    try:
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            answer, error = yoriai._collect_answer_from_candidate(
+            answer, error = yoriai._collect_review_answer_with_read_file(
                 _member("junnoMac-mini", "qwen2.5-coder-14b"), "fingerprint",
-                [{"role": "user", "content": "レビューしてください"}], available_files={"storage.py": "code"},
+                [{"role": "user", "content": "レビューしてください"}], out_dir,
             )
         output = buf.getvalue()
     finally:
         yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
 
     assert error is None
     assert answer == "問題なし", answer
@@ -249,15 +317,15 @@ def test_collect_answer_from_candidate_shows_read_file_progress_message():
 
 def main():
     tests = [
-        test_execute_read_file_tool_call_returns_content_for_existing_file,
-        test_execute_read_file_tool_call_reports_missing_file_as_not_implemented,
-        test_execute_read_file_tool_call_is_capped_at_three_calls_per_review,
-        test_execute_tool_call_dispatches_read_file_by_name_with_json_string_arguments,
-        test_snapshot_available_files_reads_all_files_in_out_dir,
-        test_snapshot_available_files_returns_empty_dict_for_missing_directory,
-        test_stream_chat_completion_executes_read_file_and_lets_model_revise_answer,
-        test_review_one_file_passes_project_directory_snapshot_as_available_files,
-        test_collect_answer_from_candidate_shows_read_file_progress_message,
+        test_read_project_file_fresh_returns_content_for_existing_file,
+        test_read_project_file_fresh_reports_missing_file_as_not_implemented,
+        test_read_project_file_fresh_reflects_file_created_after_first_check,
+        test_read_project_file_fresh_rejects_path_traversal,
+        test_stream_chat_completion_yields_pending_tool_calls_for_client_tool_without_executing,
+        test_collect_review_answer_with_read_file_rereads_disk_between_rounds,
+        test_collect_review_answer_with_read_file_caps_at_max_calls,
+        test_review_one_file_uses_read_file_powered_review_answer,
+        test_collect_review_answer_with_read_file_shows_read_progress_message,
     ]
     failures = 0
     for test in tests:
