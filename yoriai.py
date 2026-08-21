@@ -2019,6 +2019,63 @@ def _resolve_project_dir(projects_root: str, name: str) -> str:
         suffix += 1
 
 
+# ---------------------------------------------------------------------------
+# 組織自身が立てた計画を最後まで完遂させるためのタスクチェックリスト
+# ---------------------------------------------------------------------------
+#
+# 実機で、合意フェーズが「4ファイル構成が適切」と自ら提案したにもかかわらず、
+# 実装フェーズで候補不足等によりconfig.pyがスキップされたまま
+# 「✅ レビュー完了」と表示されてしまう不具合が見つかった。合意フェーズの
+# 構成案は人間が直接指定したものではなく組織自身(設計担当)が生み出した
+# 計画だが、「組織側が4つ必要だと判断した以上、その4つを完遂する責任は
+# 組織側にある」という前提のもと、合意フェーズが確定した瞬間にその計画を
+# 「必ず完遂すべきタスクリスト」として固定し、Claude CodeのTodoWriteと
+# 同様に進行状況を追跡したうえで、最後に必ず全タスクの完了を確認してから
+# でなければ「完了」を報告しない仕組みを追加した。
+
+_TASK_STATUS_PENDING = "pending"
+_TASK_STATUS_IN_PROGRESS = "in_progress"
+_TASK_STATUS_COMPLETED = "completed"
+
+_TASK_STATUS_SYMBOLS = {
+    _TASK_STATUS_PENDING: "⬜",
+    _TASK_STATUS_IN_PROGRESS: "⏳",
+    _TASK_STATUS_COMPLETED: "✅",
+}
+
+
+def _build_task_checklist(tasks: list) -> list:
+    """合意フェーズで確定したファイル一覧(`tasks`: `[(ファイル名, 内容), ...]`)
+    から、ファイルごとに「実装」「レビュー」の2タスクを持つチェックリストを
+    作る。各タスクは`{"filename":, "kind": "impl"|"review", "label":, "status":}`
+    の辞書で、生成した時点ではすべて`_TASK_STATUS_PENDING`。
+    """
+    checklist = []
+    for filename, _content in tasks:
+        checklist.append({"filename": filename, "kind": "impl", "label": f"{filename} の実装", "status": _TASK_STATUS_PENDING})
+        checklist.append({"filename": filename, "kind": "review", "label": f"{filename} のレビュー", "status": _TASK_STATUS_PENDING})
+    return checklist
+
+
+def _set_task_status(checklist: list, filename: str, kind: str, status: str) -> None:
+    for task in checklist:
+        if task["filename"] == filename and task["kind"] == kind:
+            task["status"] = status
+            return
+
+
+def _format_task_checklist(checklist: list) -> str:
+    lines = ["[📝 タスク状況(組織が自ら立てた計画)]"]
+    for task in checklist:
+        symbol = _TASK_STATUS_SYMBOLS[task["status"]]
+        lines.append(f"{symbol} {task['label']}")
+    return "\n".join(lines)
+
+
+def _incomplete_task_labels(checklist: list) -> list:
+    return [task["label"] for task in checklist if task["status"] != _TASK_STATUS_COMPLETED]
+
+
 def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str, out_dir: str) -> None:
     """「〇〇を作って」のような制作依頼用: まず優先順位が最も高い1台に
     モジュール分割案とインターフェース設計を相談し(合意フェーズ)、
@@ -2075,6 +2132,13 @@ def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str,
     for filename, content in tasks:
         print(f"  - {filename}: {content}")
 
+    # 仮の判断: 合意フェーズがまとめた計画は、組織自身が生み出したもので
+    # あっても、確定した瞬間に「必ず完遂すべきタスクリスト」として固定する。
+    # 依頼で明示された前提(「組織側が4つ必要だと判断した以上、その4つを
+    # 完遂する責任は組織側にある」)に基づく。
+    checklist = _build_task_checklist(tasks)
+    print(_format_task_checklist(checklist))
+
     # 仮の判断: 各担当への実装依頼には、自分のファイルの説明行だけでなく
     # 合意フェーズで決まった実装計画全体を埋め込む(理由は
     # _build_collaborative_implementation_request のコメントを参照)。
@@ -2091,17 +2155,48 @@ def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str,
     project_dir = _resolve_project_dir(projects_root, project_name)
     print(f"[📁 生成物の保存先: {project_dir}]")
 
+    for filename, _content in tasks:
+        _set_task_status(checklist, filename, "impl", _TASK_STATUS_IN_PROGRESS)
+
     print(f"[🔨 実装フェーズ開始: 合意した計画に基づき、{len(enriched_tasks)}件のファイルを異なるメンバーに並行実装させます]")
     implemented = _dispatch_and_save_parallel_tasks(enriched_tasks, candidates, org_fingerprint, project_dir)
+
+    # 仮の判断: 「実装済み」かどうかは_dispatch_and_save_parallel_tasksの
+    # 戻り値(実際に保存できたファイルの一覧)だけを根拠にする。候補不足で
+    # そもそも問い合わせが飛ばなかったファイル(実機で報告されたconfig.py
+    # スキップのようなケース)や、問い合わせが失敗したファイルは、この時点で
+    # 「実装中」のままステータスが更新されず残る(=最終チェックで検出される)。
+    implemented_filenames = {entry["filename"] for entry in implemented}
+    for filename, _content in tasks:
+        if filename in implemented_filenames:
+            _set_task_status(checklist, filename, "impl", _TASK_STATUS_COMPLETED)
+    print(_format_task_checklist(checklist))
 
     # 仮の判断: レビューフェーズは「お互いが担当外のファイルをレビューする」
     # 前提のため、実装に成功したファイルが2件以上無いと成立しない
     # (1件しか実装できなかった場合、担当外のレビュー担当が存在しない)。
-    if len(implemented) < 2:
+    if len(implemented) >= 2:
+        for entry in implemented:
+            _set_task_status(checklist, entry["filename"], "review", _TASK_STATUS_IN_PROGRESS)
+        resolved_filenames = _run_review_phase(implemented, tasks, org_fingerprint, project_dir)
+        for filename in resolved_filenames:
+            _set_task_status(checklist, filename, "review", _TASK_STATUS_COMPLETED)
+    else:
         print(f"[🔎 レビューフェーズはスキップします: 相互レビューを行うには実装済みファイルが2件以上必要です(保存先: {project_dir})]")
-        return
 
-    _run_review_phase(implemented, tasks, org_fingerprint, project_dir)
+    # 【最重要】組織自身が立てた計画のうち、1つでも未完了のタスクが残って
+    # いる場合は「✅ レビュー完了」を名乗らず、何が終わっていないかを
+    # 明示して報告する。実装フェーズ・レビューフェーズがそれぞれ「自分の
+    # 担当範囲では完了した」と表示していても、候補不足等で計画の一部が
+    # そもそも実装フェーズに到達しなかった場合(config.pyスキップの不具合)
+    # を、このタスクリストによる最終チェックが最後の砦として検出する。
+    print()
+    print(_format_task_checklist(checklist))
+    incomplete_labels = _incomplete_task_labels(checklist)
+    if incomplete_labels:
+        print(f"[⚠️ 未完了のタスクが残っています: {', '.join(incomplete_labels)}]")
+    else:
+        print(f"[✅ 全タスク完了 (保存先: {project_dir})]")
 
 
 # ---------------------------------------------------------------------------
@@ -2318,11 +2413,15 @@ def _review_and_fix_one_file(
     return ok
 
 
-def _run_review_phase(implemented: list, agreed_plan: list, org_fingerprint: str, out_dir: str) -> None:
+def _run_review_phase(implemented: list, agreed_plan: list, org_fingerprint: str, out_dir: str) -> list:
     """実装フェーズで生成された各ファイルを、担当外のメンバーにレビュー
     させる。`implemented`は`_dispatch_and_save_parallel_tasks`が返す
     `[{"filename":, "candidate":, "code":}, ...]`(タスクを書いた順、
     各要素の担当は互いに異なる)。
+
+    レビューの結果「問題なし」に到達したファイル名のリストを返す
+    (呼び出し元の`_ask_organization_collaborate`が、組織全体のタスク
+    チェックリストのうち「レビュー」タスクを完了扱いにするために使う)。
 
     仮の判断: レビュー担当は「次の要素の担当メンバー」を円環状(最後の
     要素の次は先頭に戻る)に割り当てる単純な方式にした。2ファイル・
@@ -2330,6 +2429,15 @@ def _run_review_phase(implemented: list, agreed_plan: list, org_fingerprint: str
     一致する。ファイル数が3件以上に増えた場合の「誰が誰をレビューするのが
     最適か」という設計はさらに検討の余地があるが、今回のスコープでは
     「担当外の誰かが必ずレビューする」ことだけを保証する方式にとどめた。
+
+    このメッセージ末尾の「✅ レビュー完了」/「⚠️ 未解決の指摘が残って
+    います」は、あくまで**このレビューフェーズが処理した範囲(=実装まで
+    たどり着いたファイル)についての結論**である。合意フェーズで計画
+    されたファイルのうち、候補不足等でそもそも実装フェーズに到達しな
+    かったファイル(依頼で報告された、config.pyが実装されないまま
+    スキップされていた不具合のようなケース)はこの関数からは見えない。
+    組織全体として本当に全タスクが完了したかどうかの最終判定は、
+    呼び出し元がタスクチェックリストで別途行う。
     """
     print()
     print("[🔎 レビューフェーズ開始: お互いが担当外のファイルをレビューします]")
@@ -2337,6 +2445,7 @@ def _run_review_phase(implemented: list, agreed_plan: list, org_fingerprint: str
     full_plan = "\n".join(f"{fn}: {content}" for fn, content in agreed_plan)
     n = len(implemented)
     unresolved = []
+    resolved = []
 
     for i, entry in enumerate(implemented):
         reviewer_entry = implemented[(i + 1) % n]
@@ -2346,14 +2455,18 @@ def _run_review_phase(implemented: list, agreed_plan: list, org_fingerprint: str
             reviewer_own_code=reviewer_entry["code"], full_plan=full_plan,
             org_fingerprint=org_fingerprint, out_dir=out_dir,
         )
-        if not ok:
+        if ok:
+            resolved.append(entry["filename"])
+        else:
             unresolved.append(entry["filename"])
 
     print()
     if unresolved:
         print(f"[⚠️ 未解決の指摘が残っています: {', '.join(unresolved)} (保存先: {out_dir})]")
     else:
-        print(f"[✅ レビュー完了 (保存先: {out_dir})]")
+        print(f"[✅ レビュー完了(今回レビュー対象の{n}ファイル、保存先: {out_dir})]")
+
+    return resolved
 
 
 # ---------------------------------------------------------------------------
