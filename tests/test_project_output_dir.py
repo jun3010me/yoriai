@@ -85,7 +85,7 @@ def _two_member_snapshot():
     }
 
 
-def _fake_stream_for_todo_cli(candidate, org_fingerprint, messages):
+def _fake_stream_for_todo_cli(candidate, org_fingerprint, messages, **_kwargs):
     request_text = messages[0]["content"]
     if "ファイルに分割する実装計画" in request_text:
         yield {"content": "storage.py: add_todo(text: str) -> int を実装\ncli.py: storage.add_todoを呼び出すCLI\n"}

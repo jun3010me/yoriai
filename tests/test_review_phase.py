@@ -51,7 +51,7 @@ def _call_review_and_fix(code, fake_stream, out_dir):
 def test_no_issues_resolves_on_first_round_without_fix_request():
     fix_calls = {"n": 0}
 
-    def fake_stream(candidate, org_fingerprint, messages):
+    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
         if "現在のコード" in messages[0]["content"]:
             fix_calls["n"] += 1
         yield {"content": "問題なし"}
@@ -71,7 +71,7 @@ def test_issue_found_then_fixed_resolves_on_rereview():
     review_round = {"n": 0}
     fix_calls = {"n": 0}
 
-    def fake_stream(candidate, org_fingerprint, messages):
+    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
         text = messages[0]["content"]
         if "レビュー対象" in text:
             review_round["n"] += 1
@@ -104,7 +104,7 @@ def test_issue_persists_after_two_rounds_gives_up_without_third_review():
     review_round = {"n": 0}
     fix_calls = {"n": 0}
 
-    def fake_stream(candidate, org_fingerprint, messages):
+    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
         text = messages[0]["content"]
         if "レビュー対象" in text:
             review_round["n"] += 1
@@ -140,7 +140,7 @@ def test_syntax_error_is_caught_before_any_llm_review_call():
     llm_review_calls = {"n": 0}
     fix_calls = {"n": 0}
 
-    def fake_stream(candidate, org_fingerprint, messages):
+    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
         text = messages[0]["content"]
         if "レビュー対象" in text:
             llm_review_calls["n"] += 1
@@ -170,7 +170,7 @@ def test_syntax_error_is_caught_before_any_llm_review_call():
 
 
 def test_syntax_check_skipped_for_non_python_filename():
-    def fake_stream(candidate, org_fingerprint, messages):
+    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
         yield {"content": "問題なし"}
         yield {"done": True}
 
