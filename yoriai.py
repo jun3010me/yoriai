@@ -40,6 +40,8 @@ except ImportError:
     pass
 
 import requests
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import InMemoryHistory
 from zeroconf import ServiceBrowser, ServiceInfo, Zeroconf, IPVersion, InterfaceChoice
 
 import config
@@ -3066,86 +3068,115 @@ def run_agent(token: str, port: int) -> None:
         server.shutdown()
 
 
-# 仮の判断: 継続入力中(まだ空行を入力していない、複数行メッセージの
-# 2行目以降)であることが一目で分かるよう、"..."系のプロンプトにする。
-# 幅を"Yoriai> "(半角8文字相当)にできるだけ合わせている。
-_REPL_FIRST_LINE_PROMPT = "Yoriai> "
+# 仮の判断(prompt_toolkit採用への設計変更): 以前は`readline`による
+# 1行単位の編集(input()を1行ずつ呼び、空行が来たら連結して送信)を
+# 使っていたが、これには「上下矢印で前の行に戻って編集できない」
+# (readlineは1行内のカーソル移動にしか対応していない)という原理的な
+# 制約があった。実機からも、複数行にまたがる入力の改行部分に制御文字と
+# 思われる記号が表示されることがあるという報告があった。
+#
+# 過去に(フェーズ5.2の判断メモを参照)、外部依存を最小限(zeroconf・
+# requestsのみ)に保つ方針から`prompt_toolkit`の導入を一度見送っていたが、
+# 今回の要望(複数行入力全体を1つの編集可能な領域として扱い、上下矢印で
+# 自由に行き来する)はreadlineでは原理的に実現できない機能のため、改めて
+# 導入を検討し、採用することにした。判断の詳細は本ファイル末尾の
+# 「複数行入力のテキストエディタ化(prompt_toolkit採用)」の判断メモを
+# 参照。ARM環境(Raspberry Pi 4)向けの事前確認(ネイティブ依存の有無)も
+# そちらに記録している。
+_REPL_PROMPT = "Yoriai> "
+# 仮の判断: 継続行(2行目以降)であることが一目で分かるよう、"..."系の
+# プロンプトにする。幅を"Yoriai> "(半角8文字相当)にできるだけ合わせている。
 _REPL_CONTINUATION_PROMPT = "...  "
 
 
-def _read_multiline_input() -> tuple:
+def _repl_prompt_continuation(width, line_number, is_soft_wrap) -> str:
+    """prompt_toolkitの`prompt_continuation`コールバック。2行目以降の
+    行番号を表示する行にも、常に同じ継続プロンプトを返す。
+    """
+    return _REPL_CONTINUATION_PROMPT
+
+
+def _create_repl_prompt_session() -> PromptSession:
+    """対話モードのメッセージ入力用に、複数行編集対応のセッションを1つ
+    作る。`_run_repl_client`が起動時に1回だけ作り、以後の全メッセージ
+    入力(`_read_multiline_input`の呼び出しごと)で使い回す。
+
+    仮の判断: セッションを使い回すことで、入力履歴(`InMemoryHistory`)が
+    メッセージをまたいで蓄積される。バッファの先頭行で上矢印を押すと、
+    (今回新たに書いていない行であれば)過去に送信したメッセージを呼び戻せる
+    (`Buffer.auto_up`の標準動作)。会話をまたいだ履歴の永続化(次回起動時に
+    前回の入力を引き継ぐ機能)は今回のスコープ外で、プロセス終了とともに
+    履歴も破棄される。
+    """
+    return PromptSession(history=InMemoryHistory())
+
+
+def _read_multiline_input(session: PromptSession) -> tuple:
     """対話モードの1メッセージ分の入力を読み取る。
 
-    仮の判断: 「1行入力してEnterを押した時点ではまだ送信しない」
-    「空行(Enterのみ)が来たら、それまでの行をすべて連結して1メッセージ
-    として確定する」という仕様にした。エディタ等から複数行の文章を
-    貼り付けた場合、各行の改行がそれぞれ別々のEnterとして届くため、
-    「1行=即送信」のままだと文章が意図せず分割送信されてしまう
-    (実機で報告された不具合)。空行を明示的な区切りにすることで、
-    1行だけの質問(1行入力→空行で即送信、という2回の操作)にも、
-    複数行の文章(貼り付け・複数行の手入力→最後に空行で送信)にも
-    同じ操作感で対応できる。
+    仮の判断: `prompt_toolkit`の`multiline=True`セッションを使う。標準の
+    キー割り当てにより、Enterは常に改行を挿入し、Alt+Enter(端末的には
+    Escapeキーに続けてEnter)で入力を確定する。上下矢印キーは、複数行の
+    バッファ内でまだ移動できる行がある間はカーソルをその行へ移動し、
+    バッファの端(最初/最後の行)に達すると入力履歴の呼び出しに切り替わる
+    (`Buffer.auto_up`/`auto_down`の標準動作)。これにより、依頼の
+    「上下矢印で自由に行き来しながら編集できる」という要望に、
+    prompt_toolkit標準の挙動だけで(独自のキー割り当てを追加せずに)
+    対応できる。
+
+    送信のトリガーは、既存の「空行で送信」から「Alt+Enterで送信」に
+    変更した。複数行バッファ全体を自由に編集できるようになった以上、
+    「空行=送信」のままだと、メッセージの途中に意図的な空行(段落区切り
+    など)を入れられなくなってしまう(空行を打った時点でその場で送信
+    されてしまうため)。Alt+Enterはprompt_toolkitの`multiline=True`
+    セッションにおける標準の確定キーであり、Claude Code等の他のツールの
+    複数行入力とも操作感が近い。
 
     戻り値は`(text, terminate)`のタプル。`terminate`が`True`の場合、
-    対話モード自体を終了すべきことを示す(EOF、入力前(まだ何も
-    入力していない状態)でのCtrl+C、または最初の1行として単独で
-    入力された"exit"/"quit")。`terminate`が`False`の場合、`text`が
-    確定したメッセージ本文(空にはならない)。
+    対話モード自体を終了すべきことを示す(EOF/Ctrl+D、または送信内容が
+    "exit"/"quit"単体)。`terminate`が`False`の場合、`text`が確定した
+    メッセージ本文(空にはならない)。
 
-    仮の判断: "exit"/"quit"による終了判定は、複数行入力の最初の1行
-    (まだ他の行を1行も入力していない状態)として、それ単体で入力された
-    場合にのみ有効にする。継続入力中(2行目以降)に"exit"とだけ書かれた
-    行が来ても、それはメッセージ本文の一部として扱う(空行が来るまで
-    送信を待つ)。
+    仮の判断: Ctrl+Cは、バッファに何か入力済みかどうかに関わらず、常に
+    そのメッセージ全体を破棄して新しい入力待ちに戻る(対話モード自体は
+    終了しない)という単一の挙動に統一した。以前は「何も入力していない
+    状態でのCtrl+Cは対話モード自体を終了する」という、入力済みかどうかで
+    挙動が変わる仕様だったが、prompt_toolkitの`session.prompt()`は
+    Ctrl+Cが押された時点のバッファの状態を呼び出し元に伝えずに一様に
+    `KeyboardInterrupt`を送出するため、この区別を維持しようとすると
+    別途バッファの状態を監視する仕組みが必要になり、複雑さに見合わない
+    と判断した。対話モード自体の終了は"exit"/"quit"の送信、またはEOF
+    (Ctrl+D)に一本化されており、これは他の多くのREPL(Pythonの標準
+    対話モード等)とも近い操作感になる。
     """
-    lines = []
     while True:
-        prompt = _REPL_FIRST_LINE_PROMPT if not lines else _REPL_CONTINUATION_PROMPT
         try:
-            raw = input(prompt)
+            raw = session.prompt(_REPL_PROMPT, multiline=True, prompt_continuation=_repl_prompt_continuation)
         except EOFError:
             print()
             return "", True
         except KeyboardInterrupt:
             print()
-            if not lines:
-                # 仮の判断: まだ何も入力していない状態でのCtrl+Cは、
-                # 対話モード自体を終了する(従来通りの挙動)。
-                return "", True
-            # 継続入力中のCtrl+Cは、そのメッセージ全体を破棄して
-            # 最初の入力待ちに戻る(対話モード自体は終了しない)。
-            lines = []
-            continue
-        except UnicodeDecodeError:
-            # 仮の判断: 端末側の文字コードの乱れ(IME入力の途中経過や、ターミナルの
-            # 表示崩れなど)で読み取れないバイト列が来ることがある実機での報告により
-            # 発覚した。この1行だけ読み捨て、それまでの入力内容は保ったまま
-            # 続けて入力を待つ(ここでクラッシュさせると常駐サービスは無事でも
-            # フロントだけ落ちてしまうため)。
-            print("入力を文字コードとして読み取れませんでした。もう一度入力してください。")
             continue
 
-        if not lines and raw.strip().lower() in ("exit", "quit"):
+        text = raw.strip()
+        if not text:
+            # 何も入力していない状態(または空白のみ)での確定は、
+            # 何もせず次の入力を待つ(従来通りの挙動)。
+            continue
+        if text.lower() in ("exit", "quit"):
             return "", True
-
-        if raw.strip() == "":
-            if not lines:
-                # まだ何も入力していない状態での空Enterは、何もせず
-                # 次の入力を待つ(従来通りの挙動)。
-                continue
-            return "\n".join(lines).strip(), False
-
-        lines.append(raw)
+        return text, False
 
 
 def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
     print()
     print("=== Yoriai 対話モード ===")
-    print("組織のメンバーに質問できます。終了するには exit または quit とだけ入力するか、")
-    print("入力前(何も入力していない状態)でCtrl+Cを押してください。")
-    print("1行入力してEnterを押しただけではまだ送信されません。空行(Enterのみ)を")
-    print("入力した時点で、それまでの行をすべて連結して1つのメッセージとして送信します")
-    print("(1行だけの質問は、入力→Enter→もう一度Enter、の2回の操作で送信できます)。")
+    print("組織のメンバーに質問できます。終了するには exit または quit とだけ入力して")
+    print("Alt+Enter(Escキーに続けてEnter)を押すか、入力前にCtrl+Dを押してください。")
+    print("Enterキーは常に改行を挿入します。上下矢印キーで、入力済みの行の間を")
+    print("自由に移動しながら編集できます。入力を送信するにはAlt+Enterを押してください")
+    print("(1行だけの質問も、入力→Alt+Enter、の操作で送信できます)。")
     print("コマンドを付けずに話しかけると、依頼内容から単発/比較/協業のどのモードで")
     print("問い合わせるかを自動的に判断します(判断理由は[判断: ...]として表示されます)。")
     print(f"{MULTI_QUERY_COMMAND} <質問文> で、自動判定に関わらず必ず空きリソース上位{MULTI_QUERY_TARGET_COUNT}台に同時に質問できます。")
@@ -3163,8 +3194,9 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
     # 仮の判断: 会話履歴(messages)はこのセッション内でのみ保持し、終了したら破棄する。
     # 次回起動時に前回の会話を引き継ぐ機能は今回のスコープ外。
     messages = []
+    session = _create_repl_prompt_session()
     while True:
-        text, terminate = _read_multiline_input()
+        text, terminate = _read_multiline_input(session)
         if terminate:
             break
 

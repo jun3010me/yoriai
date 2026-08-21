@@ -1,121 +1,146 @@
 #!/usr/bin/env python3
-"""対話モードでの行編集(矢印キーによるカーソル移動、Backspace)を検証する。
+"""対話モードでの複数行編集(上下矢印キーでの行間移動、Enter/Alt+Enterの
+使い分け、Backspace)を検証する。
 
-実機で「矢印キー(左右)を押すと、実際に移動する代わりに`^[[D`のような
-エスケープシーケンスの文字列がそのまま入力されてしまう」という不具合が
-報告された。原因は`readline`モジュールが一度もimportされていなかったこと
-だった(CPythonでは、`readline`をimportするだけで、以降の`input()`が
-GNU readline/libeditによる行編集を使うようになる)。
+以前は`readline`(1行単位の編集)に依存していたが、readlineは1行内の
+カーソル移動にしか対応しておらず、上下矢印キーで前の行に戻って編集する
+ことが原理的にできなかった。実機からも、複数行にまたがる入力の改行部分に
+制御文字と思われる記号が表示されることがあるという報告があった。
 
-矢印キー等の行編集は本物の擬似端末(pty)を通した対話でしか意味のある
-検証ができないため、標準ライブラリの`pty`モジュールを使って実際に
-サブプロセスへキー入力(エスケープシーケンスを含む)を送り込み、
-`input()`が返す文字列を確認する。`readline`をimportしない場合(修正前の
-状態を再現)と、importした場合(現在のyoriai.pyの状態)を両方実行し、
-挙動の違いを比較することで、修正が実際に効いていることを検証する。
+`prompt_toolkit`の`multiline=True`セッションを採用し、複数行の入力全体を
+1つの編集可能な領域として扱うようにした。矢印キーによる行間移動や
+Backspaceといった基本的な編集機能自体はprompt_toolkit本体が提供する
+ものであり、ライブラリ側で十分にテストされているため、ここでは
+「Yoriaiがこの機能をどう使っているか」(multiline設定・送信キーの
+割り当て・複数行バッファでの実際の編集結果)を検証する。
+
+`prompt_toolkit.input.create_pipe_input`で仮想的なキー入力を送り込み、
+`prompt_toolkit.output.DummyOutput`で実際の画面描画を行わないように
+した`PromptSession`を使う(prompt_toolkit公式のテスト手法。実際の
+擬似端末を使わずに済む)。
 
 使い方: python3 tests/test_repl_line_editing.py
 """
 import os
-import pty
-import subprocess
 import sys
 
-_REPO_ROOT = os.path.join(os.path.dirname(__file__), "..")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import yoriai  # noqa: E402
+
+from prompt_toolkit import PromptSession  # noqa: E402
+from prompt_toolkit.input import create_pipe_input  # noqa: E402
+from prompt_toolkit.output import DummyOutput  # noqa: E402
+
+_SUBMIT = "\x1b\r"  # Alt+Enter(Escapeキーに続けてEnter)
 
 
-def _run_in_pty(script: str, keystrokes: bytes, timeout: float = 5) -> str:
-    """指定したPythonスクリプト本体を擬似端末(pty)の下で実行し、
-    キー入力(バイト列、エスケープシーケンスを含んでよい)を送り込んで、
-    そのプロセスの標準出力(pty経由でエコーされた内容を含む)を返す。
+def _read_with_keys(keystrokes: str):
+    with create_pipe_input() as pipe_input:
+        session = PromptSession(input=pipe_input, output=DummyOutput())
+        pipe_input.send_text(keystrokes)
+        return yoriai._read_multiline_input(session)
+
+
+def test_enter_inserts_a_newline_instead_of_submitting():
+    """依頼の中核要件: Enterキーは(readline時代のように送信・確定の
+    トリガーにはならず)常に改行を挿入するだけであることを確認する。
+    Alt+Enterを送るまでは入力が確定しない。
     """
-    master_fd, slave_fd = pty.openpty()
-    proc = subprocess.Popen(
-        [sys.executable, "-c", script],
-        stdin=slave_fd, stdout=slave_fd, stderr=subprocess.STDOUT,
-        close_fds=True,
-    )
-    os.close(slave_fd)
-    os.write(master_fd, keystrokes)
-    proc.wait(timeout=timeout)
-    output = b""
-    try:
-        while True:
-            chunk = os.read(master_fd, 4096)
-            if not chunk:
-                break
-            output += chunk
-    except OSError:
-        pass
-    os.close(master_fd)
-    return output.decode("utf-8", errors="replace")
+    text, terminate = _read_with_keys("1行目\r2行目" + _SUBMIT)
+    assert terminate is False
+    assert text == "1行目\n2行目", repr(text)
 
 
-def test_left_arrow_key_leaves_raw_escape_sequence_without_readline():
-    """修正前の状態(`readline`未import)を再現し、実際に報告された不具合
-    (矢印キーのエスケープシーケンスがそのまま入力される)を確認する。
-    「helo」と入力し、左矢印キー(`\\x1b[D`)でカーソルを1つ戻してから
-    「l」を挿入するつもりが、`readline`が無いと単なるバイト列として
-    そのまま`input()`の戻り値に混入してしまう。
+def test_up_arrow_moves_cursor_to_the_previous_line_for_editing():
+    """依頼の中核要件: 上矢印キーで、直前に入力した行に戻ってカーソルを
+    置き、その場で編集できることを確認する(readlineでは不可能だった
+    複数行にまたがる自由な編集)。「foo」「bar」と入力後、上矢印で
+    「foo」の行末に戻り、「X」を挿入すると「fooX」になるはず(「bar」の
+    行はそのまま)。
     """
-    # 左矢印キーの入力シーケンス: ESC [ D
-    keystrokes = b"helo\x1b[Dl\n"
-    output = _run_in_pty("print(repr(input()))", keystrokes)
-    assert "'helo\\x1b[Dl'" in output, (
-        f"readline未importの場合、エスケープシーケンスがそのまま入力される"
-        f"はずです(この結果自体は仕様ではなく、修正前の不具合の再現): {output!r}"
-    )
+    keystrokes = "foo\rbar" + "\x1b[A" + "X" + _SUBMIT
+    text, terminate = _read_with_keys(keystrokes)
+    assert terminate is False
+    assert text == "fooX\nbar", repr(text)
 
 
-def test_left_arrow_key_moves_cursor_with_readline_imported():
-    """`readline`をimportすると、左矢印キーで正しくカーソルが移動し、
-    意図通りの編集結果になることを確認する(修正後の挙動)。
+def test_down_arrow_moves_cursor_back_to_the_next_line():
+    """上矢印で前の行に戻った後、下矢印で元いた行(最後の行)に戻れる
+    ことを確認する。
     """
-    keystrokes = b"helo\x1b[Dl\n"
-    output = _run_in_pty("import readline; print(repr(input()))", keystrokes)
-    assert "'hello'" in output, (
-        f"readlineをimportすれば、左矢印キーで正しく編集できるはずです: {output!r}"
-    )
+    # foo / bar と入力 → 上矢印で foo の行末へ → 下矢印で bar の行末へ戻る → Y を追記
+    keystrokes = "foo\rbar" + "\x1b[A" + "\x1b[B" + "Y" + _SUBMIT
+    text, terminate = _read_with_keys(keystrokes)
+    assert terminate is False
+    assert text == "foo\nbarY", repr(text)
 
 
-def test_backspace_deletes_one_character_with_readline_imported():
-    """Backspaceキー(DEL、0x7f)で正しく1文字ずつ削除できることを確認する。
-    「hellox」と入力してBackspaceを押すと「hello」になるはず。
+def test_backspace_deletes_one_character_within_multiline_buffer():
+    """Backspace(DEL、0x7f)で、複数行バッファ内でも1文字ずつ正しく
+    削除できることを確認する。「hellox」と入力してBackspaceを押すと
+    「hello」になるはず。
     """
-    keystrokes = b"hellox\x7f\n"
-    output = _run_in_pty("import readline; print(repr(input()))", keystrokes)
-    assert "'hello'" in output, (
-        f"Backspaceで最後の1文字が削除されるはずです: {output!r}"
-    )
+    text, terminate = _read_with_keys("1行目\rhellox\x7f" + _SUBMIT)
+    assert terminate is False
+    assert text == "1行目\nhello", repr(text)
 
 
-def test_multiline_input_still_works_with_readline_imported():
-    """複数行入力機能(空行で送信)が、`readline`のimportによって壊れて
-    いないことを、実際の擬似端末経由で確認する
-    (`yoriai._read_multiline_input`を直接呼び出す)。
+def test_multiline_japanese_text_has_no_leaked_control_characters():
+    """実機で報告された不具合の再現確認: 複数行の日本語文章を入力した際、
+    改行部分やその他の箇所に制御文字(エスケープシーケンスの断片等)が
+    紛れ込まないことを確認する。
     """
-    script = (
-        "import sys\n"
-        f"sys.path.insert(0, {_REPO_ROOT!r})\n"
-        "import yoriai\n"
-        "text, terminate = yoriai._read_multiline_input()\n"
-        "print(repr((text, terminate)))\n"
+    keystrokes = (
+        "以下の内容でプロジェクトを作って:\r"
+        "1. storage.pyでデータを保存する\r"
+        "2. cli.pyでコマンドライン操作を行う"
+        + _SUBMIT
     )
-    # 1行入力してEnter、続けて空行でEnter(送信確定)。
-    keystrokes = b"hello\r\r"
-    output = _run_in_pty(script, keystrokes)
-    assert "('hello', False)" in output, (
-        f"複数行入力(1行+空行での送信)が、readline import後も従来通り"
-        f"動作するはずです: {output!r}"
+    text, terminate = _read_with_keys(keystrokes)
+    assert terminate is False
+    assert "\x1b" not in text, f"制御文字(ESC)が結果に紛れ込んでいます: {text!r}"
+    assert all(0x20 <= ord(c) or c in "\n" for c in text), (
+        f"印字不可能な制御文字が結果に紛れ込んでいます: {text!r}"
     )
+    assert text == (
+        "以下の内容でプロジェクトを作って:\n"
+        "1. storage.pyでデータを保存する\n"
+        "2. cli.pyでコマンドライン操作を行う"
+    ), repr(text)
+
+
+def test_editing_an_earlier_line_after_pasting_multiline_text():
+    """複数行のテキストを貼り付けた(高速に連続入力された)後でも、
+    上矢印で前の行に戻って編集できることを確認する(貼り付け特有の
+    経路で壊れていないことの回帰検知)。
+
+    仮の判断: 上矢印キーは(一般的なテキストエディタと同様に)直前の
+    カーソル列を保ったまま1つ上の行へ移動するため、直前に確定した行の
+    文字数が異なる場合、そのままでは行の途中に移動することがある。
+    これは仕様通りの挙動であり、行末に確実に移動するにはEndキー
+    (`\\x1b[F`)を使う。
+    """
+    keystrokes = (
+        "storage.pyを実装\r"
+        "cli.pyを実装"
+        + "\x1b[A"  # 上矢印で「storage.pyを実装」の行へ移動
+        + "\x1b[F"  # Endキーでその行の行末へ
+        + "(add_todo関数を含む)"
+        + _SUBMIT
+    )
+    text, terminate = _read_with_keys(keystrokes)
+    assert terminate is False
+    assert text == "storage.pyを実装(add_todo関数を含む)\ncli.pyを実装", repr(text)
 
 
 def main():
     tests = [
-        test_left_arrow_key_leaves_raw_escape_sequence_without_readline,
-        test_left_arrow_key_moves_cursor_with_readline_imported,
-        test_backspace_deletes_one_character_with_readline_imported,
-        test_multiline_input_still_works_with_readline_imported,
+        test_enter_inserts_a_newline_instead_of_submitting,
+        test_up_arrow_moves_cursor_to_the_previous_line_for_editing,
+        test_down_arrow_moves_cursor_back_to_the_next_line,
+        test_backspace_deletes_one_character_within_multiline_buffer,
+        test_multiline_japanese_text_has_no_leaked_control_characters,
+        test_editing_an_earlier_line_after_pasting_multiline_text,
     ]
     failures = 0
     for test in tests:
@@ -124,7 +149,7 @@ def main():
         except AssertionError as exc:
             failures += 1
             print(f"FAIL: {test.__name__}: {exc}")
-        except Exception as exc:  # pty/subprocessの環境依存の問題は明示的に報告する
+        except Exception as exc:  # prompt_toolkitの環境依存の問題は明示的に報告する
             failures += 1
             print(f"ERROR: {test.__name__}: {type(exc).__name__}: {exc}")
         else:
