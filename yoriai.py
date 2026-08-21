@@ -1850,6 +1850,24 @@ def _truncate_file_content(content: str, limit: int = _FILE_CONTENT_TRUNCATE_CHA
     return content[:limit], True
 
 
+def _planned_filenames_from_progress(out_dir: str) -> set:
+    """`out_dir`(プロジェクトディレクトリ)のPROGRESS.mdを読み直し、
+    モジュール分割案に含まれるファイル名の集合を返す。読み取れない場合
+    (PROGRESS.mdが存在しない・想定形式で解析できない)は空集合を返す
+    (呼び出し元は、この場合は既存の汎用メッセージにフォールバックする)。
+
+    仮の判断(バグ報告への対応): read_fileで指定されたファイルが存在
+    しない場合、それが「まだ実装されていないだけの、計画通りのファイル」
+    なのか、「そもそも計画に無い架空のファイル名」なのかを区別できる
+    ようにするため、PROGRESS.mdを毎回読み直す(read_fileの既存の
+    「ディスク上の実際の状態を正として扱う」設計方針と同じ)。
+    """
+    parsed = _parse_progress_markdown(os.path.join(out_dir, PROGRESS_FILENAME))
+    if parsed is None:
+        return set()
+    return {fn for fn, _content in parsed["tasks"]}
+
+
 def _read_project_file_fresh(out_dir: str, filename: str) -> str:
     """read_fileツールの応答本体。呼び出された「その瞬間」に`out_dir`配下を
     ディスクから直接読み直して結果を作る(依頼発行時や前回のラウンド時点の
@@ -1866,6 +1884,27 @@ def _read_project_file_fresh(out_dir: str, filename: str) -> str:
         # 仮の判断: 依頼の項目4に対応。存在しないファイル名を指定された
         # 場合は、例外を投げたりエラー扱いにしたりせず、「まだ実装されて
         # いない」という情報自体をモデルへの正常な回答として返す。
+        #
+        # 仮の判断(バグ報告への対応): さらに、そのファイル名がそもそも
+        # PROGRESS.mdの計画に含まれているかを確認する。計画に無い名前で
+        # あれば、「未実装」ではなく「計画そのものに存在しない」ことを
+        # 明示し、計画に実在するファイル一覧を提示する。これにより、
+        # 設計担当の記述ミス(実際には無いファイルへの言及)が原因で
+        # レビュー往復・自動再開が無限に解決しないという事態を防ぐ
+        # (架空のファイル名を待ち続けるのではなく、モデル自身がその場で
+        # 「参照すべきは実在するどのファイルか」を判断し直せるようにする)。
+        planned = _planned_filenames_from_progress(out_dir)
+        if planned and safe_name not in planned:
+            return json.dumps({
+                "filename": filename, "exists": False,
+                "message": (
+                    f"'{filename}' は実装計画(PROGRESS.mdのモジュール分割案)に"
+                    "含まれていないファイル名です。新規に作成するつもりであれば"
+                    "write_fileを使ってください。そうでなければ、計画の記述ミスの"
+                    "可能性があります。計画に実在するファイル: "
+                    f"{', '.join(sorted(planned))}"
+                ),
+            }, ensure_ascii=False)
         return json.dumps({
             "filename": filename, "exists": False,
             "message": "そのファイルはまだ存在しません(未実装です)。",
@@ -2688,6 +2727,8 @@ _MODULE_BREAKDOWN_PROMPT_TEMPLATE = """あなたはソフトウェア設計を�
 
 重要: 複数のファイルの説明に同じ関数(例: あるファイルが呼び出す、別のファイルが定義する関数)が登場する場合、その関数名・引数名・戻り値の型は、すべてのファイルの説明文で一字一句まったく同じ表記に揃えてください。あるファイルの説明では`add_todo`、別のファイルの説明では`add_task`のように、同じ役割の関数に別々の名前を使うことは厳禁です。
 
+さらに重要: あるファイルの説明の中で、他のファイル(スクリプトの読み込み・スタイルシートの参照・importなど)に言及する場合、そのファイル名は、あなたがこの計画の中で実際に別の1行として挙げるファイル名と一字一句完全に一致させてください。あなたの説明の中にしか登場しない、実際にはファイルとして挙げていない架空のファイル名(例: 別のファイルで`editor.js`と`preview.js`を挙げているのに、説明文の中では両方をまとめて`script.js`と呼ぶ、のような食い違い)を、他のファイルから読み込む・呼び出すものとして書いてはいけません。
+
 出力は次の形式のみとし、他の説明文や前置き・後書きは一切含めないでください。ファイルごとに1行、「ファイル名: 実装すべき内容(インターフェースの詳細を含む)」という形式で出力してください(2〜4ファイル程度を想定します。ファイル名の拡張子は、上で指定した言語に合わせてください):
 
 <ファイル名1>: <実装すべき内容をここに>
@@ -2872,6 +2913,56 @@ def _parse_module_breakdown(text: str) -> list:
         for filename, details in tasks
         if details  # 詳細が全く無いファイル(見出しだけ)は実装依頼のしようがないため除外
     ]
+
+
+# 仮の判断(バグ報告への対応): 設計担当は、ある1ファイルの説明文の中で
+# 他のファイル(スクリプトの読み込み・スタイルシートの参照等)に言及する際、
+# 実際には計画に無い架空のファイル名を使ってしまうことがある(実機で、
+# editor.js/preview.jsという2ファイルを計画に挙げていながら、index.htmlの
+# 説明文の中では両方をまとめて「script.js」と呼んでしまい、実装された
+# index.htmlがscript.jsを読み込むコードになった結果、レビューが
+# 「script.jsが存在しない」という指摘を無限に繰り返す不具合が報告された)。
+# タスクキューへの割り当て自体は常に計画通りのファイル名で行われる
+# (_run_collaborative_task_queueのworkerはtasksタプルのファイル名を
+# そのままdest_pathに使う)ため、これはYoriai側の処理の不具合ではなく、
+# 設計担当(LLM)の1回の応答内での自己矛盾である。プロンプト側の指示
+# (_MODULE_BREAKDOWN_PROMPT_TEMPLATEの「さらに重要」の段落)で予防を
+# 図ったが、確率的な性質上完全には防げないため、機械的に検出して
+# ユーザーに警告する仕組みも用意する。
+# 仮の判断: 文字クラスをASCII(英数字・アンダースコア・ハイフン)に限定する。
+# Pythonの`\w`は既定でUnicodeの単語文字(日本語の漢字・かな等も含む)に
+# マッチするため、`[\w\-]+`のままだと「scriptタグでscript.js」のような
+# 日本語の説明文中で、直前の日本語部分までファイル名の一部として誤って
+# 連結して抽出してしまう(実際に発生した誤検出)。実在するファイル名は
+# 通常ASCII文字だけで構成されるため、ASCIIに限定しても実用上の取りこぼしは
+# 少ないと判断した。
+_FILENAME_LIKE_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_\-]+\.[A-Za-z0-9]{1,5}")
+
+
+def _find_undeclared_file_references(tasks: list) -> list:
+    """各タスクの説明文中に登場する「ファイル名らしきトークン」
+    (`<名前>.<拡張子>`の形)のうち、このプロジェクトが実際に使っている
+    拡張子(=他のタスクのいずれかの拡張子)を持ちながら、実際にはどの
+    タスクのファイル名とも一字一句一致しないものを探し、
+    `[(言及元のファイル名, 未宣言のファイル名らしき文字列), ...]`を返す。
+
+    仮の判断: 説明文中の全ての"x.y"形式トークンをファイル名として扱うと、
+    バージョン番号やその他の紛らわしい文字列を誤検出するリスクが高い。
+    「このプロジェクトが実際に使っている拡張子」に絞ることで、無関係な
+    誤検出を抑えつつ、実用上価値のある検出だけに絞り込む。
+    """
+    declared_names = {fn for fn, _ in tasks}
+    declared_exts = {os.path.splitext(fn)[1].lower() for fn in declared_names if os.path.splitext(fn)[1]}
+    issues = []
+    for filename, content in tasks:
+        for match in _FILENAME_LIKE_TOKEN_PATTERN.finditer(content):
+            token = match.group(0)
+            if os.path.splitext(token)[1].lower() not in declared_exts:
+                continue
+            if token in declared_names:
+                continue
+            issues.append((filename, token))
+    return issues
 
 
 # 仮の判断: 協業モードの生成物をYoriai本体(yoriai.py・config.py等)と
@@ -3285,6 +3376,20 @@ def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str,
     print(f"[📐 モジュール分割案がまとまりました({len(tasks)}ファイル): {', '.join(f for f, _ in tasks)}]")
     for filename, content in tasks:
         print(f"  - {filename}: {content}")
+
+    # 仮の判断(バグ報告への対応): 設計担当の説明文が、計画に無い架空の
+    # ファイル名に言及していないかをここで機械的にチェックする。実装・
+    # レビューを始める前(=無駄な問い合わせが発生する前)に、最も早い
+    # タイミングで検出・警告することを狙った。処理は中断せず、あくまで
+    # 「事前の注意喚起」として続行する(誤検出(例: 外部CDNのファイル名
+    # への言及)の可能性もゼロではないため)。
+    undeclared_references = _find_undeclared_file_references(tasks)
+    for source_file, missing_name in undeclared_references:
+        print(
+            f"[⚠️ {source_file} の説明文が、計画に無いファイル「{missing_name}」に"
+            f"言及しています。設計担当の記述ミスの可能性があります"
+            f"(実装予定のファイル一覧: {', '.join(f for f, _ in tasks)})]"
+        )
 
     # 仮の判断: 依頼の項目1(言語判定の結果をPROGRESS.mdに明記する)への
     # 対応。実際に設計担当が提案したファイルの拡張子から言語を逆算する
