@@ -3085,6 +3085,60 @@ def run_agent(token: str, port: int) -> None:
 # そちらに記録している。
 _REPL_PROMPT = "Yoriai> "
 
+# 仮の判断: 実機(Windows機からraspi4へのSSH接続)で、送信キー(Alt+Enter)が
+# SSHクライアント側のショートカットに奪われ、Ctrl+Enterも(SSH経由では
+# ネイティブコンソールのControl-Enter→Meta-Enter自動変換が働かないため)
+# 機能せず、exit/quit・Ctrl+D・Ctrl+Cのいずれも反応せず対話モードから
+# 一切抜け出せなくなる不具合が報告された。この「非常口」機能は、送信キーが
+# 何らかの理由で一切機能しない状況でも確実に対話モードを終了できることを
+# 唯一の目的とするため、新しい送信キーの選定は行わず、Ctrl+Cという既存の
+# 割り込みキー(SSH経由でも確実に届く、TCP接続を通じて転送される標準的な
+# シグナル)を2回連続で押すことを検出する方式にした。
+_REPL_DOUBLE_CTRL_C_WINDOW_SEC = 2.0
+
+
+class _DoubleInterruptGuard:
+    """対話モードのどのタイミング(入力編集中・応答待ちのどちらでも)で
+    Ctrl+C(`KeyboardInterrupt`)が発生しても、直前のCtrl+Cから
+    `_REPL_DOUBLE_CTRL_C_WINDOW_SEC`秒以内に連続して発生したかどうかを
+    判定できるようにする、対話モードのセッションを通じて1つだけ使い回す
+    小さな状態オブジェクト。
+
+    仮の判断: `_read_multiline_input`(入力編集中のCtrl+C)と
+    `_run_repl_client`本体(組織への問い合わせ中、応答待ちの間のCtrl+C)の
+    両方でCtrl+Cを検出する必要があるため、片方の関数内のローカル変数では
+    状態を共有できない。`_run_repl_client`が対話モードの開始時に1つだけ
+    作り、両方の箇所に渡して使い回すことで、「入力中に1回目、応答待ち中に
+    2回目」のように状況をまたいで連続したCtrl+Cも正しく検出できる。
+    """
+
+    def __init__(self, window_sec: float = _REPL_DOUBLE_CTRL_C_WINDOW_SEC):
+        self._window_sec = window_sec
+        self._last_interrupt_at = None
+
+    def note_interrupt(self) -> bool:
+        """Ctrl+Cが発生するたびに呼ぶ。直前のCtrl+Cから`window_sec`秒以内
+        なら(=2回連続とみなし)`True`を返す。それ以外は`False`を返し、
+        「今回のCtrl+C」を新たな基準時刻として記録する。
+        """
+        now = time.monotonic()
+        if self._last_interrupt_at is not None and (now - self._last_interrupt_at) <= self._window_sec:
+            return True
+        self._last_interrupt_at = now
+        return False
+
+
+def _handle_repl_command_interrupt(interrupt_guard: "_DoubleInterruptGuard") -> bool:
+    """組織への問い合わせ中(応答待ち)にCtrl+Cが発生した際の共通処理。
+    2回連続のCtrl+Cであれば、対話モードを終了すべきことを示す`True`を返す。
+    """
+    print()
+    if interrupt_guard.note_interrupt():
+        print("[⚠️ Ctrl+Cが2回連続で押されたため、対話モードを終了します]")
+        return True
+    print("(処理を中断しました。2秒以内にもう一度Ctrl+Cを押すと、対話モードを終了できます)")
+    return False
+
 
 def _repl_prompt_continuation(width, line_number, is_soft_wrap) -> str:
     """prompt_toolkitの`prompt_continuation`コールバック。
@@ -3115,7 +3169,7 @@ def _create_repl_prompt_session() -> PromptSession:
     return PromptSession(history=InMemoryHistory())
 
 
-def _read_multiline_input(session: PromptSession) -> tuple:
+def _read_multiline_input(session: PromptSession, interrupt_guard: "_DoubleInterruptGuard") -> tuple:
     """対話モードの1メッセージ分の入力を読み取る。
 
     仮の判断: `prompt_toolkit`の`multiline=True`セッションを使う。標準の
@@ -3157,21 +3211,32 @@ def _read_multiline_input(session: PromptSession) -> tuple:
     Enterは利用できないため、Alt+Enterが引き続き唯一の確実な送信キーになる。
 
     戻り値は`(text, terminate)`のタプル。`terminate`が`True`の場合、
-    対話モード自体を終了すべきことを示す(EOF/Ctrl+D、または送信内容が
-    "exit"/"quit"単体)。`terminate`が`False`の場合、`text`が確定した
-    メッセージ本文(空にはならない)。
+    対話モード自体を終了すべきことを示す(EOF/Ctrl+D、送信内容が
+    "exit"/"quit"単体、またはCtrl+Cが2回連続で押された場合)。
+    `terminate`が`False`の場合、`text`が確定したメッセージ本文
+    (空にはならない)。
 
-    仮の判断: Ctrl+Cは、バッファに何か入力済みかどうかに関わらず、常に
-    そのメッセージ全体を破棄して新しい入力待ちに戻る(対話モード自体は
-    終了しない)という単一の挙動に統一した。以前は「何も入力していない
-    状態でのCtrl+Cは対話モード自体を終了する」という、入力済みかどうかで
-    挙動が変わる仕様だったが、prompt_toolkitの`session.prompt()`は
-    Ctrl+Cが押された時点のバッファの状態を呼び出し元に伝えずに一様に
+    仮の判断: Ctrl+Cを1回だけ押した場合は、バッファに何か入力済みかどうかに
+    関わらず、常にそのメッセージ全体を破棄して新しい入力待ちに戻る
+    (対話モード自体は終了しない)。以前は「何も入力していない状態での
+    Ctrl+Cは対話モード自体を終了する」という、入力済みかどうかで挙動が
+    変わる仕様だったが、prompt_toolkitの`session.prompt()`はCtrl+Cが
+    押された時点のバッファの状態を呼び出し元に伝えずに一様に
     `KeyboardInterrupt`を送出するため、この区別を維持しようとすると
     別途バッファの状態を監視する仕組みが必要になり、複雑さに見合わない
-    と判断した。対話モード自体の終了は"exit"/"quit"の送信、またはEOF
-    (Ctrl+D)に一本化されており、これは他の多くのREPL(Pythonの標準
-    対話モード等)とも近い操作感になる。
+    と判断した。
+
+    仮の判断(実機で報告された「非常口」不具合への対応): 送信キー
+    (Alt+Enter/Ctrl+Enter)がSSH経由の接続などで一切機能しない状況では、
+    "exit"/"quit"すら送信できずEOF(Ctrl+D)も反応しないことがあり、
+    対話モードから抜け出す手段が無くなる不具合が実機で報告された。この
+    ため、`interrupt_guard`(`_DoubleInterruptGuard`)で直前のCtrl+Cから
+    `_REPL_DOUBLE_CTRL_C_WINDOW_SEC`秒以内に連続してCtrl+Cが押された
+    ことを検出した場合は、送信キーの状態に一切関係なく対話モード自体を
+    終了する(`terminate=True`を返す)。Ctrl+C(SIGINT)はSSH接続を含む
+    どのような端末経由でも標準的に転送される割り込みであり、送信キーが
+    ターミナルアプリ側に奪われるような状況でも確実に届くため、「非常口」
+    として機能する。
     """
     while True:
         try:
@@ -3181,6 +3246,10 @@ def _read_multiline_input(session: PromptSession) -> tuple:
             return "", True
         except KeyboardInterrupt:
             print()
+            if interrupt_guard.note_interrupt():
+                print("[⚠️ Ctrl+Cが2回連続で押されたため、対話モードを終了します]")
+                return "", True
+            print("(入力を破棄しました。2秒以内にもう一度Ctrl+Cを押すと、対話モードを終了できます)")
             continue
 
         text = raw.strip()
@@ -3196,8 +3265,10 @@ def _read_multiline_input(session: PromptSession) -> tuple:
 def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
     print()
     print("=== Yoriai 対話モード ===")
-    print("組織のメンバーに質問できます。終了するには exit または quit とだけ入力して")
-    print("Alt+Enter(Escキーに続けてEnter)を押すか、入力前にCtrl+Dを押してください。")
+    print("★ Ctrl+Cを2秒以内に2回連続で押すと、状況に関わらずいつでも確実に")
+    print("  終了できます(送信キーやexit/quitが効かない場合の非常口です)。")
+    print("終了するには exit または quit とだけ入力してAlt+Enter(Escキーに続けて")
+    print("Enter)を押すか、入力前にCtrl+Dを押す方法もあります。")
     print("Enterキーは常に改行を挿入します。上下矢印キーで、入力済みの行の間を")
     print("自由に移動しながら編集できます。入力を送信するにはAlt+Enterを押してください")
     print("(1行だけの質問も、入力→Alt+Enter、の操作で送信できます。Windowsの")
@@ -3221,8 +3292,13 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
     # 次回起動時に前回の会話を引き継ぐ機能は今回のスコープ外。
     messages = []
     session = _create_repl_prompt_session()
+    # 仮の判断: 入力編集中・組織への問い合わせ中(応答待ち)のどちらで
+    # Ctrl+Cが発生しても「2回連続」を正しく検出できるよう、対話モードの
+    # セッションを通じて1つのインスタンスを使い回す(_DoubleInterruptGuard
+    # の定義コメントを参照)。
+    interrupt_guard = _DoubleInterruptGuard()
     while True:
-        text, terminate = _read_multiline_input(session)
+        text, terminate = _read_multiline_input(session, interrupt_guard)
         if terminate:
             break
 
@@ -3234,7 +3310,8 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
             try:
                 _ask_organization_collaborate(port, org_fingerprint, request, out_dir)
             except KeyboardInterrupt:
-                print()
+                if _handle_repl_command_interrupt(interrupt_guard):
+                    break
             continue
 
         if text.startswith(PARALLEL_QUERY_COMMAND):
@@ -3242,7 +3319,8 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
             try:
                 _ask_organization_parallel(port, org_fingerprint, command_text, out_dir)
             except KeyboardInterrupt:
-                print()
+                if _handle_repl_command_interrupt(interrupt_guard):
+                    break
             continue
 
         if text.startswith(MULTI_QUERY_COMMAND):
@@ -3254,7 +3332,8 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
             try:
                 _ask_organization_multi(port, org_fingerprint, messages)
             except KeyboardInterrupt:
-                print()
+                if _handle_repl_command_interrupt(interrupt_guard):
+                    break
             continue
 
         # 仮の判断: 明示コマンド(//agree・//parallel・//multi)のいずれにも
@@ -3268,7 +3347,8 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
             try:
                 _ask_organization_collaborate(port, org_fingerprint, text, out_dir)
             except KeyboardInterrupt:
-                print()
+                if _handle_repl_command_interrupt(interrupt_guard):
+                    break
             continue
 
         messages.append({"role": "user", "content": text})
@@ -3278,7 +3358,8 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
             else:
                 _ask_organization(port, org_fingerprint, messages)
         except KeyboardInterrupt:
-            print()
+            if _handle_repl_command_interrupt(interrupt_guard):
+                break
             continue
 
     print("対話モードを終了します。")
