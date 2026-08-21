@@ -6,6 +6,7 @@
 """
 
 import argparse
+import ast
 import json
 import logging
 import os
@@ -2170,6 +2171,62 @@ def _parse_review_verdict(answer: str) -> tuple:
     return True, ""
 
 
+# 仮の判断: 実機で、メソッドチェーンを繋げる際の括弧漏れによる
+# IndentationErrorが、LLMによる内容レビューで「問題なし」と誤判定され、
+# そのまま確定してしまう不具合が見つかった。関数名・データ形式の一致
+# といった「内容」の妥当性はLLMでなければ判断できないが、「そもそも
+# 構文として正しいPythonコードか」は`ast.parse`で機械的かつ確実に
+# 判定できる。機械的に検出できるものをわざわざLLMに判断させると、
+# 誤判定のリスクと問い合わせのコストの両方を無駄に払うことになるため、
+# 内容レビューより前に必ず構文チェックを通す関門を設けた。
+def _check_python_syntax(code: str) -> tuple:
+    """Pythonコードの構文を`ast.parse`で機械的にチェックする。
+    (構文が正しいかどうか, エラー内容の文字列(正しい場合は空文字列))
+    を返す。`IndentationError`は`SyntaxError`のサブクラスなので、
+    まとめて捕捉できる。
+    """
+    try:
+        ast.parse(code)
+    except SyntaxError as exc:
+        error_type = type(exc).__name__
+        if exc.lineno is not None:
+            detail = f"{error_type} ({exc.lineno}行目: {exc.msg})"
+        else:
+            detail = f"{error_type}: {exc.msg}"
+        return False, detail
+    return True, ""
+
+
+def _check_and_review_one_round(
+    filename: str, code: str, reviewer: dict, reviewer_own_filename: str, reviewer_own_code: str,
+    full_plan: str, org_fingerprint: str, round_label: str,
+) -> tuple:
+    """1回分の「構文チェック→(通れば)内容レビュー」を実行し、
+    (問題なしかどうか, 指摘内容)を返す。
+
+    仮の判断: 構文チェックは`.py`で終わるファイルにのみ適用する
+    (`ast.parse`はPython専用のため、他言語のファイルに適用すると
+    正しいコードを誤って構文エラー扱いしてしまう)。`.py`以外の
+    ファイルは構文チェックをスキップし、これまで通りLLMによる内容
+    レビューだけを行う。
+    """
+    if filename.endswith(".py"):
+        syntax_ok, syntax_detail = _check_python_syntax(code)
+        if syntax_ok:
+            print("[🔍 構文チェック: OK]")
+        else:
+            print(f"[❌ 構文チェック: {syntax_detail}]")
+            # 仮の判断: 構文エラーがある場合は、LLMによる内容レビューを
+            # 待たずに即座に「問題あり」として扱う。構文が壊れている
+            # コードをLLMに読ませて内容の妥当性を判断させても意味が無く、
+            # 機械的に検出できるエラーは機械的に弾く方が速く確実。
+            return False, f"構文エラーがあります: {syntax_detail}"
+
+    return _review_one_file(
+        filename, code, reviewer, reviewer_own_filename, reviewer_own_code, full_plan, org_fingerprint, round_label,
+    )
+
+
 def _review_one_file(
     filename: str, code: str, reviewer: dict, reviewer_own_filename: str, reviewer_own_code: str,
     full_plan: str, org_fingerprint: str, round_label: str,
@@ -2224,9 +2281,13 @@ def _review_and_fix_one_file(
     「修正後の再レビュー」という3ステップを直列に明示的に呼び出す構造に
     した。ループにして回数を変数でカウントする実装だと、条件分岐を
     間違えた場合に暴走するリスクが残るが、この構造なら最大2回のレビュー
-    (+その間の1回の修正)しか物理的に発生し得ない。
+    (+その間の1回の修正)しか物理的に発生し得ない。各「レビュー」は
+    実際には「構文チェック→(通れば)内容レビュー」の2段階
+    (`_check_and_review_one_round`)になっており、構文エラーが
+    残ったまま2回目の構文チェックも通らなければ、そこで打ち切られる
+    (=構文チェックの再試行も、この最大2回の枠内に収まる)。
     """
-    ok, feedback = _review_one_file(
+    ok, feedback = _check_and_review_one_round(
         filename, code, reviewer, reviewer_own_filename, reviewer_own_code, full_plan, org_fingerprint, "1回目のレビュー",
     )
     if ok:
@@ -2236,7 +2297,7 @@ def _review_and_fix_one_file(
     if fixed_code is None:
         return False
 
-    ok, _feedback = _review_one_file(
+    ok, _feedback = _check_and_review_one_round(
         filename, fixed_code, reviewer, reviewer_own_filename, reviewer_own_code, full_plan, org_fingerprint, "修正後の再レビュー",
     )
     return ok
