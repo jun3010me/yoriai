@@ -180,7 +180,7 @@ def test_completion_message_shows_actual_save_path():
         assert project_dir in output, f"保存先パスがログに表示されていません: {output}"
         assert os.path.join(project_dir, "storage.py") in output, output
         assert os.path.join(project_dir, "cli.py") in output, output
-        assert f"レビュー完了 (保存先: {project_dir})" in output, output
+        assert f"全タスク完了 (保存先: {project_dir})" in output, output
     finally:
         yoriai._fetch_org_snapshot = original_snapshot
         yoriai._stream_chat_from_candidate = original_stream
