@@ -135,8 +135,10 @@ def test_exit_and_quit_are_case_insensitive():
 def test_normal_input_still_reaches_mode_classification():
     """空入力・終了コマンド以外の通常の入力は、これまで通りモード判定に
     進むことを確認する(回帰検知: 判定ロジックそのものを壊していないか)。
+    複数行入力の仕様(tests/test_multiline_input.py参照)により、1行だけの
+    質問も空行での確定操作が必要になった点に合わせて入力列を調整した。
     """
-    output, calls = _run_repl_with_inputs(["富士山の標高は?", "exit"])
+    output, calls = _run_repl_with_inputs(["富士山の標高は?", "", "exit"])
     assert calls["classify"] == 1, calls
     assert calls["ask_single"] == 1, calls
     assert "[判断:" in output, output
