@@ -3803,10 +3803,29 @@ _BACKGROUND_QUEUED_NOTICE = "[⏳ 実行中の処理があるため、この依�
 # ---------------------------------------------------------------------------
 #
 # 対話モードの起動時の見た目を、Claude Code等のツールに近い洗練された
-# 印象にしたいという依頼を受けた。(1)シンプルなASCIIアートのロゴ、
+# 印象にしたいという依頼を受けた。(1)複数行にわたるASCIIアートのロゴ、
 # (2)情報量の多かった説明文を階層立てて簡潔に整理、(3)検出済みの
 # メンバー数の表示、(4)色付け(ただし色に対応しない環境でも崩れない)、
 # を実装する。
+#
+# 仮の判断(実機で報告された文字化け不具合への対応): 当初、この案内文は
+# `patch_stdout()`(バックグラウンドジョブの出力を安全に差し込むための
+# 仕組み)のコンテキスト内でprint()していたが、実機(Raspberry Pi 4への
+# SSH接続)で色付けのANSIエスケープシーケンスが`?[1m?[36m`のような
+# 文字列としてそのまま表示される不具合が報告された。原因を
+# `prompt_toolkit`のソースコードを読んで調査したところ、`patch_stdout()`
+# は既定(`raw=False`)では`Output.write()`という、意図せず端末制御
+# シーケンスを注入しないための安全な書き込み経路を使い、これは
+# `Vt100_Output`(実際の対話的端末に接続されている場合に選ばれる
+# 実装)ではESC文字(`\x1b`)を`?`に置換してしまうことが分かった
+# (該当ソースのコメント: "Removes vt100 escape codes. -- used for
+# safely writing text.")。この安全策自体は、LLMの応答テキストのような
+# 信頼できない出力に対しては望ましい(応答に紛れ込んだ端末制御
+# シーケンスで表示が乗っ取られることを防ぐ)ため、`patch_stdout()`
+# 全体を`raw=True`にする対応は避けた。代わりに、案内文(Yoriai自身が
+# 用意した、信頼できる固定テキスト)は`patch_stdout()`のコンテキストに
+# 入る前に(素の`sys.stdout`へ直接)出力するようにし、LLMの応答等は
+# 引き続き安全策の効いた経路のまま維持した。
 
 _ANSI_RESET = "\x1b[0m"
 _ANSI_BOLD = "\x1b[1m"
@@ -3817,19 +3836,22 @@ _ANSI_CYAN = "\x1b[36m"
 def _supports_ansi_color() -> bool:
     """色付け(ANSIエスケープシーケンス)を使ってよいかどうかを判定する。
 
-    仮の判断: (1)`NO_COLOR`環境変数(色付けを無効化する事実上の標準、
-    https://no-color.org/ )が設定されている、(2)`TERM=dumb`(色を含む
-    高度な端末制御シーケンスに対応しない最小構成の端末)、(3)標準出力が
-    端末に直接つながっていない(ファイルやパイプにリダイレクトされて
-    いる、`isatty()`が偽)、のいずれかに該当する場合は色付けを無効にする。
+    仮の判断: 以下のいずれかに該当する場合は色付けを無効にする。
+    (1)`NO_COLOR`環境変数(色付けを無効化する事実上の標準、
+    https://no-color.org/ )が設定されている。(2)`TERM`が未設定・空、
+    または`dumb`(色を含む高度な端末制御シーケンスに対応しない、
+    もしくは対応状況が不明な端末)。(3)標準出力が端末に直接つながって
+    いない(ファイルやパイプにリダイレクトされている、`isatty()`が偽)。
     これにより、色に対応しない・対応するかどうか不明な環境でも、
     エスケープシーケンスの断片がそのまま表示されて崩れることがない
-    (依頼の「色が使えない環境でも崩れずに表示できるようにしてほしい」
-    という要件への対応)。
+    (依頼の「誤検知をできるだけ避ける」「色が使えない環境でも崩れずに
+    表示できるようにしてほしい」という要件への対応)。`TERM`未設定を
+    追加で無効化対象にしたのは、対応状況が判定できない場合は安全側
+    (色を使わない)に倒すべきという判断による。
     """
     if os.environ.get("NO_COLOR"):
         return False
-    if os.environ.get("TERM") == "dumb":
+    if os.environ.get("TERM", "") in ("", "dumb"):
         return False
     try:
         return sys.stdout.isatty()
@@ -3843,7 +3865,65 @@ def _ansi(text: str, *codes: str, use_color: bool) -> str:
     return "".join(codes) + text + _ANSI_RESET
 
 
-_YORIAI_TAGLINE = "ローカルLLMエージェントの自律組織"
+def _display_width(text: str) -> int:
+    """半角=1・全角(日本語の仮名・漢字・絵文字等)=2として、おおよその
+    表示幅を計算する簡易的な基準(Unicode East Asian Widthの正式な
+    判定ではないが、ロゴの箱組みや案内文の80文字幅チェックには十分な
+    精度)。
+
+    仮の判断: 単純に「コードポイントがU+00FFより大きいかどうか」で
+    判定すると、罫線素片(╔╗╚╝═║等、U+2500-U+257F)まで全角(幅2)扱いに
+    なってしまい、実際のターミナル描画幅(半角1文字分)より過大に見積もる
+    (実機の80文字幅チェックで実際に検出した)。罫線素片は明示的に幅1
+    として扱い、それ以外の日本語の仮名・漢字・絵文字等の代表的な範囲を
+    幅2として扱う。
+    """
+    width = 0
+    for ch in text:
+        code = ord(ch)
+        if 0x2500 <= code <= 0x257F:
+            width += 1  # 罫線素片(╔╗╚╝═║等)
+        elif (
+            0x1100 <= code <= 0x115F      # ハングル字母
+            or 0x2E80 <= code <= 0xA4CF   # CJK部首・仮名・統合漢字等
+            or 0xAC00 <= code <= 0xD7A3   # ハングル音節
+            or 0xF900 <= code <= 0xFAFF   # CJK互換漢字
+            or 0xFF00 <= code <= 0xFF60   # 全角英数・全角記号
+            or 0xFFE0 <= code <= 0xFFE6   # 全角記号
+            or 0x1F000 <= code <= 0x1FFFF  # 絵文字を含む記号面
+            or 0x2600 <= code <= 0x27BF   # その他の記号・絵文字的記号(★⚠️✅等)
+            or 0x2B00 <= code <= 0x2BFF   # その他の記号・矢印
+        ):
+            width += 2
+        else:
+            width += 1
+    return width
+
+
+# 仮の判断: figlet風のブロック体ワードマーク。ユーザー自身が指定した
+# 具体的な図案をそのまま採用した(1文字ずれるだけで罫線の噛み合わせが
+# 崩れるため、値は一切加工せずリテラルとして固定する)。
+_YORIAI_LOGO_ART_LINES = (
+    "██╗   ██╗ ██████╗ ██████╗ ██╗ █████╗ ██╗",
+    "╚██╗ ██╔╝██╔═══██╗██╔══██╗██║██╔══██╗██║",
+    " ╚████╔╝ ██║   ██║██████╔╝██║███████║██║",
+    "  ╚██╔╝  ██║   ██║██╔══██╗██║██╔══██║██║",
+    "   ██║   ╚██████╔╝██║  ██║██║██║  ██║██║",
+    "   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝╚═╝",
+)
+_YORIAI_LOGO_RULE = "─" * 46
+_YORIAI_LOGO_SUBTITLE = "             G A T H E R  ·  C R E A T E"
+
+
+def _format_logo_lines(use_color: bool) -> list:
+    """複数行にわたるASCIIアートのロゴ(figlet風のブロック体ワードマーク+
+    区切り線+サブタイトル)を組み立てる。ブロック体部分をシアン、
+    区切り線を控えめな色、サブタイトルを太字にする。
+    """
+    lines = [_ansi(line, _ANSI_BOLD, _ANSI_CYAN, use_color=use_color) for line in _YORIAI_LOGO_ART_LINES]
+    lines.append(_ansi(_YORIAI_LOGO_RULE, _ANSI_DIM, use_color=use_color))
+    lines.append(_ansi(_YORIAI_LOGO_SUBTITLE, _ANSI_BOLD, use_color=use_color))
+    return lines
 
 
 def _count_org_members(port: int, org_fingerprint: str):
@@ -3869,18 +3949,15 @@ def _format_member_count_line(member_count) -> str:
 def _format_startup_banner(out_dir: str, member_count, use_color: bool) -> str:
     """対話モード起動時に表示する案内文を組み立てる。
 
-    仮の判断: ロゴは装飾を抑えたシンプルな1行のワードマークにとどめた
-    (依頼の「凝りすぎず」という要件、および複数行の文字絵は半角/全角
-    文字が混在すると実機ごとのフォント幅の差異で見た目が崩れやすい
-    ため)。以前は1行1トピックの長い説明文が並んでいたが、「基本操作」
-    「コマンド」の2つの見出しの下にまとめることで、階層立てて簡潔に
-    整理した。
+    仮の判断: ロゴ(`_format_logo_lines`)の下に、メンバー数・「基本操作」
+    「コマンド」の2つの見出しをまとめて表示する。以前は1行1トピックの
+    長い説明文が並んでいたが、見出しの下にまとめることで階層立てて
+    簡潔に整理した。
     """
-    lines = [
-        _ansi("Y O R I A I  ·  寄合", _ANSI_BOLD, _ANSI_CYAN, use_color=use_color),
-        _ansi(_YORIAI_TAGLINE, _ANSI_DIM, use_color=use_color),
-        _format_member_count_line(member_count),
-        "",
+    lines = list(_format_logo_lines(use_color))
+    lines.append(_format_member_count_line(member_count))
+    lines.append("")
+    lines += [
         _ansi("基本操作", _ANSI_BOLD, use_color=use_color),
         "  Enterで送信、Shift+Enterで改行",
         "  上下矢印キーで、入力済みの行を自由に編集できます",
@@ -3904,11 +3981,22 @@ def _format_startup_banner(out_dir: str, member_count, use_color: bool) -> str:
 
 
 def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
-    # 仮の判断: 対話モード全体を`patch_stdout()`で包む。バックグラウンド
-    # ジョブ(協業モード等)がメインスレッドの入力待ち中にprint()する際、
-    # このコンテキストが無いと出力が入力中の行を破壊してしまう
-    # (prompt_toolkit公式が「別スレッドから安全にprintする」ために提供する
-    # 仕組み)。
+    # 仮の判断(実機で報告された文字化け不具合への対応): 起動時の案内文
+    # (ロゴ等)は、`patch_stdout()`のコンテキストに入る前に、素の
+    # `sys.stdout`へ直接print()する。理由は`_format_logo_lines`の
+    # コメントを参照。`patch_stdout()`(バックグラウンドジョブの出力を
+    # 安全に差し込むための仕組み)は、この後のセッション本体
+    # (入力ループ・LLMの応答・バックグラウンドジョブの出力)にのみ適用する。
+    print()
+    member_count = _count_org_members(port, org_fingerprint)
+    print(_format_startup_banner(out_dir, member_count, _supports_ansi_color()))
+    print()
+
+    # 仮の判断: 対話モードのセッション本体を`patch_stdout()`で包む。
+    # バックグラウンドジョブ(協業モード等)がメインスレッドの入力待ち中に
+    # print()する際、このコンテキストが無いと出力が入力中の行を破壊して
+    # しまう(prompt_toolkit公式が「別スレッドから安全にprintする」
+    # ために提供する仕組み)。
     #
     # 仮の判断: `patch_stdout()`は、内部で`prompt_toolkit`の(プロセス
     # 全体で共有される)既定の`AppSession`が持つ`Output`オブジェクトへ
@@ -3921,11 +4009,6 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
     # 出力が最初の呼び出し時点の(既に閉じられた)出力先に書き込まれて
     # 消えてしまう不具合が実際に発生した。
     with create_app_session(), patch_stdout():
-        print()
-        member_count = _count_org_members(port, org_fingerprint)
-        print(_format_startup_banner(out_dir, member_count, _supports_ansi_color()))
-        print()
-
         # 仮の判断: 会話履歴(messages)はこのセッション内でのみ保持し、終了したら破棄する。
         # 次回起動時に前回の会話を引き継ぐ機能は今回のスコープ外。
         messages = []
