@@ -38,7 +38,7 @@ def _read_with_keys(keystrokes: str):
     with create_pipe_input() as pipe_input:
         session = PromptSession(input=pipe_input, output=DummyOutput())
         pipe_input.send_text(keystrokes)
-        return yoriai._read_multiline_input(session)
+        return yoriai._read_multiline_input(session, yoriai._DoubleInterruptGuard())
 
 
 def test_continuation_lines_have_no_prefix():
