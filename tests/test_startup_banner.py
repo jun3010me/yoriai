@@ -148,14 +148,14 @@ def test_display_width_treats_japanese_text_as_full_width():
     assert yoriai._display_width("ローカル") == 8
 
 
-def test_logo_lines_are_all_the_same_display_width():
-    """`_format_logo_lines`の箱組みが、罫線・中央揃えされた各行すべてで
-    表示幅が一致していることを確認する(幅がずれていると、箱の右端の
-    罫線が縦に揃わず見た目が崩れる)。
+def test_logo_lines_all_stay_within_80_columns():
+    """`_format_logo_lines`(figlet風のブロック体ワードマーク)の各行が、
+    ターミナルの標準的な横幅(80文字)に収まっていることを確認する。
     """
     lines = yoriai._format_logo_lines(use_color=False)
-    widths = {yoriai._display_width(line) for line in lines}
-    assert len(widths) == 1, f"ロゴの各行の表示幅が揃っていません: {[(yoriai._display_width(l), l) for l in lines]}"
+    for line in lines:
+        width = yoriai._display_width(line)
+        assert width <= 80, f"80文字を超える行があります({width}): {line!r}"
 
 
 def test_banner_without_color_contains_no_ansi_escape_codes():
@@ -170,7 +170,8 @@ def test_banner_with_color_contains_ansi_escape_codes():
 
 def test_banner_includes_logo_and_member_count():
     banner = yoriai._format_startup_banner(".", 2, use_color=False)
-    assert "YORIAI" in banner.replace(" ", "") or "Yoriai" in banner or "寄合" in banner
+    assert "GATHER" in banner.replace(" ", "")
+    assert "CREATE" in banner.replace(" ", "")
     assert "2台" in banner
 
 
@@ -350,7 +351,7 @@ def main():
         test_banner_stays_within_80_columns,
         test_display_width_treats_box_drawing_characters_as_half_width,
         test_display_width_treats_japanese_text_as_full_width,
-        test_logo_lines_are_all_the_same_display_width,
+        test_logo_lines_all_stay_within_80_columns,
         test_banner_without_color_contains_no_ansi_escape_codes,
         test_banner_with_color_contains_ansi_escape_codes,
         test_banner_includes_logo_and_member_count,

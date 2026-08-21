@@ -3900,55 +3900,30 @@ def _display_width(text: str) -> int:
     return width
 
 
-def _center_display(text: str, width: int) -> str:
-    """`text`を(表示幅換算で)`width`の中央に配置し、両側を半角スペースで
-    埋める。ANSIエスケープシーケンスを含まないプレーンな文字列に対して
-    使うこと(色付けは、中央揃え済みの文字列に対して後から適用する)。
-    """
-    pad = max(width - _display_width(text), 0)
-    left = pad // 2
-    right = pad - left
-    return " " * left + text + " " * right
-
-
-_YORIAI_TAGLINE = "ローカルLLMエージェントの自律組織"
-
-# 仮の判断: ロゴの箱の内側の表示幅。80文字幅のターミナルに余裕を持って
-# 収まるサイズ(箱の左右の罫線・パディングを含めた全体の表示幅は
-# `_LOGO_BOX_INNER_WIDTH + 4`)にした。
-_LOGO_BOX_INNER_WIDTH = 50
+# 仮の判断: figlet風のブロック体ワードマーク。ユーザー自身が指定した
+# 具体的な図案をそのまま採用した(1文字ずれるだけで罫線の噛み合わせが
+# 崩れるため、値は一切加工せずリテラルとして固定する)。
+_YORIAI_LOGO_ART_LINES = (
+    "██╗   ██╗ ██████╗ ██████╗ ██╗ █████╗ ██╗",
+    "╚██╗ ██╔╝██╔═══██╗██╔══██╗██║██╔══██╗██║",
+    " ╚████╔╝ ██║   ██║██████╔╝██║███████║██║",
+    "  ╚██╔╝  ██║   ██║██╔══██╗██║██╔══██║██║",
+    "   ██║   ╚██████╔╝██║  ██║██║██║  ██║██║",
+    "   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝╚═╝",
+)
+_YORIAI_LOGO_RULE = "─" * 46
+_YORIAI_LOGO_SUBTITLE = "             G A T H E R  ·  C R E A T E"
 
 
 def _format_logo_lines(use_color: bool) -> list:
-    """複数行にわたるASCIIアートのロゴ(二重罫線の箱で囲んだワードマーク)
-    を組み立てる。
-
-    仮の判断: 文字の形を線で描く本格的な(figlet風の)複数行ブロック体は
-    採用しなかった。「YORIAI」というローマ字と「寄合」という全角文字を
-    1つの図案に組み込む場合、全角文字はターミナル上で半角の2倍の幅を
-    占めるため、手作業でブロック体の文字を組むと実機ごとのフォント・
-    文字幅の差異で意図した見た目にならないリスクがある。代わりに、
-    罫線で囲んだ箱の中にワードマークを表示幅ベースで中央揃えする方式
-    (`_center_display`)にすることで、この幅のズレをコード側で
-    プログラム的に保証しつつ、複数行(5〜8行程度)にわたる見栄えのする
-    ロゴという依頼の要件を満たした。
+    """複数行にわたるASCIIアートのロゴ(figlet風のブロック体ワードマーク+
+    区切り線+サブタイトル)を組み立てる。ブロック体部分をシアン、
+    区切り線を控えめな色、サブタイトルを太字にする。
     """
-    top = "╔" + "═" * (_LOGO_BOX_INNER_WIDTH + 2) + "╗"
-    bottom = "╚" + "═" * (_LOGO_BOX_INNER_WIDTH + 2) + "╝"
-
-    def boxed(plain_text: str, *codes: str) -> str:
-        centered = _center_display(plain_text, _LOGO_BOX_INNER_WIDTH)
-        content = _ansi(centered, *codes, use_color=use_color) if codes else centered
-        return "║ " + content + " ║"
-
-    return [
-        _ansi(top, _ANSI_CYAN, use_color=use_color),
-        boxed(""),
-        boxed("Y O R I A I   ·   寄合", _ANSI_BOLD, _ANSI_CYAN),
-        boxed(_YORIAI_TAGLINE, _ANSI_DIM),
-        boxed(""),
-        _ansi(bottom, _ANSI_CYAN, use_color=use_color),
-    ]
+    lines = [_ansi(line, _ANSI_BOLD, _ANSI_CYAN, use_color=use_color) for line in _YORIAI_LOGO_ART_LINES]
+    lines.append(_ansi(_YORIAI_LOGO_RULE, _ANSI_DIM, use_color=use_color))
+    lines.append(_ansi(_YORIAI_LOGO_SUBTITLE, _ANSI_BOLD, use_color=use_color))
+    return lines
 
 
 def _count_org_members(port: int, org_fingerprint: str):
