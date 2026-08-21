@@ -258,12 +258,15 @@ def test_collect_review_answer_with_read_file_caps_at_max_calls():
 def test_review_one_file_uses_read_file_powered_review_answer():
     """`_review_one_file`が`_collect_review_answer_with_read_file`
     (out_dirを都度読み直す経路)を使ってレビューを依頼していることを確認する。
+    あわせて、並行スレッドの出力の判別可能性の修正(バグ2)とのマージ後、
+    `print_lock`/`tag`(タグはファイル名)が正しく渡されることも確認する。
     """
     captured = {}
 
-    def fake_collect(candidate, org_fingerprint, messages, out_dir):
+    def fake_collect(candidate, org_fingerprint, messages, out_dir, print_lock=None, tag=None):
         captured["out_dir"] = out_dir
         captured["prompt"] = messages[0]["content"]
+        captured["tag"] = tag
         return "問題なし", None
 
     original = yoriai._collect_review_answer_with_read_file
@@ -279,6 +282,7 @@ def test_review_one_file_uses_read_file_powered_review_answer():
     assert ok is True and feedback == "", (ok, feedback)
     assert captured["out_dir"] == "/tmp/some-project-dir", captured
     assert "cli.py" in captured["prompt"], captured
+    assert captured["tag"] == "cli.py", captured
 
 
 def test_collect_review_answer_with_read_file_shows_read_progress_message():

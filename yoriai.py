@@ -1780,6 +1780,14 @@ def _collect_answer_from_candidate(candidate: dict, org_fingerprint: str, messag
     複数候補の出力が入り交じって読めなくなってしまう。そのため、この関数は
     ストリーミング自体はバックグラウンドで最後まで受信しきり、完成した
     回答をまとめて呼び出し元に返す(表示は呼び出し元が候補ごとに区切って行う)。
+
+    仮の判断(マージ時の整理): 以前はレビュー専用のavailable_files引数と、
+    read_fileのtool_call進捗をその場で表示するロジックをこの関数が
+    持っていたが、read_fileの実行方式を「実装依頼元がその場でディスクを
+    読み直す」設計に変更したことに伴い、その進捗表示は
+    `_collect_review_answer_with_read_file`側の責務に移った。この関数は
+    「1候補に問い合わせて回答を集めるだけ」という元のシンプルな役割に戻し、
+    印字は一切行わない(呼び出し元が候補ごとに区切って表示する)。
     """
     answer_parts = []
     error = None
@@ -1824,7 +1832,10 @@ def _read_project_file_fresh(out_dir: str, filename: str) -> str:
     return json.dumps({"filename": filename, "exists": True, "content": content}, ensure_ascii=False)
 
 
-def _collect_review_answer_with_read_file(candidate: dict, org_fingerprint: str, messages: list, out_dir: str):
+def _collect_review_answer_with_read_file(
+    candidate: dict, org_fingerprint: str, messages: list, out_dir: str,
+    print_lock: threading.Lock = None, tag: str = None,
+):
     """レビュー専用: read_fileツールの呼び出しには、実装依頼元である
     自分自身がその場で`out_dir`を読み直して応答し、会話を継続する
     (candidateのキッチンプロセスにはread_fileを実行させない)。
@@ -1836,6 +1847,11 @@ def _collect_review_answer_with_read_file(candidate: dict, org_fingerprint: str,
     見える。この呼び出しごとにout_dirを読み直す(_read_project_file_fresh)
     ため、前回のラウンド以降に他のワーカースレッドが完成させたファイルも
     正しく反映される。
+
+    `print_lock`/`tag`(タスクキュー方式専用)を渡すと、read_fileの
+    呼び出し進捗表示も`_print_tagged`でタグ付き・ロック保護付きに
+    出力され、他のワーカースレッドの出力と混ざらない。渡さない場合は
+    タグとしてcandidateのラベルを使い、ロックなしで出力する。
     """
     messages = list(messages)
     read_file_calls_used = 0
@@ -1874,7 +1890,10 @@ def _collect_review_answer_with_read_file(candidate: dict, org_fingerprint: str,
             if tool_name == READ_FILE_TOOL_NAME and read_file_calls_used < MAX_READ_FILE_CALLS_PER_REVIEW:
                 read_file_calls_used += 1
                 filename = _extract_read_file_tool_filename(tool_call.get("function", {}).get("arguments"))
-                print(f"\n[📖 {candidate['label']} が {filename or '他のファイル'} を読みに行っています...]")
+                _print_tagged(
+                    print_lock, tag or candidate["label"],
+                    f"[📖 {candidate['label']} が {filename or '他のファイル'} を読みに行っています...]",
+                )
                 result = _read_project_file_fresh(out_dir, filename)
             else:
                 result = json.dumps({
@@ -2561,9 +2580,47 @@ def _check_python_syntax(code: str) -> tuple:
     return True, ""
 
 
+# ---------------------------------------------------------------------------
+# 並行実行中のスレッドの出力が入り乱れないようにするための共通処理
+# ---------------------------------------------------------------------------
+#
+# タスクキュー方式では複数のワーカースレッドが同時に実装・レビューを
+# 進めるため、素朴にprint()を個別に呼ぶと、あるタスクの出力の途中に
+# 別のタスクの出力が挟まり、画面上でどちらの結果か判別できなくなる
+# 不具合が実機で報告された(例: cli.pyのレビュー開始の直後に、別ファイル・
+# 別担当者のutils.pyのレビュー結果が出てきてしまう)。
+
+def _print_tagged(print_lock: threading.Lock, tag: str, text: str) -> None:
+    """`text`の各行の先頭に`[tag]`を付けたうえで、`print_lock`を保持した
+    まま1回のprint()呼び出しでまとめて出力する。
+
+    仮の判断: (1)関連する複数行をこの関数の呼び出し1回にまとめ、
+    print_lockを保持している間に1回のprint()で書き出すことで、
+    「ひとまとまりの出力」(例: 複数行にわたるコードのプレビュー)が
+    他スレッドの出力によって分断されないようにする。(2)すべての行の
+    先頭に対象ファイル名(通常はタスクを一意に識別できるファイル名を
+    そのまま使う)を付けることで、たとえ別タスクのブロックが直後に
+    続いても、どちらのタスクの行かを1行単位でも判別できるようにする。
+    ネットワーク応答待ちなどブロッキングするI/Oの間はロックを保持せず、
+    実際にprintする直前だけロックを取る(呼び出し元がI/Oを待っている間は
+    ロックの外)ため、ワーカースレッド同士の並行性は損なわれない。
+
+    仮の判断: `print_lock`は`None`でもよい(この関数を含む一連のレビュー
+    関数は、タスクキュー方式(複数スレッドが並行実行)だけでなく、
+    既存のテストのように単体で直接呼び出されることもあるため)。`None`の
+    場合はロックを取らずにタグ付きテキストだけ出力する。
+    """
+    tagged = "\n".join(f"[{tag}] {line}" for line in text.split("\n"))
+    if print_lock is not None:
+        with print_lock:
+            print(tagged)
+    else:
+        print(tagged)
+
+
 def _check_and_review_one_round(
     filename: str, code: str, reviewer: dict, reviewer_own_filename: str, reviewer_own_code: str,
-    full_plan: str, org_fingerprint: str, round_label: str, out_dir: str,
+    full_plan: str, org_fingerprint: str, round_label: str, out_dir: str, print_lock: threading.Lock = None,
 ) -> tuple:
     """1回分の「構文チェック→(通れば)内容レビュー」を実行し、
     (問題なしかどうか, 指摘内容)を返す。
@@ -2577,9 +2634,9 @@ def _check_and_review_one_round(
     if filename.endswith(".py"):
         syntax_ok, syntax_detail = _check_python_syntax(code)
         if syntax_ok:
-            print("[🔍 構文チェック: OK]")
+            _print_tagged(print_lock, filename, "[🔍 構文チェック: OK]")
         else:
-            print(f"[❌ 構文チェック: {syntax_detail}]")
+            _print_tagged(print_lock, filename, f"[❌ 構文チェック: {syntax_detail}]")
             # 仮の判断: 構文エラーがある場合は、LLMによる内容レビューを
             # 待たずに即座に「問題あり」として扱う。構文が壊れている
             # コードをLLMに読ませて内容の妥当性を判断させても意味が無く、
@@ -2587,13 +2644,13 @@ def _check_and_review_one_round(
             return False, f"構文エラーがあります: {syntax_detail}"
 
     return _review_one_file(
-        filename, code, reviewer, reviewer_own_filename, reviewer_own_code, full_plan, org_fingerprint, round_label, out_dir,
+        filename, code, reviewer, reviewer_own_filename, reviewer_own_code, full_plan, org_fingerprint, round_label, out_dir, print_lock,
     )
 
 
 def _review_one_file(
     filename: str, code: str, reviewer: dict, reviewer_own_filename: str, reviewer_own_code: str,
-    full_plan: str, org_fingerprint: str, round_label: str, out_dir: str,
+    full_plan: str, org_fingerprint: str, round_label: str, out_dir: str, print_lock: threading.Lock = None,
 ) -> tuple:
     """1回分のレビューを実行し、(問題なしかどうか, 指摘内容)を返す。
     問い合わせ自体が失敗した場合も「問題あり」として扱う(暴走防止のため
@@ -2606,46 +2663,50 @@ def _review_one_file(
     開始後に他のワーカースレッドが完成させたファイルも正しく反映される
     (_collect_review_answer_with_read_file参照)。
     """
-    print(f"[🔎 {round_label}] {reviewer['label']} が {filename} をレビューしています...")
+    _print_tagged(print_lock, filename, f"[🔎 {round_label}] {reviewer['label']} が {filename} をレビューしています...")
     prompt = _build_review_prompt(filename, code, reviewer_own_filename, reviewer_own_code, full_plan)
     answer, error = _collect_review_answer_with_read_file(
         reviewer, org_fingerprint, [{"role": "user", "content": prompt}], out_dir,
+        print_lock=print_lock, tag=filename,
     )
     if error or not answer:
         message = error or "応答がありませんでした"
-        print(f"[{reviewer['label']}が{filename}をレビュー] 問い合わせに失敗しました: {message}")
+        _print_tagged(print_lock, filename, f"[{reviewer['label']}が{filename}をレビュー] 問い合わせに失敗しました: {message}")
         return False, f"レビューへの問い合わせに失敗しました: {message}"
 
     ok, feedback = _parse_review_verdict(answer)
     if ok:
-        print(f"[{reviewer['label']}が{filename}をレビュー] 問題なし")
+        _print_tagged(print_lock, filename, f"[{reviewer['label']}が{filename}をレビュー] 問題なし")
     else:
-        print(f"[{reviewer['label']}が{filename}をレビュー] 問題あり: {feedback}")
+        _print_tagged(print_lock, filename, f"[{reviewer['label']}が{filename}をレビュー] 問題あり: {feedback}")
     return ok, feedback
 
 
-def _request_fix(filename: str, code: str, feedback: str, owner: dict, full_plan: str, org_fingerprint: str, out_dir: str):
+def _request_fix(
+    filename: str, code: str, feedback: str, owner: dict, full_plan: str, org_fingerprint: str, out_dir: str,
+    print_lock: threading.Lock = None,
+):
     """レビューで指摘された内容を担当メンバーに伝え、修正版のコードを
     取得して保存する。修正後のコード文字列を返し、失敗時はNoneを返す。
     """
-    print(f"[🔧 {owner['label']} に {filename} の修正を依頼しています...]")
+    _print_tagged(print_lock, filename, f"[🔧 {owner['label']} に {filename} の修正を依頼しています...]")
     prompt = _build_fix_prompt(filename, code, feedback, full_plan)
     answer, error = _collect_answer_from_candidate(owner, org_fingerprint, [{"role": "user", "content": prompt}])
     if error or not answer:
-        print(f"  → 修正依頼への問い合わせに失敗しました: {error or '応答がありませんでした'}")
+        _print_tagged(print_lock, filename, f"  → 修正依頼への問い合わせに失敗しました: {error or '応答がありませんでした'}")
         return None
 
     fixed_code = _extract_code_from_answer(answer)
     dest_path = os.path.join(out_dir, filename)
     with open(dest_path, "w", encoding="utf-8") as f:
         f.write(fixed_code)
-    print(f"[💾 修正版の {dest_path} を保存しました (担当: {owner['label']})]")
+    _print_tagged(print_lock, filename, f"[💾 修正版の {dest_path} を保存しました (担当: {owner['label']})]")
     return fixed_code
 
 
 def _review_and_fix_one_file(
     filename: str, owner: dict, code: str, reviewer: dict, reviewer_own_filename: str, reviewer_own_code: str,
-    full_plan: str, org_fingerprint: str, out_dir: str,
+    full_plan: str, org_fingerprint: str, out_dir: str, print_lock: threading.Lock = None,
 ) -> bool:
     """1ファイル分のレビュー→(必要なら)修正→再レビューを行い、最終的に
     「問題なし」になったかどうかを返す。
@@ -2659,19 +2720,23 @@ def _review_and_fix_one_file(
     (`_check_and_review_one_round`)になっており、構文エラーが
     残ったまま2回目の構文チェックも通らなければ、そこで打ち切られる
     (=構文チェックの再試行も、この最大2回の枠内に収まる)。
+
+    `print_lock`(タスクキュー方式専用)を渡すと、このファイルに関する
+    レビュー・修正の全出力に`filename`のタグが付き、他のワーカー
+    スレッドの出力と混ざらないよう1ブロックずつまとめて出力される。
     """
     ok, feedback = _check_and_review_one_round(
-        filename, code, reviewer, reviewer_own_filename, reviewer_own_code, full_plan, org_fingerprint, "1回目のレビュー", out_dir,
+        filename, code, reviewer, reviewer_own_filename, reviewer_own_code, full_plan, org_fingerprint, "1回目のレビュー", out_dir, print_lock,
     )
     if ok:
         return True
 
-    fixed_code = _request_fix(filename, code, feedback, owner, full_plan, org_fingerprint, out_dir)
+    fixed_code = _request_fix(filename, code, feedback, owner, full_plan, org_fingerprint, out_dir, print_lock)
     if fixed_code is None:
         return False
 
     ok, _feedback = _check_and_review_one_round(
-        filename, fixed_code, reviewer, reviewer_own_filename, reviewer_own_code, full_plan, org_fingerprint, "修正後の再レビュー", out_dir,
+        filename, fixed_code, reviewer, reviewer_own_filename, reviewer_own_code, full_plan, org_fingerprint, "修正後の再レビュー", out_dir, print_lock,
     )
     return ok
 
@@ -2764,18 +2829,19 @@ def _run_collaborative_task_queue(
                 return
             (filename, content), remaining_after = popped
 
-            with print_lock:
-                remaining_desc = ", ".join(fn for fn, _ in remaining_after) if remaining_after else "なし"
-                if is_first:
-                    print(
-                        f"[📋 タスクキュー: {candidate['label']} に {filename} を割り当てました "
-                        f"(残り{len(remaining_after)}件: {remaining_desc})]"
-                    )
-                else:
-                    print(
-                        f"[🙌 {candidate['label']} の手が空いたため、次のタスク {filename} を割り当てます "
-                        f"(残り{len(remaining_after)}件: {remaining_desc})]"
-                    )
+            remaining_desc = ", ".join(fn for fn, _ in remaining_after) if remaining_after else "なし"
+            if is_first:
+                _print_tagged(
+                    print_lock, filename,
+                    f"[📋 タスクキュー: {candidate['label']} に {filename} を割り当てました "
+                    f"(残り{len(remaining_after)}件: {remaining_desc})]",
+                )
+            else:
+                _print_tagged(
+                    print_lock, filename,
+                    f"[🙌 {candidate['label']} の手が空いたため、次のタスク {filename} を割り当てます "
+                    f"(残り{len(remaining_after)}件: {remaining_desc})]",
+                )
             is_first = False
 
             _set_task_status(checklist, filename, "impl", _TASK_STATUS_IN_PROGRESS)
@@ -2783,13 +2849,17 @@ def _run_collaborative_task_queue(
             answer, error = _collect_answer_from_candidate(
                 candidate, org_fingerprint, [{"role": "user", "content": request_text}],
             )
-            with print_lock:
-                print()
-                print(f"--- {filename} ← {candidate['label']} (モデル: {candidate['model']}) ---")
-                if error or not answer:
-                    print(f"(問い合わせに失敗しました: {error or '応答なし'})")
-                else:
-                    print(answer)
+            # 仮の判断: ヘッダー行・回答本文(複数行になりうる)をまとめて
+            # 1つの文字列として組み立ててから_print_taggedに渡すことで、
+            # このタスクの実装結果プレビュー全体が1回のロック取得・1回の
+            # print()で出力され、他のワーカースレッドの出力によって
+            # 分断されないようにする。
+            preview_lines = [f"--- {filename} ← {candidate['label']} (モデル: {candidate['model']}) ---"]
+            if error or not answer:
+                preview_lines.append(f"(問い合わせに失敗しました: {error or '応答なし'})")
+            else:
+                preview_lines.append(answer)
+            _print_tagged(print_lock, filename, "\n".join(preview_lines))
 
             if error or not answer:
                 logger.warning(
@@ -2804,14 +2874,15 @@ def _run_collaborative_task_queue(
             dest_path = os.path.join(project_dir, filename)
             with open(dest_path, "w", encoding="utf-8") as f:
                 f.write(code)
-            with print_lock:
-                print(f"[💾 {dest_path} に保存しました (担当: {candidate['label']})]")
+            _print_tagged(print_lock, filename, f"[💾 {dest_path} に保存しました (担当: {candidate['label']})]")
             _set_task_status(checklist, filename, "impl", _TASK_STATUS_COMPLETED)
 
             reviewer = pick_reviewer(candidate)
             if reviewer is None:
-                with print_lock:
-                    print(f"[⚠️ {filename} のレビュー担当者がいません(メンバーが1台のみのため、レビューはスキップされます)]")
+                _print_tagged(
+                    print_lock, filename,
+                    f"[⚠️ {filename} のレビュー担当者がいません(メンバーが1台のみのため、レビューはスキップされます)]",
+                )
                 continue
 
             with queue_lock:
@@ -2826,7 +2897,7 @@ def _run_collaborative_task_queue(
             ok = _review_and_fix_one_file(
                 filename=filename, owner=candidate, code=code,
                 reviewer=reviewer, reviewer_own_filename=reviewer_own_filename, reviewer_own_code=reviewer_own_code,
-                full_plan=full_plan, org_fingerprint=org_fingerprint, out_dir=project_dir,
+                full_plan=full_plan, org_fingerprint=org_fingerprint, out_dir=project_dir, print_lock=print_lock,
             )
             if ok:
                 _set_task_status(checklist, filename, "review", _TASK_STATUS_COMPLETED)
