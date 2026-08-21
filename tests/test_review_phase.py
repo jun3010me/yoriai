@@ -70,7 +70,7 @@ def test_review_phase_completes_when_both_reviewers_report_no_issues():
     # storage.pyの担当外(junnoMac-mini)がstorage.pyを、cli.pyの担当外
     # (MacStudio自身)がcli.pyをレビューする、の2回だけ問い合わせが飛ぶこと。
     assert review_calls == ["junnoMac-mini", "MacStudio(自分)"], review_calls
-    assert "[✅ レビュー完了]" in output, output
+    assert "✅ レビュー完了" in output, output
     assert "未解決" not in output, output
     assert "修正を依頼しています" not in output, "問題なしの場合は修正依頼を送らないはずです"
 
@@ -123,7 +123,7 @@ def test_review_phase_requests_fix_and_resolves_after_rereview():
     assert "1回目のレビュー" in output, output
     assert "修正後の再レビュー" in output, output
     assert "修正を依頼しています" in output, output
-    assert "[✅ レビュー完了]" in output, (
+    assert "✅ レビュー完了" in output, (
         f"再レビューで問題なしになったので最終的に完了扱いになるはずです: {output}"
     )
     assert "未解決" not in output, output
@@ -168,8 +168,8 @@ def test_review_phase_reports_unresolved_when_issue_persists_after_two_rounds():
         f"レビューは初回+再レビューの2回で打ち切られるはずです(実際: {review_round_count['storage.py']}回)"
     )
     assert fix_call_count["n"] == 1, "修正依頼は初回レビュー後の1回だけのはずです"
-    assert "[⚠️ 未解決の指摘が残っています: storage.py]" in output, output
-    assert "[✅ レビュー完了]" not in output, output
+    assert "未解決の指摘が残っています: storage.py" in output, output
+    assert "✅ レビュー完了" not in output, output
 
 
 def test_review_phase_skipped_when_fewer_than_two_files_implemented():
