@@ -26,6 +26,7 @@ import os
 import shutil
 import sys
 import tempfile
+import types
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import yoriai  # noqa: E402
@@ -39,12 +40,113 @@ _NODE_AVAILABLE = shutil.which("node") is not None
 # check_htmlのテスト用ヘルパー
 # ---------------------------------------------------------------------------
 
-def _uninstall_fake_playwright():
-    """他のテストファイルがsys.modulesにplaywrightの偽物を残していないことを
-    保証する(「実機にPlaywrightが無い」ケースを確実にテストするため)。
+class _FakeConsoleMessage:
+    def __init__(self, type_, text):
+        self.type = type_
+        self.text = text
+
+
+class _FakePage:
+    """`_check_html_with_playwright`が実際に呼ぶAPI(on/goto/wait_for_timeout/
+    evaluate)だけを最小限に模擬する。console_messages・page_errorsは
+    goto()の時点でコールバックに流し込み、evaluate_resultはpage.evaluate()の
+    戻り値として使う(実際のJS実行はしない。ロジック側の組み立てだけを
+    検証する。ブラウザでの実際の動作確認は手元で別途行った)。
     """
-    sys.modules.pop("playwright", None)
-    sys.modules.pop("playwright.sync_api", None)
+
+    def __init__(self, console_messages, page_errors, evaluate_result):
+        self._console_messages = console_messages
+        self._page_errors = page_errors
+        self._evaluate_result = evaluate_result
+        self._console_cb = None
+        self._pageerror_cb = None
+
+    def on(self, event, callback):
+        if event == "console":
+            self._console_cb = callback
+        elif event == "pageerror":
+            self._pageerror_cb = callback
+
+    def goto(self, url, timeout=None):
+        for msg in self._console_messages:
+            if self._console_cb:
+                self._console_cb(msg)
+        for err in self._page_errors:
+            if self._pageerror_cb:
+                self._pageerror_cb(err)
+
+    def wait_for_timeout(self, ms):
+        pass
+
+    def evaluate(self, script):
+        return self._evaluate_result
+
+
+class _FakeBrowser:
+    def __init__(self, console_messages, page_errors, evaluate_result):
+        self._console_messages = console_messages
+        self._page_errors = page_errors
+        self._evaluate_result = evaluate_result
+
+    def new_page(self):
+        return _FakePage(self._console_messages, self._page_errors, self._evaluate_result)
+
+    def close(self):
+        pass
+
+
+class _FakeChromium:
+    def __init__(self, console_messages, page_errors, evaluate_result):
+        self._console_messages = console_messages
+        self._page_errors = page_errors
+        self._evaluate_result = evaluate_result
+
+    def launch(self, timeout=None, args=None):
+        return _FakeBrowser(self._console_messages, self._page_errors, self._evaluate_result)
+
+
+class _FakePlaywrightContext:
+    def __init__(self, console_messages, page_errors, evaluate_result):
+        self.chromium = _FakeChromium(console_messages, page_errors, evaluate_result)
+
+
+class _FakeSyncPlaywrightCM:
+    def __init__(self, console_messages, page_errors, evaluate_result):
+        self._console_messages = console_messages
+        self._page_errors = page_errors
+        self._evaluate_result = evaluate_result
+
+    def __enter__(self):
+        return _FakePlaywrightContext(self._console_messages, self._page_errors, self._evaluate_result)
+
+    def __exit__(self, *args):
+        return False
+
+
+def _install_fake_playwright(console_messages=(), page_errors=(), evaluate_result=None):
+    fake_playwright_pkg = types.ModuleType("playwright")
+    fake_sync_api = types.ModuleType("playwright.sync_api")
+    fake_sync_api.sync_playwright = lambda: _FakeSyncPlaywrightCM(
+        list(console_messages), list(page_errors), evaluate_result if evaluate_result is not None else [],
+    )
+    fake_playwright_pkg.sync_api = fake_sync_api
+    sys.modules["playwright"] = fake_playwright_pkg
+    sys.modules["playwright.sync_api"] = fake_sync_api
+
+def _uninstall_fake_playwright():
+    """「実機にPlaywrightが無い」ケースを確実に再現する。
+
+    仮の判断: 単に`sys.modules`から取り除くだけでは、pip等で実際に
+    playwrightパッケージがインストールされている環境では次のimportで
+    普通に見つかってしまい、「無い」ケースを再現できない
+    (実機の検証作業でこの環境にplaywrightを一時インストールした際に
+    実際に踏んだ)。`sys.modules[name] = None`はPythonのimportの仕組み上、
+    以後のimportを確実にImportErrorにする方法のため、実際に
+    パッケージがインストールされているかどうかに関わらず「無い」ケースを
+    決定的に再現できる。
+    """
+    sys.modules["playwright"] = None
+    sys.modules["playwright.sync_api"] = None
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +427,52 @@ def test_run_project_command_check_html_skips_without_playwright():
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
+def test_check_html_with_playwright_detects_dead_css_selectors():
+    """ユーザーからの追加報告への対応(重大な不具合): 実機で、CSSファイルが
+    `.container`のようなクラスをレイアウトの土台として定義していたが、
+    実際のHTMLのどの要素にも`class="container"`が付いておらず、CSSが
+    丸ごと無効になっていた事例が報告された。この種の不具合はJSの例外を
+    伴わないため、コンソールエラーの監視だけでは検出できない
+    (`_DEAD_CSS_SELECTOR_CHECK_JS`が無ければ見逃す)。ここでは、実際の
+    ブラウザでの動作確認(別途手元で実施し、報告された不具合の再現
+    ファイルに対して`.container`が正しく検出されることを確認済み)の
+    ロジック部分を、_check_html_with_playwrightのエラーメッセージ組み立て
+    として検証する。
+    """
+    _install_fake_playwright(evaluate_result=[".container", ".container"])
+    try:
+        status, detail = yoriai._check_html_with_playwright("/tmp/does-not-matter.html")
+    finally:
+        _uninstall_fake_playwright()
+    assert status == "error", (status, detail)
+    assert ".container" in detail, detail
+    assert detail.count(".container") == 1, f"重複は除いて表示されるはずです: {detail!r}"
+    assert "id/class名" in detail, detail
+
+
+def test_check_html_with_playwright_ok_when_no_console_errors_and_no_dead_selectors():
+    _install_fake_playwright(evaluate_result=[])
+    try:
+        status, detail = yoriai._check_html_with_playwright("/tmp/does-not-matter.html")
+    finally:
+        _uninstall_fake_playwright()
+    assert status == "ok", (status, detail)
+
+
+def test_check_html_with_playwright_combines_console_errors_and_dead_selectors():
+    _install_fake_playwright(
+        console_messages=[_FakeConsoleMessage("error", "Uncaught TypeError: x is not a function")],
+        evaluate_result=["#missing-id"],
+    )
+    try:
+        status, detail = yoriai._check_html_with_playwright("/tmp/does-not-matter.html")
+    finally:
+        _uninstall_fake_playwright()
+    assert status == "error", (status, detail)
+    assert "x is not a function" in detail, detail
+    assert "#missing-id" in detail, detail
+
+
 def test_run_project_command_rejects_running_binary_that_was_not_compiled():
     out_dir = tempfile.mkdtemp(prefix="yoriai_run_command_test_")
     try:
@@ -385,6 +533,9 @@ def main():
         test_run_project_command_executes_gcc_syntax_only_when_available,
         test_run_project_command_still_compiles_and_runs_c_program_end_to_end,
         test_run_project_command_check_html_detects_console_error,
+        test_check_html_with_playwright_detects_dead_css_selectors,
+        test_check_html_with_playwright_ok_when_no_console_errors_and_no_dead_selectors,
+        test_check_html_with_playwright_combines_console_errors_and_dead_selectors,
         test_run_project_command_check_html_skips_without_playwright,
         test_run_project_command_rejects_running_binary_that_was_not_compiled,
         test_execute_project_tool_call_dispatches_run_command,

@@ -403,6 +403,10 @@ READ_FILE_TOOL_SCHEMA = {
 # (ツール呼び出しラウンド全体の上限、web_searchも含む)とは別に、read_file単体の
 # 呼び出し回数をレビュー1回(=stream_chat_completionの1回の実行)ごとにカウントする。
 MAX_READ_FILE_CALLS_PER_REVIEW = 3
+# 仮の判断: レビュー担当がHTML/CSS/JSの動作確認(run_command・check_html)を
+# 行えるようにした際の上限。read_fileと同じ考え方で、無制限に検証を
+# 繰り返させず、レビュー1回あたり少数回に絞る。
+MAX_RUN_COMMAND_CALLS_PER_REVIEW = 3
 
 # 仮の判断: モデルが延々とツール呼び出しを繰り返すループに陥らないよう、
 # 1つの質問あたりのツール呼び出しラウンド数に上限を設ける。
@@ -1205,21 +1209,27 @@ class CardRequestHandler(BaseHTTPRequestHandler):
         model = body.get("model")
         messages = body.get("messages", [])
 
-        # 仮の判断: 依頼元が明示的にread_fileツール(レビュー専用)または
-        # プロジェクトツール一式(修正依頼専用、read_file+ファイル作成・
-        # 移動・削除・ディレクトリ作成・一覧表示・テスト実行)の提供を
+        # 仮の判断: 依頼元が明示的にread_fileツール(レビュー専用、後方
+        # 互換のため維持)・レビューツール一式(read_file+run_command、
+        # HTML/CSS/JSの動作確認込みのレビュー専用)・プロジェクトツール
+        # 一式(修正依頼専用、read_file+ファイル作成・移動・削除・
+        # ディレクトリ作成・一覧表示・コマンド実行)のいずれかの提供を
         # 要求してきた場合のみ、このリクエスト限定でオファーする(通常の
-        # チャットにはどちらのフラグも含まれないため、これらのツール自体が
-        # 存在しないのと同じになる)。どちらのツールも、このプロセス
-        # (レビュー担当・修正担当自身のキッチン)では実行せず、呼び出し元
-        # (プロジェクトのファイルへの実際のアクセス権を持つ側)に実行を
-        # 委ねる(client_tool_names)。詳細はREAD_FILE_TOOL_NAME定義部の
-        # コメントを参照。
+        # チャットにはどのフラグも含まれないため、これらのツール自体が
+        # 存在しないのと同じになる)。いずれも、このプロセス(レビュー担当・
+        # 修正担当自身のキッチン)では実行せず、呼び出し元(プロジェクトの
+        # ファイルへの実際のアクセス権を持つ側)に実行を委ねる
+        # (client_tool_names)。詳細はREAD_FILE_TOOL_NAME定義部のコメントを
+        # 参照。
         offer_read_file_tool = bool(body.get("offer_read_file_tool"))
+        offer_review_tools = bool(body.get("offer_review_tools"))
         offer_project_tools = bool(body.get("offer_project_tools"))
         if offer_project_tools:
             extra_tools = PROJECT_TOOLS_SCHEMAS
             client_tool_names = PROJECT_TOOLS_CLIENT_NAMES
+        elif offer_review_tools:
+            extra_tools = REVIEW_TOOLS_SCHEMAS
+            client_tool_names = REVIEW_TOOLS_CLIENT_NAMES
         elif offer_read_file_tool:
             extra_tools = [READ_FILE_TOOL_SCHEMA]
             client_tool_names = {READ_FILE_TOOL_NAME}
@@ -1695,22 +1705,27 @@ def _select_chat_candidates(self_card: dict, peers: list, local_port: int, task_
 
 def _stream_chat_from_candidate(
     candidate: dict, org_fingerprint: str, messages: list,
-    offer_read_file_tool: bool = False, offer_project_tools: bool = False,
+    offer_read_file_tool: bool = False, offer_review_tools: bool = False, offer_project_tools: bool = False,
 ):
     """候補(自分自身を含む)のキッチンにHTTP経由(/chat)で問い合わせ、
     正規化されたストリーミングイベントを順にyieldする。
 
     `offer_read_file_tool=True`を渡すと、相手のキッチンはこのリクエスト
-    限定でread_fileツールをオファーする。`offer_project_tools=True`を
-    渡すと、read_fileに加えてファイル作成・移動・削除・ディレクトリ作成・
-    一覧表示・テスト実行のツール一式をオファーする(既存プロジェクトへの
-    修正依頼専用、より広い権限のツール束)。どちらも実行結果は相手の
-    キッチンではなく呼び出し元がこの応答ストリームを見て自分で作る必要が
-    ある(詳細はREAD_FILE_TOOL_NAME定義コメントを参照)。
+    限定でread_fileツールをオファーする。`offer_review_tools=True`を
+    渡すと、read_fileに加えてrun_command(検証専用、HTML/CSS/JSの動作
+    確認を含む)もオファーする(レビュー専用、ファイルの変更はできない)。
+    `offer_project_tools=True`を渡すと、read_fileに加えてファイル作成・
+    移動・削除・ディレクトリ作成・一覧表示・コマンド実行のツール一式を
+    オファーする(既存プロジェクトへの修正依頼専用、更に広い権限のツール
+    束)。いずれも実行結果は相手のキッチンではなく呼び出し元がこの応答
+    ストリームを見て自分で作る必要がある(詳細はREAD_FILE_TOOL_NAME定義
+    コメントを参照)。
     """
     body = {"model": candidate["model"], "messages": messages}
     if offer_project_tools:
         body["offer_project_tools"] = True
+    elif offer_review_tools:
+        body["offer_review_tools"] = True
     elif offer_read_file_tool:
         body["offer_read_file_tool"] = True
     try:
@@ -1970,39 +1985,50 @@ def _collect_review_answer_with_read_file(
     candidate: dict, org_fingerprint: str, messages: list, out_dir: str,
     print_lock: threading.Lock = None, tag: str = None,
 ):
-    """レビュー専用: read_fileツールの呼び出しには、実装依頼元である
-    自分自身がその場で`out_dir`を読み直して応答し、会話を継続する
-    (candidateのキッチンプロセスにはread_fileを実行させない)。
+    """レビュー専用: read_file・run_commandツールの呼び出しには、
+    実装依頼元である自分自身がその場で`out_dir`に対して応答し、会話を
+    継続する(candidateのキッチンプロセスには実行させない)。
     (content, error, truncated)のタプルを返す。`truncated`は最終回答が
     CHAT_MAX_OUTPUT_TOKENS上限に達して途中で打ち切られたかどうかを表す。
 
     仮の判断: /chatはメッセージ履歴(messages)を毎回丸ごと送るステート
-    レスな設計のため、「read_fileの結果を会話に追加した新しいmessagesで
+    レスな設計のため、「ツール実行結果を会話に追加した新しいmessagesで
     もう一度/chatを呼ぶ」だけで、モデルからは1つの連続した会話として
-    見える。この呼び出しごとにout_dirを読み直す(_read_project_file_fresh)
-    ため、前回のラウンド以降に他のワーカースレッドが完成させたファイルも
-    正しく反映される。
+    見える。read_fileの呼び出しごとにout_dirを読み直す(_read_project_
+    file_fresh)ため、前回のラウンド以降に他のワーカースレッドが完成
+    させたファイルも正しく反映される。
 
-    `print_lock`/`tag`(タスクキュー方式専用)を渡すと、read_fileの
+    仮の判断: 実機で、静的にコードを読むだけのレビューでは、HTML/CSSの
+    セレクタ不一致やJSの過剰なエスケープ(本来レンダリングすべきHTMLを
+    escapeしてしまい入力内容がそのまま文字列として表示される等)のような
+    「実際に動かしてみないと分からない」不具合を見逃す不具合が報告
+    された。read_fileに加えてrun_command(検証専用。write_file等の
+    ファイル変更ツールは含まない)もオファーし、レビュー担当がHTML/CSS/JS
+    の動作を実際に確認したうえでレビューできるようにした。
+
+    `print_lock`/`tag`(タスクキュー方式専用)を渡すと、ツールの
     呼び出し進捗表示も`_print_tagged`でタグ付き・ロック保護付きに
     出力され、他のワーカースレッドの出力と混ざらない。渡さない場合は
     タグとしてcandidateのラベルを使い、ロックなしで出力する。
     """
     messages = list(messages)
     read_file_calls_used = 0
+    run_command_calls_used = 0
 
-    # 仮の判断: read_fileの実行が許されるのは最大MAX_READ_FILE_CALLS_PER_REVIEW
-    # 回だが、それを使い切った後に「上限に達しました」という通知を送った
+    # 仮の判断: read_file・run_commandそれぞれの実行が許されるのは最大
+    # MAX_READ_FILE_CALLS_PER_REVIEW・MAX_RUN_COMMAND_CALLS_PER_REVIEW回
+    # だが、両方を使い切った後に「上限に達しました」という通知を送った
     # ラウンドの次にも、モデルが最終回答を返すための1往復が必要になる。
-    # そのため往復の総ラウンド数には+2の余裕を持たせる(上限到達の通知を
-    # 受け取ってさらにもう一度read_fileを試みても弾かれるだけなので、
+    # そのため往復の総ラウンド数には両方の上限の合計+2の余裕を持たせる
+    # (上限到達の通知を受け取ってさらに試みても弾かれるだけなので、
     # 実質的にはこの範囲で必ず終息する)。
-    for _round_num in range(MAX_READ_FILE_CALLS_PER_REVIEW + 2):
+    max_rounds = MAX_READ_FILE_CALLS_PER_REVIEW + MAX_RUN_COMMAND_CALLS_PER_REVIEW + 2
+    for _round_num in range(max_rounds):
         answer_parts = []
         pending_tool_calls = None
         error = None
         truncated = False
-        for event in _stream_chat_from_candidate(candidate, org_fingerprint, messages, offer_read_file_tool=True):
+        for event in _stream_chat_from_candidate(candidate, org_fingerprint, messages, offer_review_tools=True):
             if "error" in event:
                 error = event["error"]
                 break
@@ -2032,20 +2058,37 @@ def _collect_review_answer_with_read_file(
                     f"[📖 {candidate['label']} が {filename or '他のファイル'} を読みに行っています...]",
                 )
                 result = _read_project_file_fresh(out_dir, filename)
-            else:
+            elif tool_name == RUN_COMMAND_TOOL_NAME and run_command_calls_used < MAX_RUN_COMMAND_CALLS_PER_REVIEW:
+                run_command_calls_used += 1
+                arguments = tool_call.get("function", {}).get("arguments")
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments) if arguments else {}
+                    except json.JSONDecodeError:
+                        arguments = {}
+                command = (arguments or {}).get("command", "")
+                _print_tagged(
+                    print_lock, tag or candidate["label"],
+                    f"[🧪 {candidate['label']} が {command} を実行して確認しています...]",
+                )
+                result = _run_project_command(out_dir, command)
+            elif tool_name in (READ_FILE_TOOL_NAME, RUN_COMMAND_TOOL_NAME):
+                limit = MAX_READ_FILE_CALLS_PER_REVIEW if tool_name == READ_FILE_TOOL_NAME else MAX_RUN_COMMAND_CALLS_PER_REVIEW
                 result = json.dumps({
                     "error": (
-                        f"ファイル読み取りツールの呼び出し回数が上限({MAX_READ_FILE_CALLS_PER_REVIEW}回)"
+                        f"{tool_name}ツールの呼び出し回数が上限({limit}回)"
                         "に達しました。これまでに確認した内容をもとに判断してください。"
                     ),
                 }, ensure_ascii=False)
+            else:
+                result = json.dumps({"error": f"未知のツールです: {tool_name}"}, ensure_ascii=False)
             messages.append({"role": "tool", "content": result, "tool_call_id": tool_call.get("id")})
 
-    # 仮の判断: 上限ラウンドに達してもモデルがまだread_fileを呼び続けようと
+    # 仮の判断: 上限ラウンドに達してもモデルがまだツールを呼び続けようと
     # した場合、暴走防止のためここで打ち切る。この経路に到達した場合、
     # _review_one_file側は「問い合わせに失敗した」扱いとして「問題あり」に
     # 倒す(安全側)。
-    return "", f"read_fileの往復回数が上限({MAX_READ_FILE_CALLS_PER_REVIEW}回)に達しました", False
+    return "", f"レビューツールの往復回数が上限({max_rounds}回)に達しました", False
 
 
 # ---------------------------------------------------------------------------
@@ -2210,6 +2253,21 @@ PROJECT_TOOLS_CLIENT_NAMES = {
     MOVE_FILE_TOOL_NAME, DELETE_FILE_TOOL_NAME, MAKE_DIRECTORY_TOOL_NAME,
     RUN_COMMAND_TOOL_NAME,
 }
+
+# 仮の判断: 実機で、HTML/CSS/JavaScriptの学習サイトが初回レビューを
+# 通過したにもかかわらず、実際にはCSSセレクタがHTMLのid/class名と
+# 一致していない・プレビュー用JSが本来レンダリングすべきHTMLを
+# エスケープしてしまい入力内容がそのまま文字列として表示される、
+# といった不具合が報告された。原因の一端は、初回実装直後のレビュー
+# フェーズがread_fileしかオファーしておらず、レビュー担当がコードを
+# 「読む」ことしかできず、実際にブラウザで動かして検証する手段
+# (run_command・check_html)を持たなかったこと(静的に正しく見える
+# コードが、実際に動かすと壊れているケースを見逃していた)。レビュー
+# 担当にもread_fileに加えてrun_command(検証専用。write_file等の
+# ファイル変更ツールは含めない)をオファーし、HTML/CSS/JSの動作を
+# 実際に確認したうえでレビューできるようにする。
+REVIEW_TOOLS_SCHEMAS = [READ_FILE_TOOL_SCHEMA, RUN_COMMAND_TOOL_SCHEMA]
+REVIEW_TOOLS_CLIENT_NAMES = {READ_FILE_TOOL_NAME, RUN_COMMAND_TOOL_NAME}
 
 
 def _list_project_directory(project_dir: str) -> str:
@@ -2503,11 +2561,54 @@ def _run_subprocess_with_output_cap(argv: list, cwd: str, timeout_sec: float, re
 
 _PLAYWRIGHT_CHECK_TIMEOUT_MS = 15000
 
+# 仮の判断: 実機で、「HTML/CSS学習サイト」のCSSファイルがグリッドレイアウト
+# 全体を`.container`セレクタに依存させて定義していたが、実際のHTMLの
+# どの要素にも`class="container"`が付いておらず、レイアウトのCSSが
+# 丸ごと無効になっていた(=id/class名の不一致)という不具合が報告された。
+# この種の不具合はJSの例外やコンソールエラーを一切出さない(単に見た目が
+# 崩れるだけ)ため、既存のconsole/pageerror監視では検出できない。ページの
+# 全スタイルシートを走査し、どの要素にも一致しないセレクタを機械的に
+# 検出することで、id/class名の不一致を拾えるようにする。
+# `:hover`等の状態依存の疑似クラスや`::before`等の疑似要素は、静的な
+# チェック時点では一致しなくて当然(バグではない)ため、誤検出を避けるために
+# 除外する。
+_DEAD_CSS_SELECTOR_CHECK_JS = r"""
+() => {
+  const deadSelectors = [];
+  const skipPattern = /::|:(hover|focus|active|visited|checked|focus-within|focus-visible|target|empty|first-child|last-child|nth-child|only-child|root|disabled|enabled|required|optional|valid|invalid|placeholder-shown|read-only|read-write|indeterminate|default|link|not|is|where|has)/i;
+  const walk = (ruleList) => {
+    for (const rule of ruleList) {
+      if (rule.selectorText) {
+        for (const sel of rule.selectorText.split(',')) {
+          const trimmed = sel.trim();
+          if (!trimmed || skipPattern.test(trimmed)) continue;
+          try {
+            if (document.querySelectorAll(trimmed).length === 0) {
+              deadSelectors.push(trimmed);
+            }
+          } catch (e) { /* 未対応のセレクタ構文は無視する */ }
+        }
+      } else if (rule.cssRules) {
+        walk(rule.cssRules);
+      }
+    }
+  };
+  for (const sheet of document.styleSheets) {
+    let rules;
+    try { rules = sheet.cssRules || sheet.rules; } catch (e) { continue; }
+    if (rules) walk(rules);
+  }
+  return deadSelectors;
+}
+"""
+
 
 def _check_html_with_playwright(file_path: str) -> tuple:
     """`(status, detail)`を返す。`status`は次のいずれか:
-    - `"ok"`: ヘッドレスブラウザで開けて、コンソールエラー・実行時エラーが無かった
-    - `"error"`: コンソールエラーまたは未捕捉の実行時エラーを検出した(`detail`に内容)
+    - `"ok"`: ヘッドレスブラウザで開けて、コンソールエラー・実行時エラー・
+      どの要素にも一致しないCSSセレクタが無かった
+    - `"error"`: コンソールエラー・未捕捉の実行時エラー・id/class名の
+      不一致が疑われるCSSセレクタのいずれかを検出した(`detail`に内容)
     - `"skipped"`: Playwrightが実機に無い、またはブラウザの起動自体に失敗した
       ためスキップした(`detail`にその理由。gcc/node等の構文チェックと同じく、
       ツール不在はエラー扱いにしない)
@@ -2517,7 +2618,10 @@ def _check_html_with_playwright(file_path: str) -> tuple:
     初めて`getElementById`がnullを返す等で表面化するため)。ヘッドレス
     ブラウザで実際にファイルを開き、コンソールに出力されたエラー
     (`console.error`・未捕捉の例外)を拾うことで、この種の不具合を
-    機械的に検出できるようにする。
+    機械的に検出できるようにする。加えて、CSSセレクタがHTML側のid/class
+    と一致しているかどうかも確認する(`_DEAD_CSS_SELECTOR_CHECK_JS`参照。
+    こちらはJSの例外を伴わないため、console/pageerrorの監視だけでは
+    見逃してしまう)。
     """
     try:
         from playwright.sync_api import sync_playwright
@@ -2526,21 +2630,45 @@ def _check_html_with_playwright(file_path: str) -> tuple:
 
     console_errors = []
     page_errors = []
+    dead_selectors = []
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(timeout=_PLAYWRIGHT_CHECK_TIMEOUT_MS)
+            # 仮の判断: `file://`で開いたページは、Chromiumのセキュリティ
+            # モデル上、リンクした外部の`.css`ファイル(このプロジェクトの
+            # index.html+editor.cssのような、複数ファイルにまたがる構成)を
+            # 別オリジン扱いし、`sheet.cssRules`へのアクセスを拒否する
+            # (`_DEAD_CSS_SELECTOR_CHECK_JS`が常に空を返してしまい、実際に
+            # 検証で確認された)。`--allow-file-access-from-files`で
+            # `file://`オリジン間の読み取り制限を緩和しないと、複数ファイル
+            # 構成のプロジェクトでこのチェックが機能しない。この検証専用の
+            # 使い捨てヘッドレスブラウザだけに適用され、通常のブラウジングに
+            # 使うプロファイルには影響しない。
+            browser = p.chromium.launch(
+                timeout=_PLAYWRIGHT_CHECK_TIMEOUT_MS, args=["--allow-file-access-from-files"],
+            )
             try:
                 page = browser.new_page()
                 page.on("console", lambda msg: console_errors.append(msg.text) if msg.type == "error" else None)
                 page.on("pageerror", lambda exc: page_errors.append(str(exc)))
                 page.goto(f"file://{file_path}", timeout=_PLAYWRIGHT_CHECK_TIMEOUT_MS)
                 page.wait_for_timeout(500)
+                try:
+                    dead_selectors = page.evaluate(_DEAD_CSS_SELECTOR_CHECK_JS) or []
+                except Exception:
+                    dead_selectors = []
             finally:
                 browser.close()
     except Exception as exc:
         return "skipped", f"ヘッドレスブラウザでの検証実行に失敗したためスキップしました: {exc}"
 
     errors = console_errors + page_errors
+    if dead_selectors:
+        unique_dead_selectors = list(dict.fromkeys(dead_selectors))[:10]
+        errors.append(
+            "次のCSSセレクタは、このHTML内のどの要素にも一致しませんでした"
+            "(id/class名がHTML側と一致しているか確認してください): "
+            + ", ".join(unique_dead_selectors)
+        )
     if errors:
         return "error", "\n".join(errors[:10])
     return "ok", ""
@@ -3860,6 +3988,7 @@ _REVIEW_PROMPT_TEMPLATE = """あなたはコードレビュー担当です。以
 2. あなたが担当した{reviewer_own_filename}と正しく連携できそうか
 3. 実装計画に登場する他のファイル(あなたが担当したファイル以外)との連携が必要な場合、read_fileツールで実際のファイルの中身を確認したうえで判断すること。推測だけで判断してはいけません。まだ実装されていないファイルを指定した場合は、その旨が結果として返されます。
 4. 例外処理の欠如・タイポなど、コードとして明らかな不備がないか
+5. HTML/CSS/JavaScriptのファイルについては、コードを読むだけでは「見た目は正しそうでも実際には動かない」不具合(例: CSSのセレクタ名がHTML側のid/classと一致していない、JavaScriptが動的に生成するHTMLを不必要にエスケープしてしまい入力内容がそのまま文字列としてしか表示されない、等)を見逃しやすいので、run_commandツールで実際に検証すること(例: HTMLファイルなら'check_html <ファイル名>'でヘッドレスブラウザによる動作確認、JSファイルなら'node --check <ファイル名>')。実機にPlaywright等が無い場合は自動的にスキップされるので、その場合はコードの読解だけで判断してください。
 
 出力は次の形式のみとし、他の説明文は含めないでください。
 - 問題が無ければ、1行目に「問題なし」とだけ書いてください。
@@ -4823,7 +4952,9 @@ _FIX_REQUEST_TOOL_PROMPT_TEMPLATE = """あなたはこのプロジェクトの�
 - delete_file: 不要になったファイルを削除する(取り消せないため、本当に不要な場合のみ使うこと)
 - run_command: ファイルの検証(動作確認)に使う。そのファイルの種類に適したコマンドを自分で判断して実行すること(例: .pyファイルなら'python3 <ファイル名>'、.jsファイルなら'node --check <ファイル名>'、.cファイルなら'gcc -fsyntax-only <ファイル名>'、.html/.cssファイルなら'check_html <HTMLファイル名>')。ただし、ネットワークアクセス(curl・wget・ssh等)・ファイルの削除や移動(rm・mv・cp等)・権限昇格(sudo等)を行うコマンドは実行できない(拒否される)。ファイルの削除・移動・作成・上書きは、run_commandではなく必ずdelete_file・move_file・write_fileを使うこと。
 
-関連するファイル(import元・import先など)がある場合は、read_fileで確認したうえで、必要なファイルすべてに修正を反映してください。修正が完了したら、最後にツールを呼び出さずに、何をどう変更したかを簡潔な日本語の文章で報告してください。
+関連するファイル(import元・import先など)がある場合は、read_fileで確認したうえで、必要なファイルすべてに修正を反映してください。
+
+重要: HTML/CSS/JavaScriptのファイルを変更した場合は、write_fileで保存して終わりにせず、必ずrun_commandの'check_html <HTMLファイル名>'で実際にヘッドレスブラウザで開いて動作を確認してから完了を報告してください(構文として正しくても、実際には動かないことがあります。例: CSSのセレクタ名がHTML側のid/classと一致していない、JavaScriptが動的に生成するHTMLを不必要にエスケープしてしまい入力内容がそのまま文字列としてしか表示されない、等)。実機にPlaywright等が無い場合は自動的にスキップされるので、その場合はコードの見直しだけで判断してください。修正が完了したら、最後にツールを呼び出さずに、何をどう変更し、どう検証したかを簡潔な日本語の文章で報告してください。
 """
 
 

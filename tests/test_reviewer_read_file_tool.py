@@ -299,6 +299,132 @@ def test_collect_review_answer_with_read_file_caps_at_max_calls():
     assert "問題なし" in answer, answer
 
 
+def test_collect_review_answer_with_read_file_dispatches_run_command():
+    """重大なバグ報告への対応: HTML/CSS/JSの学習サイトが、実際には
+    CSSセレクタの不一致・プレビュー用JSのエスケープ不具合により機能
+    しなかったにもかかわらず初回レビューを通過してしまった件を受けて、
+    レビュー担当にもrun_command(check_html含む)をオファーするように
+    した。レビュー担当がrun_commandを呼んだ場合、実装依頼元
+    (_collect_review_answer_with_read_file)がclient側で_run_project_command
+    を実行し、結果を会話に差し戻すことを確認する。
+    """
+    def fake_stream(candidate, org_fingerprint, messages, offer_review_tools=False, **_kwargs):
+        tool_messages = [m for m in messages if m.get("role") == "tool"]
+        if not tool_messages:
+            yield {"pending_tool_calls": [
+                {"id": "call_1", "type": "function", "function": {
+                    "name": "run_command", "arguments": {"command": "python3 app.py"},
+                }},
+            ]}
+            return
+        result = json.loads(tool_messages[0]["content"])
+        assert result["ok"] is True, result
+        assert "3" in result["output"], result
+        yield {"content": "問題なし"}
+        yield {"done": True}
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_read_file_test_")
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._stream_chat_from_candidate = fake_stream
+    try:
+        with open(os.path.join(out_dir, "app.py"), "w", encoding="utf-8") as f:
+            f.write("print(1 + 2)\n")
+        answer, error, truncated = yoriai._collect_review_answer_with_read_file(
+            _member("junnoMac-mini", "qwen2.5-coder-14b"), "fingerprint",
+            [{"role": "user", "content": "app.pyをレビューしてください"}], out_dir,
+        )
+    finally:
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+    assert error is None, error
+    assert "問題なし" in answer, answer
+
+
+def test_collect_review_answer_with_read_file_rejects_dangerous_run_command():
+    """レビュー担当が呼べるrun_commandも、通常のrun_command同様に
+    ネットワークアクセス等の危険なコマンドは拒否されることを確認する
+    (レビュー専用の抜け道になっていないこと)。
+    """
+    def fake_stream(candidate, org_fingerprint, messages, offer_review_tools=False, **_kwargs):
+        tool_messages = [m for m in messages if m.get("role") == "tool"]
+        if not tool_messages:
+            yield {"pending_tool_calls": [
+                {"id": "call_1", "type": "function", "function": {
+                    "name": "run_command", "arguments": {"command": "curl http://example.com"},
+                }},
+            ]}
+            return
+        result = json.loads(tool_messages[0]["content"])
+        assert result["ok"] is False, result
+        yield {"content": "問題なし"}
+        yield {"done": True}
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_read_file_test_")
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._stream_chat_from_candidate = fake_stream
+    try:
+        answer, error, truncated = yoriai._collect_review_answer_with_read_file(
+            _member("junnoMac-mini", "qwen2.5-coder-14b"), "fingerprint",
+            [{"role": "user", "content": "app.pyをレビューしてください"}], out_dir,
+        )
+    finally:
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+    assert error is None, error
+    assert "問題なし" in answer, answer
+
+
+def test_collect_review_answer_with_read_file_caps_run_command_calls_separately_from_read_file():
+    """read_fileとrun_commandは、それぞれ独立した上限
+    (MAX_READ_FILE_CALLS_PER_REVIEW・MAX_RUN_COMMAND_CALLS_PER_REVIEW)を
+    持つことを確認する(run_commandの追加によって、read_fileが使える
+    回数が意図せず減っていないこと)。
+    """
+    run_command_calls = {"n": 0}
+    original_run_command = yoriai._run_project_command
+
+    def counting_run_command(project_dir, command):
+        run_command_calls["n"] += 1
+        return original_run_command(project_dir, command)
+
+    def fake_stream(candidate, org_fingerprint, messages, offer_review_tools=False, **_kwargs):
+        tool_messages = [m for m in messages if m.get("role") == "tool"]
+        if len(tool_messages) < 5:
+            # run_commandの上限(3回)を超えて5回まで要求してみる。
+            yield {"pending_tool_calls": [
+                {"id": f"call_{len(tool_messages)}", "type": "function", "function": {
+                    "name": "run_command", "arguments": {"command": "python3 app.py"},
+                }},
+            ]}
+            return
+        yield {"content": "問題なし"}
+        yield {"done": True}
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_read_file_test_")
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._stream_chat_from_candidate = fake_stream
+    yoriai._run_project_command = counting_run_command
+    try:
+        with open(os.path.join(out_dir, "app.py"), "w", encoding="utf-8") as f:
+            f.write("print(1 + 2)\n")
+        answer, error, truncated = yoriai._collect_review_answer_with_read_file(
+            _member("junnoMac-mini", "qwen2.5-coder-14b"), "fingerprint",
+            [{"role": "user", "content": "app.pyをレビューしてください"}], out_dir,
+        )
+    finally:
+        yoriai._stream_chat_from_candidate = original_stream
+        yoriai._run_project_command = original_run_command
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+    assert run_command_calls["n"] == yoriai.MAX_RUN_COMMAND_CALLS_PER_REVIEW, (
+        f"実際の実行はMAX_RUN_COMMAND_CALLS_PER_REVIEW回までのはずです: {run_command_calls}"
+    )
+    assert error is None, error
+    assert "問題なし" in answer, answer
+
+
 def test_review_one_file_uses_read_file_powered_review_answer():
     """`_review_one_file`が`_collect_review_answer_with_read_file`
     (out_dirを都度読み直す経路)を使ってレビューを依頼していることを確認する。
@@ -411,6 +537,9 @@ def main():
         test_stream_chat_completion_yields_pending_tool_calls_for_client_tool_without_executing,
         test_collect_review_answer_with_read_file_rereads_disk_between_rounds,
         test_collect_review_answer_with_read_file_caps_at_max_calls,
+        test_collect_review_answer_with_read_file_dispatches_run_command,
+        test_collect_review_answer_with_read_file_rejects_dangerous_run_command,
+        test_collect_review_answer_with_read_file_caps_run_command_calls_separately_from_read_file,
         test_review_one_file_uses_read_file_powered_review_answer,
         test_review_one_file_truncates_large_reviewer_own_code_in_prompt,
         test_collect_review_answer_with_read_file_shows_read_progress_message,
