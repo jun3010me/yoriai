@@ -2166,7 +2166,11 @@ RUN_TEST_TOOL_SCHEMA = {
             "プロジェクトディレクトリ内でテストを実行して動作を確認する。実行できるコマンドは"
             "'python3 <ファイル名>'・'pytest'・'pytest <ファイル名>'・'node <ファイル名>'・"
             "'gcc <Cファイル名> -o <出力ファイル名>'(コンパイル)・'./<出力ファイル名>'"
-            "(コンパイル済みファイルの実行)のみに限定されており、それ以外の任意のコマンドは実行できない。"
+            "(コンパイル済みファイルの実行)・'check_html <HTMLファイル名>'"
+            "(ヘッドレスブラウザで開き、コンソールエラーの有無を確認する。実機にPlaywrightが"
+            "無い場合はスキップされる)のみに限定されており、それ以外の任意のコマンドは実行できない。"
+            "各コマンドは対応する拡張子のファイルにのみ使用できる(例: gccは.cファイル専用、"
+            ".html/.cssファイルの動作確認にはcheck_htmlを使う)。"
         ),
         "parameters": {
             "type": "object",
@@ -2301,15 +2305,50 @@ _RUN_TEST_MAX_OUTPUT_CHARS = 4000
 
 # 仮の判断: 依頼の項目3(言語ごとにホワイトリストを切り替える)への対応。
 # Python(python3/pytest)に加えて、JavaScript(node)・C言語(gccによる
-# コンパイル→コンパイル済みバイナリの実行、の2段階)を許可する。C言語は
-# 「コンパイル」と「実行」が別コマンドのため、Bashのようなシェル連結
-# (&&等)を使わず、モデルにrun_testを2回呼んでもらう設計にした
-# (shell=Trueを使わない既存方針を維持するため)。
+# コンパイル→コンパイル済みバイナリの実行、の2段階)・HTML(check_html、
+# Playwrightによる簡易動作検証)を許可する。C言語は「コンパイル」と
+# 「実行」が別コマンドのため、Bashのようなシェル連結(&&等)を使わず、
+# モデルにrun_testを2回呼んでもらう設計にした(shell=Trueを使わない
+# 既存方針を維持するため)。
 _RUN_TEST_WHITELIST_HELP = (
     "実行できるコマンドは 'python3 <ファイル名>' / 'pytest' / 'pytest <ファイル名>' / "
     "'node <ファイル名>' / 'gcc <Cファイル名> -o <出力ファイル名>' / "
-    "'./<出力ファイル名>' のみです。"
+    "'./<出力ファイル名>' / 'check_html <HTMLファイル名>' のみです。"
 )
+
+# 仮の判断: 実機で、「HTMLのプレビューが機能してない」という修正依頼に
+# 対して、モデルが.js/.cssファイルにgcc(C言語用)を試すなど、見当違いの
+# ツールを何度も試してツール呼び出し上限に達する不具合が報告された。
+# 各コマンドは対象ファイルの拡張子ごとに固定されている(python3は.py、
+# nodeは.js、gccは.c、check_htmlは.html)ため、コマンド名とファイル名の
+# 組み合わせが妥当かを実行前に検証し、不適切な場合は「このファイルの
+# 種類には使えません。代わりに〇〇を使ってください」という具体的な
+# 誘導メッセージを返す(依頼の項目1)。
+_EXPECTED_EXTENSION_BY_RUN_TEST_COMMAND = {
+    "python3": ".py", "pytest": ".py", "node": ".js", "gcc": ".c", "check_html": ".html",
+}
+_RECOMMENDED_RUN_TEST_COMMAND_BY_EXTENSION = {
+    ".py": "'python3 <ファイル名>' または 'pytest <ファイル名>'",
+    ".js": "'node <ファイル名>'",
+    ".c": "'gcc <ファイル名> -o <出力ファイル名>'",
+    ".html": "'check_html <ファイル名>'",
+    ".css": "このCSSを読み込んでいるHTMLファイルに対する 'check_html <HTMLファイル名>'"
+            "(CSSファイル単体の動作検証はできません)",
+}
+
+
+def _validate_run_test_filename_extension(cmd: str, filename: str) -> str:
+    """`cmd`(python3/node/gcc/check_html)に対して`filename`の拡張子が
+    妥当か検証し、不適切な場合はエラーメッセージを返す(妥当なら空文字列)。
+    """
+    expected_ext = _EXPECTED_EXTENSION_BY_RUN_TEST_COMMAND[cmd]
+    actual_ext = os.path.splitext(filename)[1]
+    if actual_ext == expected_ext:
+        return ""
+    recommendation = _RECOMMENDED_RUN_TEST_COMMAND_BY_EXTENSION.get(actual_ext)
+    if recommendation:
+        return f"{filename} は{actual_ext or '拡張子の無い'}ファイルのため、'{cmd}'は使用できません。代わりに{recommendation}を使ってください。"
+    return f"{filename} は{actual_ext or '拡張子の無い'}ファイルのため、'{cmd}'は使用できません。{_RUN_TEST_WHITELIST_HELP}"
 
 
 def _parse_run_test_command(command: str) -> tuple:
@@ -2317,17 +2356,74 @@ def _parse_run_test_command(command: str) -> tuple:
     parts = (command or "").split()
     if not parts:
         return None, "コマンドが指定されていません。"
-    if parts[0] == "python3" and len(parts) == 2:
+    cmd = parts[0]
+
+    if cmd == "python3" and len(parts) == 2:
+        error = _validate_run_test_filename_extension(cmd, parts[1])
+        return (None, error) if error else (parts, None)
+    if cmd == "pytest" and len(parts) <= 2:
+        if len(parts) == 2:
+            error = _validate_run_test_filename_extension(cmd, parts[1])
+            if error:
+                return None, error
         return parts, None
-    if parts[0] == "pytest" and len(parts) <= 2:
-        return parts, None
-    if parts[0] == "node" and len(parts) == 2:
-        return parts, None
-    if parts[0] == "gcc" and len(parts) == 4 and parts[2] == "-o":
-        return parts, None
+    if cmd == "node" and len(parts) == 2:
+        error = _validate_run_test_filename_extension(cmd, parts[1])
+        return (None, error) if error else (parts, None)
+    if cmd == "gcc" and len(parts) == 4 and parts[2] == "-o":
+        error = _validate_run_test_filename_extension(cmd, parts[1])
+        return (None, error) if error else (parts, None)
+    if cmd == "check_html" and len(parts) == 2:
+        error = _validate_run_test_filename_extension(cmd, parts[1])
+        return (None, error) if error else (parts, None)
     if len(parts) == 1 and parts[0].startswith("./") and len(parts[0]) > 2:
         return parts, None
     return None, _RUN_TEST_WHITELIST_HELP
+
+
+_PLAYWRIGHT_CHECK_TIMEOUT_MS = 15000
+
+
+def _check_html_with_playwright(file_path: str) -> tuple:
+    """`(status, detail)`を返す。`status`は次のいずれか:
+    - `"ok"`: ヘッドレスブラウザで開けて、コンソールエラー・実行時エラーが無かった
+    - `"error"`: コンソールエラーまたは未捕捉の実行時エラーを検出した(`detail`に内容)
+    - `"skipped"`: Playwrightが実機に無い、またはブラウザの起動自体に失敗した
+      ためスキップした(`detail`にその理由。gcc/node等の構文チェックと同じく、
+      ツール不在はエラー扱いにしない)
+
+    仮の判断: idの不一致のようなJS実行時エラーは、静的な構文チェック
+    (node --check)では検出できない(構文としては正しく、実行してみて
+    初めて`getElementById`がnullを返す等で表面化するため)。ヘッドレス
+    ブラウザで実際にファイルを開き、コンソールに出力されたエラー
+    (`console.error`・未捕捉の例外)を拾うことで、この種の不具合を
+    機械的に検出できるようにする。
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return "skipped", "Playwright(ヘッドレスブラウザ操作ツール)が見つからないため、動作検証をスキップしました。"
+
+    console_errors = []
+    page_errors = []
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(timeout=_PLAYWRIGHT_CHECK_TIMEOUT_MS)
+            try:
+                page = browser.new_page()
+                page.on("console", lambda msg: console_errors.append(msg.text) if msg.type == "error" else None)
+                page.on("pageerror", lambda exc: page_errors.append(str(exc)))
+                page.goto(f"file://{file_path}", timeout=_PLAYWRIGHT_CHECK_TIMEOUT_MS)
+                page.wait_for_timeout(500)
+            finally:
+                browser.close()
+    except Exception as exc:
+        return "skipped", f"ヘッドレスブラウザでの検証実行に失敗したためスキップしました: {exc}"
+
+    errors = console_errors + page_errors
+    if errors:
+        return "error", "\n".join(errors[:10])
+    return "ok", ""
 
 
 def _run_project_test_command(project_dir: str, command: str) -> str:
@@ -2336,9 +2432,9 @@ def _run_project_test_command(project_dir: str, command: str) -> str:
         return json.dumps({"ok": False, "message": error}, ensure_ascii=False)
 
     # 仮の判断: コマンドの種類ごとに「どの引数がファイル名で、実行前に
-    # 実在を要求するか」が異なる(python3/node/pytestは実在必須の1引数、
-    # gccは入力(実在必須)と出力(これから作る、実在不要)の2引数、
-    # './<出力>'は自分自身が実在必須のファイル名)。どの場合も
+    # 実在を要求するか」が異なる(python3/node/pytest/check_htmlは実在
+    # 必須の1引数、gccは入力(実在必須)と出力(これから作る、実在不要)の
+    # 2引数、'./<出力>'は自分自身が実在必須のファイル名)。どの場合も
     # `_resolve_safe_project_path`によるパストラバーサル対策は必ず通す。
     if argv[0].startswith("./"):
         exe_name = argv[0][2:]
@@ -2357,12 +2453,27 @@ def _run_project_test_command(project_dir: str, command: str) -> str:
     else:
         filename_positions = [(1, True)] if len(argv) == 2 else []
 
+    safe_paths = {}
     for index, must_exist in filename_positions:
         safe_path, path_error = _resolve_safe_project_path(project_dir, argv[index])
         if path_error:
             return json.dumps({"ok": False, "message": path_error}, ensure_ascii=False)
         if must_exist and not os.path.isfile(safe_path):
             return json.dumps({"ok": False, "message": f"{argv[index]} が見つかりません。"}, ensure_ascii=False)
+        safe_paths[index] = safe_path
+
+    if argv[0] == "check_html":
+        status, detail = _check_html_with_playwright(safe_paths[1])
+        if status == "ok":
+            return json.dumps(
+                {"ok": True, "returncode": 0, "output": "ヘッドレスブラウザでコンソールエラーは検出されませんでした。"},
+                ensure_ascii=False,
+            )
+        if status == "error":
+            return json.dumps(
+                {"ok": False, "returncode": 1, "output": detail[:_RUN_TEST_MAX_OUTPUT_CHARS]}, ensure_ascii=False,
+            )
+        return json.dumps({"ok": False, "message": detail}, ensure_ascii=False)  # skipped
 
     try:
         result = subprocess.run(
