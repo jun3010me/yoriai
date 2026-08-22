@@ -2687,6 +2687,27 @@ def _mutated_filename_from_tool_result(tool_call: dict, result: str) -> str:
     return parsed.get("filename") or parsed.get("new_filename") or "(不明なファイル)"
 
 
+# 仮の判断: 実機で、モデル(qwen3-235b等)が「〇〇ファイルを修正しました」
+# 「write_fileツールを使用して上書きしました」と、あたかも実行したかの
+# ような説明文を返しながら、実際にはwrite_file等のツールを一度も呼んで
+# いない(＝ツール呼び出しの構造化出力ではなく、ただの説明文としてしか
+# 出力していない)現象が報告された。この場合、以前は(前回の修正で)
+# 「実行されませんでした」と正直に報告するようにしたが、それだけでは
+# 依頼が達成されないままで終わってしまう。そこで、最終回答が
+# pending_tool_callsを伴わずに終わった時点でmodified_filesが空であれば、
+# セッションを終了させる前に1回だけ「実際にツールを呼んでください」と
+# 明示的に促し、再試行の機会を与える(無制限に促し続けると暴走に
+# つながるため、1回のみ)。それでも改善しなければ、これまで通り正直に
+# 「実行されませんでした」と報告する。
+_NO_TOOL_CALL_NUDGE_MESSAGE = (
+    "あなたは変更を説明していますが、write_file・move_file・delete_fileのいずれの"
+    "ツールも実際には呼び出されていません。説明文だけでは、プロジェクトのファイルには"
+    "何も反映されません。先ほど説明した変更内容を、実際にwrite_file等のツールを"
+    "呼び出して反映してください。よく確認した結果、本当に変更が不要だと判断した場合は、"
+    "その理由を説明してください。"
+)
+
+
 def _collect_answer_with_project_tools(
     candidate: dict, org_fingerprint: str, messages: list, project_dir: str,
     print_lock: threading.Lock = None, tag: str = None,
@@ -2704,9 +2725,13 @@ def _collect_answer_with_project_tools(
     達した場合でも、それまでに実際に成功した変更は失われず反映される
     (呼び出し元が「途中終了でも一部は変更されている」ことを正しく
     報告できるようにするため)。
+
+    モデルが説明文だけを返してツールを一度も呼ばなかった場合は、
+    `_NO_TOOL_CALL_NUDGE_MESSAGE`参照。
     """
     messages = list(messages)
     modified_files = []
+    nudged = False
     for _round_num in range(MAX_PROJECT_TOOL_ROUNDS):
         answer_parts = []
         pending_tool_calls = None
@@ -2729,7 +2754,17 @@ def _collect_answer_with_project_tools(
         if error:
             return "", error, False, modified_files
         if not pending_tool_calls:
-            return "".join(answer_parts), None, truncated, modified_files
+            final_answer = "".join(answer_parts)
+            if not modified_files and not nudged:
+                nudged = True
+                _print_tagged(
+                    print_lock, tag or candidate["label"],
+                    "[⚠️ 説明文だけでツールが実際には呼ばれていないため、実行するよう促して再試行しています...]",
+                )
+                messages.append({"role": "assistant", "content": final_answer})
+                messages.append({"role": "user", "content": _NO_TOOL_CALL_NUDGE_MESSAGE})
+                continue
+            return final_answer, None, truncated, modified_files
 
         messages.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
         for tool_call in pending_tool_calls:
@@ -4835,6 +4870,18 @@ def _ask_organization_fix_project(port: int, org_fingerprint: str, request_text:
     されませんでした」と正直に報告し、PROGRESS.mdへの更新履歴の記録も
     行わない。これにより、「完了しました」という報告とPROGRESS.mdの
     更新履歴は、常に実際のファイル変更と対応することが保証される。
+
+    仮の判断(追加のユーザー報告への対応): 上記の対応だけでは「正直に
+    失敗を報告する」に留まり、依頼そのものは達成されないままだった。
+    実機で、モデルが「〇〇を修正しました」という説明文だけを返し、
+    write_file等を一度も呼ばない現象が繰り返し報告されたため、
+    `_collect_answer_with_project_tools`側で、最終回答がツール呼び出しを
+    伴わずmodified_filesが空のまま終わろうとした場合に、1回だけ「実際に
+    ツールを呼んでください」と促して再試行する仕組みを追加した
+    (`_NO_TOOL_CALL_NUDGE_MESSAGE`)。これにより、モデルが行動を忘れた
+    だけのケースでは実際に修正が成功するようになる。無制限に促し続けると
+    暴走につながるため、促しは1回のみで、それでも改善しなければ上記の
+    正直な失敗報告に落ち着く。
     """
     explicit_project_dir, request = _resolve_explicit_fix_target(request_text, out_dir)
     if explicit_project_dir:
