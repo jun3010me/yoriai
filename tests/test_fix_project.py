@@ -887,11 +887,12 @@ def test_collect_answer_with_project_tools_stops_at_round_cap():
     out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
     try:
         candidate = {"label": "MacStudio", "model": "m", "address": "127.0.0.1", "port": 47120}
-        content, error = yoriai._collect_answer_with_project_tools(
+        content, error, truncated = yoriai._collect_answer_with_project_tools(
             candidate, "fingerprint", [{"role": "user", "content": "何か直して"}], out_dir,
         )
         assert content == ""
         assert error is not None and "上限" in error, error
+        assert truncated is False
     finally:
         yoriai._stream_chat_from_candidate = original_stream
         shutil.rmtree(out_dir, ignore_errors=True)

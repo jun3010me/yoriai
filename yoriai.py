@@ -68,6 +68,19 @@ HEARTBEAT_INTERVAL_SEC = 10
 CHAT_CONNECT_TIMEOUT_SEC = 5
 CHAT_READ_TIMEOUT_SEC = 120
 
+# 仮の判断: バックエンド(Ollama/LM Studio/MLX-LM)への問い合わせに応答の
+# 最大トークン数を指定していなかったため、複雑な修正依頼(複数の指摘を
+# 同時に反映しようとする等)を受けたモデルが、生成をやめる判断ができずに
+# 応答を延々と続けてしまう不具合が実機で報告された(index.htmlの修正で
+# 13,819トークンから20,000超まで際限なく増え続けた事例。手動でのCtrl+C×2
+# による強制終了が必要だった)。読み取りタイムアウト(CHAT_READ_TIMEOUT_SEC)は
+# トークンが実際に流れ続けている間は働かない(データが届く限り「タイムアウト」
+# にはならない)ため、この問題への歯止めにはならない。そのため、生成される
+# トークン数そのものに上限を設ける。値は、HTML/CSS/JS学習サイトの1ファイル
+# 丸ごとの書き直しのような大きめの生成でも収まる余裕を持たせつつ、暴走時の
+# 被害(待ち時間・トークン消費)を現実的な範囲に抑えられる値として選んだ。
+CHAT_MAX_OUTPUT_TOKENS = 8192
+
 # 仮の判断: 起動時1回だけのスキャンだと、たまたま相手のYoriaiがまだ起動しきっていない
 # タイミングで実行してしまった場合に「Connection refused」で失敗し、その後相手が
 # 起動してもずっと0件のまま固定されてしまう問題が実機検証で見つかった。
@@ -570,13 +583,17 @@ def _log_and_build_http_error(base_url: str, resp) -> dict:
 def _stream_ollama_turn(model: str, messages: list, tools: list):
     """OllamaのネイティブAPI(/api/chat、NDJSONストリーミング)に1往復だけ
     問い合わせ、正規化したイベント({"content": ...} / {"error": ...})を
-    順にyieldし、最後にそのターンで要求されたtool_calls一覧
-    ({"tool_calls": [...]}、無ければ空リスト)をyieldする。
+    順にyieldし、最後にそのターンで要求されたtool_calls一覧と、応答が
+    CHAT_MAX_OUTPUT_TOKENS上限に達して打ち切られたかどうか
+    ({"tool_calls": [...], "truncated": bool})をyieldする。
     """
     try:
         resp = requests.post(
             f"{OLLAMA_BASE_URL}/api/chat",
-            json={"model": model, "messages": messages, "tools": tools, "stream": True},
+            json={
+                "model": model, "messages": messages, "tools": tools, "stream": True,
+                "options": {"num_predict": CHAT_MAX_OUTPUT_TOKENS},
+            },
             stream=True,
             timeout=(CHAT_CONNECT_TIMEOUT_SEC, CHAT_READ_TIMEOUT_SEC),
         )
@@ -588,6 +605,7 @@ def _stream_ollama_turn(model: str, messages: list, tools: list):
         return
 
     tool_calls = []
+    truncated = False
     try:
         for line in resp.iter_lines():
             if not line:
@@ -603,11 +621,14 @@ def _stream_ollama_turn(model: str, messages: list, tools: list):
             if message.get("tool_calls"):
                 tool_calls.extend(message["tool_calls"])
             if obj.get("done"):
+                # 仮の判断: Ollamaはdone_reasonで打ち切り理由を返す
+                # ("stop"は正常終了、"length"はnum_predict上限による打ち切り)。
+                truncated = obj.get("done_reason") == "length"
                 break
     except Exception as exc:
         yield {"error": str(exc)}
         return
-    yield {"tool_calls": tool_calls}
+    yield {"tool_calls": tool_calls, "truncated": truncated}
 
 
 def _stream_openai_compatible_turn(base_url: str, model: str, messages: list, tools: list):
@@ -622,7 +643,10 @@ def _stream_openai_compatible_turn(base_url: str, model: str, messages: list, to
     try:
         resp = requests.post(
             f"{base_url}/v1/chat/completions",
-            json={"model": model, "messages": messages, "tools": tools, "stream": True},
+            json={
+                "model": model, "messages": messages, "tools": tools, "stream": True,
+                "max_tokens": CHAT_MAX_OUTPUT_TOKENS,
+            },
             stream=True,
             timeout=(CHAT_CONNECT_TIMEOUT_SEC, CHAT_READ_TIMEOUT_SEC),
         )
@@ -634,6 +658,7 @@ def _stream_openai_compatible_turn(base_url: str, model: str, messages: list, to
         return
 
     tool_calls_by_index = {}
+    truncated = False
     try:
         for raw_line in resp.iter_lines():
             if not raw_line:
@@ -651,7 +676,12 @@ def _stream_openai_compatible_turn(base_url: str, model: str, messages: list, to
             choices = obj.get("choices", [])
             if not choices:
                 continue
-            delta = choices[0].get("delta", {})
+            choice = choices[0]
+            # 仮の判断: OpenAI互換APIはfinish_reasonで打ち切り理由を返す
+            # ("stop"は正常終了、"length"はmax_tokens上限による打ち切り)。
+            if choice.get("finish_reason") == "length":
+                truncated = True
+            delta = choice.get("delta", {})
             content = delta.get("content")
             if content:
                 yield {"content": content}
@@ -683,7 +713,7 @@ def _stream_openai_compatible_turn(base_url: str, model: str, messages: list, to
         }
         for _, entry in sorted(tool_calls_by_index.items())
     ]
-    yield {"tool_calls": tool_calls}
+    yield {"tool_calls": tool_calls, "truncated": truncated}
 
 
 def _stream_lmstudio_turn(model: str, messages: list, tools: list):
@@ -797,8 +827,9 @@ def _run_turn_with_leak_detection(turn, tools: list):
 def stream_chat_completion(model: str, messages: list, extra_tools: list = None, client_tool_names: set = None):
     """モデル名からOllama/LM Studio/MLX-LMのどれにチャットを振るかを決め、
     正規化されたストリーミングイベント({"content": ...} / {"tool_call": <ツール名>} /
-    {"pending_tool_calls": [...]} / {"done": True} / {"error": ...})を順に
-    yieldする。
+    {"pending_tool_calls": [...]} / {"done": True, "truncated": bool} /
+    {"error": ...})を順にyieldする。`truncated`は、最後のラウンドの応答が
+    CHAT_MAX_OUTPUT_TOKENS上限に達して途中で打ち切られたかどうかを表す。
 
     モデルがツール(既定ではweb_searchのみ)の呼び出しを要求した場合は、
     ここでツールを実行して結果を会話履歴に追加し、モデルに再度問い合わせる
@@ -858,6 +889,7 @@ def stream_chat_completion(model: str, messages: list, extra_tools: list = None,
             turn = _stream_lmstudio_turn(model, messages, tools)
 
         tool_calls = []
+        round_truncated = False
         leaked = False
         tools_rejected = False
         for event in _run_turn_with_leak_detection(turn, tools):
@@ -912,6 +944,7 @@ def stream_chat_completion(model: str, messages: list, extra_tools: list = None,
                 yield event
             elif "tool_calls" in event:
                 tool_calls = event["tool_calls"]
+                round_truncated = event.get("truncated", False)
 
         if (leaked or tools_rejected) and tools:
             tools = None  # このモデルにはツールを二度とオファーせず、素の会話として再試行する
@@ -942,7 +975,7 @@ def stream_chat_completion(model: str, messages: list, extra_tools: list = None,
                 "tool_call_id": tool_call.get("id"),
             })
 
-    yield {"done": True}
+    yield {"done": True, "truncated": round_truncated}
 
 
 def build_profile_card(agent_id: str) -> dict:
@@ -1799,7 +1832,10 @@ def _extract_read_file_tool_filename(tool_call_arguments) -> str:
 
 def _collect_answer_from_candidate(candidate: dict, org_fingerprint: str, messages: list):
     """1候補に問い合わせ、回答をすべて集めて文字列として返す
-    (content, error)のタプル。エラー時はcontentが空文字列になる。
+    (content, error, truncated)のタプル。エラー時はcontentが空文字列に
+    なる。`truncated`は、応答がCHAT_MAX_OUTPUT_TOKENS上限に達して途中で
+    打ち切られたかどうかを表す(この場合`content`には打ち切られた時点
+    までの不完全な内容が入っている)。
 
     仮の判断: //multi では複数候補への問い合わせを並列に行うため、通常モード
     のように1文字ずつその場で画面に出す(ライブストリーミング)方式のままだと
@@ -1817,6 +1853,7 @@ def _collect_answer_from_candidate(candidate: dict, org_fingerprint: str, messag
     """
     answer_parts = []
     error = None
+    truncated = False
     for event in _stream_chat_from_candidate(candidate, org_fingerprint, messages):
         if "error" in event:
             error = event["error"]
@@ -1825,8 +1862,9 @@ def _collect_answer_from_candidate(candidate: dict, org_fingerprint: str, messag
         if content:
             answer_parts.append(content)
         if event.get("done"):
+            truncated = bool(event.get("truncated"))
             break
-    return "".join(answer_parts), error
+    return "".join(answer_parts), error, truncated
 
 
 # 仮の判断: 複雑な依頼(HTML/CSSの学習サイト等)では、1ファイルの中身が
@@ -1934,7 +1972,8 @@ def _collect_review_answer_with_read_file(
     """レビュー専用: read_fileツールの呼び出しには、実装依頼元である
     自分自身がその場で`out_dir`を読み直して応答し、会話を継続する
     (candidateのキッチンプロセスにはread_fileを実行させない)。
-    (content, error)のタプルを返す。
+    (content, error, truncated)のタプルを返す。`truncated`は最終回答が
+    CHAT_MAX_OUTPUT_TOKENS上限に達して途中で打ち切られたかどうかを表す。
 
     仮の判断: /chatはメッセージ履歴(messages)を毎回丸ごと送るステート
     レスな設計のため、「read_fileの結果を会話に追加した新しいmessagesで
@@ -1961,6 +2000,7 @@ def _collect_review_answer_with_read_file(
         answer_parts = []
         pending_tool_calls = None
         error = None
+        truncated = False
         for event in _stream_chat_from_candidate(candidate, org_fingerprint, messages, offer_read_file_tool=True):
             if "error" in event:
                 error = event["error"]
@@ -1972,12 +2012,13 @@ def _collect_review_answer_with_read_file(
             if content:
                 answer_parts.append(content)
             if event.get("done"):
+                truncated = bool(event.get("truncated"))
                 break
 
         if error:
-            return "", error
+            return "", error, False
         if not pending_tool_calls:
-            return "".join(answer_parts), None
+            return "".join(answer_parts), None, truncated
 
         messages.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
         for tool_call in pending_tool_calls:
@@ -2003,7 +2044,7 @@ def _collect_review_answer_with_read_file(
     # した場合、暴走防止のためここで打ち切る。この経路に到達した場合、
     # _review_one_file側は「問い合わせに失敗した」扱いとして「問題あり」に
     # 倒す(安全側)。
-    return "", f"read_fileの往復回数が上限({MAX_READ_FILE_CALLS_PER_REVIEW}回)に達しました"
+    return "", f"read_fileの往復回数が上限({MAX_READ_FILE_CALLS_PER_REVIEW}回)に達しました", False
 
 
 # ---------------------------------------------------------------------------
@@ -2403,13 +2444,15 @@ def _collect_answer_with_project_tools(
     「/chatはステートレスなので、ツール実行結果を足したmessagesで再度
     /chatを呼び直せば会話を継続できる」という設計を踏襲するが、read_file
     単体ではなく複数種類のツールを1つのループで扱えるように汎化した。
-    `(content, error)`のタプルを返す。
+    `(content, error, truncated)`のタプルを返す。`truncated`は最終回答が
+    CHAT_MAX_OUTPUT_TOKENS上限に達して途中で打ち切られたかどうかを表す。
     """
     messages = list(messages)
     for _round_num in range(MAX_PROJECT_TOOL_ROUNDS):
         answer_parts = []
         pending_tool_calls = None
         error = None
+        truncated = False
         for event in _stream_chat_from_candidate(candidate, org_fingerprint, messages, offer_project_tools=True):
             if "error" in event:
                 error = event["error"]
@@ -2421,19 +2464,20 @@ def _collect_answer_with_project_tools(
             if content:
                 answer_parts.append(content)
             if event.get("done"):
+                truncated = bool(event.get("truncated"))
                 break
 
         if error:
-            return "", error
+            return "", error, False
         if not pending_tool_calls:
-            return "".join(answer_parts), None
+            return "".join(answer_parts), None, truncated
 
         messages.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
         for tool_call in pending_tool_calls:
             result = _execute_project_tool_call(project_dir, tool_call, print_lock, tag or candidate["label"])
             messages.append({"role": "tool", "content": result, "tool_call_id": tool_call.get("id")})
 
-    return "", f"ツール呼び出しの往復回数が上限({MAX_PROJECT_TOOL_ROUNDS}回)に達しました"
+    return "", f"ツール呼び出しの往復回数が上限({MAX_PROJECT_TOOL_ROUNDS}回)に達しました", False
 
 
 def _syntax_check_all_files(project_dir: str) -> list:
@@ -2496,7 +2540,7 @@ def _ask_organization_multi(port: int, org_fingerprint: str, messages: list) -> 
         # 仮の判断: 複数スレッドが同じmessagesを同時に読むこと自体は安全だが、
         # 誤って書き換えてしまうバグを将来混入させないよう、念のため
         # スレッドごとにコピーを渡す。
-        answer, error = _collect_answer_from_candidate(candidate, org_fingerprint, list(messages))
+        answer, error, truncated = _collect_answer_from_candidate(candidate, org_fingerprint, list(messages))
         results[index] = (candidate, answer, error)
         with print_lock:
             print()
@@ -2505,6 +2549,8 @@ def _ask_organization_multi(port: int, org_fingerprint: str, messages: list) -> 
                 print(f"(問い合わせに失敗しました: {error})")
             else:
                 print(answer if answer else "(応答がありませんでした)")
+                if truncated:
+                    print(f"(⚠️ 応答が長すぎたため、{CHAT_MAX_OUTPUT_TOKENS}トークンで打ち切られました)")
 
     threads = [threading.Thread(target=worker, args=(i, c), daemon=True) for i, c in enumerate(targets)]
     for t in threads:
@@ -2628,7 +2674,7 @@ def _dispatch_and_save_parallel_tasks(tasks: list, candidates: list, org_fingerp
 
     def worker(index: int, filename: str, request: str, candidate: dict) -> None:
         task_messages = [{"role": "user", "content": request}]
-        answer, error = _collect_answer_from_candidate(candidate, org_fingerprint, task_messages)
+        answer, error, truncated = _collect_answer_from_candidate(candidate, org_fingerprint, task_messages)
         results[index] = (filename, candidate, answer, error)
         with print_lock:
             print()
@@ -2637,6 +2683,8 @@ def _dispatch_and_save_parallel_tasks(tasks: list, candidates: list, org_fingerp
                 print(f"(問い合わせに失敗しました: {error})")
             else:
                 print(answer if answer else "(応答がありませんでした)")
+                if truncated:
+                    print(f"(⚠️ 応答が長すぎたため、{CHAT_MAX_OUTPUT_TOKENS}トークンで打ち切られました)")
 
     threads = [
         threading.Thread(target=worker, args=(i, filename, request, candidate), daemon=True)
@@ -3352,7 +3400,7 @@ def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str,
     )
 
     breakdown_prompt = _build_module_breakdown_prompt(request)
-    answer, error = _collect_answer_from_candidate(
+    answer, error, truncated = _collect_answer_from_candidate(
         architect, org_fingerprint, [{"role": "user", "content": breakdown_prompt}],
     )
     if error:
@@ -3361,6 +3409,8 @@ def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str,
     if not answer:
         print("設計担当から応答が得られませんでした。")
         return
+    if truncated:
+        print(f"[⚠️ 設計担当の応答が長すぎたため、{CHAT_MAX_OUTPUT_TOKENS}トークンで打ち切られました。以下は不完全な内容の可能性があります]")
 
     # 仮の判断: 解析後の内容だけでなく、設計担当の回答そのもの(生テキスト)も
     # 表示する。パース処理(_parse_module_breakdown)の解釈が意図と異なって
@@ -3846,10 +3896,21 @@ def _review_one_file(
         )
     _print_tagged(print_lock, filename, f"[🔎 {round_label}] {reviewer['label']} が {filename} をレビューしています...")
     prompt = _build_review_prompt(filename, code, reviewer_own_filename, truncated_reviewer_own_code, full_plan)
-    answer, error = _collect_review_answer_with_read_file(
+    answer, error, answer_truncated = _collect_review_answer_with_read_file(
         reviewer, org_fingerprint, [{"role": "user", "content": prompt}], out_dir,
         print_lock=print_lock, tag=filename,
     )
+    if answer_truncated:
+        # 仮の判断: 複雑な指摘を書こうとした応答がCHAT_MAX_OUTPUT_TOKENS上限で
+        # 途中で打ち切られた場合、1行目の判定(「問題あり」/「問題なし」)は
+        # 残っていても、その後に続くはずだった指摘内容が不完全な可能性がある。
+        # 中途半端な指摘内容に基づいて修正を進めるより、この回のレビューを
+        # 問い合わせ失敗と同様に扱い安全側(=最大2回の枠内で次に進む)に倒す。
+        _print_tagged(
+            print_lock, filename,
+            f"[{reviewer['label']}が{filename}をレビュー] 応答が長すぎたため打ち切りました({CHAT_MAX_OUTPUT_TOKENS}トークン上限)。",
+        )
+        return False, f"レビュー応答が{CHAT_MAX_OUTPUT_TOKENS}トークン上限で打ち切られました"
     if error or not answer:
         message = error or "応答がありませんでした"
         _print_tagged(print_lock, filename, f"[{reviewer['label']}が{filename}をレビュー] 問い合わせに失敗しました: {message}")
@@ -3869,10 +3930,27 @@ def _request_fix(
 ):
     """レビューで指摘された内容を担当メンバーに伝え、修正版のコードを
     取得して保存する。修正後のコード文字列を返し、失敗時はNoneを返す。
+
+    仮の判断: 複雑な指摘(複数の問題点を同時に含む等)を受けた修正依頼で、
+    モデルの応答がCHAT_MAX_OUTPUT_TOKENS上限に達して途中で打ち切られる
+    ことが実機で報告された(生成が終わらず手動での強制終了が必要になった
+    事例)。打ち切られた応答は、モデルが「修正し終えた」と判断した結果
+    ではなく不完全なコードである可能性が高いため、通常の問い合わせ失敗と
+    同様にNoneを返して不採用にする。これにより、この回の修正は
+    (既存の「最大2回のレビュー」構造における)1回分として消費され、
+    呼び出し元の`_review_and_fix_one_file`は元のレビュー指摘内容を
+    未解決として報告する(新たな再試行ループは追加しない)。
     """
     _print_tagged(print_lock, filename, f"[🔧 {owner['label']} に {filename} の修正を依頼しています...]")
     prompt = _build_fix_prompt(filename, code, feedback, full_plan)
-    answer, error = _collect_answer_from_candidate(owner, org_fingerprint, [{"role": "user", "content": prompt}])
+    answer, error, truncated = _collect_answer_from_candidate(owner, org_fingerprint, [{"role": "user", "content": prompt}])
+    if truncated:
+        _print_tagged(
+            print_lock, filename,
+            f"  → 応答が長すぎたため打ち切りました({CHAT_MAX_OUTPUT_TOKENS}トークン上限)。"
+            "この回の修正は不採用とし、未完了として扱います。",
+        )
+        return None
     if error or not answer:
         _print_tagged(print_lock, filename, f"  → 修正依頼への問い合わせに失敗しました: {error or '応答がありませんでした'}")
         return None
@@ -4044,7 +4122,7 @@ def _run_collaborative_task_queue(
             if on_update:
                 on_update()
             request_text = _build_collaborative_implementation_request(filename, content, tasks)
-            answer, error = _collect_answer_from_candidate(
+            answer, error, truncated = _collect_answer_from_candidate(
                 candidate, org_fingerprint, [{"role": "user", "content": request_text}],
             )
             # 仮の判断: ヘッダー行・回答本文(複数行になりうる)をまとめて
@@ -4057,6 +4135,8 @@ def _run_collaborative_task_queue(
                 preview_lines.append(f"(問い合わせに失敗しました: {error or '応答なし'})")
             else:
                 preview_lines.append(answer)
+                if truncated:
+                    preview_lines.append(f"(⚠️ 応答が長すぎたため、{CHAT_MAX_OUTPUT_TOKENS}トークンで打ち切られました。以降の構文チェック・レビューで検出されます)")
             _print_tagged(print_lock, filename, "\n".join(preview_lines))
 
             if error or not answer:
@@ -4526,7 +4606,7 @@ def _ask_organization_fix_project(port: int, org_fingerprint: str, request_text:
     prompt = _FIX_REQUEST_TOOL_PROMPT_TEMPLATE.format(
         full_plan=full_plan, file_list="\n".join(file_list), request=request, language=language,
     )
-    summary, error = _collect_answer_with_project_tools(
+    summary, error, truncated = _collect_answer_with_project_tools(
         implementer, org_fingerprint, [{"role": "user", "content": prompt}], project_dir,
     )
     if error:
@@ -4534,6 +4614,8 @@ def _ask_organization_fix_project(port: int, org_fingerprint: str, request_text:
         return
     if summary:
         print(summary)
+    if truncated:
+        print(f"[⚠️ 応答が長すぎたため、{CHAT_MAX_OUTPUT_TOKENS}トークンで打ち切られました。この後の構文チェックで問題が残っていないか確認してください]")
 
     broken_files = _syntax_check_all_files(project_dir)
 

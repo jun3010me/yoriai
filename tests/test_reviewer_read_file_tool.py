@@ -240,7 +240,7 @@ def test_collect_review_answer_with_read_file_rereads_disk_between_rounds():
     original_stream = yoriai._stream_chat_from_candidate
     yoriai._stream_chat_from_candidate = fake_stream
     try:
-        answer, error = yoriai._collect_review_answer_with_read_file(
+        answer, error, truncated = yoriai._collect_review_answer_with_read_file(
             _member("junnoMac-mini", "qwen2.5-coder-14b"), "fingerprint",
             [{"role": "user", "content": "cli.pyをレビューしてください"}], out_dir,
         )
@@ -250,6 +250,7 @@ def test_collect_review_answer_with_read_file_rereads_disk_between_rounds():
 
     assert error is None, error
     assert "問題なし" in answer, answer
+    assert truncated is False
     assert len(call_log) == 3, f"初回+2回のread_file往復で合計3回/chatを呼ぶはずです: {call_log}"
 
 
@@ -284,7 +285,7 @@ def test_collect_review_answer_with_read_file_caps_at_max_calls():
     yoriai._stream_chat_from_candidate = fake_stream
     yoriai._read_project_file_fresh = counting_read
     try:
-        answer, error = yoriai._collect_review_answer_with_read_file(
+        answer, error, truncated = yoriai._collect_review_answer_with_read_file(
             _member("junnoMac-mini", "qwen2.5-coder-14b"), "fingerprint",
             [{"role": "user", "content": "storage.pyをレビューしてください"}], out_dir,
         )
@@ -310,7 +311,7 @@ def test_review_one_file_uses_read_file_powered_review_answer():
         captured["out_dir"] = out_dir
         captured["prompt"] = messages[0]["content"]
         captured["tag"] = tag
-        return "問題なし", None
+        return "問題なし", None, False
 
     original = yoriai._collect_review_answer_with_read_file
     yoriai._collect_review_answer_with_read_file = fake_collect
@@ -339,7 +340,7 @@ def test_review_one_file_truncates_large_reviewer_own_code_in_prompt():
 
     def fake_collect(candidate, org_fingerprint, messages, out_dir, print_lock=None, tag=None):
         captured["prompt"] = messages[0]["content"]
-        return "問題なし", None
+        return "問題なし", None, False
 
     original = yoriai._collect_review_answer_with_read_file
     yoriai._collect_review_answer_with_read_file = fake_collect
@@ -381,7 +382,7 @@ def test_collect_review_answer_with_read_file_shows_read_progress_message():
     try:
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            answer, error = yoriai._collect_review_answer_with_read_file(
+            answer, error, truncated = yoriai._collect_review_answer_with_read_file(
                 _member("junnoMac-mini", "qwen2.5-coder-14b"), "fingerprint",
                 [{"role": "user", "content": "レビューしてください"}], out_dir,
             )
