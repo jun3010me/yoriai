@@ -3596,7 +3596,7 @@ def _check_python_syntax(code: str) -> tuple:
 # 全体の「使用言語」設定ではなく、ファイル単体の拡張子で振り分ける
 # (1つのプロジェクトにHTML/CSS/JavaScriptのように複数の拡張子が混在する
 # ことが普通にあり得るため、ファイル単位の判定の方が実態に即している)。
-_GCC_SYNTAX_CHECK_TIMEOUT_SEC = 15
+_EXTERNAL_SYNTAX_CHECK_TIMEOUT_SEC = 15
 
 
 def _check_file_syntax(filename: str, code: str, file_path: str = None) -> tuple:
@@ -3614,13 +3614,29 @@ def _check_file_syntax(filename: str, code: str, file_path: str = None) -> tuple
     if filename.endswith(".py"):
         ok, detail = _check_python_syntax(code)
         return ("ok" if ok else "error"), detail
-    if filename.endswith((".html", ".css", ".js")):
+    if filename.endswith((".html", ".css")):
         # 仮の判断: 依頼の「可能であれば軽量ライブラリで簡易チェック、
         # 難しければスキップしその旨を明示する」という許容に従った。
         # 標準ライブラリのhtml.parserは壊れたマークアップにも寛容で
-        # 構文エラーを検出できず、CSS/JS向けのパーサーは標準ライブラリに
+        # 構文エラーを検出できず、CSS向けのパーサーは標準ライブラリに
         # 存在しないため、新たな依存を追加せずスキップを選んだ。
-        return "skipped", "この種類のファイル(HTML/CSS/JavaScript)の構文チェックには対応していません。"
+        return "skipped", "この種類のファイル(HTML/CSS)の構文チェックには対応していません。"
+    if filename.endswith(".js"):
+        # C言語のgcc確認と同じ方式: 実機にnodeが無い場合はエラー扱いに
+        # せずスキップする(依頼の項目3)。
+        node_path = shutil.which("node")
+        if not node_path or not file_path:
+            return "skipped", "node(Node.js)が見つからないため、構文チェックをスキップしました。"
+        try:
+            result = subprocess.run(
+                [node_path, "--check", file_path],
+                capture_output=True, text=True, timeout=_EXTERNAL_SYNTAX_CHECK_TIMEOUT_SEC,
+            )
+        except Exception as exc:
+            return "skipped", f"構文チェックの実行に失敗したためスキップしました: {exc}"
+        if result.returncode == 0:
+            return "ok", ""
+        return "error", (result.stderr or result.stdout or "構文エラーが発生しました").strip()
     if filename.endswith(".c"):
         gcc_path = shutil.which("gcc") or shutil.which("cc")
         if not gcc_path or not file_path:
@@ -3628,7 +3644,7 @@ def _check_file_syntax(filename: str, code: str, file_path: str = None) -> tuple
         try:
             result = subprocess.run(
                 [gcc_path, "-fsyntax-only", file_path],
-                capture_output=True, text=True, timeout=_GCC_SYNTAX_CHECK_TIMEOUT_SEC,
+                capture_output=True, text=True, timeout=_EXTERNAL_SYNTAX_CHECK_TIMEOUT_SEC,
             )
         except Exception as exc:
             return "skipped", f"構文チェックの実行に失敗したためスキップしました: {exc}"

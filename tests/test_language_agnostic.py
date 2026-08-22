@@ -12,14 +12,14 @@
 組み立て(`_build_module_breakdown_prompt`)、(2)実際に生成されたファイルの
 拡張子からの言語の逆算(`_infer_language_from_tasks`)とPROGRESS.mdへの
 記録・読み込み(後方互換込み)、(3)拡張子に応じた構文チェックの切り替え
-(`_check_file_syntax`: Python/HTML・CSS・JavaScript/C言語/未対応言語)、
-(4)run_testのホワイトリストの言語ごとの切り替え(`_parse_run_test_command`・
-`_run_project_test_command`: node・gcc追加)、(5)`_ask_organization_
-collaborate`・`_ask_organization_fix_project`・`_resume_project`への
-結線、を検証する。
+(`_check_file_syntax`: Python/HTML・CSS/JavaScript(node --check)/C言語
+(gcc -fsyntax-only)/未対応言語)、(4)run_testのホワイトリストの言語ごとの
+切り替え(`_parse_run_test_command`・`_run_project_test_command`: node・gcc
+追加)、(5)`_ask_organization_collaborate`・`_ask_organization_fix_project`・
+`_resume_project`への結線、を検証する。
 
-gcc/gccのコンパイルチェックに依存するテストは、実行環境にgccが無い場合
-でも(スキップの理由を明示したうえで)失敗させない。
+gcc・nodeのコンパイル/構文チェックに依存するテストは、実行環境にgcc・node
+が無い場合でも(スキップの理由を明示したうえで)失敗させない。
 
 使い方: python3 tests/test_language_agnostic.py
 """
@@ -195,8 +195,8 @@ def test_check_file_syntax_python_ok_and_error():
     assert status == "error" and detail, detail
 
 
-def test_check_file_syntax_skips_html_css_js_with_explanation():
-    for filename in ("index.html", "style.css", "app.js"):
+def test_check_file_syntax_skips_html_css_with_explanation():
+    for filename in ("index.html", "style.css"):
         status, detail = yoriai._check_file_syntax(filename, "anything")
         assert status == "skipped", (filename, status)
         assert detail, (filename, detail)
@@ -222,7 +222,19 @@ def test_check_file_syntax_c_skips_when_gcc_unavailable():
         yoriai.shutil.which = original_which
 
 
+def test_check_file_syntax_js_skips_when_node_unavailable():
+    original_which = yoriai.shutil.which
+    yoriai.shutil.which = lambda name: None
+    try:
+        status, detail = yoriai._check_file_syntax("app.js", "function f() {}", file_path="/tmp/does-not-matter.js")
+        assert status == "skipped", status
+        assert "node" in detail, detail
+    finally:
+        yoriai.shutil.which = original_which
+
+
 _GCC_AVAILABLE = shutil.which("gcc") is not None or shutil.which("cc") is not None
+_NODE_AVAILABLE = shutil.which("node") is not None
 
 
 def test_check_file_syntax_c_detects_valid_and_invalid_code_with_real_gcc():
@@ -246,6 +258,32 @@ def test_check_file_syntax_c_detects_valid_and_invalid_code_with_real_gcc():
         with open(broken_path, "w", encoding="utf-8") as f:
             f.write("int main(void) { return 0 \n")  # 閉じ括弧・セミコロン欠落
         status, detail = yoriai._check_file_syntax("broken.c", open(broken_path).read(), file_path=broken_path)
+        assert status == "error", (status, detail)
+        assert detail, detail
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_check_file_syntax_js_detects_valid_and_invalid_code_with_real_node():
+    """依頼1の動作確認: 「node --check」でJavaScriptの構文チェックまで
+    機能することを確認する。実機にnodeが無い環境でも、その旨を明示して
+    テスト自体は失敗させない。
+    """
+    if not _NODE_AVAILABLE:
+        print("  (nodeが見つからないため、このテストの本体はスキップします)")
+        return
+    out_dir = tempfile.mkdtemp(prefix="yoriai_lang_test_")
+    try:
+        valid_path = os.path.join(out_dir, "ok.js")
+        with open(valid_path, "w", encoding="utf-8") as f:
+            f.write("function add(a, b) { return a + b; }\n")
+        status, detail = yoriai._check_file_syntax("ok.js", open(valid_path).read(), file_path=valid_path)
+        assert status == "ok", (status, detail)
+
+        broken_path = os.path.join(out_dir, "broken.js")
+        with open(broken_path, "w", encoding="utf-8") as f:
+            f.write("function add(a, b) { return a + b \n")  # 閉じ括弧欠落
+        status, detail = yoriai._check_file_syntax("broken.js", open(broken_path).read(), file_path=broken_path)
         assert status == "error", (status, detail)
         assert detail, detail
     finally:
@@ -553,10 +591,12 @@ def main():
         test_progress_markdown_omits_language_section_when_empty,
         test_parse_progress_markdown_treats_missing_language_section_as_empty_string,
         test_check_file_syntax_python_ok_and_error,
-        test_check_file_syntax_skips_html_css_js_with_explanation,
+        test_check_file_syntax_skips_html_css_with_explanation,
         test_check_file_syntax_skips_unknown_extension_without_treating_it_as_error,
         test_check_file_syntax_c_skips_when_gcc_unavailable,
         test_check_file_syntax_c_detects_valid_and_invalid_code_with_real_gcc,
+        test_check_file_syntax_js_skips_when_node_unavailable,
+        test_check_file_syntax_js_detects_valid_and_invalid_code_with_real_node,
         test_parse_run_test_command_accepts_node,
         test_parse_run_test_command_accepts_gcc_compile_and_run_binary,
         test_parse_run_test_command_still_rejects_disallowed_forms,
