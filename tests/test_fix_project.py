@@ -675,6 +675,11 @@ def test_fix_project_end_to_end_rejects_path_traversal_tool_calls():
     """モデルの応答(悪意ある、または壊れた応答)がプロジェクト外への
     パスを指定しても、ツール実行の安全対策(_resolve_safe_project_path)
     により実際には何も書き込まれないことを確認する(依頼の項目2・5)。
+
+    重大なバグ報告への対応の検証も兼ねる(依頼の項目3): write_file自体は
+    呼ばれたが、パストラバーサル対策により実際には失敗した場合、それが
+    "修正完了"として誤報告されず、PROGRESS.mdにも記録されないことを
+    確認する。
     """
     def fake_stream(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
         if _tool_round(messages) == 0:
@@ -696,14 +701,156 @@ def test_fix_project_end_to_end_rejects_path_traversal_tool_calls():
     out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
     try:
         projects_root = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME)
-        _write_completed_project(projects_root, "todo-cli", [("utils.py", "説明")])
+        project_dir = _write_completed_project(projects_root, "todo-cli", [("utils.py", "説明")])
 
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             yoriai._ask_organization_fix_project(47120, "fingerprint", "todo-cli: 何かを直して", out_dir)
+        output = buf.getvalue()
 
         assert not os.path.exists(os.path.join(out_dir, "etc", "passwd"))
         assert not os.path.exists(os.path.join(os.path.dirname(out_dir), "etc", "passwd"))
+
+        assert "[✅ 修正が完了しました" not in output, (
+            f"実際には何も書き込まれていないのに完了扱いになっています: {output}"
+        )
+        assert "実行されませんでした" in output, output
+
+        parsed = yoriai._parse_progress_markdown(os.path.join(project_dir, yoriai.PROGRESS_FILENAME))
+        assert parsed["changelog"] == [], (
+            f"何も変更されていないのにPROGRESS.mdへ更新履歴が記録されています: {parsed['changelog']}"
+        )
+    finally:
+        yoriai._fetch_org_snapshot = original_snapshot
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_fix_project_reports_honestly_when_model_never_calls_a_tool():
+    """重大なバグ報告への対応(依頼の項目2): モデルが「修正しました」と
+    いう文章だけを返し、write_file等のツールを一度も呼ばなかった場合に、
+    "修正完了"ではなく正直に「実行されませんでした」と報告し、
+    PROGRESS.mdにも記録しないことを確認する。
+    """
+    def fake_stream(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
+        yield {"content": "ID生成のロジックを確認しましたが、特に問題は見当たりませんでした。修正しました。"}
+        yield {"done": True}
+
+    original_snapshot = yoriai._fetch_org_snapshot
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False: _two_member_snapshot()
+    yoriai._stream_chat_from_candidate = fake_stream
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        projects_root = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME)
+        project_dir = _write_completed_project(
+            projects_root, "todo-cli", [("utils.py", "説明")], files={"utils.py": "def generate_id():\n    return 1\n"},
+        )
+        original_content = open(os.path.join(project_dir, "utils.py"), encoding="utf-8").read()
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            yoriai._ask_organization_fix_project(47120, "fingerprint", "todo-cli: バグを直して", out_dir)
+        output = buf.getvalue()
+
+        assert "[✅ 修正が完了しました" not in output, output
+        assert "実行されませんでした" in output, output
+        with open(os.path.join(project_dir, "utils.py"), encoding="utf-8") as f:
+            assert f.read() == original_content, "ファイルの中身が変わってしまっています"
+
+        parsed = yoriai._parse_progress_markdown(os.path.join(project_dir, yoriai.PROGRESS_FILENAME))
+        assert parsed["changelog"] == [], parsed["changelog"]
+    finally:
+        yoriai._fetch_org_snapshot = original_snapshot
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_fix_project_records_actually_modified_filenames_in_changelog():
+    """依頼の動作確認: PROGRESS.mdの更新履歴が、実際に変更されたファイル名を
+    含み、実態と一致していることを確認する。
+    """
+    original_snapshot = yoriai._fetch_org_snapshot
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False: _two_member_snapshot()
+    yoriai._stream_chat_from_candidate = _fake_stream_fix_simple_write
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        projects_root = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME)
+        project_dir = _write_completed_project(
+            projects_root, "todo-cli", [("utils.py", "説明")], files={"utils.py": "def generate_id():\n    return 1\n"},
+        )
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            yoriai._ask_organization_fix_project(47120, "fingerprint", "todo-cli: バグを直して", out_dir)
+        output = buf.getvalue()
+
+        assert "utils.py" in output and "変更したファイル" in output, output
+        parsed = yoriai._parse_progress_markdown(os.path.join(project_dir, yoriai.PROGRESS_FILENAME))
+        assert len(parsed["changelog"]) == 1, parsed["changelog"]
+        assert "utils.py" in parsed["changelog"][0], parsed["changelog"]
+    finally:
+        yoriai._fetch_org_snapshot = original_snapshot
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_fix_project_records_partial_progress_honestly_when_round_cap_is_hit():
+    """依頼の動作確認: 「暴走・ツール呼び出し上限到達」に近い状況を作り、
+    その場合に誤って"完了"と報告されないことを確認する。一部のファイルは
+    実際に変更された状態でMAX_PROJECT_TOOL_ROUNDSに達した場合、"完了"では
+    なく正直に「セッションが最後まで正常に完了しなかった」旨を報告し、
+    かつ実際に変更されたファイルはPROGRESS.mdに記録される
+    (変更そのものは無かったことにしない)ことを確認する。
+    """
+    def fake_stream_writes_then_loops_forever(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
+        if _tool_round(messages) == 0:
+            yield {"pending_tool_calls": [
+                {"id": "call_1", "type": "function", "function": {
+                    "name": "write_file",
+                    "arguments": {"filename": "utils.py", "content": "def generate_id():\n    return 'fixed-id'\n"},
+                }},
+            ]}
+            return
+        # 以降は無限にlist_dirを呼び続け、最終回答を一切返さない状況を模す。
+        yield {"pending_tool_calls": [
+            {"id": "call_loop", "type": "function", "function": {"name": "list_dir", "arguments": {}}},
+        ]}
+
+    original_snapshot = yoriai._fetch_org_snapshot
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False: _two_member_snapshot()
+    yoriai._stream_chat_from_candidate = fake_stream_writes_then_loops_forever
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        projects_root = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME)
+        project_dir = _write_completed_project(
+            projects_root, "todo-cli", [("utils.py", "説明")], files={"utils.py": "def generate_id():\n    return 1\n"},
+        )
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            yoriai._ask_organization_fix_project(47120, "fingerprint", "todo-cli: バグを直して", out_dir)
+        output = buf.getvalue()
+
+        assert "[✅ 修正が完了しました" not in output, (
+            f"往復回数の上限到達で異常終了しているのに完了扱いになっています: {output}"
+        )
+        assert "正常に完了しませんでした" in output, output
+        assert "utils.py" in output, output
+
+        with open(os.path.join(project_dir, "utils.py"), encoding="utf-8") as f:
+            assert "fixed-id" in f.read(), "実際に成功した書き込みは反映されているはずです"
+
+        parsed = yoriai._parse_progress_markdown(os.path.join(project_dir, yoriai.PROGRESS_FILENAME))
+        assert len(parsed["changelog"]) == 1, (
+            f"実際に変更が確認できた場合は、異常終了でもPROGRESS.mdに記録されるはずです: {parsed['changelog']}"
+        )
+        assert "utils.py" in parsed["changelog"][0], parsed["changelog"]
     finally:
         yoriai._fetch_org_snapshot = original_snapshot
         yoriai._stream_chat_from_candidate = original_stream
@@ -839,12 +986,13 @@ def test_collect_answer_with_project_tools_stops_at_round_cap():
     out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
     try:
         candidate = {"label": "MacStudio", "model": "m", "address": "127.0.0.1", "port": 47120}
-        content, error, truncated = yoriai._collect_answer_with_project_tools(
+        content, error, truncated, modified_files = yoriai._collect_answer_with_project_tools(
             candidate, "fingerprint", [{"role": "user", "content": "何か直して"}], out_dir,
         )
         assert content == ""
         assert error is not None and "上限" in error, error
         assert truncated is False
+        assert modified_files == [], modified_files
     finally:
         yoriai._stream_chat_from_candidate = original_stream
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -932,6 +1080,9 @@ def main():
         test_fix_project_reports_not_found_without_modifying_anything,
         test_fix_project_refuses_when_target_project_is_incomplete,
         test_fix_project_end_to_end_rejects_path_traversal_tool_calls,
+        test_fix_project_reports_honestly_when_model_never_calls_a_tool,
+        test_fix_project_records_actually_modified_filenames_in_changelog,
+        test_fix_project_records_partial_progress_honestly_when_round_cap_is_hit,
         test_fix_project_reports_syntax_errors_remaining_after_fix,
         test_fix_project_works_with_single_member_present,
         test_fix_project_end_to_end_delete_records_two_changelog_entries,
