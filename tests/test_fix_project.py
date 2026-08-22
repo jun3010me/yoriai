@@ -299,54 +299,6 @@ def test_list_project_directory_excludes_progress_md():
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
-def test_parse_run_test_command_allows_only_whitelisted_forms():
-    assert yoriai._parse_run_test_command("python3 test_utils.py") == (["python3", "test_utils.py"], None)
-    assert yoriai._parse_run_test_command("pytest") == (["pytest"], None)
-    assert yoriai._parse_run_test_command("pytest test_utils.py") == (["pytest", "test_utils.py"], None)
-
-    argv, error = yoriai._parse_run_test_command("rm -rf /")
-    assert argv is None
-    assert error is not None
-
-    argv, error = yoriai._parse_run_test_command("python3 a.py; rm -rf /")
-    assert argv is None, "セミコロンを含む文字列はホワイトリストの2トークン形式に一致しないため拒否されるはずです"
-
-
-def test_run_project_test_command_executes_passing_test():
-    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
-    try:
-        with open(os.path.join(out_dir, "test_ok.py"), "w", encoding="utf-8") as f:
-            f.write("assert 1 + 1 == 2\nprint('OK')\n")
-        result = json.loads(yoriai._run_project_test_command(out_dir, "python3 test_ok.py"))
-        assert result["ok"] is True, result
-        assert "OK" in result["output"], result
-    finally:
-        shutil.rmtree(out_dir, ignore_errors=True)
-
-
-def test_run_project_test_command_reports_failure_output():
-    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
-    try:
-        with open(os.path.join(out_dir, "test_fail.py"), "w", encoding="utf-8") as f:
-            f.write("assert 1 + 1 == 3, 'broken math'\n")
-        result = json.loads(yoriai._run_project_test_command(out_dir, "python3 test_fail.py"))
-        assert result["ok"] is False, result
-        assert "broken math" in result["output"], result
-    finally:
-        shutil.rmtree(out_dir, ignore_errors=True)
-
-
-def test_run_project_test_command_rejects_disallowed_command_without_executing():
-    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
-    try:
-        marker = os.path.join(out_dir, "should_not_exist")
-        result = json.loads(yoriai._run_project_test_command(out_dir, f"touch {marker}"))
-        assert result["ok"] is False, result
-        assert not os.path.exists(marker), "ホワイトリスト外のコマンドは実行されないはずです"
-    finally:
-        shutil.rmtree(out_dir, ignore_errors=True)
-
-
 def test_syntax_check_all_files_reports_broken_files_only():
     """未対応の拡張子(notes.txt)はスキップされ、"broken"扱いにはならない
     ことも合わせて確認する(言語非依存化に伴う名称・挙動の更新)。
@@ -529,7 +481,7 @@ def _tool_round(messages):
 def _fake_stream_fix_with_tools(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
     """依頼の動作確認のシナリオ(リネーム→import修正→テスト実行)を
     模したフェイクの/chat応答。read_file→move_file→write_file→
-    run_test→最終報告、の順にツール呼び出しラウンドを進める。
+    run_command→最終報告、の順にツール呼び出しラウンドを進める。
     """
     n = _tool_round(messages)
     if n == 0:
@@ -557,7 +509,7 @@ def _fake_stream_fix_with_tools(candidate, org_fingerprint, messages, offer_proj
         return
     if n == 3:
         yield {"pending_tool_calls": [
-            {"id": "call_4", "type": "function", "function": {"name": "run_test", "arguments": {"command": "pytest"}}},
+            {"id": "call_4", "type": "function", "function": {"name": "run_command", "arguments": {"command": "pytest"}}},
         ]}
         return
     yield {"content": "utils.pyをhelpers.pyにリネームし、cli.pyのimportを修正してテストを実行しました。"}
@@ -581,7 +533,7 @@ def test_fix_project_end_to_end_uses_tools_to_rename_edit_and_test():
     """依頼の動作確認: 完成済みプロジェクトに「ファイル名をutils.pyから
     helpers.pyに変更して、それに合わせてimportも直して、テストがあれば
     実行して確認して」のような依頼を送ると、正しいプロジェクトが特定され、
-    複数のツール(read_file・move_file・write_file・run_test)を使って
+    複数のツール(read_file・move_file・write_file・run_command)を使って
     修正が行われ、無関係なファイルには影響が出ないことを確認する。
     """
     original_snapshot = yoriai._fetch_org_snapshot
@@ -962,10 +914,6 @@ def main():
         test_delete_project_file_rejects_progress_md_itself,
         test_make_project_directory_creates_subdirectory,
         test_list_project_directory_excludes_progress_md,
-        test_parse_run_test_command_allows_only_whitelisted_forms,
-        test_run_project_test_command_executes_passing_test,
-        test_run_project_test_command_reports_failure_output,
-        test_run_project_test_command_rejects_disallowed_command_without_executing,
         test_syntax_check_all_files_reports_broken_files_only,
         test_execute_project_tool_call_dispatches_to_write_file,
         test_identify_target_project_matches_unique_high_scoring_project,

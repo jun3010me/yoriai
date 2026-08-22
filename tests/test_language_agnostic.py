@@ -13,10 +13,10 @@
 拡張子からの言語の逆算(`_infer_language_from_tasks`)とPROGRESS.mdへの
 記録・読み込み(後方互換込み)、(3)拡張子に応じた構文チェックの切り替え
 (`_check_file_syntax`: Python/HTML・CSS/JavaScript(node --check)/C言語
-(gcc -fsyntax-only)/未対応言語)、(4)run_testのホワイトリストの言語ごとの
-切り替え(`_parse_run_test_command`・`_run_project_test_command`: node・gcc
-追加)、(5)`_ask_organization_collaborate`・`_ask_organization_fix_project`・
-`_resume_project`への結線、を検証する。
+(gcc -fsyntax-only)/未対応言語)、(4)`_ask_organization_collaborate`・
+`_ask_organization_fix_project`・`_resume_project`への結線、を検証する
+(以前ここにあった、run_testの言語ごとの決め打ちホワイトリストの検証は、
+run_commandへの刷新に伴い`tests/test_run_command.py`へ移設した)。
 
 gcc・nodeのコンパイル/構文チェックに依存するテストは、実行環境にgcc・node
 が無い場合でも(スキップの理由を明示したうえで)失敗させない。
@@ -357,94 +357,6 @@ def test_check_file_syntax_html_supports_module_type_inline_script():
 
 
 # ---------------------------------------------------------------------------
-# run_testのホワイトリスト(言語ごとの切り替え)
-# ---------------------------------------------------------------------------
-
-def test_parse_run_test_command_accepts_node():
-    assert yoriai._parse_run_test_command("node app.js") == (["node", "app.js"], None)
-
-
-def test_parse_run_test_command_accepts_gcc_compile_and_run_binary():
-    assert yoriai._parse_run_test_command("gcc calc.c -o calc") == (["gcc", "calc.c", "-o", "calc"], None)
-    assert yoriai._parse_run_test_command("./calc") == (["./calc"], None)
-
-
-def test_parse_run_test_command_still_rejects_disallowed_forms():
-    argv, error = yoriai._parse_run_test_command("rm -rf /")
-    assert argv is None
-    assert error is not None
-    argv, error = yoriai._parse_run_test_command("gcc calc.c -Wall -o calc")  # -o が想定位置に無い
-    assert argv is None, argv
-
-
-def test_run_project_test_command_compiles_and_runs_c_program_end_to_end():
-    """依頼の動作確認: C言語の「コンパイル→実行」の一連の手順が、
-    run_testツールの2回の呼び出し(gccでコンパイル→./<出力>で実行)で
-    実際に機能することを確認する。
-    """
-    if not _GCC_AVAILABLE:
-        print("  (gccが見つからないため、このテストの本体はスキップします)")
-        return
-    out_dir = tempfile.mkdtemp(prefix="yoriai_lang_test_")
-    try:
-        with open(os.path.join(out_dir, "calc.c"), "w", encoding="utf-8") as f:
-            f.write(
-                '#include <stdio.h>\n'
-                'int main(void) { printf("%d\\n", 1 + 2); return 0; }\n'
-            )
-        compile_result = json.loads(yoriai._run_project_test_command(out_dir, "gcc calc.c -o calc"))
-        assert compile_result["ok"] is True, compile_result
-        assert os.path.isfile(os.path.join(out_dir, "calc"))
-
-        run_result = json.loads(yoriai._run_project_test_command(out_dir, "./calc"))
-        assert run_result["ok"] is True, run_result
-        assert "3" in run_result["output"], run_result
-    finally:
-        shutil.rmtree(out_dir, ignore_errors=True)
-
-
-def test_run_project_test_command_rejects_running_binary_that_was_not_compiled():
-    """"./<出力>"は、対象ファイルがプロジェクト内に実在しない限り実行
-    できないことを確認する(write_fileはテキストを書き込むだけで実行権限を
-    付与しないため、実質的にgccのコンパイル手順を経たファイルしか実行
-    できない、という安全設計を裏付ける)。
-    """
-    out_dir = tempfile.mkdtemp(prefix="yoriai_lang_test_")
-    try:
-        result = json.loads(yoriai._run_project_test_command(out_dir, "./nonexistent"))
-        assert result["ok"] is False, result
-    finally:
-        shutil.rmtree(out_dir, ignore_errors=True)
-
-
-def test_run_project_test_command_rejects_path_traversal_in_gcc_output_name():
-    out_dir = tempfile.mkdtemp(prefix="yoriai_lang_test_")
-    try:
-        with open(os.path.join(out_dir, "calc.c"), "w", encoding="utf-8") as f:
-            f.write("int main(void) { return 0; }\n")
-        result = json.loads(yoriai._run_project_test_command(out_dir, "gcc calc.c -o ../../evil"))
-        assert result["ok"] is False, result
-        assert not os.path.exists(os.path.join(os.path.dirname(out_dir), "evil"))
-    finally:
-        shutil.rmtree(out_dir, ignore_errors=True)
-
-
-def test_run_project_test_command_executes_node_script_when_available():
-    if not shutil.which("node"):
-        print("  (nodeが見つからないため、このテストの本体はスキップします)")
-        return
-    out_dir = tempfile.mkdtemp(prefix="yoriai_lang_test_")
-    try:
-        with open(os.path.join(out_dir, "app.js"), "w", encoding="utf-8") as f:
-            f.write("console.log(1 + 2);\n")
-        result = json.loads(yoriai._run_project_test_command(out_dir, "node app.js"))
-        assert result["ok"] is True, result
-        assert "3" in result["output"], result
-    finally:
-        shutil.rmtree(out_dir, ignore_errors=True)
-
-
-# ---------------------------------------------------------------------------
 # _ask_organization_collaborateへの結線(統合テスト)
 # ---------------------------------------------------------------------------
 
@@ -667,13 +579,6 @@ def main():
         test_check_file_syntax_html_detects_inline_script_syntax_errors_with_real_node,
         test_check_file_syntax_html_ignores_external_and_non_javascript_script_tags,
         test_check_file_syntax_html_supports_module_type_inline_script,
-        test_parse_run_test_command_accepts_node,
-        test_parse_run_test_command_accepts_gcc_compile_and_run_binary,
-        test_parse_run_test_command_still_rejects_disallowed_forms,
-        test_run_project_test_command_compiles_and_runs_c_program_end_to_end,
-        test_run_project_test_command_rejects_running_binary_that_was_not_compiled,
-        test_run_project_test_command_rejects_path_traversal_in_gcc_output_name,
-        test_run_project_test_command_executes_node_script_when_available,
         test_collaborate_records_c_language_from_explicit_request,
         test_collaborate_still_defaults_python_regression,
         test_resume_project_backfills_language_for_old_progress_md,
