@@ -2654,6 +2654,38 @@ def _execute_project_tool_call(
 # 上限を設ける。
 MAX_PROJECT_TOOL_ROUNDS = 12
 
+# 仮の判断: 実機で、//fixが「修正が完了しました」と表示し、PROGRESS.mdにも
+# 更新履歴を記録したにもかかわらず、実際にはファイルの中身が一切変更
+# されていないという不具合が報告された。原因は、モデルが「修正しました」
+# という文章だけを返してwrite_file等を一度も呼ばなかった場合や、
+# write_fileが呼ばれたがパストラバーサル対策等で実際には失敗した場合に、
+# それを検出せず無条件に完了扱いにしていたこと。これらのツールは
+# 「プロジェクトの実ファイルを実際に変更する」ツールであり、その成功
+# (JSON結果の"ok"フィールド)を追跡することで、「本当に何か変更されたか」
+# を機械的に判定できるようにする。make_directoryは空のディレクトリを
+# 作るだけで「修正の実体」とは言えないため含めない。read_file・list_dir・
+# run_commandはファイルを変更しないため対象外。
+_MUTATING_PROJECT_TOOL_NAMES = {WRITE_FILE_TOOL_NAME, MOVE_FILE_TOOL_NAME, DELETE_FILE_TOOL_NAME}
+
+
+def _mutated_filename_from_tool_result(tool_call: dict, result: str) -> str:
+    """`tool_call`が実際にファイルを変更した(write_file/move_file/
+    delete_fileが成功した)場合、そのファイル名を返す。それ以外
+    (対象外のツール・失敗した呼び出し・結果が解析できない場合)は
+    空文字列を返す。
+    """
+    function = tool_call.get("function", {})
+    name = function.get("name", "")
+    if name not in _MUTATING_PROJECT_TOOL_NAMES:
+        return ""
+    try:
+        parsed = json.loads(result)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(parsed, dict) or not parsed.get("ok"):
+        return ""
+    return parsed.get("filename") or parsed.get("new_filename") or "(不明なファイル)"
+
 
 def _collect_answer_with_project_tools(
     candidate: dict, org_fingerprint: str, messages: list, project_dir: str,
@@ -2664,10 +2696,17 @@ def _collect_answer_with_project_tools(
     「/chatはステートレスなので、ツール実行結果を足したmessagesで再度
     /chatを呼び直せば会話を継続できる」という設計を踏襲するが、read_file
     単体ではなく複数種類のツールを1つのループで扱えるように汎化した。
-    `(content, error, truncated)`のタプルを返す。`truncated`は最終回答が
-    CHAT_MAX_OUTPUT_TOKENS上限に達して途中で打ち切られたかどうかを表す。
+    `(content, error, truncated, modified_files)`のタプルを返す。
+    `truncated`は最終回答がCHAT_MAX_OUTPUT_TOKENS上限に達して途中で
+    打ち切られたかどうかを表す。`modified_files`は、write_file/move_file/
+    delete_fileが実際に成功した結果、変更が確認できたファイル名のリスト
+    (呼び出し順、重複あり)。エラーで打ち切られた場合・往復回数の上限に
+    達した場合でも、それまでに実際に成功した変更は失われず反映される
+    (呼び出し元が「途中終了でも一部は変更されている」ことを正しく
+    報告できるようにするため)。
     """
     messages = list(messages)
+    modified_files = []
     for _round_num in range(MAX_PROJECT_TOOL_ROUNDS):
         answer_parts = []
         pending_tool_calls = None
@@ -2688,16 +2727,19 @@ def _collect_answer_with_project_tools(
                 break
 
         if error:
-            return "", error, False
+            return "", error, False, modified_files
         if not pending_tool_calls:
-            return "".join(answer_parts), None, truncated
+            return "".join(answer_parts), None, truncated, modified_files
 
         messages.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
         for tool_call in pending_tool_calls:
             result = _execute_project_tool_call(project_dir, tool_call, print_lock, tag or candidate["label"])
             messages.append({"role": "tool", "content": result, "tool_call_id": tool_call.get("id")})
+            mutated_filename = _mutated_filename_from_tool_result(tool_call, result)
+            if mutated_filename:
+                modified_files.append(mutated_filename)
 
-    return "", f"ツール呼び出しの往復回数が上限({MAX_PROJECT_TOOL_ROUNDS}回)に達しました", False
+    return "", f"ツール呼び出しの往復回数が上限({MAX_PROJECT_TOOL_ROUNDS}回)に達しました", False, modified_files
 
 
 def _syntax_check_all_files(project_dir: str) -> list:
@@ -4778,6 +4820,21 @@ def _ask_organization_fix_project(port: int, org_fingerprint: str, request_text:
       で言語の記録が無い場合は、モジュール分割案のファイル拡張子から
       その場で逆算する。`_resume_project`と同じ「読み込み時に補完する」
       考え方)。
+
+    仮の判断(重大なバグ報告への対応): 実機で、「修正が完了しました」と
+    表示されPROGRESS.mdにも更新履歴が記録されたにもかかわらず、実際には
+    対象ファイルが一切変更されていない不具合が報告された。原因は、
+    `_collect_answer_with_project_tools`の問い合わせ自体が成功したか
+    どうか(`error`)だけを見ており、モデルが実際にwrite_file等を呼んで
+    ファイルを変更したかどうかを一切確認していなかったこと(文章だけの
+    "修正しました"という回答や、write_fileが呼ばれたがパストラバーサル
+    対策等で実際には失敗したケースの両方で、無条件に完了扱いになって
+    いた)。`_collect_answer_with_project_tools`が返す`modified_files`
+    (write_file/move_file/delete_fileが実際に成功したファイル名の
+    リスト)が空の場合は、問い合わせ自体の成否に関わらず「修正が実行
+    されませんでした」と正直に報告し、PROGRESS.mdへの更新履歴の記録も
+    行わない。これにより、「完了しました」という報告とPROGRESS.mdの
+    更新履歴は、常に実際のファイル変更と対応することが保証される。
     """
     explicit_project_dir, request = _resolve_explicit_fix_target(request_text, out_dir)
     if explicit_project_dir:
@@ -4834,12 +4891,35 @@ def _ask_organization_fix_project(port: int, org_fingerprint: str, request_text:
     prompt = _FIX_REQUEST_TOOL_PROMPT_TEMPLATE.format(
         full_plan=full_plan, file_list="\n".join(file_list), request=request, language=language,
     )
-    summary, error, truncated = _collect_answer_with_project_tools(
+    summary, error, truncated, modified_files = _collect_answer_with_project_tools(
         implementer, org_fingerprint, [{"role": "user", "content": prompt}], project_dir,
     )
-    if error:
-        print(f"修正の問い合わせに失敗しました: {error}")
+
+    # 仮の判断: 実機で、「修正が完了しました」と表示されPROGRESS.mdにも
+    # 更新履歴が記録されたにもかかわらず、実際にはファイルが一切変更
+    # されていない(モデルが文章だけを返してwrite_file等を一度も呼ばな
+    # かった、または呼んだが失敗した)という不具合が報告された。
+    # write_file/move_file/delete_fileが実際に成功したことが確認できた
+    # 場合(modified_filesが空でない場合)のみ、"完了"の報告とPROGRESS.md
+    # への更新履歴の記録を行う。1件も変更が確認できなければ、問い合わせ
+    # 自体は成功していても(=モデルが応答は返したが行動しなかった場合も
+    # 含めて)正直に「実行されませんでした」と報告し、PROGRESS.mdは
+    # 一切書き換えない(事実と異なる完了報告をしないため)。
+    if not modified_files:
+        if error:
+            print(f"修正の問い合わせに失敗しました: {error}")
+        else:
+            if summary:
+                print(summary)
+            print(
+                "[ℹ️ 修正が実行されませんでした(ファイルへの書き込み・変更が一度も"
+                "確認できませんでした)。依頼内容を具体的にして再度お試しください]"
+            )
         return
+
+    # ここに到達した時点で、少なくとも1件のファイル変更が実際に確認できている。
+    # （エラー・往復回数の上限到達により途中で終わった場合でも、それまでに
+    # 成功した変更はmodified_filesに残っているため、報告・記録の対象にする。）
     if summary:
         print(summary)
     if truncated:
@@ -4853,17 +4933,28 @@ def _ask_organization_fix_project(port: int, org_fingerprint: str, request_text:
     # changelogに1件追記する(その更新履歴を上書きで消してしまわないため)。
     latest_parsed = _parse_progress_markdown(os.path.join(project_dir, PROGRESS_FILENAME)) or parsed
     today = datetime.date.today().isoformat()
-    note = "" if not broken_files else f"(構文エラーが残っています: {', '.join(broken_files)})"
+    # 仮の判断: 「PROGRESS.mdの更新履歴が、実際の変更内容と一致している
+    # ことを確認したい」という依頼の動作確認要件に応えるため、実際に変更が
+    # 確認できたファイル名を更新履歴にも明記する(重複は除いて表示する)。
+    unique_modified_files = list(dict.fromkeys(modified_files))
+    file_note = f" [変更ファイル: {', '.join(unique_modified_files)}]"
+    error_note = f" (セッションが最後まで完了しませんでした: {error})" if error else ""
+    syntax_note = f" (構文エラーが残っています: {', '.join(broken_files)})" if broken_files else ""
     changelog = list(latest_parsed["changelog"])
-    changelog.append(f"- {today}: {request.strip()}{note}")
+    changelog.append(f"- {today}: {request.strip()}{file_note}{error_note}{syntax_note}")
     _write_progress_md(
         project_dir, latest_parsed["request"], latest_parsed["tasks"], latest_parsed["checklist"],
         review_feedback={}, auto_resume_count=latest_parsed["auto_resume_count"], changelog=changelog,
         language=latest_parsed["language"] or language,
     )
 
-    if not broken_files:
-        print(f"[✅ 修正が完了しました (プロジェクト: {project_dir})]")
+    if error:
+        print(
+            f"[⚠️ 修正セッションが最後まで正常に完了しませんでした({error})。"
+            f"ただし一部のファイルは実際に変更されています: {', '.join(unique_modified_files)}]"
+        )
+    elif not broken_files:
+        print(f"[✅ 修正が完了しました (プロジェクト: {project_dir}, 変更したファイル: {', '.join(unique_modified_files)})]")
     else:
         print(f"[⚠️ 修正は保存されましたが、構文エラーが残っているファイルがあります: {', '.join(broken_files)}]")
 
