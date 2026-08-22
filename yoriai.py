@@ -15,6 +15,7 @@ import os
 import platform
 import queue
 import re
+import select
 import shutil
 import socket
 import subprocess
@@ -2157,25 +2158,38 @@ MAKE_DIRECTORY_TOOL_SCHEMA = {
     },
 }
 
-RUN_TEST_TOOL_NAME = "run_test"
-RUN_TEST_TOOL_SCHEMA = {
+# 仮の判断: 依頼(「検証専用の、より柔軟なコマンド実行ツールへの刷新」)
+# への対応。以前のrun_testは拡張子ごとに決め打ちのコマンドしか実行でき
+# ず、対応していない言語・状況(HTML/CSS等)ではモデルが見当違いの
+# コマンドを何度も試してツール呼び出し上限を無駄にする不具合が繰り返し
+# 報告された。run_commandはコマンド文字列を自由に指定できる代わりに、
+# 実行前に機械的なフィルタ(ネットワークアクセス・破壊的操作・権限昇格の
+# 拒否、プロジェクトディレクトリへの実行範囲の固定)を必ず通す設計に
+# 置き換えた(run_testは廃止し、check_htmlの機能はrun_command経由で
+# 引き続き使えるようにした)。Claude CodeのBashツールのような無制限な
+# 実行権限とは異なり、あくまで「検証・確認」の範囲内での柔軟性向上が
+# 目的であることに注意(詳細は_validate_run_commandのコメントを参照)。
+RUN_COMMAND_TOOL_NAME = "run_command"
+RUN_COMMAND_TOOL_SCHEMA = {
     "type": "function",
     "function": {
-        "name": RUN_TEST_TOOL_NAME,
+        "name": RUN_COMMAND_TOOL_NAME,
         "description": (
-            "プロジェクトディレクトリ内でテストを実行して動作を確認する。実行できるコマンドは"
-            "'python3 <ファイル名>'・'pytest'・'pytest <ファイル名>'・'node <ファイル名>'・"
-            "'gcc <Cファイル名> -o <出力ファイル名>'(コンパイル)・'./<出力ファイル名>'"
-            "(コンパイル済みファイルの実行)・'check_html <HTMLファイル名>'"
-            "(ヘッドレスブラウザで開き、コンソールエラーの有無を確認する。実機にPlaywrightが"
-            "無い場合はスキップされる)のみに限定されており、それ以外の任意のコマンドは実行できない。"
-            "各コマンドは対応する拡張子のファイルにのみ使用できる(例: gccは.cファイル専用、"
-            ".html/.cssファイルの動作確認にはcheck_htmlを使う)。"
+            "プロジェクトディレクトリ内で、ファイルの検証に適したコマンドを自由に実行して動作を"
+            "確認する(例: 'python3 app.py'・'node --check app.js'・'gcc -fsyntax-only calc.c'・"
+            "'pytest'。HTML/CSSファイルは実機にPlaywrightがあれば"
+            "'check_html <HTMLファイル名>' でヘッドレスブラウザによる検証ができる)。"
+            "検証専用のツールであり、ファイルの作成・上書き・移動・削除にはwrite_file・"
+            "move_file・delete_fileを使うこと(run_commandでは行えない)。"
+            "ネットワークアクセス(curl・wget・ssh等)・ファイルの削除や移動(rm・mv・cp等)・"
+            "権限昇格(sudo等)・シェル自体の起動(bash・sh等)を行うコマンド、"
+            "プロジェクトディレクトリの外を指すパス(絶対パス・'..'を含む相対パス)は"
+            "実行前に拒否される。実行時間は10秒、出力は4000文字まで。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "command": {"type": "string", "description": "実行するコマンド(例: python3 test_utils.py)"},
+                "command": {"type": "string", "description": "実行するコマンド(例: python3 app.py)"},
             },
             "required": ["command"],
         },
@@ -2189,12 +2203,12 @@ RUN_TEST_TOOL_SCHEMA = {
 PROJECT_TOOLS_SCHEMAS = [
     READ_FILE_TOOL_SCHEMA, LIST_DIR_TOOL_SCHEMA, WRITE_FILE_TOOL_SCHEMA,
     MOVE_FILE_TOOL_SCHEMA, DELETE_FILE_TOOL_SCHEMA, MAKE_DIRECTORY_TOOL_SCHEMA,
-    RUN_TEST_TOOL_SCHEMA,
+    RUN_COMMAND_TOOL_SCHEMA,
 ]
 PROJECT_TOOLS_CLIENT_NAMES = {
     READ_FILE_TOOL_NAME, LIST_DIR_TOOL_NAME, WRITE_FILE_TOOL_NAME,
     MOVE_FILE_TOOL_NAME, DELETE_FILE_TOOL_NAME, MAKE_DIRECTORY_TOOL_NAME,
-    RUN_TEST_TOOL_NAME,
+    RUN_COMMAND_TOOL_NAME,
 }
 
 
@@ -2293,92 +2307,198 @@ def _make_project_directory(project_dir: str, dirname: str) -> str:
     return json.dumps({"ok": True, "dirname": os.path.basename(safe_path)}, ensure_ascii=False)
 
 
-# 仮の判断: 依頼の項目3(「テスト実行コマンドも、実行できるコマンドの種類を
-# ホワイトリスト形式で限定」)への対応。'python3 <ファイル名>'・'pytest'・
-# 'pytest <ファイル名>'の3パターンのみを許可し、それ以外の文字列は
-# 一切実行しない。shell=Trueは使わず引数リストのまま渡すため、
-# ';'や'&&'のようなシェル特殊文字を含む文字列を渡されても素朴に
-# トークン分割されるだけでシェルには解釈されない(コマンドインジェクション対策)。
-_RUN_TEST_TIMEOUT_SEC = 30
-_RUN_TEST_MAX_OUTPUT_CHARS = 4000
+# 仮の判断: 依頼(「検証専用の、より柔軟なコマンド実行ツールへの刷新」)
+# への対応。以前は拡張子ごとに決め打ちのコマンドしか実行できず、対応
+# していない言語・状況ではモデルが見当違いのコマンドを何度も試して
+# ツール呼び出し上限を無駄にしていた。ここではその逆に、コマンド文字列
+# 自体は自由に指定できる代わりに、実行前に機械的なフィルタ(ブロック
+# リスト方式)を必ず通す設計にした。
+#
+# 重要な注意: これはホワイトリスト(許可リスト)ではなくブロックリスト
+# (拒否リスト)方式であるため、原理的に「絶対安全」を保証するものでは
+# ない(未知の抜け道が存在しうる)。Claude CodeのBashツールのような
+# 無制限の実行権限とは異なり、あくまで「検証・確認」の範囲内での柔軟性
+# 向上が目的であることを踏まえ、以下の観点で防御している:
+# (1) ネットワークアクセス・破壊的なファイル操作(削除・移動・上書き。
+#     これらはwrite_file/delete_file/move_fileの役割)・権限昇格・
+#     シェル自体の起動を、コマンド名の一致で拒否する。argv[0]だけでなく
+#     コマンド文字列内の全トークンをチェックすることで、
+#     'env curl ...'や'timeout 5 curl ...'のような、他コマンドを間接的に
+#     起動できる「ラッパー」経由の迂回もある程度防ぐ(basenameで比較する
+#     ため'/usr/bin/curl'のようなパス付き指定も検出できる)。
+# (2) 既知のインタプリタ(python3/node等)がインラインコード実行フラグ
+#     (-c/-e/-m等)を通じて任意のコードを実行できてしまう抜け道を、
+#     フラグ単位で個別に拒否する。gccの-c(リンクなしコンパイル、
+#     'gcc -fsyntax-only'と同様によく使う正当なフラグ)のような無関係な
+#     同名フラグを誤って禁止しないよう、コマンドごとに個別のフラグ集合を
+#     持つ。
+# (3) shell=Trueは使わないため';'・'&&'・'|'・バッククォート・'$()'の
+#     ようなシェル構文はそもそも解釈されないが、念のため文字列レベルでも
+#     拒否する(縦深防御。将来shell=Trueに変更された場合の事故も防ぐ)。
+#     リダイレクト('>'/'<')も同様の理由で拒否する。
+# (4) 絶対パス・'..'を含む相対パスをどの引数にも許可しないことで、
+#     プロジェクトディレクトリの外への読み書きを防ぐ(cdはシェル無しでは
+#     単体のコマンドとして存在しないため既に実行できないが、念のため
+#     ブロックリストにも加えている)。相対パスに'..'が無ければ、
+#     cwd=project_dirの外を指すことは原理的にできない。
+#
+# なお、書き込まれたファイル自体に危険なコードが含まれていた場合
+# (例: 生成された.pyファイルが内部でファイル削除を行う)、そのファイルを
+# 検証のために実行すれば当然そのコードは動いてしまう。これは以前の
+# run_testでも同じ性質の既存のリスクであり、今回新たに生まれたもの
+# ではない(サンドボックス化・コンテナ化のような対策は今回のスコープ外)。
+RUN_COMMAND_TIMEOUT_SEC = 10
+RUN_COMMAND_MAX_OUTPUT_CHARS = 4000
+# 'yes'のように出力が際限なく続くコマンドでも、タイムアウトを待たずに
+# 読み取りを打ち切ることでメモリを圧迫しないようにする上限
+# (最終的な表示用の切り詰め幅より十分大きいが無制限ではない値。
+# Raspberry Piのようなメモリの少ない実機での常駐も想定した値)。
+_RUN_COMMAND_OUTPUT_READ_CAP_CHARS = RUN_COMMAND_MAX_OUTPUT_CHARS * 10
 
+_RUN_COMMAND_BLOCKED_SHELL_CHARS = ";|&`<>\n"
 
-# 仮の判断: 依頼の項目3(言語ごとにホワイトリストを切り替える)への対応。
-# Python(python3/pytest)に加えて、JavaScript(node)・C言語(gccによる
-# コンパイル→コンパイル済みバイナリの実行、の2段階)・HTML(check_html、
-# Playwrightによる簡易動作検証)を許可する。C言語は「コンパイル」と
-# 「実行」が別コマンドのため、Bashのようなシェル連結(&&等)を使わず、
-# モデルにrun_testを2回呼んでもらう設計にした(shell=Trueを使わない
-# 既存方針を維持するため)。
-_RUN_TEST_WHITELIST_HELP = (
-    "実行できるコマンドは 'python3 <ファイル名>' / 'pytest' / 'pytest <ファイル名>' / "
-    "'node <ファイル名>' / 'gcc <Cファイル名> -o <出力ファイル名>' / "
-    "'./<出力ファイル名>' / 'check_html <HTMLファイル名>' のみです。"
-)
-
-# 仮の判断: 実機で、「HTMLのプレビューが機能してない」という修正依頼に
-# 対して、モデルが.js/.cssファイルにgcc(C言語用)を試すなど、見当違いの
-# ツールを何度も試してツール呼び出し上限に達する不具合が報告された。
-# 各コマンドは対象ファイルの拡張子ごとに固定されている(python3は.py、
-# nodeは.js、gccは.c、check_htmlは.html)ため、コマンド名とファイル名の
-# 組み合わせが妥当かを実行前に検証し、不適切な場合は「このファイルの
-# 種類には使えません。代わりに〇〇を使ってください」という具体的な
-# 誘導メッセージを返す(依頼の項目1)。
-_EXPECTED_EXTENSION_BY_RUN_TEST_COMMAND = {
-    "python3": ".py", "pytest": ".py", "node": ".js", "gcc": ".c", "check_html": ".html",
+_RUN_COMMAND_BLOCKED_COMMAND_NAMES = {
+    # ネットワークアクセス
+    "curl", "wget", "wget2", "nc", "ncat", "netcat", "socat", "ssh", "scp", "sftp",
+    "ftp", "ftps", "tftp", "telnet", "rsync", "rlogin", "rsh", "ping", "traceroute",
+    "dig", "nslookup", "host", "whois", "nmap", "git",
+    # 破壊的なファイル操作(write_file/move_file/delete_fileを使うべき)
+    "rm", "rmdir", "mv", "cp", "dd", "shred", "unlink", "truncate", "install", "ln",
+    "mkfifo", "tee", "patch",
+    # 権限昇格
+    "sudo", "su", "doas", "pkexec", "runas",
+    # プロセス・システム制御
+    "kill", "pkill", "killall", "reboot", "shutdown", "halt", "poweroff",
+    "systemctl", "service", "launchctl", "init", "telinit", "crontab", "at",
+    # 権限・所有者の変更
+    "chmod", "chown", "chgrp", "setfacl", "chattr", "attrib", "icacls",
+    # シェル自体・ディレクトリ移動(shell=Trueを使わないため実体は無いが念のため)
+    "bash", "sh", "zsh", "csh", "tcsh", "ksh", "fish", "dash", "ash", "busybox",
+    "powershell", "pwsh", "cmd", "osascript", "cd",
+    # 他コマンドを間接的に起動できる「ラッパー」(ブロックリストの迂回経路)
+    "env", "xargs", "find", "nohup", "setsid", "exec", "eval", "source",
 }
-_RECOMMENDED_RUN_TEST_COMMAND_BY_EXTENSION = {
-    ".py": "'python3 <ファイル名>' または 'pytest <ファイル名>'",
-    ".js": "'node <ファイル名>'",
-    ".c": "'gcc <ファイル名> -o <出力ファイル名>'",
-    ".html": "'check_html <ファイル名>'",
-    ".css": "このCSSを読み込んでいるHTMLファイルに対する 'check_html <HTMLファイル名>'"
-            "(CSSファイル単体の動作検証はできません)",
+
+# インタプリタごとの「インラインコード実行/危険なモジュール実行」フラグ。
+# gccの-c(リンクなしコンパイル)のような無関係な同名フラグを誤って
+# 禁止しないよう、コマンドごとに個別の集合として持つ(依頼の「.c → gcc
+# -fsyntax-onlyのみ許可」のような決め打ちをやめ、モデルが自分でコマンドを
+# 選べるようにしたことの裏返しとして必要になった防御)。
+_RUN_COMMAND_BLOCKED_FLAGS_BY_INTERPRETER = {
+    "python3": {"-c", "-m", "-i"},
+    "python": {"-c", "-m", "-i"},
+    "node": {"-e", "--eval", "-p", "--print", "-r", "--require", "-i", "--interactive"},
+    "ruby": {"-e"},
+    "perl": {"-e", "-E"},
+    "php": {"-r"},
 }
 
 
-def _validate_run_test_filename_extension(cmd: str, filename: str) -> str:
-    """`cmd`(python3/node/gcc/check_html)に対して`filename`の拡張子が
-    妥当か検証し、不適切な場合はエラーメッセージを返す(妥当なら空文字列)。
+def _validate_run_command(command: str) -> tuple:
+    """`(argv, エラーメッセージ)`を返す。ブロックリスト方式の各種検証を
+    行う(詳細は直前のコメントを参照)。
     """
-    expected_ext = _EXPECTED_EXTENSION_BY_RUN_TEST_COMMAND[cmd]
-    actual_ext = os.path.splitext(filename)[1]
-    if actual_ext == expected_ext:
-        return ""
-    recommendation = _RECOMMENDED_RUN_TEST_COMMAND_BY_EXTENSION.get(actual_ext)
-    if recommendation:
-        return f"{filename} は{actual_ext or '拡張子の無い'}ファイルのため、'{cmd}'は使用できません。代わりに{recommendation}を使ってください。"
-    return f"{filename} は{actual_ext or '拡張子の無い'}ファイルのため、'{cmd}'は使用できません。{_RUN_TEST_WHITELIST_HELP}"
+    raw = command or ""
+    if not raw.strip():
+        return None, "コマンドが指定されていません。"
+    if any(ch in raw for ch in _RUN_COMMAND_BLOCKED_SHELL_CHARS) or "$(" in raw:
+        return None, (
+            "シェルの制御文字(; | & ` $() < > や改行)を含むコマンドは実行できません。"
+            "1つの単純なコマンドだけを指定してください。"
+        )
 
-
-def _parse_run_test_command(command: str) -> tuple:
-    """`(argv, エラーメッセージ)`を返す。"""
-    parts = (command or "").split()
+    parts = raw.split()
     if not parts:
         return None, "コマンドが指定されていません。"
-    cmd = parts[0]
 
-    if cmd == "python3" and len(parts) == 2:
-        error = _validate_run_test_filename_extension(cmd, parts[1])
-        return (None, error) if error else (parts, None)
-    if cmd == "pytest" and len(parts) <= 2:
-        if len(parts) == 2:
-            error = _validate_run_test_filename_extension(cmd, parts[1])
-            if error:
-                return None, error
-        return parts, None
-    if cmd == "node" and len(parts) == 2:
-        error = _validate_run_test_filename_extension(cmd, parts[1])
-        return (None, error) if error else (parts, None)
-    if cmd == "gcc" and len(parts) == 4 and parts[2] == "-o":
-        error = _validate_run_test_filename_extension(cmd, parts[1])
-        return (None, error) if error else (parts, None)
-    if cmd == "check_html" and len(parts) == 2:
-        error = _validate_run_test_filename_extension(cmd, parts[1])
-        return (None, error) if error else (parts, None)
-    if len(parts) == 1 and parts[0].startswith("./") and len(parts[0]) > 2:
-        return parts, None
-    return None, _RUN_TEST_WHITELIST_HELP
+    for token in parts:
+        basename = re.sub(r"\.(exe|bat|cmd|com)$", "", os.path.basename(token).lower())
+        if basename in _RUN_COMMAND_BLOCKED_COMMAND_NAMES:
+            return None, (
+                f"'{token}' は使用できません(ネットワークアクセス・破壊的なファイル操作・"
+                "権限昇格・シェルの起動につながるコマンドは禁止されています)。"
+                "ファイルの作成・上書き・移動・削除にはwrite_file・move_file・delete_fileを使ってください。"
+            )
+        if token.startswith("/") or re.match(r"^[A-Za-z]:[\\/]", token):
+            return None, f"'{token}': プロジェクトディレクトリの外を指す絶対パスは使用できません。"
+        if ".." in re.split(r"[\\/]", token):
+            return None, f"'{token}': プロジェクトディレクトリの外に出る'..'を含むパスは使用できません。"
+
+    blocked_flags = _RUN_COMMAND_BLOCKED_FLAGS_BY_INTERPRETER.get(parts[0])
+    if blocked_flags:
+        used = blocked_flags.intersection(parts[1:])
+        if used:
+            return None, (
+                f"'{parts[0]}'の{'/'.join(sorted(used))}は任意のコード実行やネットワークアクセスに"
+                f"つながるため使用できません。検証したいファイルを直接指定してください"
+                f"(例: '{parts[0]} app.py')。"
+            )
+
+    return parts, None
+
+
+def _run_subprocess_with_output_cap(argv: list, cwd: str, timeout_sec: float, read_cap_chars: int) -> tuple:
+    """`argv`を`cwd`で実行し、`(returncode, output, timed_out)`を返す。
+
+    仮の判断: 素朴に`subprocess.run(..., capture_output=True, timeout=N)`
+    だけを使うと、'yes'のように出力が際限なく続くコマンドの場合、
+    タイムアウトで強制終了されるまでの間に出力全体をメモリ上に貯め
+    続けてしまい、実機(Raspberry Pi等メモリの少ない機体を含む)で
+    メモリを圧迫しかねない。`select`でパイプの読み取り可否を都度確認
+    しながら少しずつ読むことで、(1)出力量が`read_cap_chars`を超えたら
+    それ以上読み取らずタイムアウトによる強制終了を待つ、(2)出力を
+    まったく出さずに無応答なコマンド(`sleep 100`等)でも、`select`の
+    タイムアウト経由で確実に`timeout_sec`で強制終了できる、の両方を
+    満たす。
+    """
+    proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    chunks = []
+    total_len = 0
+    deadline = time.monotonic() + timeout_sec
+    timed_out = False
+    fd = proc.stdout.fileno()
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            if total_len >= read_cap_chars:
+                if proc.poll() is not None:
+                    break
+                time.sleep(min(0.1, remaining))
+                continue
+            ready, _, _ = select.select([fd], [], [], min(0.2, remaining))
+            if not ready:
+                if proc.poll() is not None:
+                    break
+                continue
+            try:
+                data = os.read(fd, 65536)
+            except OSError:
+                break
+            if not data:
+                if proc.poll() is not None:
+                    break
+                continue
+            text = data.decode("utf-8", errors="replace")
+            chunks.append(text)
+            total_len += len(text)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+
+    output = "".join(chunks)
+    returncode = proc.returncode if proc.returncode is not None else -1
+    return returncode, output, timed_out
 
 
 _PLAYWRIGHT_CHECK_TIMEOUT_MS = 15000
@@ -2426,44 +2546,27 @@ def _check_html_with_playwright(file_path: str) -> tuple:
     return "ok", ""
 
 
-def _run_project_test_command(project_dir: str, command: str) -> str:
-    argv, error = _parse_run_test_command(command)
+def _run_project_command(project_dir: str, command: str) -> str:
+    """`run_command`ツール本体。バリデーションを通過したコマンドを
+    `project_dir`をカレントディレクトリとして実行し、結果をモデルに
+    返すJSON文字列を組み立てる。
+    """
+    argv, error = _validate_run_command(command)
     if error:
         return json.dumps({"ok": False, "message": error}, ensure_ascii=False)
 
-    # 仮の判断: コマンドの種類ごとに「どの引数がファイル名で、実行前に
-    # 実在を要求するか」が異なる(python3/node/pytest/check_htmlは実在
-    # 必須の1引数、gccは入力(実在必須)と出力(これから作る、実在不要)の
-    # 2引数、'./<出力>'は自分自身が実在必須のファイル名)。どの場合も
-    # `_resolve_safe_project_path`によるパストラバーサル対策は必ず通す。
-    if argv[0].startswith("./"):
-        exe_name = argv[0][2:]
-        safe_exe_path, path_error = _resolve_safe_project_path(project_dir, exe_name)
-        if path_error:
-            return json.dumps({"ok": False, "message": path_error}, ensure_ascii=False)
-        if not os.path.isfile(safe_exe_path):
+    if argv[0] == "check_html":
+        if len(argv) != 2:
             return json.dumps(
-                {"ok": False, "message": f"{exe_name} が見つかりません(先にコンパイルしてください)。"},
+                {"ok": False, "message": "check_htmlは 'check_html <HTMLファイル名>' の形式で指定してください。"},
                 ensure_ascii=False,
             )
-        argv = [safe_exe_path]
-        filename_positions = []
-    elif argv[0] == "gcc":
-        filename_positions = [(1, True), (3, False)]
-    else:
-        filename_positions = [(1, True)] if len(argv) == 2 else []
-
-    safe_paths = {}
-    for index, must_exist in filename_positions:
-        safe_path, path_error = _resolve_safe_project_path(project_dir, argv[index])
+        safe_path, path_error = _resolve_safe_project_path(project_dir, argv[1])
         if path_error:
             return json.dumps({"ok": False, "message": path_error}, ensure_ascii=False)
-        if must_exist and not os.path.isfile(safe_path):
-            return json.dumps({"ok": False, "message": f"{argv[index]} が見つかりません。"}, ensure_ascii=False)
-        safe_paths[index] = safe_path
-
-    if argv[0] == "check_html":
-        status, detail = _check_html_with_playwright(safe_paths[1])
+        if not os.path.isfile(safe_path):
+            return json.dumps({"ok": False, "message": f"{argv[1]} が見つかりません。"}, ensure_ascii=False)
+        status, detail = _check_html_with_playwright(safe_path)
         if status == "ok":
             return json.dumps(
                 {"ok": True, "returncode": 0, "output": "ヘッドレスブラウザでコンソールエラーは検出されませんでした。"},
@@ -2471,24 +2574,30 @@ def _run_project_test_command(project_dir: str, command: str) -> str:
             )
         if status == "error":
             return json.dumps(
-                {"ok": False, "returncode": 1, "output": detail[:_RUN_TEST_MAX_OUTPUT_CHARS]}, ensure_ascii=False,
+                {"ok": False, "returncode": 1, "output": detail[:RUN_COMMAND_MAX_OUTPUT_CHARS]}, ensure_ascii=False,
             )
         return json.dumps({"ok": False, "message": detail}, ensure_ascii=False)  # skipped
 
     try:
-        result = subprocess.run(
-            argv, cwd=project_dir, capture_output=True, text=True, timeout=_RUN_TEST_TIMEOUT_SEC,
+        returncode, output, timed_out = _run_subprocess_with_output_cap(
+            argv, project_dir, RUN_COMMAND_TIMEOUT_SEC, _RUN_COMMAND_OUTPUT_READ_CAP_CHARS,
         )
-    except subprocess.TimeoutExpired:
-        return json.dumps({"ok": False, "message": f"実行が{_RUN_TEST_TIMEOUT_SEC}秒でタイムアウトしました。"}, ensure_ascii=False)
     except FileNotFoundError:
-        return json.dumps({"ok": False, "message": f"'{argv[0]}' コマンドが見つかりませんでした。"}, ensure_ascii=False)
+        # 仮の判断: './<出力名>'のようにコンパイル済みバイナリをまだ
+        # 作っていない場合にありがちな失敗のため、その場合だけヒントを添える。
+        hint = "(先に必要な準備(コンパイル等)をしてください)" if argv[0].startswith("./") else ""
+        return json.dumps({"ok": False, "message": f"'{argv[0]}' が見つかりませんでした。{hint}"}, ensure_ascii=False)
     except PermissionError:
         return json.dumps({"ok": False, "message": f"'{argv[0]}' を実行する権限がありません。"}, ensure_ascii=False)
-    output = (result.stdout or "") + (result.stderr or "")
+
+    if timed_out:
+        return json.dumps(
+            {"ok": False, "message": f"実行が{RUN_COMMAND_TIMEOUT_SEC}秒でタイムアウトしたため強制終了しました。"},
+            ensure_ascii=False,
+        )
     return json.dumps({
-        "ok": result.returncode == 0, "returncode": result.returncode,
-        "output": output[:_RUN_TEST_MAX_OUTPUT_CHARS],
+        "ok": returncode == 0, "returncode": returncode,
+        "output": output[:RUN_COMMAND_MAX_OUTPUT_CHARS],
     }, ensure_ascii=False)
 
 
@@ -2532,10 +2641,10 @@ def _execute_project_tool_call(
         dirname = arguments.get("dirname", "")
         _print_tagged(print_lock, tag, f"[📁 {dirname} ディレクトリを作成しています...]")
         return _make_project_directory(project_dir, dirname)
-    if name == RUN_TEST_TOOL_NAME:
+    if name == RUN_COMMAND_TOOL_NAME:
         command = arguments.get("command", "")
         _print_tagged(print_lock, tag, f"[🧪 {command} を実行しています...]")
-        return _run_project_test_command(project_dir, command)
+        return _run_project_command(project_dir, command)
     return json.dumps({"ok": False, "message": f"未知のツールです: {name}"}, ensure_ascii=False)
 
 
@@ -3416,9 +3525,9 @@ def _parse_progress_markdown(path: str):
 
     仮の判断: `language`は、この節が無い旧バージョンのPROGRESS.mdでは
     空文字列になる(この機能追加より前に作られた既存プロジェクトを
-    エラー扱いにしない後方互換のため)。空文字列の場合、構文チェック・
-    run_testのホワイトリストはファイルの拡張子で判定するため実害は無く、
-    `_ask_organization_fix_project`のプロンプトでは「不明」として扱う。
+    エラー扱いにしない後方互換のため)。空文字列の場合、構文チェックは
+    ファイルの拡張子で判定するため実害は無く、`_ask_organization_
+    fix_project`のプロンプトでは「不明」として扱う。
     """
     try:
         with open(path, encoding="utf-8") as f:
@@ -4599,13 +4708,21 @@ def _list_project_files(project_dir: str) -> list:
 
 # 仮の判断: 依頼の項目2(既存のread_fileツールの仕組みを流用し、
 # プロジェクト内の全ファイルを確認できるようにする)への対応として、
-# 「プロジェクト内でのファイル操作・テスト実行ツール」の追加に伴い、
+# 「プロジェクト内でのファイル操作・コマンド実行ツール」の追加に伴い、
 # 修正担当はread_fileだけでなくlist_dir・write_file・move_file・
-# delete_file・make_directory・run_testも自由に使い、複数ファイル・
-# 複数手順にまたがる修正(リネーム→import修正→テスト実行、等)を1回の
+# delete_file・make_directory・run_commandも自由に使い、複数ファイル・
+# 複数手順にまたがる修正(リネーム→import修正→動作確認、等)を1回の
 # 依頼の中で完結できるようにした(_collect_answer_with_project_tools)。
 # 以前の「FILE: <ファイル名> + コードブロック1つだけを解析して1ファイルを
 # 上書きする」設計は、複数ファイルにまたがる修正を表現できないため廃止した。
+#
+# 仮の判断(run_commandへの刷新に伴うプロンプト更新): 依頼の項目5
+# 「ファイルの検証にはrun_commandを使い、そのファイルに適したコマンドを
+# 自分で判断すること。ただしネットワークアクセスや削除操作は別のツールで
+# 行う必要がある」という指示を明示的に加えた。run_commandは以前のような
+# 拡張子ごとの決め打ちコマンドを提供しないため、この指示が無いとモデルが
+# 検証を試みずに済ませてしまう・誤って禁止されたコマンドを繰り返し試す、
+# のどちらかに陥りやすいと判断したため。
 _FIX_REQUEST_TOOL_PROMPT_TEMPLATE = """あなたはこのプロジェクトの改修担当です。以下はこのプロジェクトの実装計画全体と、現在保存されているファイルの一覧です。
 
 【このプロジェクトの使用言語】
@@ -4627,7 +4744,7 @@ _FIX_REQUEST_TOOL_PROMPT_TEMPLATE = """あなたはこのプロジェクトの�
 - move_file: ファイル名を変更(移動)する
 - make_directory: サブディレクトリを作成する
 - delete_file: 不要になったファイルを削除する(取り消せないため、本当に不要な場合のみ使うこと)
-- run_test: プロジェクト内のテストを実行して動作を確認する(このプロジェクトの言語に応じて、'python3 <ファイル名>'・'pytest'・'node <ファイル名>'・'gcc <ファイル名> -o <出力名>'・'./<出力名>' のいずれかのみ使用可能)
+- run_command: ファイルの検証(動作確認)に使う。そのファイルの種類に適したコマンドを自分で判断して実行すること(例: .pyファイルなら'python3 <ファイル名>'、.jsファイルなら'node --check <ファイル名>'、.cファイルなら'gcc -fsyntax-only <ファイル名>'、.html/.cssファイルなら'check_html <HTMLファイル名>')。ただし、ネットワークアクセス(curl・wget・ssh等)・ファイルの削除や移動(rm・mv・cp等)・権限昇格(sudo等)を行うコマンドは実行できない(拒否される)。ファイルの削除・移動・作成・上書きは、run_commandではなく必ずdelete_file・move_file・write_fileを使うこと。
 
 関連するファイル(import元・import先など)がある場合は、read_fileで確認したうえで、必要なファイルすべてに修正を反映してください。修正が完了したら、最後にツールを呼び出さずに、何をどう変更したかを簡潔な日本語の文章で報告してください。
 """
