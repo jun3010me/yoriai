@@ -730,9 +730,15 @@ def test_fix_project_reports_honestly_when_model_never_calls_a_tool():
     """重大なバグ報告への対応(依頼の項目2): モデルが「修正しました」と
     いう文章だけを返し、write_file等のツールを一度も呼ばなかった場合に、
     "修正完了"ではなく正直に「実行されませんでした」と報告し、
-    PROGRESS.mdにも記録しないことを確認する。
+    PROGRESS.mdにも記録しないことを確認する。ナッジ(1回だけ実際に
+    ツールを呼ぶよう促す再試行)をしても改善しない場合の最終挙動であり、
+    問い合わせ回数がナッジ1回分(合計2回)で頭打ちになり無限に促し続け
+    ないことも合わせて確認する。
     """
+    call_count = {"n": 0}
+
     def fake_stream(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
+        call_count["n"] += 1
         yield {"content": "ID生成のロジックを確認しましたが、特に問題は見当たりませんでした。修正しました。"}
         yield {"done": True}
 
@@ -756,11 +762,85 @@ def test_fix_project_reports_honestly_when_model_never_calls_a_tool():
 
         assert "[✅ 修正が完了しました" not in output, output
         assert "実行されませんでした" in output, output
+        assert call_count["n"] == 2, f"ナッジは1回だけのはずです(問い合わせ回数: {call_count['n']})"
         with open(os.path.join(project_dir, "utils.py"), encoding="utf-8") as f:
             assert f.read() == original_content, "ファイルの中身が変わってしまっています"
 
         parsed = yoriai._parse_progress_markdown(os.path.join(project_dir, yoriai.PROGRESS_FILENAME))
         assert parsed["changelog"] == [], parsed["changelog"]
+    finally:
+        yoriai._fetch_org_snapshot = original_snapshot
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_fix_project_recovers_when_model_actually_calls_tool_after_nudge():
+    """ユーザーからの追加報告への対応: 実機(qwen3-235b)で、モデルが
+    「editor.cssを修正しました」「write_fileツールを使用して上書き
+    しました」と、あたかも実行したかのような説明文だけを返し、実際には
+    write_fileを一度も呼んでいなかった事例が報告された。この場合、単に
+    正直に「実行されませんでした」と報告するだけでなく、1回だけ実際に
+    ツールを呼ぶよう促すことで、修正そのものが成功するようになることを
+    確認する。
+    """
+    def _was_nudged(messages):
+        return any(
+            m.get("role") == "user" and "実際には呼び出されていません" in m.get("content", "")
+            for m in messages
+        )
+
+    def fake_stream(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
+        # 実機の再現: 1回目はwrite_fileを呼ばず、あたかも実行したかのような説明文だけを返す。
+        if not _was_nudged(messages):
+            yield {"content": (
+                "HTMLとCSSのエディタの入力欄を広くするために、editor.cssファイルを修正しました。"
+                "`textarea`セレクタにwidth: 90%;を追加しました。"
+            )}
+            yield {"done": True}
+            return
+        # ナッジを受けて、まだ実際にツールを呼んでいなければ、今度こそwrite_fileを呼ぶ。
+        if _tool_round(messages) == 0:
+            yield {"pending_tool_calls": [
+                {"id": "call_1", "type": "function", "function": {
+                    "name": "write_file",
+                    "arguments": {"filename": "editor.css", "content": "textarea { width: 90%; height: 200px; }\n"},
+                }},
+            ]}
+            return
+        # write_file実行後、最終的な報告を返す。
+        yield {"content": "editor.cssを実際に修正しました。"}
+        yield {"done": True}
+
+    original_snapshot = yoriai._fetch_org_snapshot
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False: _two_member_snapshot()
+    yoriai._stream_chat_from_candidate = fake_stream
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        projects_root = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME)
+        project_dir = _write_completed_project(
+            projects_root, "html-css-html-css", [("editor.css", "説明")],
+            files={"editor.css": "textarea { width: 50%; }\n"},
+        )
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            yoriai._ask_organization_fix_project(
+                47120, "fingerprint", "html-css-html-css: HTMLとCSSのテキストエリアが狭いので広くして", out_dir,
+            )
+        output = buf.getvalue()
+
+        assert "促して再試行しています" in output, output
+        assert "[✅ 修正が完了しました" in output, output
+        assert "実行されませんでした" not in output, output
+        with open(os.path.join(project_dir, "editor.css"), encoding="utf-8") as f:
+            content = f.read()
+        assert "width: 90%" in content, f"ナッジ後の実際の書き込みが反映されていません: {content!r}"
+
+        parsed = yoriai._parse_progress_markdown(os.path.join(project_dir, yoriai.PROGRESS_FILENAME))
+        assert len(parsed["changelog"]) == 1, parsed["changelog"]
+        assert "editor.css" in parsed["changelog"][0], parsed["changelog"]
     finally:
         yoriai._fetch_org_snapshot = original_snapshot
         yoriai._stream_chat_from_candidate = original_stream
@@ -1081,6 +1161,7 @@ def main():
         test_fix_project_refuses_when_target_project_is_incomplete,
         test_fix_project_end_to_end_rejects_path_traversal_tool_calls,
         test_fix_project_reports_honestly_when_model_never_calls_a_tool,
+        test_fix_project_recovers_when_model_actually_calls_tool_after_nudge,
         test_fix_project_records_actually_modified_filenames_in_changelog,
         test_fix_project_records_partial_progress_honestly_when_round_cap_is_hit,
         test_fix_project_reports_syntax_errors_remaining_after_fix,
