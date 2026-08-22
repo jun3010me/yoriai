@@ -3598,6 +3598,70 @@ def _check_python_syntax(code: str) -> tuple:
 # ことが普通にあり得るため、ファイル単位の判定の方が実態に即している)。
 _EXTERNAL_SYNTAX_CHECK_TIMEOUT_SEC = 15
 
+_INLINE_SCRIPT_JS_TYPES = {"", "text/javascript", "application/javascript", "module"}
+
+
+class _InlineScriptExtractor(_HTMLParser):
+    """HTML内の`<script>...</script>`から、インラインJavaScriptの中身
+    だけを抜き出す(`src`属性を持つ外部ファイル参照や、
+    `type="application/json"`のようなJavaScript以外の`<script>`は除く)。
+
+    仮の判断: 「HTML/CSSと組み合わせたJavaScript(`<script>`タグ内に直接
+    書かれたコード)は構文チェックされない」という依頼への対応。HTML
+    ファイル全体をJavaScriptとして構文チェックすることはできないため、
+    `<script>`タグの中身だけをブロック単位で取り出し、`node --check`に
+    個別にかける(壊れた1ブロックが他のブロックの検査を妨げないよう、
+    ブロックごとに独立して実行する)。`type="module"`かどうかも記録し、
+    ESモジュール構文(`import`/`export`)を通常のスクリプトと誤判定して
+    構文エラー扱いにしないようにする。
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.scripts = []  # [(開始行, コード, is_module), ...]
+        self._collecting = False
+        self._buffer = []
+        self._start_line = 0
+        self._is_module = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "script":
+            return
+        attrs = dict(attrs)
+        if "src" in attrs:
+            return
+        script_type = (attrs.get("type") or "").strip().lower()
+        if script_type not in _INLINE_SCRIPT_JS_TYPES:
+            return
+        self._collecting = True
+        self._buffer = []
+        self._start_line = self.getpos()[0]
+        self._is_module = script_type == "module"
+
+    def handle_endtag(self, tag):
+        if tag.lower() != "script" or not self._collecting:
+            return
+        self.scripts.append((self._start_line, "".join(self._buffer), self._is_module))
+        self._collecting = False
+
+    def handle_data(self, data):
+        if self._collecting:
+            self._buffer.append(data)
+
+
+def _extract_inline_scripts(html_code: str) -> list:
+    """`(開始行, コード, is_module)`のリストを返す。壊れたHTMLでも
+    `html.parser`は寛容にパースを続けるため、抽出自体が例外で失敗する
+    ことは無い(念のため`feed`は例外を握りつぶし、その時点までに集まった
+    結果を返す)。
+    """
+    parser = _InlineScriptExtractor()
+    try:
+        parser.feed(html_code)
+    except Exception:
+        pass
+    return parser.scripts
+
 
 def _check_file_syntax(filename: str, code: str, file_path: str = None) -> tuple:
     """`(status, detail)`を返す。`status`は次のいずれか:
@@ -3614,13 +3678,43 @@ def _check_file_syntax(filename: str, code: str, file_path: str = None) -> tuple
     if filename.endswith(".py"):
         ok, detail = _check_python_syntax(code)
         return ("ok" if ok else "error"), detail
-    if filename.endswith((".html", ".css")):
-        # 仮の判断: 依頼の「可能であれば軽量ライブラリで簡易チェック、
-        # 難しければスキップしその旨を明示する」という許容に従った。
-        # 標準ライブラリのhtml.parserは壊れたマークアップにも寛容で
-        # 構文エラーを検出できず、CSS向けのパーサーは標準ライブラリに
+    if filename.endswith(".html"):
+        # 仮の判断: HTMLマークアップ自体の構文チェックは、標準ライブラリの
+        # html.parserが壊れたマークアップにも寛容で構文エラーを検出できない
+        # ため、引き続き行わない。一方、HTML内に直接書かれたインライン
+        # JavaScript(`<script>`タグの中身)はnode --checkでチェックできる
+        # ため、実機にnodeがあれば行う(依頼: 「JSをHTML/CSSと組み合わせた
+        # 場合もチェックしてほしい」への対応)。
+        node_path = shutil.which("node")
+        if not node_path:
+            return "skipped", "node(Node.js)が見つからないため、インラインの<script>の構文チェックをスキップしました。"
+        scripts = _extract_inline_scripts(code)
+        if not scripts:
+            return "skipped", "この種類のファイル(HTML)のマークアップ自体の構文チェックには対応していません(インラインの<script>も見つかりませんでした)。"
+        errors = []
+        for start_line, script_code, is_module in scripts:
+            node_args = [node_path]
+            if is_module:
+                node_args.append("--input-type=module")
+            node_args += ["--check", "-"]
+            try:
+                result = subprocess.run(
+                    node_args, input=script_code, capture_output=True, text=True,
+                    timeout=_EXTERNAL_SYNTAX_CHECK_TIMEOUT_SEC,
+                )
+            except Exception as exc:
+                errors.append(f"{start_line}行目付近の<script>: 構文チェックの実行に失敗しました: {exc}")
+                continue
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "構文エラーが発生しました").strip()
+                errors.append(f"{start_line}行目付近の<script>: {detail}")
+        if errors:
+            return "error", "\n".join(errors)
+        return "ok", ""
+    if filename.endswith(".css"):
+        # 仮の判断: CSS向けの信頼できる構文パーサーは標準ライブラリに
         # 存在しないため、新たな依存を追加せずスキップを選んだ。
-        return "skipped", "この種類のファイル(HTML/CSS)の構文チェックには対応していません。"
+        return "skipped", "この種類のファイル(CSS)の構文チェックには対応していません。"
     if filename.endswith(".js"):
         # C言語のgcc確認と同じ方式: 実機にnodeが無い場合はエラー扱いに
         # せずスキップする(依頼の項目3)。

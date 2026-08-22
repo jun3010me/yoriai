@@ -233,6 +233,17 @@ def test_check_file_syntax_js_skips_when_node_unavailable():
         yoriai.shutil.which = original_which
 
 
+def test_check_file_syntax_html_skips_inline_script_when_node_unavailable():
+    original_which = yoriai.shutil.which
+    yoriai.shutil.which = lambda name: None
+    try:
+        status, detail = yoriai._check_file_syntax("index.html", "<script>function f(\n</script>")
+        assert status == "skipped", status
+        assert "node" in detail, detail
+    finally:
+        yoriai.shutil.which = original_which
+
+
 _GCC_AVAILABLE = shutil.which("gcc") is not None or shutil.which("cc") is not None
 _NODE_AVAILABLE = shutil.which("node") is not None
 
@@ -288,6 +299,61 @@ def test_check_file_syntax_js_detects_valid_and_invalid_code_with_real_node():
         assert detail, detail
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_check_file_syntax_html_detects_inline_script_syntax_errors_with_real_node():
+    """依頼の動作確認: HTML/CSSと組み合わせて`<script>`タグに直接書かれた
+    JavaScript(外部の.jsファイルに分割されていないインラインコード)も、
+    node --checkで構文チェックされることを確認する。実機にnodeが無い
+    環境ではその旨を明示してテスト自体は失敗させない。
+    """
+    if not _NODE_AVAILABLE:
+        print("  (nodeが見つからないため、このテストの本体はスキップします)")
+        return
+    valid_html = (
+        "<html><head><style>body { color: red; }</style></head><body>\n"
+        "<script>\nfunction add(a, b) { return a + b; }\n</script>\n"
+        "</body></html>\n"
+    )
+    status, detail = yoriai._check_file_syntax("index.html", valid_html)
+    assert status == "ok", (status, detail)
+
+    broken_html = (
+        "<html><body>\n<script>\nfunction add(a, b) { return a + b\n</script>\n</body></html>\n"
+    )
+    status, detail = yoriai._check_file_syntax("index.html", broken_html)
+    assert status == "error", (status, detail)
+    assert detail, detail
+
+
+def test_check_file_syntax_html_ignores_external_and_non_javascript_script_tags():
+    """`src`属性を持つ外部スクリプト参照(壊れていてもHTML側では検出
+    しない。既にそのファイル自体が.jsとして個別にチェックされるため)と、
+    `type="application/json"`のようなJavaScript以外の`<script>`は、
+    インラインJSチェックの対象から除外されることを確認する。
+    """
+    if not _NODE_AVAILABLE:
+        print("  (nodeが見つからないため、このテストの本体はスキップします)")
+        return
+    html = (
+        '<script src="app.js"></script>\n'
+        '<script type="application/json">{"a": 1,}</script>\n'
+        "<p>スクリプトなし</p>\n"
+    )
+    status, detail = yoriai._check_file_syntax("index.html", html)
+    assert status == "skipped", (status, detail)
+
+
+def test_check_file_syntax_html_supports_module_type_inline_script():
+    """`type="module"`のインラインスクリプトは、`import`/`export`構文を
+    通常のスクリプトと誤判定して構文エラー扱いにしないことを確認する。
+    """
+    if not _NODE_AVAILABLE:
+        print("  (nodeが見つからないため、このテストの本体はスキップします)")
+        return
+    html = '<script type="module">\nexport function add(a, b) { return a + b; }\n</script>\n'
+    status, detail = yoriai._check_file_syntax("index.html", html)
+    assert status == "ok", (status, detail)
 
 
 # ---------------------------------------------------------------------------
@@ -597,6 +663,10 @@ def main():
         test_check_file_syntax_c_detects_valid_and_invalid_code_with_real_gcc,
         test_check_file_syntax_js_skips_when_node_unavailable,
         test_check_file_syntax_js_detects_valid_and_invalid_code_with_real_node,
+        test_check_file_syntax_html_skips_inline_script_when_node_unavailable,
+        test_check_file_syntax_html_detects_inline_script_syntax_errors_with_real_node,
+        test_check_file_syntax_html_ignores_external_and_non_javascript_script_tags,
+        test_check_file_syntax_html_supports_module_type_inline_script,
         test_parse_run_test_command_accepts_node,
         test_parse_run_test_command_accepts_gcc_compile_and_run_binary,
         test_parse_run_test_command_still_rejects_disallowed_forms,
