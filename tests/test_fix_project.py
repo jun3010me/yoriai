@@ -734,6 +734,11 @@ def test_fix_project_reports_honestly_when_model_never_calls_a_tool():
     ツールを呼ぶよう促す再試行)をしても改善しない場合の最終挙動であり、
     問い合わせ回数がナッジ1回分(合計2回)で頭打ちになり無限に促し続け
     ないことも合わせて確認する。
+
+    追加のバグ報告(曖昧な依頼でファイルが特定できない場合)への対応:
+    単に失敗を報告するだけでなく、「どのファイルを直せば良いか判断
+    できませんでした」という確認を求める文面で、ユーザーに次の一手
+    (ファイル名や直したい箇所を教える)を案内することも確認する。
     """
     call_count = {"n": 0}
 
@@ -762,6 +767,7 @@ def test_fix_project_reports_honestly_when_model_never_calls_a_tool():
 
         assert "[✅ 修正が完了しました" not in output, output
         assert "実行されませんでした" in output, output
+        assert "どのファイルを直せば良いか判断できませんでした" in output, output
         assert call_count["n"] == 2, f"ナッジは1回だけのはずです(問い合わせ回数: {call_count['n']})"
         with open(os.path.join(project_dir, "utils.py"), encoding="utf-8") as f:
             assert f.read() == original_content, "ファイルの中身が変わってしまっています"

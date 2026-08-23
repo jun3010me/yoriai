@@ -4827,15 +4827,74 @@ _FIX_REQUEST_TOOL_PROMPT_TEMPLATE = """あなたはこのプロジェクトの�
 """
 
 
-def _ask_organization_fix_project(port: int, org_fingerprint: str, request_text: str, out_dir: str) -> None:
-    """既存の完成済みプロジェクトへの修正依頼を処理する。
+def _resolve_and_validate_fix_target(request_text: str, out_dir: str) -> tuple:
+    """`//fix`の依頼文から対象プロジェクトを解決する。
 
     仮の判断:
     - プロジェクトの特定は、まず`//fix <プロジェクト名>: <依頼>`という
       明示指定を試み、それが無ければ依頼文とPROGRESS.mdの内容を照合する
       自動判定(`_identify_target_project`)に委ねる。複数の候補が拮抗
-      した場合・十分な一致が無い場合はユーザーに確認を求め、その場で
-      推測して処理を進めることはしない。
+      した場合・十分な一致が無い場合・対象が未完了の場合は、ここで
+      ユーザーに確認を求める案内をprintしたうえで`(None, None)`を返し、
+      その場で推測して処理を進めることはしない。
+    - 対話的な修正セッション(`_FixSession`)が2回目以降の発言では
+      この特定処理をやり直さずに済むよう、特定処理そのものを実際の
+      修正の実行(`_run_fix_on_project`)から分離した。`_run_repl_client`は
+      この関数を(バックグラウンドジョブに載せず)同期的に呼んでセッションを
+      開始・継続するかどうかを判断し、成功した場合だけ
+      `_run_fix_on_project`をバックグラウンドジョブとして投入する。
+    """
+    explicit_project_dir, request = _resolve_explicit_fix_target(request_text, out_dir)
+    if explicit_project_dir:
+        project_dir = explicit_project_dir
+    else:
+        status, candidate_dirs = _identify_target_project(request_text, out_dir)
+        if status == "not_found":
+            print(
+                "[⚠️ 修正依頼の対象となるプロジェクトが見つかりませんでした。"
+                "新規の依頼として作成したい場合は、通常の会話や"
+                f"{AGREE_COMMAND}をお使いください]"
+            )
+            return None, None
+        if status == "ambiguous":
+            names = ", ".join(os.path.basename(d) for d in candidate_dirs)
+            example = os.path.basename(candidate_dirs[0])
+            print(f"[❓ 複数のプロジェクトが候補に挙がりました: {names}]")
+            print(f"どのプロジェクトのことでしょうか? {FIX_PROJECT_COMMAND} {example}: {request_text} のように、プロジェクト名を付けて教えてください。")
+            return None, None
+        project_dir = candidate_dirs[0]
+        request = request_text
+
+    parsed = _parse_progress_markdown(os.path.join(project_dir, PROGRESS_FILENAME))
+    if parsed is None:
+        print(f"[⚠️ {project_dir} のPROGRESS.mdを読み取れなかったため、修正を中断します]")
+        return None, None
+    if _progress_checklist_is_incomplete(parsed["checklist"]):
+        print(
+            f"[⚠️ {project_dir} はまだ未完了のタスクが残っています。"
+            f"先に{RESUME_ALL_COMMAND}で完了させてから修正を依頼してください]"
+        )
+        return None, None
+
+    return project_dir, request
+
+
+def _ask_organization_fix_project(port: int, org_fingerprint: str, request_text: str, out_dir: str) -> None:
+    """既存の完成済みプロジェクトへの修正依頼(//fixの単発呼び出し)を
+    処理する。対象プロジェクトの解決は`_resolve_and_validate_fix_target`、
+    実際の修正の実行は`_run_fix_on_project`に委ねる(分割の理由は
+    `_resolve_and_validate_fix_target`のdocstringを参照)。
+    """
+    project_dir, request = _resolve_and_validate_fix_target(request_text, out_dir)
+    if project_dir is None:
+        return
+    _run_fix_on_project(port, org_fingerprint, project_dir, request, out_dir)
+
+
+def _run_fix_on_project(port: int, org_fingerprint: str, project_dir: str, request: str, out_dir: str) -> None:
+    """既に対象が確定した`project_dir`に対して、実際の修正を実行する。
+
+    仮の判断:
     - 修正の実行は、実装担当のモデル自身にプロジェクトツール一式
       (`_collect_answer_with_project_tools`)を使わせて行う。Yoriai側で
       「修正が必要なファイル」を先読みして決め打ちする実装は避けた
@@ -4855,6 +4914,12 @@ def _ask_organization_fix_project(port: int, org_fingerprint: str, request_text:
       で言語の記録が無い場合は、モジュール分割案のファイル拡張子から
       その場で逆算する。`_resume_project`と同じ「読み込み時に補完する」
       考え方)。
+    - 呼び出し元(`_ask_organization_fix_project`・対話的な修正セッション
+      `_FixSession`のいずれか)が事前に`_resolve_and_validate_fix_target`で
+      対象を検証済みであっても、ここでも同じ検証(PROGRESS.mdが読める
+      か・タスクが完了済みか)をやり直す。修正セッションの2回目以降の
+      発言はこの検証を経ずに直接呼ばれるため、この関数自身が自己完結
+      した安全網であることを保証するため。
 
     仮の判断(重大なバグ報告への対応): 実機で、「修正が完了しました」と
     表示されPROGRESS.mdにも更新履歴が記録されたにもかかわらず、実際には
@@ -4882,27 +4947,19 @@ def _ask_organization_fix_project(port: int, org_fingerprint: str, request_text:
     だけのケースでは実際に修正が成功するようになる。無制限に促し続けると
     暴走につながるため、促しは1回のみで、それでも改善しなければ上記の
     正直な失敗報告に落ち着く。
+
+    仮の判断(修正対象ファイルの特定失敗に関する追加のバグ報告への
+    対応): 依頼文にファイル名や具体的な手がかりが乏しい場合
+    (「もう少し大きくして」等)、モデルがどのファイルを直せば良いか
+    自信を持てないまま何も書き込まずに終わる(=`modified_files`が
+    空になる)ケースが実機で確認された。この状況は上記の対応で既に
+    「実行されませんでした」という正直な報告にはなっているが、単に
+    再試行を促すだけでなく、ユーザーに次の一手(ファイル名や直したい
+    箇所を教える)を明確に案内した方が親切なため、メッセージを
+    「どのファイルを直せば良いか判断できませんでした」という確認を
+    求める文面に変更した。
     """
-    explicit_project_dir, request = _resolve_explicit_fix_target(request_text, out_dir)
-    if explicit_project_dir:
-        project_dir = explicit_project_dir
-    else:
-        status, candidate_dirs = _identify_target_project(request_text, out_dir)
-        if status == "not_found":
-            print(
-                "[⚠️ 修正依頼の対象となるプロジェクトが見つかりませんでした。"
-                "新規の依頼として作成したい場合は、通常の会話や"
-                f"{AGREE_COMMAND}をお使いください]"
-            )
-            return
-        if status == "ambiguous":
-            names = ", ".join(os.path.basename(d) for d in candidate_dirs)
-            example = os.path.basename(candidate_dirs[0])
-            print(f"[❓ 複数のプロジェクトが候補に挙がりました: {names}]")
-            print(f"どのプロジェクトのことでしょうか? {FIX_PROJECT_COMMAND} {example}: {request_text} のように、プロジェクト名を付けて教えてください。")
-            return
-        project_dir = candidate_dirs[0]
-        request = request_text
+    print(f"[🔧 対象プロジェクトを特定しました: {project_dir}]")
 
     parsed = _parse_progress_markdown(os.path.join(project_dir, PROGRESS_FILENAME))
     if parsed is None:
@@ -4914,8 +4971,6 @@ def _ask_organization_fix_project(port: int, org_fingerprint: str, request_text:
             f"先に{RESUME_ALL_COMMAND}で完了させてから修正を依頼してください]"
         )
         return
-
-    print(f"[🔧 対象プロジェクトを特定しました: {project_dir}]")
 
     tasks = parsed["tasks"]
     language = parsed["language"] or _infer_language_from_tasks(tasks)
@@ -4959,8 +5014,9 @@ def _ask_organization_fix_project(port: int, org_fingerprint: str, request_text:
             if summary:
                 print(summary)
             print(
-                "[ℹ️ 修正が実行されませんでした(ファイルへの書き込み・変更が一度も"
-                "確認できませんでした)。依頼内容を具体的にして再度お試しください]"
+                "[❓ どのファイルを直せば良いか判断できませんでした"
+                "(修正は実行されませんでした)。"
+                "もう少し具体的に(ファイル名や、直したい場所を)教えてください]"
             )
         return
 
@@ -5086,6 +5142,111 @@ def _execution_mode_reason_label(mode: str) -> str:
     if mode == EXECUTION_MODE_FIX_PROJECT:
         return "既存プロジェクトへの修正依頼と判断し、対象プロジェクトを特定します"
     return "単発の質問と判断しました"
+
+
+# ---------------------------------------------------------------------------
+# 対話的な修正セッション(//fixの継続利用)
+# ---------------------------------------------------------------------------
+#
+# これまでの//fixは常に単発の処理で、1回の依頼ごとに対象プロジェクトを
+# 独立して特定し直していた。実際の運用では、「まだ狭い」「今度は逆に」の
+# ように、コマンドを付けない自然な発言で少しずつ調整しながら何度も
+# //fixを打ち直す使い方が多く発生していたため、一度//fixで対象プロジェクトを
+# 指定したら、その後はコマンド無しの発言も継続してそのプロジェクトへの
+# 修正依頼として扱う「修正セッション」を導入する。
+
+# 仮の判断: セッションを保持したまま一定時間操作が無かった場合に自動終了
+# させるための目安値。厳密な根拠のある値ではなく、対話モードが1回の
+# セッションで数十分~数時間開きっぱなしになることを踏まえ、「明らかに
+# 別の作業に移った」とみなせる程度の間隔として設定した。
+_FIX_SESSION_IDLE_TIMEOUT_SEC = 30 * 60
+
+# 仮の判断: セッション中に「そのプロジェクトに関係ない話題」(このコード
+# ベースの簡易な判定では、比較モード=`EXECUTION_MODE_COMPARE`と判定された
+# 発言)が何ターン連続したら自動終了とみなすかの目安値。1回程度の脱線では
+# 終了せず、複数ターン続けて別の話題に移った場合にのみ終了する。
+_FIX_SESSION_UNRELATED_STREAK_LIMIT = 3
+
+# 仮の判断: ユーザーが明示的にセッションを終えたいときの言い回し。短い
+# 相槌的な発言(この単語だけの発言)に限定してマッチさせることで、
+# 「(修正が)まだ終了していません」のような、たまたま"終了"という語を含む
+# 通常の修正依頼を誤って終了コマンドとして扱ってしまう事故を防ぐ。
+_FIX_SESSION_END_PHRASES = (
+    "終了", "セッション終了", "修正セッション終了", "修正セッションを終了",
+    "セッションを終了", "やめる", "おわり", "終わり",
+)
+
+
+class _FixSession:
+    """`//fix`で対象プロジェクトを指定した後、コマンド無しの発言を継続的に
+    そのプロジェクトへの修正依頼として扱うための状態。`_run_repl_client`が
+    1つだけ保持し、セッションが有効な間は対象プロジェクトの再特定を行わない。
+    """
+
+    def __init__(self, project_dir: str):
+        self.project_dir = project_dir
+        self.unrelated_streak = 0
+        self.last_active = time.monotonic()
+
+    @property
+    def project_name(self) -> str:
+        return os.path.basename(self.project_dir.rstrip(os.sep))
+
+    def touch(self) -> None:
+        """このセッションへの継続的な操作があったことを記録し、無関係な
+        話題の連続カウントをリセットする。
+        """
+        self.unrelated_streak = 0
+        self.last_active = time.monotonic()
+
+    def is_idle_expired(self) -> bool:
+        return time.monotonic() - self.last_active >= _FIX_SESSION_IDLE_TIMEOUT_SEC
+
+
+def _format_fix_session_marker(fix_session: "_FixSession") -> str:
+    return f"[🔧 修正セッション中: {fix_session.project_name}]"
+
+
+def _is_fix_session_end_phrase(text: str) -> bool:
+    stripped = text.strip().rstrip("。.!!")
+    return stripped in _FIX_SESSION_END_PHRASES
+
+
+def _begin_fix_session(port: int, org_fingerprint: str, out_dir: str, job_runner: "_BackgroundJobRunner",
+                        fix_session, request_text: str):
+    """`//fix`(明示コマンド・コマンド無しの自然文どちらの経由でも)による
+    新規の修正依頼を処理する。対象プロジェクトをその場で(同期的に)解決し、
+    成功すればセッションを開始・更新したうえで実際の修正をバックグラウンド
+    ジョブとして投入する。解決できなかった場合(未検出・複数候補・
+    未完了)は、`_resolve_and_validate_fix_target`が理由をprint済みのため、
+    ここでは何もせず`fix_session`をそのまま返す(依頼の項目3: 別プロジェクト
+    への//fixが実際に特定できた場合にのみ、前のセッションを終了する)。
+
+    戻り値は、更新後の(または変化が無ければそのままの)`fix_session`。
+    """
+    project_dir, request = _resolve_and_validate_fix_target(request_text, out_dir)
+    if project_dir is None:
+        return fix_session
+
+    if fix_session is not None and fix_session.project_dir != project_dir:
+        print(
+            f"[🔧 修正セッションを終了しました({fix_session.project_name} → "
+            f"{os.path.basename(project_dir)}への切り替えのため)]"
+        )
+        fix_session = None
+    if fix_session is None:
+        fix_session = _FixSession(project_dir)
+    else:
+        fix_session.touch()
+
+    print(_format_fix_session_marker(fix_session))
+    job_runner.submit(
+        lambda project_dir=project_dir, request=request: _run_fix_on_project(
+            port, org_fingerprint, project_dir, request, out_dir,
+        ),
+        queued_notice=_BACKGROUND_QUEUED_NOTICE,
+    )
+    return fix_session
 
 
 # ---------------------------------------------------------------------------
@@ -5663,6 +5824,8 @@ def _format_startup_banner(out_dir: str, member_count, use_color: bool) -> str:
         f"  {AGREE_COMMAND} <制作依頼>: 事前すり合わせを経て協業モードで実装",
         f"  {FIX_PROJECT_COMMAND} <修正依頼>: 完成済みプロジェクトの一部を修正(プロジェクト名を",
         f"    先頭に付けて{FIX_PROJECT_COMMAND} <プロジェクト名>: <修正依頼>のように明示指定も可能)",
+        f"    ({FIX_PROJECT_COMMAND}後は修正セッションが始まり、続けてコマンド無しで話しかけても",
+        "     同じプロジェクトへの修正として扱われます。「終了」で終わります)",
         f"  {PARALLEL_QUERY_COMMAND} <ファイル名1>:<依頼1> | ...: ファイル・依頼を手動指定して並行実装",
         f"  {RESUME_ALL_COMMAND}: 未完了プロジェクトを検出して再開",
         "",
@@ -5712,10 +5875,22 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
         # の定義コメントを参照)。
         interrupt_guard = _DoubleInterruptGuard()
         job_runner = _create_background_job_runner()
+        # 仮の判断: 対話的な修正セッション(`_FixSession`)の状態。//fixで
+        # 対象プロジェクトが特定できるたびにここへセットし、コマンド無しの
+        # 発言はこれが有効な間、優先的にそのプロジェクトへの継続的な修正
+        # 依頼として扱う(詳細は`_FixSession`・`_begin_fix_session`を参照)。
+        fix_session = None
         while True:
             text, terminate = _read_multiline_input(session, interrupt_guard)
             if terminate:
                 break
+
+            if fix_session is not None and fix_session.is_idle_expired():
+                print(
+                    f"[🔧 修正セッションを終了しました({fix_session.project_name}への"
+                    "操作がしばらく無かったため)]"
+                )
+                fix_session = None
 
             if text.startswith(RESUME_ALL_COMMAND):
                 job_runner.submit(
@@ -5729,6 +5904,14 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                 if not request:
                     print(f"使い方: {AGREE_COMMAND} <制作依頼>  (例: {AGREE_COMMAND} ToDoリストのCLIツールを作って)")
                     continue
+                # 仮の判断(依頼の項目3): 新規の//agreeが実行された場合、
+                # 進行中の修正セッションは自動的に終了する。
+                if fix_session is not None:
+                    print(
+                        f"[🔧 修正セッションを終了しました(新規の{AGREE_COMMAND}が"
+                        "実行されたため)]"
+                    )
+                    fix_session = None
                 job_runner.submit(
                     lambda request=request: _ask_organization_collaborate(port, org_fingerprint, request, out_dir),
                     queued_notice=_BACKGROUND_QUEUED_NOTICE,
@@ -5743,10 +5926,7 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                         f"(例: {FIX_PROJECT_COMMAND} ID生成のロジックにバグがあるので直して)"
                     )
                     continue
-                job_runner.submit(
-                    lambda fix_request=fix_request: _ask_organization_fix_project(port, org_fingerprint, fix_request, out_dir),
-                    queued_notice=_BACKGROUND_QUEUED_NOTICE,
-                )
+                fix_session = _begin_fix_session(port, org_fingerprint, out_dir, job_runner, fix_session, fix_request)
                 continue
 
             if text.startswith(PARALLEL_QUERY_COMMAND):
@@ -5770,6 +5950,59 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                         break
                 continue
 
+            # 仮の判断(修正セッション中のコマンド無しの発言): セッションが
+            # 有効な間は、明らかに別の新規制作依頼(協業モードのキーワードに
+            # 一致)と判断できない限り、コマンド無しの発言を優先的にそのまま
+            # 対象プロジェクトへの継続的な修正依頼として扱う。「無関係な
+            # 単発質問」の判定は、既存の比較モードのキーワード判定
+            # (`EXECUTION_MODE_COMPARE`)を流用する簡易なものにとどめており、
+            # それ以外の(キーワードに引っかからない)単発の雑談は誤って
+            # 修正依頼として扱われる可能性がある。これは「曖昧な依頼では
+            # ファイルが特定できず、無闇に書き換えは行われない」という
+            # バグ1の修正(`_run_fix_on_project`のmodified_filesチェック)が
+            # 安全網になっているため、実害は限定的と判断した。
+            if fix_session is not None and not _is_fix_session_end_phrase(text):
+                mode = _classify_execution_mode(text, out_dir)
+                if mode == EXECUTION_MODE_COLLABORATE:
+                    print(
+                        f"[🔧 修正セッションを終了しました({fix_session.project_name}とは"
+                        "別の新規制作依頼と判断したため)]"
+                    )
+                    fix_session = None
+                elif mode == EXECUTION_MODE_COMPARE:
+                    fix_session.unrelated_streak += 1
+                    print(f"[判断: {_execution_mode_reason_label(mode)}]")
+                    messages.append({"role": "user", "content": text})
+                    try:
+                        _ask_organization_multi(port, org_fingerprint, messages)
+                    except KeyboardInterrupt:
+                        if _handle_repl_command_interrupt(interrupt_guard):
+                            break
+                        continue
+                    if fix_session.unrelated_streak >= _FIX_SESSION_UNRELATED_STREAK_LIMIT:
+                        print(
+                            f"[🔧 修正セッションを終了しました({fix_session.project_name}に"
+                            "関係ない話題が続いたため)]"
+                        )
+                        fix_session = None
+                    continue
+                else:
+                    fix_session.touch()
+                    print(_format_fix_session_marker(fix_session))
+                    project_dir = fix_session.project_dir
+                    job_runner.submit(
+                        lambda project_dir=project_dir, request=text: _run_fix_on_project(
+                            port, org_fingerprint, project_dir, request, out_dir,
+                        ),
+                        queued_notice=_BACKGROUND_QUEUED_NOTICE,
+                    )
+                    continue
+            elif fix_session is not None:
+                # _is_fix_session_end_phrase(text) が真だった場合。
+                print(f"[🔧 修正セッションを終了しました({fix_session.project_name})]")
+                fix_session = None
+                continue
+
             # 仮の判断: 明示コマンド(//agree・//fix・//parallel・//multi・
             # //resume-all)のいずれにも一致しない通常の入力は、依頼文の
             # 内容から実行モードを自動判定する。判定根拠は既存のメンバー
@@ -5785,10 +6018,7 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                 continue
 
             if mode == EXECUTION_MODE_FIX_PROJECT:
-                job_runner.submit(
-                    lambda text=text: _ask_organization_fix_project(port, org_fingerprint, text, out_dir),
-                    queued_notice=_BACKGROUND_QUEUED_NOTICE,
-                )
+                fix_session = _begin_fix_session(port, org_fingerprint, out_dir, job_runner, fix_session, text)
                 continue
 
             messages.append({"role": "user", "content": text})
