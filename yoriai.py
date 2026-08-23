@@ -5212,18 +5212,59 @@ def _is_fix_session_end_phrase(text: str) -> bool:
     return stripped in _FIX_SESSION_END_PHRASES
 
 
+def _continue_fix_session(port: int, org_fingerprint: str, out_dir: str, job_runner: "_BackgroundJobRunner",
+                           fix_session: "_FixSession", request_text: str) -> None:
+    """既に有効な`fix_session`に対して、対象の再特定を行わずそのまま
+    対象プロジェクトへの継続的な修正依頼を投入する。コマンド無しの発言
+    (`_run_repl_client`)と、プロジェクト名を省略した`//fix <依頼>`
+    (`_begin_fix_session`)の両方から、同じ「今のセッション対象へ続ける」
+    処理として共有される。
+    """
+    fix_session.touch()
+    print(_format_fix_session_marker(fix_session))
+    project_dir = fix_session.project_dir
+    job_runner.submit(
+        lambda project_dir=project_dir, request=request_text: _run_fix_on_project(
+            port, org_fingerprint, project_dir, request, out_dir,
+        ),
+        queued_notice=_BACKGROUND_QUEUED_NOTICE,
+    )
+
+
 def _begin_fix_session(port: int, org_fingerprint: str, out_dir: str, job_runner: "_BackgroundJobRunner",
                         fix_session, request_text: str):
     """`//fix`(明示コマンド・コマンド無しの自然文どちらの経由でも)による
-    新規の修正依頼を処理する。対象プロジェクトをその場で(同期的に)解決し、
-    成功すればセッションを開始・更新したうえで実際の修正をバックグラウンド
-    ジョブとして投入する。解決できなかった場合(未検出・複数候補・
-    未完了)は、`_resolve_and_validate_fix_target`が理由をprint済みのため、
-    ここでは何もせず`fix_session`をそのまま返す(依頼の項目3: 別プロジェクト
-    への//fixが実際に特定できた場合にのみ、前のセッションを終了する)。
+    修正依頼を処理する。
+
+    仮の判断(気づきへの対応): セッションが有効な間に、プロジェクト名を
+    省略した`//fix <依頼>`(`<プロジェクト名>: `構文を伴わない)が送られた
+    場合、コマンド無しの発言と全く同じ扱いにする。つまり依頼文と
+    PROGRESS.mdを照合する自動判定(`_identify_target_project`、文字
+    バイグラムによる簡易な照合のため曖昧な依頼文では失敗しやすい)へは
+    回さず、`_continue_fix_session`で現在のセッション対象へそのまま
+    続ける。以前は明示コマンド経由かどうかに関わらず常に対象の解決を
+    やり直していたため、セッション中に"//fix "を付けて発言しただけで
+    「対象となるプロジェクトが見つかりませんでした」と誤って報告される
+    (コマンドを付けない発言なら問題なく継続できるのに、という一貫性の
+    無さがあった)。プロジェクト名を明示した`//fix <プロジェクト名>:
+    <依頼>`は、別プロジェクトへの明示的な切り替え手段として引き続き
+    そのまま解決処理に委ねる。
+
+    それ以外の場合(明示指定あり、またはセッションが無い状態)は、対象
+    プロジェクトをその場で(同期的に)解決し、成功すればセッションを
+    開始・更新したうえで実際の修正をバックグラウンドジョブとして投入
+    する。解決できなかった場合(未検出・複数候補・未完了)は、
+    `_resolve_and_validate_fix_target`が理由をprint済みのため、ここでは
+    何もせず`fix_session`をそのまま返す(依頼の項目3: 別プロジェクトへの
+    //fixが実際に特定できた場合にのみ、前のセッションを終了する)。
 
     戻り値は、更新後の(または変化が無ければそのままの)`fix_session`。
     """
+    explicit_project_dir, _rest = _resolve_explicit_fix_target(request_text, out_dir)
+    if explicit_project_dir is None and fix_session is not None:
+        _continue_fix_session(port, org_fingerprint, out_dir, job_runner, fix_session, request_text)
+        return fix_session
+
     project_dir, request = _resolve_and_validate_fix_target(request_text, out_dir)
     if project_dir is None:
         return fix_session
@@ -5987,15 +6028,7 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                         fix_session = None
                     continue
                 else:
-                    fix_session.touch()
-                    print(_format_fix_session_marker(fix_session))
-                    project_dir = fix_session.project_dir
-                    job_runner.submit(
-                        lambda project_dir=project_dir, request=text: _run_fix_on_project(
-                            port, org_fingerprint, project_dir, request, out_dir,
-                        ),
-                        queued_notice=_BACKGROUND_QUEUED_NOTICE,
-                    )
+                    _continue_fix_session(port, org_fingerprint, out_dir, job_runner, fix_session, text)
                     continue
             elif fix_session is not None:
                 # _is_fix_session_end_phrase(text) が真だった場合。
