@@ -175,10 +175,11 @@ def test_begin_fix_session_switches_and_announces_when_project_differs():
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
-def test_begin_fix_session_leaves_existing_session_untouched_when_resolution_fails():
-    """未検出・複数候補などで対象が特定できなかった場合、既存のセッションは
-    変化しない(推測で処理を進めない・既存セッションを不必要に壊さない)
-    ことを確認する。
+def test_begin_fix_session_reports_not_found_when_no_session_and_resolution_fails():
+    """セッションが無い状態で、プロジェクト名の手がかりに乏しい依頼文が
+    どの完成済みプロジェクトとも一致しなかった場合は、これまで通り
+    「見つかりませんでした」と報告し、セッションは開始されないことを
+    確認する。
     """
     out_dir = tempfile.mkdtemp(prefix="yoriai_fix_session_test_")
     try:
@@ -186,16 +187,76 @@ def test_begin_fix_session_leaves_existing_session_untouched_when_resolution_fai
         _write_completed_project(projects_root, "todo-cli", [("utils.py", "説明")])
 
         runner = _FakeJobRunner()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            result = yoriai._begin_fix_session(47120, "fingerprint", out_dir, runner, None, "xyzzy plugh quuxを直して")
+        output = buf.getvalue()
+
+        assert result is None, "特定に失敗した場合、セッションは開始されないはずです"
+        assert "見つかりませんでした" in output, output
+        assert len(runner.submitted) == 0, "特定に失敗した依頼はジョブとして投入されないはずです"
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_begin_fix_session_treats_prefixless_fix_command_as_continuation_when_session_active():
+    """気づきへの対応の回帰テスト: セッションが有効な間に、プロジェクト名を
+    省略した`//fix <依頼>`(手がかりに乏しくバイグラム照合では本来
+    見つからないはずの依頼文)が送られても、識別処理へは回さず、
+    コマンド無しの発言と同様に現在のセッション対象への継続修正として
+    扱われることを確認する(以前は"対象となるプロジェクトが見つかりません
+    でした"と誤って報告されていた)。
+    """
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_session_test_")
+    try:
+        projects_root = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME)
+        project_dir = _write_completed_project(projects_root, "todo-cli", [("utils.py", "説明")])
+
+        runner = _FakeJobRunner()
         with contextlib.redirect_stdout(io.StringIO()):
             first = yoriai._begin_fix_session(47120, "fingerprint", out_dir, runner, None, "todo-cli: 直して")
 
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            result = yoriai._begin_fix_session(47120, "fingerprint", out_dir, runner, first, "xyzzy plugh quuxを直して")
+            result = yoriai._begin_fix_session(47120, "fingerprint", out_dir, runner, first, "まだ狭いって")
+        output = buf.getvalue()
+
+        assert result is first, "同じセッションがそのまま継続されるはずです"
+        assert "見つかりませんでした" not in output, output
+        assert "[🔧 修正セッション中: todo-cli]" in output, output
+        assert len(runner.submitted) == 2, "継続依頼もジョブとして投入されるはずです"
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_begin_fix_session_leaves_existing_session_untouched_when_explicit_target_is_incomplete():
+    """プロジェクト名を明示指定した`//fix`で、その対象が未完了だった場合は
+    従来通りエラーを報告し、既存のセッションは変化しないことを確認する
+    (明示指定がある限り、セッション中でも通常の解決処理に委ねられる)。
+    """
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_session_test_")
+    try:
+        projects_root = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME)
+        _write_completed_project(projects_root, "todo-cli", [("utils.py", "説明")])
+        incomplete_checklist = yoriai._build_task_checklist([("api.py", "説明")])
+        yoriai._write_progress_md(
+            os.path.join(projects_root, "weather-cli"), "天気予報アプリを作って",
+            [("api.py", "説明")], incomplete_checklist, {},
+        )
+
+        runner = _FakeJobRunner()
+        with contextlib.redirect_stdout(io.StringIO()):
+            first = yoriai._begin_fix_session(47120, "fingerprint", out_dir, runner, None, "todo-cli: 直して")
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            result = yoriai._begin_fix_session(
+                47120, "fingerprint", out_dir, runner, first, "weather-cli: URLを直して",
+            )
         output = buf.getvalue()
 
         assert result is first, "特定に失敗した場合、既存のセッションは維持されるはずです"
-        assert "見つかりませんでした" in output, output
+        assert "未完了のタスクが残っています" in output, output
         assert len(runner.submitted) == 1, "特定に失敗した依頼はジョブとして投入されないはずです"
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -300,6 +361,35 @@ def test_fix_command_then_plain_followup_continues_the_same_project():
         assert calls["run_fix"] == 2, calls
         assert fix_calls[0][0] == project_dir and "広くして" in fix_calls[0][1]
         assert fix_calls[1][0] == project_dir and fix_calls[1][1] == "まだ狭いよ", fix_calls
+        assert output.count("[🔧 修正セッション中: html-css-html-css]") == 2, output
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_fix_command_without_project_name_continues_the_session_like_a_plain_followup():
+    """気づきへの対応の回帰テスト(`_run_repl_client`全体を通した検証):
+    セッション中に、コマンド無しの発言だけでなく`//fix <依頼>`
+    (プロジェクト名を省略した形式)で発言しても、同様に現在のセッション
+    対象プロジェクトへの継続修正として扱われ、「対象となるプロジェクトが
+    見つかりませんでした」というエラーにならないことを確認する。
+    """
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_session_test_")
+    try:
+        projects_root = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME)
+        project_dir = _write_completed_project(
+            projects_root, "html-css-html-css", [("editor.css", "説明")],
+        )
+
+        keys = (
+            f"{yoriai.FIX_PROJECT_COMMAND} html-css-html-css: テキストエリアが狭いので広くして" + _SUBMIT
+            + f"{yoriai.FIX_PROJECT_COMMAND} まだ狭いって" + _SUBMIT
+            + "exit" + _SUBMIT
+        )
+        output, calls, fix_calls = _run_repl_with_keys(keys, out_dir)
+
+        assert calls["run_fix"] == 2, calls
+        assert fix_calls[1] == (project_dir, "まだ狭いって"), fix_calls
+        assert "見つかりませんでした" not in output, output
         assert output.count("[🔧 修正セッション中: html-css-html-css]") == 2, output
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -485,8 +575,11 @@ def main():
         test_begin_fix_session_starts_a_new_session_on_first_resolution,
         test_begin_fix_session_keeps_the_same_session_object_for_the_same_project,
         test_begin_fix_session_switches_and_announces_when_project_differs,
-        test_begin_fix_session_leaves_existing_session_untouched_when_resolution_fails,
+        test_begin_fix_session_reports_not_found_when_no_session_and_resolution_fails,
+        test_begin_fix_session_treats_prefixless_fix_command_as_continuation_when_session_active,
+        test_begin_fix_session_leaves_existing_session_untouched_when_explicit_target_is_incomplete,
         test_fix_command_then_plain_followup_continues_the_same_project,
+        test_fix_command_without_project_name_continues_the_session_like_a_plain_followup,
         test_explicit_end_phrase_ends_the_session_without_triggering_a_fix,
         test_new_agree_ends_the_active_fix_session,
         test_natural_production_request_ends_the_active_fix_session,
