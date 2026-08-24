@@ -620,20 +620,31 @@ def test_identify_target_project_reports_not_found_when_no_overlap():
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
-def test_identify_target_project_ignores_incomplete_projects():
-    """未完了のプロジェクトは、たとえ依頼文と強く一致していても候補に
-    含めない(未完了プロジェクトは//resume-allの役割であり、修正依頼の
-    対象は完成済みプロジェクトに限定するため)。
+def test_identify_target_project_ignores_incomplete_projects_as_a_fix_target():
+    """未完了のプロジェクトは、たとえ依頼文と強く一致していても「//fixで
+    直接修正してよい候補」には含めない(未完了プロジェクトは//resume-all
+    の役割であり、修正依頼の対象は完成済みプロジェクトに限定するため)。
+
+    仮の判断(バグ報告への対応): 以前はこの場合を一律"not_found"として
+    扱っていたが、依頼文に最も近いのがまさにその未完了プロジェクトである
+    場合、「見つかりませんでした。新規に//agreeで作ってください」という
+    誤った案内になり、ユーザーが誤って重複したプロジェクトを作ってしまい
+    かねなかった。この関数自体は"not_found"ではなく、区別可能な
+    "pending_fix"を返す(そのプロジェクトが存在し、かつ十分一致することは
+    正しく伝えつつ、修正対象としては選ばない)。呼び出し元
+    (`_resolve_and_validate_fix_target`)はこれを見て
+    `//resume-all`へ誘導する。
     """
     out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
     try:
         projects_root = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME)
-        _write_incomplete_project(
+        project_dir = _write_incomplete_project(
             projects_root, "todo-cli", [("utils.py", "IDの生成関数generate_idを実装する")],
         )
 
         status, dirs = yoriai._identify_target_project("ID生成のロジックにバグがあるので直して", out_dir)
-        assert status == "not_found", (status, dirs)
+        assert status == "pending_fix", (status, dirs)
+        assert dirs == [project_dir], dirs
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
 
@@ -965,6 +976,53 @@ def test_fix_project_refuses_when_target_project_is_incomplete():
         with contextlib.redirect_stdout(buf):
             yoriai._ask_organization_fix_project(47120, "fingerprint", "todo-cli: 何かを直して", out_dir)
         output = buf.getvalue()
+        assert "未完了のタスクが残っています" in output, output
+        assert yoriai.RESUME_ALL_COMMAND in output, output
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_fix_project_auto_matched_target_with_pending_fix_subtasks_guides_to_resume_all():
+    """実機のバグ報告の再現と修正の確認: プロジェクト名をコロン付きで
+    明示せずに(自動判定に委ねる形で)//fixを送った場合、依頼文に最も
+    近いプロジェクトに//fixのタスク分割由来の未完了サブタスクが残って
+    いても、「見つかりませんでした。新規に//agreeで作ってください」という
+    誤った案内(以前の不具合)ではなく、「未完了のタスクが残っています。
+    先に//resume-allで完了させてから」という正しい案内になることを
+    確認する。
+    """
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        projects_root = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME)
+        project_dir = _write_completed_project(
+            projects_root, "html-css-html-css",
+            [("lesson1.html", "レッスン1"), ("lesson2.html", "レッスン2")],
+        )
+        # //fixのタスク分割が一部未完了のまま終わった状態を直接再現する
+        # (_run_fix_task_queueが実際に書き込むのと同じ形でPROGRESS.mdに
+        # 記録する)。
+        parsed = yoriai._parse_progress_markdown(os.path.join(project_dir, yoriai.PROGRESS_FILENAME))
+        yoriai._write_progress_md(
+            project_dir, parsed["request"], parsed["tasks"], parsed["checklist"], {},
+            pending_fix_request="HTMLエディタの改修をお願いします。初心者向けレッスン機能を追加してください。",
+            pending_fix_subtasks=["レッスンページのレイアウトを統一するためのテンプレートファイルを作成"],
+        )
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            # プロジェクト名の後にコロンを付けない、自動判定に頼る依頼文
+            # (実機の再現: "//fix html-css-html-css <コロン無しの依頼文>")。
+            yoriai._ask_organization_fix_project(
+                47120, "fingerprint",
+                "html-css-html-css HTMLエディタの改修をお願いします。初心者向けレッスン機能を追加してください。",
+                out_dir,
+            )
+        output = buf.getvalue()
+
+        assert "見つかりませんでした" not in output, (
+            "未完了のプロジェクトが実在するのに「見つからない」と誤案内しています: " + output
+        )
+        assert project_dir in output, output
         assert "未完了のタスクが残っています" in output, output
         assert yoriai.RESUME_ALL_COMMAND in output, output
     finally:
@@ -1963,7 +2021,7 @@ def main():
         test_identify_target_project_matches_unique_high_scoring_project,
         test_identify_target_project_reports_ambiguous_on_tie,
         test_identify_target_project_reports_not_found_when_no_overlap,
-        test_identify_target_project_ignores_incomplete_projects,
+        test_identify_target_project_ignores_incomplete_projects_as_a_fix_target,
         test_identify_target_project_not_found_when_no_projects_dir,
         test_resolve_explicit_fix_target_matches_existing_project_name,
         test_resolve_explicit_fix_target_falls_through_for_unknown_prefix,
@@ -1975,6 +2033,7 @@ def main():
         test_fix_project_reports_ambiguous_candidates_without_modifying_anything,
         test_fix_project_reports_not_found_without_modifying_anything,
         test_fix_project_refuses_when_target_project_is_incomplete,
+        test_fix_project_auto_matched_target_with_pending_fix_subtasks_guides_to_resume_all,
         test_fix_project_end_to_end_rejects_path_traversal_tool_calls,
         test_fix_project_reports_honestly_when_model_never_calls_a_tool,
         test_fix_project_recovers_when_model_actually_calls_tool_after_nudge,

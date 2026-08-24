@@ -5133,43 +5133,66 @@ def _project_summary_text(parsed: dict) -> str:
 
 
 def _identify_target_project(request_text: str, out_dir: str) -> tuple:
-    """依頼文と、`./projects/`以下の完成済み(全タスク✅)プロジェクトの
-    PROGRESS.md(元の依頼・モジュール分割案)を照合し、どのプロジェクトに
-    ついての依頼かを判定する。
+    """依頼文と、`./projects/`以下の完成済み(全タスク✅かつ//fixの
+    未完了サブタスクも無い)プロジェクトのPROGRESS.md(元の依頼・モジュール
+    分割案)を照合し、どのプロジェクトについての依頼かを判定する。
 
     戻り値は`(status, project_dirs)`のタプル。
     - `status == "matched"`: `project_dirs == [project_dir]`
       (1件に絞り込めた)
     - `status == "ambiguous"`: `project_dirs == [project_dir, ...]`
       (複数の候補が同点で並んだ)
+    - `status == "pending_fix"`: `project_dirs == [project_dir]`
+      (依頼文に最も近いプロジェクトは見つかったが、未完了の作業
+      (モジュールタスク、または//fixのタスク分割の残り)が残っており、
+      新規の//fixの対象にはできない)
     - `status == "not_found"`: `project_dirs == []`
-      (完成済みプロジェクトが無い、またはどれとも十分に一致しなかった)
+      (完成済み・未完了を問わず、どのプロジェクトとも十分に一致しなかった)
+
+    仮の判断(バグ報告への対応): 以前は未完了の作業が残るプロジェクトを
+    候補から単純に除外していたため、依頼文に最も近いのがまさにその
+    プロジェクトだった場合、「見つかりませんでした。新規に//agreeで
+    作ってください」という誤った案内になってしまっていた
+    (実機で、//fixのタスク分割が一部未完了のまま残っていたプロジェクトに
+    対して次の//fixを送ったところ、この誤案内が発生し、ユーザーが
+    誤って重複した新規プロジェクトを作ってしまいかねない状況になった)。
+    完成済みの候補が見つからない場合でも、未完了の候補の中に十分近い
+    ものがあれば、それを「未完了」として区別して報告し、
+    `//resume-all`へ誘導する。
     """
     projects_root = os.path.join(out_dir, PROJECTS_SUBDIR_NAME)
     if not os.path.isdir(projects_root):
         return "not_found", []
 
-    scored = []
+    completed_scored = []
+    pending_scored = []
     for name in sorted(os.listdir(projects_root)):
         project_dir = os.path.join(projects_root, name)
         parsed = _parse_progress_markdown(os.path.join(project_dir, PROGRESS_FILENAME))
-        if parsed is None or _project_has_pending_work(parsed):
+        if parsed is None:
             continue
         score = _text_similarity_score(request_text, _project_summary_text(parsed))
-        scored.append((score, project_dir))
+        if _project_has_pending_work(parsed):
+            pending_scored.append((score, project_dir))
+        else:
+            completed_scored.append((score, project_dir))
 
-    if not scored:
-        return "not_found", []
+    if completed_scored:
+        completed_scored.sort(key=lambda item: item[0], reverse=True)
+        top_score = completed_scored[0][0]
+        if top_score >= _PROJECT_MATCH_MIN_SCORE:
+            top_candidates = [project_dir for score, project_dir in completed_scored if score == top_score]
+            if len(top_candidates) == 1:
+                return "matched", top_candidates
+            return "ambiguous", top_candidates
 
-    scored.sort(key=lambda item: item[0], reverse=True)
-    top_score = scored[0][0]
-    if top_score < _PROJECT_MATCH_MIN_SCORE:
-        return "not_found", []
+    if pending_scored:
+        pending_scored.sort(key=lambda item: item[0], reverse=True)
+        top_score, top_project_dir = pending_scored[0]
+        if top_score >= _PROJECT_MATCH_MIN_SCORE:
+            return "pending_fix", [top_project_dir]
 
-    top_candidates = [project_dir for score, project_dir in scored if score == top_score]
-    if len(top_candidates) == 1:
-        return "matched", top_candidates
-    return "ambiguous", top_candidates
+    return "not_found", []
 
 
 def _resolve_explicit_fix_target(request_text: str, out_dir: str) -> tuple:
@@ -5290,6 +5313,12 @@ def _resolve_and_validate_fix_target(request_text: str, out_dir: str) -> tuple:
                 "[⚠️ 修正依頼の対象となるプロジェクトが見つかりませんでした。"
                 "新規の依頼として作成したい場合は、通常の会話や"
                 f"{AGREE_COMMAND}をお使いください]"
+            )
+            return None, None
+        if status == "pending_fix":
+            print(
+                f"[⚠️ {candidate_dirs[0]} が対象と思われますが、まだ未完了のタスクが残っています。"
+                f"先に{RESUME_ALL_COMMAND}で完了させてから修正を依頼してください]"
             )
             return None, None
         if status == "ambiguous":
