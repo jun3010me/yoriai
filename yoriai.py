@@ -5121,6 +5121,331 @@ def _ask_organization_fix_project(port: int, org_fingerprint: str, request_text:
     _run_fix_on_project(port, org_fingerprint, project_dir, request, out_dir)
 
 
+# ---------------------------------------------------------------------------
+# //fixの規模判定・タスク分割(//agreeのタスクキュー方式の//fixへの再利用)
+# ---------------------------------------------------------------------------
+#
+# これまでの//fixは、依頼の大小に関わらず常に1人のメンバーに丸ごと修正を
+# 依頼していた。実機で、教材コンテンツの創作を含む複数ファイルにまたがる
+# 大規模な修正依頼を送ったところ、1台のメンバーがそれを丸ごと処理しようと
+# して応答時間の増大・タイムアウトにつながる不具合が報告された。
+#
+# //agree(新規プロジェクト作成)は、合意フェーズで複数ファイルに分割し、
+# タスクキュー方式(`_run_collaborative_task_queue`)で複数メンバーが分担する
+# 仕組みを既に持っている。この考え方を//fixにも導入する: 依頼を受けた直後に
+# 「1人で完結できる規模か、複数のサブタスクに分けるべき規模か」を判定し、
+# 分割すべきと判断された場合のみ、同じ「ワーカーがキューから次々にタスクを
+# 取る」設計(`_run_fix_task_queue`)に乗せて複数メンバーで分担する。小さな
+# 修正まで毎回この判定を挟むとオーバーヘッドになるため、分割不要と判断
+# された場合はこれまで通り1人のメンバーに直接依頼する(既存の単一実装
+# 経路は一切変更しない)。
+
+_FIX_SPLIT_DECISION_PROMPT_TEMPLATE = """あなたはこのプロジェクトの改修判断を担当します。以下のプロジェクト情報と修正依頼を確認し、この修正を1人のメンバーが一度に実行できる規模か、それとも複数の独立したサブタスクに分けて複数メンバーで分担すべき規模かを判断してください。
+
+【このプロジェクトの使用言語】
+{language}
+
+【実装計画全体】
+{full_plan}
+
+【現在保存されているファイル一覧】
+{file_list}
+
+【ユーザーからの修正依頼】
+{request}
+
+判断基準:
+- 修正内容が単純(見た目の微調整・1箇所だけの挙動修正など)で、1人が一度に実行しても長時間化しなさそうであれば「分割不要」と判断してください。
+- 複数ファイルにまたがる大規模な変更、まとまった分量のコンテンツ作成(例: 複数レッスン分の教材追加)、独立して並行実装できる複数の変更点を含む場合は、分割してください。
+
+出力は次のいずれかの形式のみとし、他の説明文は含めないでください。
+
+分割不要と判断した場合、次の1行だけを出力してください:
+分割不要
+
+分割すべきと判断した場合は、2〜5個程度の、互いに独立して実装できるサブタスクに分け、1行に1つずつ「- <サブタスクの内容>」の形式で列挙してください(このサブタスクの一覧以外の説明文は書かないでください):
+- <サブタスク1の内容>
+- <サブタスク2の内容>
+"""
+
+
+def _decide_fix_task_split(
+    candidate: dict, org_fingerprint: str, request: str, full_plan: str, file_list: list, language: str,
+) -> list:
+    """//fixの依頼規模を、依頼の実装担当予定のメンバー(`candidate`)に
+    問い合わせて判定する。分割すべきと判断された場合はサブタスクの説明
+    (2件以上)のリストを、分割不要と判断された場合は空リストを返す。
+
+    仮の判断: 問い合わせ自体に失敗した場合・応答が期待した形式で解釈
+    できなかった場合も、安全側(=分割しない、これまで通り1人に依頼する)
+    にフォールバックする。判定のための余計な往復でユーザーの依頼が
+    宙に浮くことを避けるため。
+    """
+    print("[🔍 修正の規模を判定しています...]")
+    prompt = _FIX_SPLIT_DECISION_PROMPT_TEMPLATE.format(
+        full_plan=full_plan, file_list="\n".join(file_list), request=request, language=language,
+    )
+    answer, error, _truncated = _collect_answer_from_candidate(
+        candidate, org_fingerprint, [{"role": "user", "content": prompt}],
+    )
+    if error or not answer:
+        return []
+    return _parse_fix_split_subtasks(answer)
+
+
+def _parse_fix_split_subtasks(text: str) -> list:
+    """判定担当の回答から、分割後の各サブタスクの説明を取り出す。行頭が
+    箇条書き記号(-・*)の行だけを対象にする。2件未満しか取り出せない
+    場合は「分割不要」の判断とみなし空リストを返す(「分割不要」という
+    見出し文言そのものではなく、実際に列挙されたサブタスクの件数を見る
+    ことで、モデルの言い回しの揺れに対しても頑健に判定する)。
+    """
+    subtasks = []
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if line and line[0] in "-・*":
+            content = line.lstrip("-・*").strip()
+            if content:
+                subtasks.append(content)
+    return subtasks if len(subtasks) >= 2 else []
+
+
+_FIX_SUBTASK_REVIEW_PROMPT_TEMPLATE = """あなたはこのプロジェクトの改修レビュー担当です。以下のサブタスクは、組織内の別のメンバーが実装済みです。実際に変更されたファイルの中身をread_file・search_in_file等で確認し、問題があれば自分でwrite_file等のツールを使って直してください。
+
+【このプロジェクトの使用言語】
+{language}
+
+【実装計画全体】
+{full_plan}
+
+【担当メンバーが取り組んだサブタスク】
+{subtask}
+
+【実際に変更されたファイル】
+{modified_files}
+
+確認した結果、問題が無ければツールを何も呼び出さずに「問題なし」とだけ回答してください。問題があれば、write_file等のツールで実際に修正したうえで、何をどう直したかを簡潔に報告してください。
+"""
+
+
+def _build_fix_subtask_review_prompt(subtask: str, full_plan: str, language: str, modified_files: list) -> str:
+    return _FIX_SUBTASK_REVIEW_PROMPT_TEMPLATE.format(
+        subtask=subtask, full_plan=full_plan, language=language,
+        modified_files=", ".join(modified_files) if modified_files else "(不明)",
+    )
+
+
+def _finalize_fix_changes(
+    project_dir: str, request: str, parsed: dict, language: str, modified_files: list, error: str,
+) -> None:
+    """//fixで実際に確認された変更を受けて、プロジェクト全体の構文チェック・
+    PROGRESS.mdへの更新履歴の追記・最終報告までを行う。通常の単一実装
+    //fix・分割タスクキュー(`_run_fix_task_queue`)のどちらから呼ばれても
+    同じ記録・報告の仕組みを使う(依頼の項目3: 「PROGRESS.mdへの記録も、
+    通常の//fixと同様に適用する」への対応。元々`_run_fix_on_project`に
+    直接書かれていた処理をそのまま切り出したもので、動作は変えていない)。
+
+    呼び出し前に`modified_files`が空でないことは呼び出し元が保証すること。
+    1件も変更が無い場合の「実行されませんでした」という報告は、単一実装・
+    分割それぞれの文脈で言い回しが異なるため、呼び出し元側で行う。
+    """
+    broken_files = _syntax_check_all_files(project_dir)
+
+    # 仮の判断: delete_fileツールが修正セッション中にPROGRESS.mdを既に
+    # 更新している可能性がある(依頼の項目4)ため、ここでは最初に読み込んだ
+    # parsedを使い回さず、ディスク上の最新の状態を読み直してから
+    # changelogに1件追記する(その更新履歴を上書きで消してしまわないため)。
+    latest_parsed = _parse_progress_markdown(os.path.join(project_dir, PROGRESS_FILENAME)) or parsed
+    today = datetime.date.today().isoformat()
+    # 仮の判断: 「PROGRESS.mdの更新履歴が、実際の変更内容と一致している
+    # ことを確認したい」という依頼の動作確認要件に応えるため、実際に変更が
+    # 確認できたファイル名を更新履歴にも明記する(重複は除いて表示する)。
+    unique_modified_files = list(dict.fromkeys(modified_files))
+    file_note = f" [変更ファイル: {', '.join(unique_modified_files)}]"
+    error_note = f" (セッションが最後まで完了しませんでした: {error})" if error else ""
+    syntax_note = f" (構文エラーが残っています: {', '.join(broken_files)})" if broken_files else ""
+    changelog = list(latest_parsed["changelog"])
+    changelog.append(f"- {today}: {request.strip()}{file_note}{error_note}{syntax_note}")
+    _write_progress_md(
+        project_dir, latest_parsed["request"], latest_parsed["tasks"], latest_parsed["checklist"],
+        review_feedback={}, auto_resume_count=latest_parsed["auto_resume_count"], changelog=changelog,
+        language=latest_parsed["language"] or language,
+    )
+
+    if error:
+        print(
+            f"[⚠️ 修正セッションが最後まで正常に完了しませんでした({error})。"
+            f"ただし一部のファイルは実際に変更されています: {', '.join(unique_modified_files)}]"
+        )
+    elif not broken_files:
+        print(f"[✅ 修正が完了しました (プロジェクト: {project_dir}, 変更したファイル: {', '.join(unique_modified_files)})]")
+    else:
+        print(f"[⚠️ 修正は保存されましたが、構文エラーが残っているファイルがあります: {', '.join(broken_files)}]")
+
+
+def _run_fix_task_queue(
+    subtasks: list, candidates: list, org_fingerprint: str, project_dir: str,
+    request: str, parsed: dict, full_plan: str, file_list: list, language: str,
+) -> None:
+    """//fixが大規模と判定した修正依頼を、`_run_collaborative_task_queue`と
+    同じ「ワーカーがキューから次々にサブタスクを取る」設計に乗せ、複数
+    メンバーで分担して処理する(依頼の項目3)。
+
+    仮の判断:
+    - 各サブタスクの「実装」は、通常の単一実装//fixと全く同じ
+      `_collect_answer_with_project_tools`(read_file/write_file等の
+      プロジェクトツール一式)を使う。担当メンバーは依頼文(サブタスクの
+      説明)だけを受け取り、修正すべきファイルの特定も含めて自分で判断する
+      (通常の//fixと同じ設計思想)。
+    - 「レビュー」は、//agreeの相互レビュー(単一ファイルの内容全体を
+      突き合わせるテンプレート、`_REVIEW_PROMPT_TEMPLATE`)をそのまま
+      流用するのではなく、別のメンバーに同じプロジェクトツール一式を
+      与えて「実装担当が変更したファイルを確認し、問題があれば自分で
+      直してよい」という形にした。//fixはモデル自身がread_file/write_file
+      で複数ファイルを自由に操作する設計のため、単一ファイルの内容を
+      丸ごと比較する既存のレビュー用テンプレートはこの設計とはかみ合わない。
+    - タスクの重さの見積もり(`_estimate_task_weight`、重い順にキューへ
+      並べる)・チェックリストの表現(`_build_task_checklist`/
+      `_format_task_checklist`/`_incomplete_task_labels`)は、//agreeの
+      タスクキューと全く同じものをそのまま再利用する(依頼の「車輪の
+      再発明はせず、既存の仕組みをできる限り流用してほしい」への対応)。
+      サブタスクには実ファイル名が無いため、チェックリスト上は
+      「サブタスクN」という仮の識別子を「ファイル名」として扱う。
+    - メンバーが1台しかない場合、担当外のレビュー担当を選べないため、
+      そのサブタスクのレビューはスキップする(実装だけは行う)。
+    """
+    numbered_subtasks = list(enumerate(subtasks, start=1))
+    numbered_subtasks.sort(key=lambda t: _estimate_task_weight(t[1]), reverse=True)
+    checklist = _build_task_checklist([(f"サブタスク{i}", st) for i, st in numbered_subtasks])
+    print(_format_task_checklist(checklist))
+
+    queue_lock = threading.Lock()
+    print_lock = threading.Lock()
+    remaining = list(numbered_subtasks)
+    all_modified_files = []
+    session_errors = []
+
+    def pop_next():
+        with queue_lock:
+            if not remaining:
+                return None
+            return remaining.pop(0)
+
+    def record_modified(files):
+        if not files:
+            return
+        with queue_lock:
+            all_modified_files.extend(files)
+
+    def record_error(note):
+        with queue_lock:
+            session_errors.append(note)
+
+    def worker(candidate):
+        while True:
+            popped = pop_next()
+            if popped is None:
+                return
+            index, subtask = popped
+            task_key = f"サブタスク{index}"
+
+            _print_tagged(
+                print_lock, task_key,
+                f"[📋 タスクキュー: {candidate['label']} に {task_key}「{subtask}」を割り当てました]",
+            )
+            _set_task_status(checklist, task_key, "impl", _TASK_STATUS_IN_PROGRESS)
+
+            impl_prompt = _FIX_REQUEST_TOOL_PROMPT_TEMPLATE.format(
+                full_plan=full_plan, file_list="\n".join(file_list), request=subtask, language=language,
+                search_then_read_guidance=_SEARCH_THEN_READ_GUIDANCE,
+            )
+            summary, error, truncated, modified = _collect_answer_with_project_tools(
+                candidate, org_fingerprint, [{"role": "user", "content": impl_prompt}], project_dir,
+                print_lock=print_lock, tag=task_key,
+            )
+            record_modified(modified)
+            preview_lines = [f"--- {task_key} ← {candidate['label']} (モデル: {candidate['model']}) ---"]
+            if error:
+                preview_lines.append(f"(問い合わせに失敗しました: {error})")
+            elif summary:
+                preview_lines.append(summary)
+                if truncated:
+                    preview_lines.append(f"(⚠️ 応答が長すぎたため、{CHAT_MAX_OUTPUT_TOKENS}トークンで打ち切られました)")
+            _print_tagged(print_lock, task_key, "\n".join(preview_lines))
+
+            if error:
+                record_error(f"{task_key}: {error}")
+                # 実装が完了しなかったサブタスクはチェックリスト上「未完了」の
+                # まま残り、最終チェックで検出される。このメンバーは次の
+                # サブタスクへ進む。
+                continue
+
+            _set_task_status(checklist, task_key, "impl", _TASK_STATUS_COMPLETED)
+
+            if not modified:
+                # このサブタスクでは実際のファイル変更が無かった(=判断の
+                # 結果、何もする必要が無かった)ため、レビューする対象も
+                # 無く、そのままレビュー済み扱いにして次へ進む。
+                _set_task_status(checklist, task_key, "review", _TASK_STATUS_COMPLETED)
+                continue
+
+            reviewer = next((c for c in candidates if c["label"] != candidate["label"]), None)
+            if reviewer is None:
+                _print_tagged(
+                    print_lock, task_key,
+                    f"[⚠️ {task_key} のレビュー担当者がいません(メンバーが1台のみのため、レビューはスキップされます)]",
+                )
+                continue
+
+            _set_task_status(checklist, task_key, "review", _TASK_STATUS_IN_PROGRESS)
+            review_prompt = _build_fix_subtask_review_prompt(
+                subtask, full_plan, language, list(dict.fromkeys(modified)),
+            )
+            review_summary, review_error, review_truncated, review_modified = _collect_answer_with_project_tools(
+                reviewer, org_fingerprint, [{"role": "user", "content": review_prompt}], project_dir,
+                print_lock=print_lock, tag=task_key,
+            )
+            record_modified(review_modified)
+            review_preview = [f"--- {task_key} のレビュー ← {reviewer['label']} (モデル: {reviewer['model']}) ---"]
+            if review_error:
+                review_preview.append(f"(レビューの問い合わせに失敗しました: {review_error})")
+            elif review_summary:
+                review_preview.append(review_summary)
+            _print_tagged(print_lock, task_key, "\n".join(review_preview))
+
+            if review_error:
+                record_error(f"{task_key}のレビュー: {review_error}")
+                continue
+
+            _set_task_status(checklist, task_key, "review", _TASK_STATUS_COMPLETED)
+
+    threads = [threading.Thread(target=worker, args=(c,)) for c in candidates]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    print()
+    print(_format_task_checklist(checklist))
+    incomplete_labels = _incomplete_task_labels(checklist)
+    if incomplete_labels:
+        print(f"[⚠️ 未完了のサブタスクが残っています: {', '.join(incomplete_labels)}]")
+
+    combined_error = "; ".join(session_errors) if session_errors else None
+    if not all_modified_files:
+        if combined_error:
+            print(f"修正の問い合わせに失敗しました: {combined_error}")
+        else:
+            print(
+                "[❓ どのサブタスクでも実際のファイル変更が行われませんでした"
+                "(修正は実行されませんでした)。"
+                "もう少し具体的に(ファイル名や、直したい場所を)教えてください]"
+            )
+        return
+
+    _finalize_fix_changes(project_dir, request, parsed, language, all_modified_files, combined_error)
+
+
 def _run_fix_on_project(port: int, org_fingerprint: str, project_dir: str, request: str, out_dir: str) -> None:
     """既に対象が確定した`project_dir`に対して、実際の修正を実行する。
 
@@ -5219,6 +5544,21 @@ def _run_fix_on_project(port: int, org_fingerprint: str, project_dir: str, reque
         return
 
     implementer = candidates[0]
+
+    # 仮の判断(依頼への対応: //fixにも規模に応じたタスク分割を導入する):
+    # 実際に修正を依頼する前に、まず依頼の規模を判定する。分割すべきと
+    # 判断された場合は、既存のタスクキュー方式(`_run_fix_task_queue`)に
+    # 委ねて複数メンバーで分担し、ここでは戻ってその後の処理を続けない。
+    # 分割不要と判断された場合(既定の安全側フォールバックを含む)は、
+    # 以下の既存の単一実装の経路をこれまで通り実行する。
+    subtasks = _decide_fix_task_split(implementer, org_fingerprint, request, full_plan, file_list, language)
+    if subtasks:
+        print(f"[📐 大規模な修正のため、{len(subtasks)}件のサブタスクに分割します]")
+        for i, subtask in enumerate(subtasks, start=1):
+            print(f"  {i}. {subtask}")
+        _run_fix_task_queue(subtasks, candidates, org_fingerprint, project_dir, request, parsed, full_plan, file_list, language)
+        return
+
     print(f"[🔧 {implementer['label']} (モデル: {implementer['model']}) に修正を依頼しています...]")
     prompt = _FIX_REQUEST_TOOL_PROMPT_TEMPLATE.format(
         full_plan=full_plan, file_list="\n".join(file_list), request=request, language=language,
@@ -5259,38 +5599,7 @@ def _run_fix_on_project(port: int, org_fingerprint: str, project_dir: str, reque
     if truncated:
         print(f"[⚠️ 応答が長すぎたため、{CHAT_MAX_OUTPUT_TOKENS}トークンで打ち切られました。この後の構文チェックで問題が残っていないか確認してください]")
 
-    broken_files = _syntax_check_all_files(project_dir)
-
-    # 仮の判断: delete_fileツールが修正セッション中にPROGRESS.mdを既に
-    # 更新している可能性がある(依頼の項目4)ため、ここでは最初に読み込んだ
-    # parsedを使い回さず、ディスク上の最新の状態を読み直してから
-    # changelogに1件追記する(その更新履歴を上書きで消してしまわないため)。
-    latest_parsed = _parse_progress_markdown(os.path.join(project_dir, PROGRESS_FILENAME)) or parsed
-    today = datetime.date.today().isoformat()
-    # 仮の判断: 「PROGRESS.mdの更新履歴が、実際の変更内容と一致している
-    # ことを確認したい」という依頼の動作確認要件に応えるため、実際に変更が
-    # 確認できたファイル名を更新履歴にも明記する(重複は除いて表示する)。
-    unique_modified_files = list(dict.fromkeys(modified_files))
-    file_note = f" [変更ファイル: {', '.join(unique_modified_files)}]"
-    error_note = f" (セッションが最後まで完了しませんでした: {error})" if error else ""
-    syntax_note = f" (構文エラーが残っています: {', '.join(broken_files)})" if broken_files else ""
-    changelog = list(latest_parsed["changelog"])
-    changelog.append(f"- {today}: {request.strip()}{file_note}{error_note}{syntax_note}")
-    _write_progress_md(
-        project_dir, latest_parsed["request"], latest_parsed["tasks"], latest_parsed["checklist"],
-        review_feedback={}, auto_resume_count=latest_parsed["auto_resume_count"], changelog=changelog,
-        language=latest_parsed["language"] or language,
-    )
-
-    if error:
-        print(
-            f"[⚠️ 修正セッションが最後まで正常に完了しませんでした({error})。"
-            f"ただし一部のファイルは実際に変更されています: {', '.join(unique_modified_files)}]"
-        )
-    elif not broken_files:
-        print(f"[✅ 修正が完了しました (プロジェクト: {project_dir}, 変更したファイル: {', '.join(unique_modified_files)})]")
-    else:
-        print(f"[⚠️ 修正は保存されましたが、構文エラーが残っているファイルがあります: {', '.join(broken_files)}]")
+    _finalize_fix_changes(project_dir, request, parsed, language, modified_files, error)
 
 
 # ---------------------------------------------------------------------------

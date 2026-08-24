@@ -782,7 +782,11 @@ def test_fix_project_reports_honestly_when_model_never_calls_a_tool():
     call_count = {"n": 0}
 
     def fake_stream(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
-        call_count["n"] += 1
+        # 依頼の規模判定ステップ(_decide_fix_task_split、offer_project_tools無しの
+        # 素の会話)もこのフェイクを1回通るため、ナッジの回数は
+        # offer_project_tools=Trueの呼び出しだけを数えて確認する。
+        if offer_project_tools:
+            call_count["n"] += 1
         yield {"content": "ID生成のロジックを確認しましたが、特に問題は見当たりませんでした。修正しました。"}
         yield {"done": True}
 
@@ -1166,6 +1170,280 @@ def test_resume_project_preserves_changelog_from_a_prior_fix():
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# //fixの規模判定・タスク分割(_decide_fix_task_split・_run_fix_task_queue)
+# ---------------------------------------------------------------------------
+#
+# 大規模な修正依頼(教材コンテンツの創作を含む、複数ファイルにまたがる
+# 改修)を//fixに送ると、1台のメンバーが丸ごと処理しようとして応答時間の
+# 増大・タイムアウトにつながる不具合への対応。//agreeの合意フェーズ・
+# タスクキュー方式と同じ発想を//fixにも導入し、規模が大きい場合のみ
+# 複数のサブタスクに分割して複数メンバーで分担する。
+
+def test_parse_fix_split_subtasks_extracts_bullet_lines():
+    text = "- lesson1.htmlにレッスン1を追加する\n- lesson2.htmlにレッスン2を追加する\n- progress.jsに保存機能を追加する"
+    subtasks = yoriai._parse_fix_split_subtasks(text)
+    assert subtasks == [
+        "lesson1.htmlにレッスン1を追加する", "lesson2.htmlにレッスン2を追加する", "progress.jsに保存機能を追加する",
+    ], subtasks
+
+
+def test_parse_fix_split_subtasks_returns_empty_for_no_split_answer():
+    """「分割不要」という単純な回答、または箇条書きが1件しか無い回答は、
+    分割不要の安全側フォールバックとして空リストを返すことを確認する。
+    """
+    assert yoriai._parse_fix_split_subtasks("分割不要") == []
+    assert yoriai._parse_fix_split_subtasks("- 1箇所だけ直せば十分です") == []
+    assert yoriai._parse_fix_split_subtasks("") == []
+
+
+def test_decide_fix_task_split_returns_subtasks_when_model_recommends_split():
+    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
+        yield {"content": "- レッスン1を追加する\n- レッスン2を追加する\n- 進捗保存機能を追加する"}
+        yield {"done": True}
+
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._stream_chat_from_candidate = fake_stream
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            subtasks = yoriai._decide_fix_task_split(
+                _member("MacStudio", "qwen2.5-coder-32b"), "fingerprint",
+                "レッスンを2つ追加して進捗保存機能もつけて", "index.html: トップページ", ["index.html"], "HTML/CSS/JavaScript",
+            )
+        output = buf.getvalue()
+    finally:
+        yoriai._stream_chat_from_candidate = original_stream
+
+    assert subtasks == ["レッスン1を追加する", "レッスン2を追加する", "進捗保存機能を追加する"], subtasks
+    assert "[🔍 修正の規模を判定しています...]" in output, output
+
+
+def test_decide_fix_task_split_falls_back_to_empty_on_error():
+    """判定担当への問い合わせ自体が失敗した場合も、安全側(分割しない)に
+    フォールバックすることを確認する。
+    """
+    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
+        yield {"error": "接続に失敗しました"}
+
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._stream_chat_from_candidate = fake_stream
+    try:
+        subtasks = yoriai._decide_fix_task_split(
+            _member("MacStudio", "qwen2.5-coder-32b"), "fingerprint", "直して", "a.py: 説明", ["a.py"], "Python",
+        )
+    finally:
+        yoriai._stream_chat_from_candidate = original_stream
+    assert subtasks == []
+
+
+# 分割ありのend-to-endテスト用フェイク。判定ステップ・実装ステップ・
+# レビューステップを、プロンプト本文に含まれる目印(テンプレート内の
+# 固定文言、サブタスクの説明に含めたファイル名)で区別する。
+_SPLIT_SUBTASKS = [
+    "lesson1.html に新しいレッスン1のコンテンツを追加する",
+    "lesson2.html に新しいレッスン2のコンテンツを追加する",
+    "progress.js に進捗保存機能を追加する",
+]
+_SPLIT_TARGET_FILES = ("lesson1.html", "lesson2.html", "progress.js")
+
+
+def _fake_stream_fix_split(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
+    prompt = messages[0]["content"] if messages else ""
+    tool_round = _tool_round(messages)
+
+    if "1人のメンバーが一度に実行できる規模か" in prompt:
+        yield {"content": "\n".join(f"- {s}" for s in _SPLIT_SUBTASKS)}
+        yield {"done": True}
+        return
+
+    if "改修レビュー担当です" in prompt:
+        # レビュー担当は常に「問題なし」とだけ答える単純なフェイク
+        # (レビューが実装を上書きしないことの確認が目的のテストで使う)。
+        yield {"content": "問題なし"}
+        yield {"done": True}
+        return
+
+    # 仮の判断: full_plan・file_listにはプロジェクト内の全ファイル名が
+    # 常に含まれるため、単純なファイル名の部分一致では、どのサブタスクの
+    # プロンプトでも先頭のファイル名にマッチしてしまう(全サブタスクが
+    # 同じファイルを書き込んでしまう不具合の原因になった)。「【ユーザー
+    # からの修正依頼】」に埋め込まれるのはサブタスクの説明文そのもの
+    # (ファイル名だけでなく「に新しい...を追加する」まで含む全文)なので、
+    # サブタスク文全体との一致で判定することで、そのプロンプトが実際に
+    # どのサブタスクの実装依頼なのかを一意に特定する。
+    for filename, subtask_text in zip(_SPLIT_TARGET_FILES, _SPLIT_SUBTASKS):
+        if subtask_text in prompt:
+            if tool_round == 0:
+                yield {"pending_tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {
+                        "name": "write_file",
+                        "arguments": {"filename": filename, "content": f"<!-- {filename} updated -->\n"},
+                    }},
+                ]}
+                return
+            yield {"content": f"{filename}を更新しました。"}
+            yield {"done": True}
+            return
+
+    # マッチしなかった場合(想定外)は何もしない安全側の応答。
+    yield {"content": "問題なし"}
+    yield {"done": True}
+
+
+def test_fix_project_splits_large_request_into_subtasks_and_completes_all():
+    """依頼の動作確認: 大規模な修正依頼では、複数のサブタスクに分割され、
+    タスクキュー方式で複数メンバーが分担して処理されることを確認する。
+    """
+    original_snapshot = yoriai._fetch_org_snapshot
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False: _two_member_snapshot()
+    yoriai._stream_chat_from_candidate = _fake_stream_fix_split
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        projects_root = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME)
+        project_dir = _write_completed_project(
+            projects_root, "html-course",
+            [("lesson1.html", "レッスン1"), ("lesson2.html", "レッスン2"), ("progress.js", "進捗保存")],
+            files={fn: f"<!-- {fn} placeholder -->\n" for fn in _SPLIT_TARGET_FILES},
+        )
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            yoriai._ask_organization_fix_project(
+                47120, "fingerprint", "レッスンを2つ追加して進捗保存機能もつけて", out_dir,
+            )
+        output = buf.getvalue()
+
+        assert "[🔍 修正の規模を判定しています...]" in output, output
+        assert "[📐 大規模な修正のため、3件のサブタスクに分割します]" in output, output
+        assert "[✅ 修正が完了しました" in output, output
+
+        for filename in _SPLIT_TARGET_FILES:
+            with open(os.path.join(project_dir, filename), encoding="utf-8") as f:
+                assert f.read() == f"<!-- {filename} updated -->\n", filename
+
+        parsed = yoriai._parse_progress_markdown(os.path.join(project_dir, yoriai.PROGRESS_FILENAME))
+        assert len(parsed["changelog"]) == 1, parsed["changelog"]
+        for filename in _SPLIT_TARGET_FILES:
+            assert filename in parsed["changelog"][0], parsed["changelog"]
+        # 修正はサブタスク単位の一時的なチェックリストであり、元のプロジェクトの
+        # 実装計画チェックリスト(完了済み)には影響しないはずである。
+        assert yoriai._progress_checklist_is_incomplete(parsed["checklist"]) is False
+    finally:
+        yoriai._fetch_org_snapshot = original_snapshot
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_fix_project_split_shows_subtask_checklist_progress():
+    """依頼の項目5: 画面表示で、規模判定・分割件数・サブタスクの
+    チェックリスト進捗が分かることを確認する。
+    """
+    original_snapshot = yoriai._fetch_org_snapshot
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False: _two_member_snapshot()
+    yoriai._stream_chat_from_candidate = _fake_stream_fix_split
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        projects_root = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME)
+        _write_completed_project(
+            projects_root, "html-course",
+            [("lesson1.html", "レッスン1"), ("lesson2.html", "レッスン2"), ("progress.js", "進捗保存")],
+            files={fn: f"<!-- {fn} placeholder -->\n" for fn in _SPLIT_TARGET_FILES},
+        )
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            yoriai._ask_organization_fix_project(
+                47120, "fingerprint", "レッスンを2つ追加して進捗保存機能もつけて", out_dir,
+            )
+        output = buf.getvalue()
+
+        for i in range(1, 4):
+            assert f"サブタスク{i} の実装" in output, output
+            assert f"サブタスク{i} のレビュー" in output, output
+        assert "[📋 タスクキュー:" in output, output
+    finally:
+        yoriai._fetch_org_snapshot = original_snapshot
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_fix_project_split_works_with_single_member_and_skips_review():
+    """メンバーが1台のみの場合、実装は行われるがレビュー担当を選べないため
+    レビューはスキップされ、それでも実装した変更自体は反映されることを
+    確認する。
+    """
+    original_snapshot = yoriai._fetch_org_snapshot
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False: _one_member_snapshot()
+    yoriai._stream_chat_from_candidate = _fake_stream_fix_split
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        projects_root = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME)
+        project_dir = _write_completed_project(
+            projects_root, "html-course",
+            [("lesson1.html", "レッスン1"), ("lesson2.html", "レッスン2"), ("progress.js", "進捗保存")],
+            files={fn: f"<!-- {fn} placeholder -->\n" for fn in _SPLIT_TARGET_FILES},
+        )
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            yoriai._ask_organization_fix_project(
+                47120, "fingerprint", "レッスンを2つ追加して進捗保存機能もつけて", out_dir,
+            )
+        output = buf.getvalue()
+
+        assert "レビュー担当者がいません" in output, output
+        assert "[✅ 修正が完了しました" in output, output
+        for filename in _SPLIT_TARGET_FILES:
+            with open(os.path.join(project_dir, filename), encoding="utf-8") as f:
+                assert f.read() == f"<!-- {filename} updated -->\n", filename
+    finally:
+        yoriai._fetch_org_snapshot = original_snapshot
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_fix_project_small_request_stays_on_single_implementer_path():
+    """依頼の動作確認: 小さな修正依頼では、規模判定は行われるが「分割不要」
+    と判断され、これまで通り1人のメンバーへの直接依頼のまま処理される
+    ことを確認する(既存の単一実装end-to-endテストへの追加確認)。
+    """
+    original_snapshot = yoriai._fetch_org_snapshot
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False: _two_member_snapshot()
+    yoriai._stream_chat_from_candidate = _fake_stream_fix_simple_write
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        projects_root = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME)
+        _write_completed_project(
+            projects_root, "todo-cli-1", [("utils.py", "IDの生成関数generate_idを実装する")],
+            files={"utils.py": "def generate_id():\n    return 1\n"},
+        )
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            yoriai._ask_organization_fix_project(
+                47120, "fingerprint", "todo-cli-1: テキストエリアを広くして", out_dir,
+            )
+        output = buf.getvalue()
+
+        assert "[🔍 修正の規模を判定しています...]" in output, output
+        assert "[📐" not in output, "小さな依頼では分割しないはずです"
+        assert "[📋 タスクキュー:" not in output, "小さな依頼では分割しないはずです"
+        assert "[✅ 修正が完了しました" in output, output
+    finally:
+        yoriai._fetch_org_snapshot = original_snapshot
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
 def main():
     tests = [
         test_text_similarity_score_rewards_shared_substrings,
@@ -1216,6 +1494,14 @@ def main():
         test_fix_project_end_to_end_delete_records_two_changelog_entries,
         test_collect_answer_with_project_tools_stops_at_round_cap,
         test_resume_project_preserves_changelog_from_a_prior_fix,
+        test_parse_fix_split_subtasks_extracts_bullet_lines,
+        test_parse_fix_split_subtasks_returns_empty_for_no_split_answer,
+        test_decide_fix_task_split_returns_subtasks_when_model_recommends_split,
+        test_decide_fix_task_split_falls_back_to_empty_on_error,
+        test_fix_project_splits_large_request_into_subtasks_and_completes_all,
+        test_fix_project_split_shows_subtask_checklist_progress,
+        test_fix_project_split_works_with_single_member_and_skips_review,
+        test_fix_project_small_request_stays_on_single_implementer_path,
     ]
     failures = 0
     for test in tests:
