@@ -388,16 +388,75 @@ READ_FILE_TOOL_SCHEMA = {
             "自分が担当していないファイルとの連携(関数名・引数・データ形式が"
             "合っているか等)を、推測ではなく実際のコードを確認してから判断したい"
             "場合に使う。まだ実装されていないファイルを指定した場合は、その旨が返される。"
+            "引数を省略するとファイル全体を返すが、大きなファイルを確認する際は、まず"
+            "search_in_fileで関連箇所を探し、start_line/end_line(またはlineと"
+            "context_lines)で必要な範囲だけを指定して読むことを検討すること。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "filename": {"type": "string", "description": "読みたいファイル名(例: storage.py)"},
+                "start_line": {
+                    "type": "integer",
+                    "description": "読み始めたい行番号(1始まり)。省略時はファイル全体を返す。",
+                },
+                "end_line": {
+                    "type": "integer",
+                    "description": "読み終わりたい行番号。省略時はファイル末尾(または開始行から一定範囲)まで。",
+                },
+                "line": {
+                    "type": "integer",
+                    "description": (
+                        "特定の行番号を中心に前後だけ読みたい場合に指定する"
+                        "(context_linesと併用。start_line/end_lineの代わりに使える)。"
+                    ),
+                },
+                "context_lines": {
+                    "type": "integer",
+                    "description": "lineを指定した場合に、その前後何行を含めるか(省略時は20行)。",
+                },
             },
             "required": ["filename"],
         },
     },
 }
+
+SEARCH_IN_FILE_TOOL_NAME = "search_in_file"
+SEARCH_IN_FILE_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": SEARCH_IN_FILE_TOOL_NAME,
+        "description": (
+            "他のファイルの中身全体をread_fileで読む前に、まずキーワードや関数名で"
+            "ファイル内を検索し、一致した行番号とその前後数行の抜粋だけを確認する。"
+            "大きなファイルの該当箇所に見当をつけてから、read_fileでその範囲だけを"
+            "読むと、無駄なやり取り・トークン消費を減らせる。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "filename": {"type": "string", "description": "検索したいファイル名(例: storage.py)"},
+                "query": {"type": "string", "description": "検索したいキーワードまたは関数名"},
+                "context_lines": {
+                    "type": "integer",
+                    "description": "一致箇所の前後何行を抜粋に含めるか(省略時は5行)。",
+                },
+            },
+            "required": ["filename", "query"],
+        },
+    },
+}
+
+# 仮の判断(依頼への対応: search_in_file/read_fileの部分読み機能の導入):
+# Claude Codeの「まずGrepで見当をつけ、その範囲だけをReadする」という
+# 2段階アプローチをYoriaiにも導入するための共通の案内文。read_fileの
+# 呼び出しを提供するすべてのプロンプト(レビュー専用・修正依頼専用の
+# 両方)で同じ文言を使い回すことで、案内内容がずれないようにする。
+_SEARCH_THEN_READ_GUIDANCE = (
+    "大きなファイルを確認する際は、まずsearch_in_fileで関連箇所を探し、"
+    "必要な範囲だけをread_fileで読むことを検討してください。"
+)
+
 # 仮の判断: 依頼の「1回のレビューにつき、ファイル読み取りツールの呼び出しは
 # 最大3回程度までに制限してほしい」という要件に対応する上限。MAX_TOOL_CALL_ROUNDS
 # (ツール呼び出しラウンド全体の上限、web_searchも含む)とは別に、read_file単体の
@@ -1221,8 +1280,8 @@ class CardRequestHandler(BaseHTTPRequestHandler):
             extra_tools = PROJECT_TOOLS_SCHEMAS
             client_tool_names = PROJECT_TOOLS_CLIENT_NAMES
         elif offer_read_file_tool:
-            extra_tools = [READ_FILE_TOOL_SCHEMA]
-            client_tool_names = {READ_FILE_TOOL_NAME}
+            extra_tools = [READ_FILE_TOOL_SCHEMA, SEARCH_IN_FILE_TOOL_SCHEMA]
+            client_tool_names = {READ_FILE_TOOL_NAME, SEARCH_IN_FILE_TOOL_NAME}
         else:
             extra_tools = None
             client_tool_names = None
@@ -1816,19 +1875,24 @@ MULTI_QUERY_COMMAND = "//multi"
 MULTI_QUERY_TARGET_COUNT = 3
 
 
-def _extract_read_file_tool_filename(tool_call_arguments) -> str:
-    """read_fileツールのtool_call引数(dictまたはJSON文字列)から
-    filenameを取り出す。画面表示専用の用途のため、取り出せない場合は
-    空文字列を返すだけで例外は投げない。
+def _parse_tool_call_arguments(tool_call_arguments) -> dict:
+    """tool_callの引数(dictまたはJSON文字列)を辞書として返す。
+    取り出せない場合は空の辞書を返すだけで例外は投げない
+    (read_file・search_in_file共通で使う引数パース処理)。
     """
     if isinstance(tool_call_arguments, str):
         try:
             tool_call_arguments = json.loads(tool_call_arguments) if tool_call_arguments else {}
         except json.JSONDecodeError:
-            return ""
-    if isinstance(tool_call_arguments, dict):
-        return tool_call_arguments.get("filename", "")
-    return ""
+            return {}
+    return tool_call_arguments if isinstance(tool_call_arguments, dict) else {}
+
+
+def _extract_read_file_tool_filename(tool_call_arguments) -> str:
+    """read_file/search_in_fileツールのtool_call引数からfilenameを取り出す。
+    画面表示専用の用途のため、取り出せない場合は空文字列を返す。
+    """
+    return _parse_tool_call_arguments(tool_call_arguments).get("filename", "")
 
 
 def _collect_answer_from_candidate(candidate: dict, org_fingerprint: str, messages: list):
@@ -1907,7 +1971,20 @@ def _planned_filenames_from_progress(out_dir: str) -> set:
     return {fn for fn, _content in parsed["tasks"]}
 
 
-def _read_project_file_fresh(out_dir: str, filename: str) -> str:
+# 仮の判断(部分読み機能の追加): start_line/end_lineを指定した部分読みでも、
+# 極端に広い範囲(例: 1〜100000行目)を指定されて丸ごと返してしまうと、
+# 文字数上限による切り詰めと同じ問題が再発する。行数ベースでも上限を
+# 設け、それを超える場合は開始行からこの行数分までに切り詰める。
+_READ_FILE_MAX_LINES_PER_CALL = 400
+# `line`(中心行)指定時、context_linesを省略した場合のデフォルトの前後行数。
+_READ_FILE_DEFAULT_CONTEXT_LINES = 20
+
+
+def _read_project_file_fresh(
+    out_dir: str, filename: str,
+    start_line: int = None, end_line: int = None,
+    line: int = None, context_lines: int = None,
+) -> str:
     """read_fileツールの応答本体。呼び出された「その瞬間」に`out_dir`配下を
     ディスクから直接読み直して結果を作る(依頼発行時や前回のラウンド時点の
     古いスナップショットを使い回さない)。
@@ -1916,6 +1993,13 @@ def _read_project_file_fresh(out_dir: str, filename: str) -> str:
     `os.path.basename`でディレクトリ部分を取り除いたうえで`out_dir`配下
     としてのみ解決する(`../../etc/passwd`のようなパストラバーサルで
     プロジェクト外のファイルを読ませられないようにする安全対策)。
+
+    仮の判断(部分読み機能の追加): `start_line`/`end_line`(またはその代わりに
+    `line`+`context_lines`)がすべて省略された場合は、従来通りファイル全体を
+    返す(既存の呼び出し元・既存のプロンプトとの後方互換性を保つ)。いずれか
+    が指定された場合は、その範囲だけを行番号付きで返す(search_in_fileの
+    出力と同じ「行番号: 内容」形式にして、両ツールの結果を突き合わせやすく
+    している)。
     """
     safe_name = os.path.basename(filename or "")
     path = os.path.join(out_dir, safe_name) if safe_name else None
@@ -1955,13 +2039,126 @@ def _read_project_file_fresh(out_dir: str, filename: str) -> str:
     except Exception as exc:
         return json.dumps({"filename": filename, "exists": False, "message": f"読み取りに失敗しました: {exc}"}, ensure_ascii=False)
 
-    truncated_content, was_truncated = _truncate_file_content(content)
-    result = {"filename": filename, "exists": True, "content": truncated_content}
-    if was_truncated:
-        result["truncated"] = True
+    if start_line is None and end_line is None and line is None:
+        truncated_content, was_truncated = _truncate_file_content(content)
+        result = {"filename": filename, "exists": True, "content": truncated_content}
+        if was_truncated:
+            result["truncated"] = True
+            result["message"] = (
+                f"ファイルサイズが大きいため、先頭{_FILE_CONTENT_TRUNCATE_CHARS}文字のみを返しています"
+                "(トークン使用量を抑えるための制限です)。"
+            )
+        return json.dumps(result, ensure_ascii=False)
+
+    lines = content.splitlines()
+    total_lines = len(lines)
+    if total_lines == 0:
+        return json.dumps(
+            {"filename": filename, "exists": True, "start_line": 0, "end_line": 0, "total_lines": 0, "content": ""},
+            ensure_ascii=False,
+        )
+
+    if start_line is None and end_line is None and line is not None:
+        span = context_lines if context_lines and context_lines > 0 else _READ_FILE_DEFAULT_CONTEXT_LINES
+        start_line, end_line = line - span, line + span
+
+    resolved_start = start_line if start_line and start_line > 0 else 1
+    resolved_end = end_line if end_line and end_line > 0 else total_lines
+    resolved_start = max(1, min(resolved_start, total_lines))
+    resolved_end = max(resolved_start, min(resolved_end, total_lines))
+
+    range_was_capped = False
+    if resolved_end - resolved_start + 1 > _READ_FILE_MAX_LINES_PER_CALL:
+        resolved_end = resolved_start + _READ_FILE_MAX_LINES_PER_CALL - 1
+        range_was_capped = True
+
+    excerpt = "\n".join(f"{n}: {lines[n - 1]}" for n in range(resolved_start, resolved_end + 1))
+    result = {
+        "filename": filename, "exists": True,
+        "start_line": resolved_start, "end_line": resolved_end, "total_lines": total_lines,
+        "content": excerpt,
+    }
+    if range_was_capped:
         result["message"] = (
-            f"ファイルサイズが大きいため、先頭{_FILE_CONTENT_TRUNCATE_CHARS}文字のみを返しています"
-            "(トークン使用量を抑えるための制限です)。"
+            f"指定範囲が広すぎるため、{resolved_start}〜{resolved_end}行目までを返しています"
+            f"(1回あたり最大{_READ_FILE_MAX_LINES_PER_CALL}行までの制限です)。"
+        )
+    return json.dumps(result, ensure_ascii=False)
+
+
+_SEARCH_IN_FILE_DEFAULT_CONTEXT_LINES = 5
+# 仮の判断: 一致件数が多いキーワード(短い変数名等)を指定された場合に
+# 抜粋が際限なく膨らまないよう、返す一致件数自体にも上限を設ける。
+_SEARCH_IN_FILE_MAX_MATCHES = 20
+
+
+def _search_in_project_file(out_dir: str, filename: str, query: str, context_lines: int = None) -> str:
+    """search_in_fileツールの応答本体。`_read_project_file_fresh`と同様、
+    呼び出された瞬間に`out_dir`配下をディスクから直接読み直す。
+
+    大文字小文字を区別しない単純な部分一致検索で、一致した行番号の一覧と、
+    各一致箇所の前後`context_lines`行(省略時は
+    `_SEARCH_IN_FILE_DEFAULT_CONTEXT_LINES`行)の抜粋を返す。ファイル全体を
+    read_fileで読む前に、まずここで見当をつけることを想定している。
+    """
+    safe_name = os.path.basename(filename or "")
+    path = os.path.join(out_dir, safe_name) if safe_name else None
+    if not safe_name or not os.path.isfile(path):
+        planned = _planned_filenames_from_progress(out_dir)
+        if planned and safe_name not in planned:
+            return json.dumps({
+                "filename": filename, "exists": False,
+                "message": (
+                    f"'{filename}' は実装計画(PROGRESS.mdのモジュール分割案)に"
+                    "含まれていないファイル名です。計画に実在するファイル: "
+                    f"{', '.join(sorted(planned))}"
+                ),
+            }, ensure_ascii=False)
+        return json.dumps({
+            "filename": filename, "exists": False,
+            "message": "そのファイルはまだ存在しません(未実装です)。",
+        }, ensure_ascii=False)
+
+    query = (query or "").strip()
+    if not query:
+        return json.dumps(
+            {"filename": filename, "exists": True, "message": "検索キーワードが指定されていません。"},
+            ensure_ascii=False,
+        )
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except Exception as exc:
+        return json.dumps({"filename": filename, "exists": False, "message": f"読み取りに失敗しました: {exc}"}, ensure_ascii=False)
+
+    query_lower = query.lower()
+    matched_line_numbers = [n for n, text in enumerate(lines, start=1) if query_lower in text.lower()]
+    if not matched_line_numbers:
+        return json.dumps({
+            "filename": filename, "exists": True, "query": query, "match_count": 0,
+            "message": f"'{query}' に一致する行は見つかりませんでした。",
+        }, ensure_ascii=False)
+
+    span = context_lines if context_lines and context_lines > 0 else _SEARCH_IN_FILE_DEFAULT_CONTEXT_LINES
+    reported_line_numbers = matched_line_numbers[:_SEARCH_IN_FILE_MAX_MATCHES]
+    excerpts = []
+    for line_num in reported_line_numbers:
+        start = max(1, line_num - span)
+        end = min(len(lines), line_num + span)
+        excerpt = "\n".join(f"{n}: {lines[n - 1]}" for n in range(start, end + 1))
+        excerpts.append({"line": line_num, "excerpt": excerpt})
+
+    result = {
+        "filename": filename, "exists": True, "query": query,
+        "match_count": len(matched_line_numbers),
+        "matched_lines": matched_line_numbers,
+        "excerpts": excerpts,
+    }
+    if len(matched_line_numbers) > _SEARCH_IN_FILE_MAX_MATCHES:
+        result["message"] = (
+            f"一致件数が多いため、最初の{_SEARCH_IN_FILE_MAX_MATCHES}件のみ抜粋しています。"
+            "より具体的なキーワードで絞り込んでください。"
         )
     return json.dumps(result, ensure_ascii=False)
 
@@ -1970,33 +2167,39 @@ def _collect_review_answer_with_read_file(
     candidate: dict, org_fingerprint: str, messages: list, out_dir: str,
     print_lock: threading.Lock = None, tag: str = None,
 ):
-    """レビュー専用: read_fileツールの呼び出しには、実装依頼元である
-    自分自身がその場で`out_dir`を読み直して応答し、会話を継続する
-    (candidateのキッチンプロセスにはread_fileを実行させない)。
+    """レビュー専用: read_file/search_in_fileツールの呼び出しには、実装依頼元
+    である自分自身がその場で`out_dir`を読み直して応答し、会話を継続する
+    (candidateのキッチンプロセスにはこれらのツールを実行させない)。
     (content, error, truncated)のタプルを返す。`truncated`は最終回答が
     CHAT_MAX_OUTPUT_TOKENS上限に達して途中で打ち切られたかどうかを表す。
 
     仮の判断: /chatはメッセージ履歴(messages)を毎回丸ごと送るステート
-    レスな設計のため、「read_fileの結果を会話に追加した新しいmessagesで
+    レスな設計のため、「ツール実行結果を会話に追加した新しいmessagesで
     もう一度/chatを呼ぶ」だけで、モデルからは1つの連続した会話として
-    見える。この呼び出しごとにout_dirを読み直す(_read_project_file_fresh)
-    ため、前回のラウンド以降に他のワーカースレッドが完成させたファイルも
-    正しく反映される。
+    見える。この呼び出しごとにout_dirを読み直す(_read_project_file_fresh・
+    _search_in_project_file)ため、前回のラウンド以降に他のワーカースレッドが
+    完成させたファイルも正しく反映される。
 
-    `print_lock`/`tag`(タスクキュー方式専用)を渡すと、read_fileの
-    呼び出し進捗表示も`_print_tagged`でタグ付き・ロック保護付きに
-    出力され、他のワーカースレッドの出力と混ざらない。渡さない場合は
-    タグとしてcandidateのラベルを使い、ロックなしで出力する。
+    `print_lock`/`tag`(タスクキュー方式専用)を渡すと、ツール呼び出しの
+    進捗表示も`_print_tagged`でタグ付き・ロック保護付きに出力され、他の
+    ワーカースレッドの出力と混ざらない。渡さない場合はタグとして
+    candidateのラベルを使い、ロックなしで出力する。
+
+    仮の判断(search_in_file追加): read_fileとsearch_in_fileは「他ファイルを
+    参照するための下調べ」という同じ目的のツールのため、往復回数の上限
+    (MAX_READ_FILE_CALLS_PER_REVIEW)は両者で共有する。search_in_fileで
+    見当をつけてからread_fileで絞った範囲だけを読む、という2段階の使い方を
+    しても呼び出し回数の枠を圧迫しないよう、上限自体は変えていない。
     """
     messages = list(messages)
-    read_file_calls_used = 0
+    file_lookup_calls_used = 0
 
-    # 仮の判断: read_fileの実行が許されるのは最大MAX_READ_FILE_CALLS_PER_REVIEW
-    # 回だが、それを使い切った後に「上限に達しました」という通知を送った
-    # ラウンドの次にも、モデルが最終回答を返すための1往復が必要になる。
-    # そのため往復の総ラウンド数には+2の余裕を持たせる(上限到達の通知を
-    # 受け取ってさらにもう一度read_fileを試みても弾かれるだけなので、
-    # 実質的にはこの範囲で必ず終息する)。
+    # 仮の判断: read_file/search_in_fileの実行が許されるのは最大
+    # MAX_READ_FILE_CALLS_PER_REVIEW回だが、それを使い切った後に「上限に
+    # 達しました」という通知を送ったラウンドの次にも、モデルが最終回答を
+    # 返すための1往復が必要になる。そのため往復の総ラウンド数には+2の
+    # 余裕を持たせる(上限到達の通知を受け取ってさらにもう一度呼び出しを
+    # 試みても弾かれるだけなので、実質的にはこの範囲で必ず終息する)。
     for _round_num in range(MAX_READ_FILE_CALLS_PER_REVIEW + 2):
         answer_parts = []
         pending_tool_calls = None
@@ -2024,14 +2227,28 @@ def _collect_review_answer_with_read_file(
         messages.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
         for tool_call in pending_tool_calls:
             tool_name = tool_call.get("function", {}).get("name", "")
-            if tool_name == READ_FILE_TOOL_NAME and read_file_calls_used < MAX_READ_FILE_CALLS_PER_REVIEW:
-                read_file_calls_used += 1
-                filename = _extract_read_file_tool_filename(tool_call.get("function", {}).get("arguments"))
-                _print_tagged(
-                    print_lock, tag or candidate["label"],
-                    f"[📖 {candidate['label']} が {filename or '他のファイル'} を読みに行っています...]",
-                )
-                result = _read_project_file_fresh(out_dir, filename)
+            arguments = tool_call.get("function", {}).get("arguments")
+            if tool_name in (READ_FILE_TOOL_NAME, SEARCH_IN_FILE_TOOL_NAME) and file_lookup_calls_used < MAX_READ_FILE_CALLS_PER_REVIEW:
+                file_lookup_calls_used += 1
+                parsed_args = _parse_tool_call_arguments(arguments)
+                filename = parsed_args.get("filename", "")
+                if tool_name == SEARCH_IN_FILE_TOOL_NAME:
+                    query = parsed_args.get("query", "")
+                    _print_tagged(
+                        print_lock, tag or candidate["label"],
+                        f"[🔍 {candidate['label']} が {filename or '他のファイル'} 内で '{query}' を検索しています...]",
+                    )
+                    result = _search_in_project_file(out_dir, filename, query, parsed_args.get("context_lines"))
+                else:
+                    _print_tagged(
+                        print_lock, tag or candidate["label"],
+                        f"[📖 {candidate['label']} が {filename or '他のファイル'} を読みに行っています...]",
+                    )
+                    result = _read_project_file_fresh(
+                        out_dir, filename,
+                        parsed_args.get("start_line"), parsed_args.get("end_line"),
+                        parsed_args.get("line"), parsed_args.get("context_lines"),
+                    )
             else:
                 result = json.dumps({
                     "error": (
@@ -2196,17 +2413,18 @@ RUN_COMMAND_TOOL_SCHEMA = {
     },
 }
 
-# 仮の判断: read_fileも含めて「このプロジェクトディレクトリの中だけを
-# 対象にした、用途を絞ったツール」としてまとめて1つの束(offer_project_tools)
-# にする。既存のレビューフェーズ(offer_read_file_tool、read_file単体のみ)
-# とは別の、修正依頼専用のより広い権限のツール束として明確に分離する。
+# 仮の判断: read_file・search_in_fileも含めて「このプロジェクトディレクトリの
+# 中だけを対象にした、用途を絞ったツール」としてまとめて1つの束
+# (offer_project_tools)にする。既存のレビューフェーズ(offer_read_file_tool、
+# read_file+search_in_fileのみ)とは別の、修正依頼専用のより広い権限のツール束
+# として明確に分離する。
 PROJECT_TOOLS_SCHEMAS = [
-    READ_FILE_TOOL_SCHEMA, LIST_DIR_TOOL_SCHEMA, WRITE_FILE_TOOL_SCHEMA,
+    READ_FILE_TOOL_SCHEMA, SEARCH_IN_FILE_TOOL_SCHEMA, LIST_DIR_TOOL_SCHEMA, WRITE_FILE_TOOL_SCHEMA,
     MOVE_FILE_TOOL_SCHEMA, DELETE_FILE_TOOL_SCHEMA, MAKE_DIRECTORY_TOOL_SCHEMA,
     RUN_COMMAND_TOOL_SCHEMA,
 ]
 PROJECT_TOOLS_CLIENT_NAMES = {
-    READ_FILE_TOOL_NAME, LIST_DIR_TOOL_NAME, WRITE_FILE_TOOL_NAME,
+    READ_FILE_TOOL_NAME, SEARCH_IN_FILE_TOOL_NAME, LIST_DIR_TOOL_NAME, WRITE_FILE_TOOL_NAME,
     MOVE_FILE_TOOL_NAME, DELETE_FILE_TOOL_NAME, MAKE_DIRECTORY_TOOL_NAME,
     RUN_COMMAND_TOOL_NAME,
 }
@@ -2622,7 +2840,16 @@ def _execute_project_tool_call(
     if name == READ_FILE_TOOL_NAME:
         filename = arguments.get("filename", "")
         _print_tagged(print_lock, tag, f"[📖 {filename or '他のファイル'} を読みに行っています...]")
-        return _read_project_file_fresh(project_dir, filename)
+        return _read_project_file_fresh(
+            project_dir, filename,
+            arguments.get("start_line"), arguments.get("end_line"),
+            arguments.get("line"), arguments.get("context_lines"),
+        )
+    if name == SEARCH_IN_FILE_TOOL_NAME:
+        filename = arguments.get("filename", "")
+        query = arguments.get("query", "")
+        _print_tagged(print_lock, tag, f"[🔍 {filename or '他のファイル'} 内で '{query}' を検索しています...]")
+        return _search_in_project_file(project_dir, filename, query, arguments.get("context_lines"))
     if name == LIST_DIR_TOOL_NAME:
         _print_tagged(print_lock, tag, "[📂 ファイル一覧を確認しています...]")
         return _list_project_directory(project_dir)
@@ -3858,7 +4085,7 @@ _REVIEW_PROMPT_TEMPLATE = """あなたはコードレビュー担当です。以
 以下の観点でレビューしてください:
 1. 実装計画で合意した内容(関数名・引数・戻り値の型・データ形式)と、実際のコードが一致しているか
 2. あなたが担当した{reviewer_own_filename}と正しく連携できそうか
-3. 実装計画に登場する他のファイル(あなたが担当したファイル以外)との連携が必要な場合、read_fileツールで実際のファイルの中身を確認したうえで判断すること。推測だけで判断してはいけません。まだ実装されていないファイルを指定した場合は、その旨が結果として返されます。
+3. 実装計画に登場する他のファイル(あなたが担当したファイル以外)との連携が必要な場合、read_fileツールで実際のファイルの中身を確認したうえで判断すること。推測だけで判断してはいけません。まだ実装されていないファイルを指定した場合は、その旨が結果として返されます。{search_then_read_guidance}
 4. 例外処理の欠如・タイポなど、コードとして明らかな不備がないか
 
 出力は次の形式のみとし、他の説明文は含めないでください。
@@ -3887,7 +4114,7 @@ def _build_review_prompt(filename: str, code: str, reviewer_own_filename: str, r
     return _REVIEW_PROMPT_TEMPLATE.format(
         filename=filename, code=code,
         reviewer_own_filename=reviewer_own_filename, reviewer_own_code=reviewer_own_code,
-        full_plan=full_plan,
+        full_plan=full_plan, search_then_read_guidance=f" {_SEARCH_THEN_READ_GUIDANCE}",
     )
 
 
@@ -4815,13 +5042,16 @@ _FIX_REQUEST_TOOL_PROMPT_TEMPLATE = """あなたはこのプロジェクトの�
 {request}
 
 以下のツールを使って、このプロジェクトディレクトリ内のファイルに直接修正を加えてください。
-- read_file: 既存ファイルの中身を確認する
+- search_in_file: 既存ファイル内でキーワードや関数名を検索し、該当行番号とその前後の抜粋だけを確認する。ファイルが大きい場合、read_fileでいきなり全体を読む前にまずこれで見当をつけると効率的。
+- read_file: 既存ファイルの中身を確認する(filenameのみ指定するとファイル全体、start_line/end_line(またはline+context_lines)を指定するとその範囲だけを読める)
 - list_dir: ファイル一覧を確認する
 - write_file: ファイルを新規作成・上書きする(部分修正の場合も、まずread_fileで現在の中身を確認したうえでファイル全体を書き直すこと)
 - move_file: ファイル名を変更(移動)する
 - make_directory: サブディレクトリを作成する
 - delete_file: 不要になったファイルを削除する(取り消せないため、本当に不要な場合のみ使うこと)
 - run_command: ファイルの検証(動作確認)に使う。そのファイルの種類に適したコマンドを自分で判断して実行すること(例: .pyファイルなら'python3 <ファイル名>'、.jsファイルなら'node --check <ファイル名>'、.cファイルなら'gcc -fsyntax-only <ファイル名>'、.html/.cssファイルなら'check_html <HTMLファイル名>')。ただし、ネットワークアクセス(curl・wget・ssh等)・ファイルの削除や移動(rm・mv・cp等)・権限昇格(sudo等)を行うコマンドは実行できない(拒否される)。ファイルの削除・移動・作成・上書きは、run_commandではなく必ずdelete_file・move_file・write_fileを使うこと。
+
+{search_then_read_guidance}
 
 関連するファイル(import元・import先など)がある場合は、read_fileで確認したうえで、必要なファイルすべてに修正を反映してください。修正が完了したら、最後にツールを呼び出さずに、何をどう変更したかを簡潔な日本語の文章で報告してください。
 """
@@ -4992,6 +5222,7 @@ def _run_fix_on_project(port: int, org_fingerprint: str, project_dir: str, reque
     print(f"[🔧 {implementer['label']} (モデル: {implementer['model']}) に修正を依頼しています...]")
     prompt = _FIX_REQUEST_TOOL_PROMPT_TEMPLATE.format(
         full_plan=full_plan, file_list="\n".join(file_list), request=request, language=language,
+        search_then_read_guidance=_SEARCH_THEN_READ_GUIDANCE,
     )
     summary, error, truncated, modified_files = _collect_answer_with_project_tools(
         implementer, org_fingerprint, [{"role": "user", "content": prompt}], project_dir,

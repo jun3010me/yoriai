@@ -264,9 +264,9 @@ def test_collect_review_answer_with_read_file_caps_at_max_calls():
     read_calls = {"n": 0}
     original_read = yoriai._read_project_file_fresh
 
-    def counting_read(out_dir, filename):
+    def counting_read(out_dir, filename, *args, **kwargs):
         read_calls["n"] += 1
-        return original_read(out_dir, filename)
+        return original_read(out_dir, filename, *args, **kwargs)
 
     def fake_stream(candidate, org_fingerprint, messages, offer_read_file_tool=False, **_kwargs):
         tool_messages = [m for m in messages if m.get("role") == "tool"]
@@ -398,6 +398,154 @@ def test_collect_review_answer_with_read_file_shows_read_progress_message():
     )
 
 
+def test_read_project_file_fresh_returns_range_with_line_numbers():
+    """依頼の項目2: start_line/end_lineを指定すると、その範囲だけを
+    「行番号: 内容」形式で返すことを確認する(省略時は従来通り全体)。
+    """
+    out_dir = tempfile.mkdtemp(prefix="yoriai_read_file_test_")
+    try:
+        lines = [f"line{i}" for i in range(1, 21)]
+        with open(os.path.join(out_dir, "big.py"), "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        result = json.loads(yoriai._read_project_file_fresh(out_dir, "big.py", 5, 8))
+        assert result["exists"] is True, result
+        assert result["start_line"] == 5 and result["end_line"] == 8, result
+        assert result["total_lines"] == 20, result
+        assert result["content"] == "5: line5\n6: line6\n7: line7\n8: line8", result
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_read_project_file_fresh_line_and_context_lines():
+    """`line`+`context_lines`(開始行・終了行の代わりに「この行から前後N行」)
+    指定でも範囲読みができることを確認する。
+    """
+    out_dir = tempfile.mkdtemp(prefix="yoriai_read_file_test_")
+    try:
+        lines = [f"line{i}" for i in range(1, 21)]
+        with open(os.path.join(out_dir, "big.py"), "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        result = json.loads(yoriai._read_project_file_fresh(out_dir, "big.py", None, None, 10, 2))
+        assert result["start_line"] == 8 and result["end_line"] == 12, result
+        assert result["content"] == "8: line8\n9: line9\n10: line10\n11: line11\n12: line12", result
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_read_project_file_fresh_caps_overly_wide_line_range():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_read_file_test_")
+    try:
+        lines = [f"line{i}" for i in range(1, 1000)]
+        with open(os.path.join(out_dir, "huge.py"), "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        result = json.loads(yoriai._read_project_file_fresh(out_dir, "huge.py", 1, 999))
+        assert result["end_line"] - result["start_line"] + 1 == yoriai._READ_FILE_MAX_LINES_PER_CALL, result
+        assert "message" in result, result
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_search_in_project_file_returns_matched_lines_with_excerpts():
+    """依頼の項目1: search_in_fileが一致行番号と前後の抜粋を返すことを確認する。"""
+    out_dir = tempfile.mkdtemp(prefix="yoriai_search_in_file_test_")
+    try:
+        lines = [f"line{i}" for i in range(1, 21)]
+        lines[9] = "def target_function():"
+        with open(os.path.join(out_dir, "storage.py"), "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        result = json.loads(yoriai._search_in_project_file(out_dir, "storage.py", "target_function"))
+        assert result["exists"] is True, result
+        assert result["match_count"] == 1, result
+        assert result["matched_lines"] == [10], result
+        excerpt = result["excerpts"][0]["excerpt"]
+        assert "10: def target_function():" in excerpt, excerpt
+        assert "5: line5" in excerpt and "15: line15" in excerpt, excerpt
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_search_in_project_file_reports_no_match():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_search_in_file_test_")
+    try:
+        with open(os.path.join(out_dir, "storage.py"), "w", encoding="utf-8") as f:
+            f.write("def add_todo():\n    pass\n")
+        result = json.loads(yoriai._search_in_project_file(out_dir, "storage.py", "nonexistent_keyword"))
+        assert result["exists"] is True and result["match_count"] == 0, result
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_search_in_project_file_reports_missing_file():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_search_in_file_test_")
+    try:
+        result = json.loads(yoriai._search_in_project_file(out_dir, "config.py", "DB_PATH"))
+        assert result["exists"] is False, result
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_review_offers_search_in_file_tool_alongside_read_file():
+    """レビュー専用のツールオファーに、read_fileに加えてsearch_in_fileも
+    含まれることを確認する(依頼の項目1・2: 「まず検索してから部分的に
+    読む」2段階アプローチをレビューフェーズでも使えるようにする)。
+    """
+    def fake_turn(base_url, model, messages, tools):
+        tool_names = {t["function"]["name"] for t in (tools or [])}
+        assert yoriai.SEARCH_IN_FILE_TOOL_NAME in tool_names, f"search_in_fileがオファーされていません: {tools}"
+        yield {"content": "問題なし"}
+        yield {"done": True}
+
+    original = yoriai._stream_openai_compatible_turn
+    yoriai._stream_openai_compatible_turn = fake_turn
+    try:
+        list(yoriai.stream_chat_completion(
+            "some-review-model",
+            [{"role": "user", "content": "cli.pyをレビューしてください"}],
+            extra_tools=[yoriai.READ_FILE_TOOL_SCHEMA, yoriai.SEARCH_IN_FILE_TOOL_SCHEMA],
+            client_tool_names={yoriai.READ_FILE_TOOL_NAME, yoriai.SEARCH_IN_FILE_TOOL_NAME},
+        ))
+    finally:
+        yoriai._stream_openai_compatible_turn = original
+
+
+def test_collect_review_answer_with_read_file_dispatches_search_in_file():
+    """`_collect_review_answer_with_read_file`がsearch_in_file要求も
+    (read_fileと同じ呼び出し元実行の経路で)正しく処理することを確認する。
+    """
+    out_dir = tempfile.mkdtemp(prefix="yoriai_search_in_file_test_")
+
+    def fake_stream(candidate, org_fingerprint, messages, offer_read_file_tool=False, **_kwargs):
+        tool_messages = [m for m in messages if m.get("role") == "tool"]
+        if not tool_messages:
+            yield {"pending_tool_calls": [
+                {"id": "call_1", "type": "function", "function": {
+                    "name": "search_in_file", "arguments": {"filename": "storage.py", "query": "add_todo"},
+                }},
+            ]}
+            return
+        result = json.loads(tool_messages[0]["content"])
+        assert result["exists"] is True and result["match_count"] == 1, result
+        yield {"content": "問題なし"}
+        yield {"done": True}
+
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._stream_chat_from_candidate = fake_stream
+    try:
+        with open(os.path.join(out_dir, "storage.py"), "w", encoding="utf-8") as f:
+            f.write("def add_todo():\n    pass\n")
+        answer, error, truncated = yoriai._collect_review_answer_with_read_file(
+            _member("junnoMac-mini", "qwen2.5-coder-14b"), "fingerprint",
+            [{"role": "user", "content": "storage.pyをレビューしてください"}], out_dir,
+        )
+    finally:
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+    assert error is None, error
+    assert "問題なし" in answer, answer
+    assert truncated is False
+
+
 def main():
     tests = [
         test_read_project_file_fresh_returns_content_for_existing_file,
@@ -408,6 +556,14 @@ def main():
         test_truncate_file_content_truncates_long_content,
         test_read_project_file_fresh_truncates_large_files,
         test_read_project_file_fresh_does_not_truncate_small_files,
+        test_read_project_file_fresh_returns_range_with_line_numbers,
+        test_read_project_file_fresh_line_and_context_lines,
+        test_read_project_file_fresh_caps_overly_wide_line_range,
+        test_search_in_project_file_returns_matched_lines_with_excerpts,
+        test_search_in_project_file_reports_no_match,
+        test_search_in_project_file_reports_missing_file,
+        test_review_offers_search_in_file_tool_alongside_read_file,
+        test_collect_review_answer_with_read_file_dispatches_search_in_file,
         test_stream_chat_completion_yields_pending_tool_calls_for_client_tool_without_executing,
         test_collect_review_answer_with_read_file_rereads_disk_between_rounds,
         test_collect_review_answer_with_read_file_caps_at_max_calls,
