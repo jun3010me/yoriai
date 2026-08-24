@@ -317,6 +317,174 @@ def test_syntax_check_all_files_reports_broken_files_only():
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# サブディレクトリ内のファイル操作(バグ報告への対応)
+# ---------------------------------------------------------------------------
+#
+# 実機のバグ報告: make_directoryでtemplates・lessons等のサブディレクトリを
+# 作成できるにもかかわらず、write_fileはディレクトリ区切りを含む名前を
+# 一律拒否していたため、モデルがサブディレクトリ内にファイルを書き込もう
+# とし続けても常に失敗し、結果としてディレクトリだけが空のまま残っていた。
+# ログを見る限りモデル自身のコーディング能力に問題は無く、Yoriai側の
+# ファイルパスの制約が原因だったため、書き込み側を緩和して修正する。
+
+def test_resolve_safe_project_path_accepts_subdirectory_relative_path():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        path, error = yoriai._resolve_safe_project_path(out_dir, "templates/base.html")
+        assert error is None, error
+        assert path == os.path.join(out_dir, "templates", "base.html")
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_resolve_safe_project_path_still_rejects_parent_directory_reference_inside_subpath():
+    """サブディレクトリ内の相対パスは許可するが、その途中に'..'が
+    含まれる場合は引き続き拒否されることを確認する(依頼の項目5:
+    パストラバーサル対策自体は緩めない)。
+    """
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        path, error = yoriai._resolve_safe_project_path(out_dir, "templates/../../outside.py")
+        assert path is None
+        assert error is not None
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_resolve_safe_project_path_rejects_progress_md_inside_subdirectory():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        path, error = yoriai._resolve_safe_project_path(out_dir, f"sub/{yoriai.PROGRESS_FILENAME}")
+        assert path is None
+        assert error is not None
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_write_project_file_creates_missing_subdirectory_automatically():
+    """バグ再現の核心: make_directoryを呼ばなくても、write_fileだけで
+    サブディレクトリごと自動的に作成され、実際にファイルが書き込まれる
+    ことを確認する。
+    """
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        result = json.loads(yoriai._write_project_file(out_dir, "templates/base.html", "<html></html>\n"))
+        assert result["ok"] is True, result
+        assert result["filename"] == "templates/base.html", result
+        with open(os.path.join(out_dir, "templates", "base.html"), encoding="utf-8") as f:
+            assert f.read() == "<html></html>\n"
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_write_project_file_populates_directory_created_via_make_directory():
+    """バグの元シナリオそのもの: 先にmake_directoryでディレクトリを作り、
+    その後write_fileでその中にファイルを書き込む、という順序でも
+    正しく成功することを確認する。
+    """
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        mkdir_result = json.loads(yoriai._make_project_directory(out_dir, "lessons"))
+        assert mkdir_result["ok"] is True, mkdir_result
+        write_result = json.loads(yoriai._write_project_file(out_dir, "lessons/lesson1.html", "<p>lesson1</p>\n"))
+        assert write_result["ok"] is True, write_result
+        with open(os.path.join(out_dir, "lessons", "lesson1.html"), encoding="utf-8") as f:
+            assert f.read() == "<p>lesson1</p>\n"
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_move_project_file_into_subdirectory_creates_it_automatically():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        with open(os.path.join(out_dir, "base.html"), "w", encoding="utf-8") as f:
+            f.write("<html></html>\n")
+        result = json.loads(yoriai._move_project_file(out_dir, "base.html", "templates/base.html"))
+        assert result["ok"] is True, result
+        assert result["new_filename"] == "templates/base.html", result
+        assert not os.path.exists(os.path.join(out_dir, "base.html"))
+        assert os.path.isfile(os.path.join(out_dir, "templates", "base.html"))
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_delete_project_file_from_subdirectory_records_relative_path_in_changelog():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        tasks = [("a.py", "説明")]
+        checklist = yoriai._build_task_checklist(tasks)
+        yoriai._write_progress_md(out_dir, "何か作って", tasks, checklist, {})
+        os.makedirs(os.path.join(out_dir, "lessons"))
+        with open(os.path.join(out_dir, "lessons", "old.html"), "w", encoding="utf-8") as f:
+            f.write("<p>old</p>\n")
+
+        result = json.loads(yoriai._delete_project_file(out_dir, "lessons/old.html"))
+        assert result["ok"] is True, result
+        assert not os.path.exists(os.path.join(out_dir, "lessons", "old.html"))
+
+        parsed = yoriai._parse_progress_markdown(os.path.join(out_dir, yoriai.PROGRESS_FILENAME))
+        assert "lessons/old.html" in parsed["changelog"][0], parsed["changelog"]
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_list_project_files_includes_subdirectory_contents():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        os.makedirs(os.path.join(out_dir, "templates"))
+        with open(os.path.join(out_dir, "index.html"), "w", encoding="utf-8") as f:
+            f.write("x")
+        with open(os.path.join(out_dir, "templates", "base.html"), "w", encoding="utf-8") as f:
+            f.write("x")
+        with open(os.path.join(out_dir, yoriai.PROGRESS_FILENAME), "w", encoding="utf-8") as f:
+            f.write("x")
+        assert yoriai._list_project_files(out_dir) == ["index.html", "templates/base.html"]
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_syntax_check_all_files_checks_subdirectory_files_too():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        os.makedirs(os.path.join(out_dir, "sub"))
+        with open(os.path.join(out_dir, "sub", "broken.py"), "w", encoding="utf-8") as f:
+            f.write("def f(:\n    pass\n")
+        broken = yoriai._syntax_check_all_files(out_dir)
+        assert broken == ["sub/broken.py"], broken
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_read_project_file_fresh_reads_files_inside_subdirectories():
+    """バグの裏返し: サブディレクトリに書き込んだファイルを、
+    read_fileで正しく読み返せることを確認する(書き込み側だけを
+    緩和して読み取り側が対応していないと、モデルは自分が書いた内容を
+    確認できなくなってしまう)。
+    """
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        os.makedirs(os.path.join(out_dir, "templates"))
+        with open(os.path.join(out_dir, "templates", "base.html"), "w", encoding="utf-8") as f:
+            f.write("<html></html>\n")
+        result = json.loads(yoriai._read_project_file_fresh(out_dir, "templates/base.html"))
+        assert result == {"filename": "templates/base.html", "exists": True, "content": "<html></html>\n"}, result
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_search_in_project_file_searches_inside_subdirectories():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        os.makedirs(os.path.join(out_dir, "templates"))
+        with open(os.path.join(out_dir, "templates", "base.html"), "w", encoding="utf-8") as f:
+            f.write("<html>\n<title>target</title>\n</html>\n")
+        result = json.loads(yoriai._search_in_project_file(out_dir, "templates/base.html", "target"))
+        assert result["exists"] is True and result["match_count"] == 1, result
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
 def test_execute_project_tool_call_dispatches_to_write_file():
     out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
     try:
@@ -328,6 +496,35 @@ def test_execute_project_tool_call_dispatches_to_write_file():
         assert result["ok"] is True, result
         with open(os.path.join(out_dir, "a.py"), encoding="utf-8") as f:
             assert f.read() == "x = 1\n"
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_execute_project_tool_call_writes_into_subdirectory_via_write_file():
+    """バグ再現の全体的な結線確認: モデルがmake_directory→write_fileの
+    順でツール呼び出しを行うシナリオを、_execute_project_tool_call経由で
+    再現しても実際にファイルが保存されることを確認する。
+    """
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        mkdir_call = {
+            "id": "call_1", "type": "function",
+            "function": {"name": "make_directory", "arguments": {"dirname": "templates"}},
+        }
+        mkdir_result = json.loads(yoriai._execute_project_tool_call(out_dir, mkdir_call))
+        assert mkdir_result["ok"] is True, mkdir_result
+
+        write_call = {
+            "id": "call_2", "type": "function",
+            "function": {
+                "name": "write_file",
+                "arguments": {"filename": "templates/base.html", "content": "<html></html>\n"},
+            },
+        }
+        write_result = json.loads(yoriai._execute_project_tool_call(out_dir, write_call))
+        assert write_result["ok"] is True, write_result
+        with open(os.path.join(out_dir, "templates", "base.html"), encoding="utf-8") as f:
+            assert f.read() == "<html></html>\n"
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
 
@@ -566,6 +763,70 @@ def _fake_stream_fix_simple_write(candidate, org_fingerprint, messages, offer_pr
         return
     yield {"content": "utils.pyのID生成ロジックを修正しました。"}
     yield {"done": True}
+
+
+def _fake_stream_fix_make_directory_then_write_into_it(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
+    """実機のバグ報告を再現するフェイク: make_directoryでtemplatesを
+    作成した後、その中にwrite_fileでファイルを書き込もうとする(モデルが
+    サブディレクトリに整理しようとする自然な振る舞いを模擬する)。
+    """
+    n = _tool_round(messages)
+    if n == 0:
+        yield {"pending_tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "make_directory", "arguments": {"dirname": "templates"}}},
+        ]}
+        return
+    if n == 1:
+        yield {"pending_tool_calls": [
+            {"id": "call_2", "type": "function", "function": {
+                "name": "write_file",
+                "arguments": {"filename": "templates/base.html", "content": "<html><body>base</body></html>\n"},
+            }},
+        ]}
+        return
+    yield {"content": "templates/base.htmlを作成しました。"}
+    yield {"done": True}
+
+
+def test_fix_project_end_to_end_populates_subdirectory_created_via_make_directory():
+    """バグ報告の再現と修正の確認: 「テンプレートファイルを作成」の
+    ような依頼で、モデルがmake_directory→write_fileの順でサブ
+    ディレクトリ内にファイルを作ろうとした場合、以前は書き込みが
+    常に拒否されディレクトリだけが空のまま残っていたが、修正後は
+    実際にファイルが保存されることを確認する。
+    """
+    original_snapshot = yoriai._fetch_org_snapshot
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False: _two_member_snapshot()
+    yoriai._stream_chat_from_candidate = _fake_stream_fix_make_directory_then_write_into_it
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        projects_root = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME)
+        project_dir = _write_completed_project(projects_root, "html-course", [("index.html", "トップページ")])
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            yoriai._ask_organization_fix_project(
+                47120, "fingerprint", "html-course: レッスンページのレイアウトを統一するためのテンプレートファイルを作成", out_dir,
+            )
+        output = buf.getvalue()
+
+        assert "[✅ 修正が完了しました" in output, output
+        assert os.path.isdir(os.path.join(project_dir, "templates")), "テンプレートディレクトリ自体は作成されるはずです"
+        template_path = os.path.join(project_dir, "templates", "base.html")
+        assert os.path.isfile(template_path), (
+            f"サブディレクトリの中身が空のままになる不具合が再発しています: {output}"
+        )
+        with open(template_path, encoding="utf-8") as f:
+            assert f.read() == "<html><body>base</body></html>\n"
+
+        parsed = yoriai._parse_progress_markdown(os.path.join(project_dir, yoriai.PROGRESS_FILENAME))
+        assert "templates/base.html" in parsed["changelog"][0], parsed["changelog"]
+    finally:
+        yoriai._fetch_org_snapshot = original_snapshot
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
 
 
 def test_fix_project_end_to_end_uses_tools_to_rename_edit_and_test():
@@ -1683,9 +1944,22 @@ def main():
         test_make_project_directory_creates_subdirectory,
         test_list_project_directory_excludes_progress_md,
         test_syntax_check_all_files_reports_broken_files_only,
+        test_resolve_safe_project_path_accepts_subdirectory_relative_path,
+        test_resolve_safe_project_path_still_rejects_parent_directory_reference_inside_subpath,
+        test_resolve_safe_project_path_rejects_progress_md_inside_subdirectory,
+        test_write_project_file_creates_missing_subdirectory_automatically,
+        test_write_project_file_populates_directory_created_via_make_directory,
+        test_move_project_file_into_subdirectory_creates_it_automatically,
+        test_delete_project_file_from_subdirectory_records_relative_path_in_changelog,
+        test_list_project_files_includes_subdirectory_contents,
+        test_syntax_check_all_files_checks_subdirectory_files_too,
+        test_read_project_file_fresh_reads_files_inside_subdirectories,
+        test_search_in_project_file_searches_inside_subdirectories,
         test_execute_project_tool_call_dispatches_to_write_file,
+        test_execute_project_tool_call_writes_into_subdirectory_via_write_file,
         test_execute_project_tool_call_dispatches_to_read_file_with_range,
         test_execute_project_tool_call_dispatches_to_search_in_file,
+        test_fix_project_end_to_end_populates_subdirectory_created_via_make_directory,
         test_identify_target_project_matches_unique_high_scoring_project,
         test_identify_target_project_reports_ambiguous_on_tie,
         test_identify_target_project_reports_not_found_when_no_overlap,

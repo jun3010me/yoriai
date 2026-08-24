@@ -395,7 +395,10 @@ READ_FILE_TOOL_SCHEMA = {
         "parameters": {
             "type": "object",
             "properties": {
-                "filename": {"type": "string", "description": "読みたいファイル名(例: storage.py)"},
+                "filename": {
+                    "type": "string",
+                    "description": "読みたいファイル名(例: storage.py、またはtemplates/base.htmlのようなサブディレクトリ内のパス)",
+                },
                 "start_line": {
                     "type": "integer",
                     "description": "読み始めたい行番号(1始まり)。省略時はファイル全体を返す。",
@@ -435,7 +438,10 @@ SEARCH_IN_FILE_TOOL_SCHEMA = {
         "parameters": {
             "type": "object",
             "properties": {
-                "filename": {"type": "string", "description": "検索したいファイル名(例: storage.py)"},
+                "filename": {
+                    "type": "string",
+                    "description": "検索したいファイル名(例: storage.py、またはtemplates/base.htmlのようなサブディレクトリ内のパス)",
+                },
                 "query": {"type": "string", "description": "検索したいキーワードまたは関数名"},
                 "context_lines": {
                     "type": "integer",
@@ -1990,9 +1996,15 @@ def _read_project_file_fresh(
     古いスナップショットを使い回さない)。
 
     仮の判断: `filename`はモデルが自由な文字列として指定してくる値のため、
-    `os.path.basename`でディレクトリ部分を取り除いたうえで`out_dir`配下
-    としてのみ解決する(`../../etc/passwd`のようなパストラバーサルで
+    `_resolve_safe_project_path`(write_file等と共通)で`out_dir`配下の
+    相対パスとしてのみ解決する(`../../etc/passwd`のようなパストラバーサルで
     プロジェクト外のファイルを読ませられないようにする安全対策)。
+
+    仮の判断(バグ報告への対応): 以前は`os.path.basename`でディレクトリ
+    部分を一律取り除いていたため、write_fileでサブディレクトリ内に
+    書き込んだファイル(例: templates/base.html)を、その後read_fileで
+    読み返すことができなかった。書き込み側と同じ`_resolve_safe_project_
+    path`を使うことで、サブディレクトリ内のファイルも読めるようにした。
 
     仮の判断(部分読み機能の追加): `start_line`/`end_line`(またはその代わりに
     `line`+`context_lines`)がすべて省略された場合は、従来通りファイル全体を
@@ -2001,9 +2013,8 @@ def _read_project_file_fresh(
     出力と同じ「行番号: 内容」形式にして、両ツールの結果を突き合わせやすく
     している)。
     """
-    safe_name = os.path.basename(filename or "")
-    path = os.path.join(out_dir, safe_name) if safe_name else None
-    if not safe_name or not os.path.isfile(path):
+    path, path_error = _resolve_safe_project_path(out_dir, filename)
+    if path_error or not os.path.isfile(path):
         # 仮の判断: 依頼の項目4に対応。存在しないファイル名を指定された
         # 場合は、例外を投げたりエラー扱いにしたりせず、「まだ実装されて
         # いない」という情報自体をモデルへの正常な回答として返す。
@@ -2017,7 +2028,7 @@ def _read_project_file_fresh(
         # (架空のファイル名を待ち続けるのではなく、モデル自身がその場で
         # 「参照すべきは実在するどのファイルか」を判断し直せるようにする)。
         planned = _planned_filenames_from_progress(out_dir)
-        if planned and safe_name not in planned:
+        if planned and os.path.basename(filename or "") not in planned:
             return json.dumps({
                 "filename": filename, "exists": False,
                 "message": (
@@ -2100,12 +2111,16 @@ def _search_in_project_file(out_dir: str, filename: str, query: str, context_lin
     各一致箇所の前後`context_lines`行(省略時は
     `_SEARCH_IN_FILE_DEFAULT_CONTEXT_LINES`行)の抜粋を返す。ファイル全体を
     read_fileで読む前に、まずここで見当をつけることを想定している。
+
+    仮の判断(バグ報告への対応): `_read_project_file_fresh`と同じ理由で、
+    `os.path.basename`によるディレクトリ部分の除去ではなく
+    `_resolve_safe_project_path`を使い、サブディレクトリ内のファイルも
+    検索できるようにする。
     """
-    safe_name = os.path.basename(filename or "")
-    path = os.path.join(out_dir, safe_name) if safe_name else None
-    if not safe_name or not os.path.isfile(path):
+    path, path_error = _resolve_safe_project_path(out_dir, filename)
+    if path_error or not os.path.isfile(path):
         planned = _planned_filenames_from_progress(out_dir)
-        if planned and safe_name not in planned:
+        if planned and os.path.basename(filename or "") not in planned:
             return json.dumps({
                 "filename": filename, "exists": False,
                 "message": (
@@ -2277,26 +2292,50 @@ def _collect_review_answer_with_read_file(
 # 絞った専用ツールのみを提供する。
 
 def _resolve_safe_project_path(project_dir: str, filename: str) -> tuple:
-    """`(絶対パス, エラーメッセージ)`を返す。`project_dir`直下の、
-    ディレクトリ区切りを含まないフラットなファイル名だけを許可する
-    (依頼の項目2・5: パストラバーサル対策と、Yoriai本体・他プロジェクトへの
-    アクセスを絶対に許さないための唯一の入口)。この関数を経由しない限り
-    以下のツールはどれも実際のファイルパスを作らないため、モデルからの
-    入力がどのような文字列であってもproject_dirの外に出ることはない。
+    """`(絶対パス, エラーメッセージ)`を返す。`project_dir`配下(サブ
+    ディレクトリを含む)の相対パスだけを許可する(依頼の項目2・5:
+    パストラバーサル対策と、Yoriai本体・他プロジェクトへのアクセスを
+    絶対に許さないための唯一の入口)。この関数を経由しない限り以下の
+    ツールはどれも実際のファイルパスを作らないため、モデルからの入力が
+    どのような文字列であってもproject_dirの外に出ることはない。
+
+    仮の判断(バグ報告への対応): 当初はディレクトリ区切りを含む名前を
+    一律拒否し、project_dir直下のフラットなファイルのみ許可していた。
+    しかしmake_directoryでサブディレクトリ自体は作成できるにもかかわらず、
+    write_fileではその中に一切書き込めないという矛盾した制約になって
+    いた。実機で、モデルが「templates/base.html」のようなサブディレクトリ
+    内のパスをfilenameに指定し続けて書き込みが常に拒否され、結果として
+    templates・lessons等のディレクトリだけが空のまま残る不具合が報告
+    された。パストラバーサル対策(絶対パス・'..'による親ディレクトリ参照の
+    拒否)は維持しつつ、project_dir配下のサブディレクトリの利用を許可する
+    形に緩和した(サブディレクトリが実在しなくても、書き込み側
+    (`_write_project_file`・`_move_project_file`)が自動的に作成する)。
 
     仮の判断: PROGRESS.mdはYoriai自身が状態管理に使うファイルであり、
     モデルが自由に書き換えたり消したりできてしまうと、進行状況の
-    永続化・巡回モード・自動再開の前提が壊れる。そのため名前で明示的に
-    弾く。
+    永続化・巡回モード・自動再開の前提が壊れる。そのため(どのサブ
+    ディレクトリに置かれていても)名前(最後の要素)で明示的に弾く。
     """
-    name = (filename or "").strip()
+    name = (filename or "").strip().replace("\\", "/")
     if not name:
         return None, "ファイル名が指定されていません。"
-    if os.path.basename(name) != name or name in (".", ".."):
-        return None, f"'{name}' はディレクトリを含む名前のため使用できません(プロジェクト直下のファイル名のみ指定してください)。"
-    if name == PROGRESS_FILENAME:
+    if name.startswith("/"):
+        return None, f"'{name}' は絶対パスのため使用できません(プロジェクト直下、またはそのサブディレクトリ内の相対パスを指定してください)。"
+    parts = [p for p in name.split("/") if p not in ("", ".")]
+    if not parts or any(p == ".." for p in parts):
+        return None, f"'{name}' は使用できないパスです(プロジェクトディレクトリの外を指す'..'は使用できません)。"
+    if parts[-1] == PROGRESS_FILENAME:
         return None, "PROGRESS.mdはYoriai自身が管理するファイルのため、このツールでは操作できません。"
-    return os.path.join(project_dir, name), None
+    return os.path.join(project_dir, *parts), None
+
+
+def _project_relpath(project_dir: str, path: str) -> str:
+    """`path`(`_resolve_safe_project_path`が返した絶対パス)を、
+    `project_dir`からの相対パス(区切りは常にスラッシュ)として返す。
+    モデルへの応答(書き込み・移動・削除・一覧の結果)で、サブディレクトリ
+    内のファイルがどこに置かれたかを正確に伝えるために使う。
+    """
+    return os.path.relpath(path, project_dir).replace(os.sep, "/")
 
 
 LIST_DIR_TOOL_NAME = "list_dir"
@@ -2304,7 +2343,10 @@ LIST_DIR_TOOL_SCHEMA = {
     "type": "function",
     "function": {
         "name": LIST_DIR_TOOL_NAME,
-        "description": "このプロジェクトディレクトリ直下にあるファイルの一覧を取得する。",
+        "description": (
+            "このプロジェクトディレクトリ内にあるファイルの一覧を取得する"
+            "(サブディレクトリ内のファイルも'サブディレクトリ名/ファイル名'の形で含まれる)。"
+        ),
         "parameters": {"type": "object", "properties": {}},
     },
 }
@@ -2315,14 +2357,20 @@ WRITE_FILE_TOOL_SCHEMA = {
     "function": {
         "name": WRITE_FILE_TOOL_NAME,
         "description": (
-            "このプロジェクトディレクトリ直下に、指定した内容でファイルを新規作成・上書きする。"
+            "このプロジェクトディレクトリ内に、指定した内容でファイルを新規作成・上書きする。"
+            "'サブディレクトリ名/ファイル名'のようにサブディレクトリ内のパスを指定することもでき、"
+            "そのサブディレクトリがまだ存在しなければ自動的に作成される"
+            "(make_directoryを先に呼ぶ必要はない)。"
             "既存ファイルの一部だけを直したい場合も、read_fileで現在の中身を確認したうえで"
             "ファイル全体の新しい内容をここに渡すこと(差分ではなく全体を渡す)。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "filename": {"type": "string", "description": "書き込むファイル名(例: utils.py)"},
+                "filename": {
+                    "type": "string",
+                    "description": "書き込むファイル名(例: utils.py、またはtemplates/base.htmlのようなサブディレクトリ内のパス)",
+                },
                 "content": {"type": "string", "description": "ファイルの新しい中身(ファイル全体)"},
             },
             "required": ["filename", "content"],
@@ -2335,12 +2383,16 @@ MOVE_FILE_TOOL_SCHEMA = {
     "type": "function",
     "function": {
         "name": MOVE_FILE_TOOL_NAME,
-        "description": "このプロジェクトディレクトリ直下のファイルの名前を変更(移動)する。",
+        "description": (
+            "このプロジェクトディレクトリ内のファイルの名前を変更(移動)する。"
+            "サブディレクトリ内へ、またはサブディレクトリ間で移動することもできる"
+            "('サブディレクトリ名/ファイル名'の形で指定する)。"
+        ),
         "parameters": {
             "type": "object",
             "properties": {
-                "old_filename": {"type": "string", "description": "変更前のファイル名"},
-                "new_filename": {"type": "string", "description": "変更後のファイル名"},
+                "old_filename": {"type": "string", "description": "変更前のファイル名(サブディレクトリ内のパスも可)"},
+                "new_filename": {"type": "string", "description": "変更後のファイル名(サブディレクトリ内のパスも可)"},
             },
             "required": ["old_filename", "new_filename"],
         },
@@ -2352,10 +2404,10 @@ DELETE_FILE_TOOL_SCHEMA = {
     "type": "function",
     "function": {
         "name": DELETE_FILE_TOOL_NAME,
-        "description": "このプロジェクトディレクトリ直下のファイルを削除する。取り消せない操作なので、本当に不要なファイルにのみ使うこと。",
+        "description": "このプロジェクトディレクトリ内のファイルを削除する(サブディレクトリ内のファイルも可)。取り消せない操作なので、本当に不要なファイルにのみ使うこと。",
         "parameters": {
             "type": "object",
-            "properties": {"filename": {"type": "string", "description": "削除するファイル名"}},
+            "properties": {"filename": {"type": "string", "description": "削除するファイル名(サブディレクトリ内のパスも可)"}},
             "required": ["filename"],
         },
     },
@@ -2366,7 +2418,11 @@ MAKE_DIRECTORY_TOOL_SCHEMA = {
     "type": "function",
     "function": {
         "name": MAKE_DIRECTORY_TOOL_NAME,
-        "description": "このプロジェクトディレクトリ直下にサブディレクトリを作成する。",
+        "description": (
+            "このプロジェクトディレクトリ直下にサブディレクトリを作成する。"
+            "write_fileはサブディレクトリが無くても自動的に作成するため、このツールは"
+            "空のディレクトリだけを先に用意しておきたい場合にのみ使えばよい(通常は不要)。"
+        ),
         "parameters": {
             "type": "object",
             "properties": {"dirname": {"type": "string", "description": "作成するディレクトリ名"}},
@@ -2448,11 +2504,18 @@ def _write_project_file(project_dir: str, filename: str, content) -> str:
         return json.dumps({"ok": False, "message": error}, ensure_ascii=False)
     text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
     try:
+        # 仮の判断(バグ報告への対応): filenameがサブディレクトリを含む
+        # パス(例: templates/base.html)の場合、そのサブディレクトリが
+        # まだ存在しなければここで自動的に作成する。make_directoryを
+        # 事前に呼んでいなくてもwrite_fileだけで完結できるようにするため
+        # (flatなファイル名の場合、dirnameはproject_dir自身になり、
+        # 既に存在するため実質的に何もしない)。
+        os.makedirs(os.path.dirname(safe_path), exist_ok=True)
         with open(safe_path, "w", encoding="utf-8") as f:
             f.write(text)
     except Exception as exc:
         return json.dumps({"ok": False, "message": f"書き込みに失敗しました: {exc}"}, ensure_ascii=False)
-    result = {"ok": True, "filename": os.path.basename(safe_path)}
+    result = {"ok": True, "filename": _project_relpath(project_dir, safe_path)}
     status, detail = _check_file_syntax(os.path.basename(safe_path), text, file_path=safe_path)
     if status == "ok":
         result["syntax_ok"] = True
@@ -2474,11 +2537,17 @@ def _move_project_file(project_dir: str, old_filename: str, new_filename: str) -
     if not os.path.isfile(old_path):
         return json.dumps({"ok": False, "message": f"{old_filename} が見つかりません。"}, ensure_ascii=False)
     try:
+        # write_fileと同様、移動先のサブディレクトリが無ければ自動作成する。
+        os.makedirs(os.path.dirname(new_path), exist_ok=True)
         os.replace(old_path, new_path)
     except Exception as exc:
         return json.dumps({"ok": False, "message": f"移動に失敗しました: {exc}"}, ensure_ascii=False)
     return json.dumps(
-        {"ok": True, "old_filename": os.path.basename(old_path), "new_filename": os.path.basename(new_path)},
+        {
+            "ok": True,
+            "old_filename": _project_relpath(project_dir, old_path),
+            "new_filename": _project_relpath(project_dir, new_path),
+        },
         ensure_ascii=False,
     )
 
@@ -2493,7 +2562,7 @@ def _delete_project_file(project_dir: str, filename: str, print_lock: threading.
         return json.dumps({"ok": False, "message": error}, ensure_ascii=False)
     if not os.path.isfile(safe_path):
         return json.dumps({"ok": False, "message": f"{filename} が見つかりません。"}, ensure_ascii=False)
-    safe_name = os.path.basename(safe_path)
+    safe_name = _project_relpath(project_dir, safe_path)
 
     progress_path = os.path.join(project_dir, PROGRESS_FILENAME)
     parsed = _parse_progress_markdown(progress_path)
@@ -2522,7 +2591,7 @@ def _make_project_directory(project_dir: str, dirname: str) -> str:
         os.makedirs(safe_path, exist_ok=True)
     except Exception as exc:
         return json.dumps({"ok": False, "message": f"ディレクトリの作成に失敗しました: {exc}"}, ensure_ascii=False)
-    return json.dumps({"ok": True, "dirname": os.path.basename(safe_path)}, ensure_ascii=False)
+    return json.dumps({"ok": True, "dirname": _project_relpath(project_dir, safe_path)}, ensure_ascii=False)
 
 
 # 仮の判断: 依頼(「検証専用の、より柔軟なコマンド実行ツールへの刷新」)
@@ -3005,17 +3074,17 @@ def _collect_answer_with_project_tools(
 
 
 def _syntax_check_all_files(project_dir: str) -> list:
-    """プロジェクトディレクトリ直下の全ファイルに、拡張子に応じた機械的な
-    構文チェック(`_check_file_syntax`、言語非依存)を行い、構文エラーが
-    残っているファイル名のリストを返す(対応していない拡張子・スキップ
-    されたファイルはこのリストに含めない。あくまで「確実に壊れている」と
-    判定できたものだけを報告する)。
+    """プロジェクトディレクトリ内(サブディレクトリを含む)の全ファイルに、
+    拡張子に応じた機械的な構文チェック(`_check_file_syntax`、言語非依存)
+    を行い、構文エラーが残っているファイルの相対パスのリストを返す
+    (対応していない拡張子・スキップされたファイルはこのリストに含めない。
+    あくまで「確実に壊れている」と判定できたものだけを報告する)。
 
     仮の判断: 個々の`write_file`呼び出し直後の即時フィードバックに加えて、
     修正セッション全体が終わった後にプロジェクト全体を最終確認する
     安全網として用意した(モデルが「直したつもり」でも別のファイルへの
     影響を見落とす可能性があるため)。`_list_project_files`と同じく
-    直下のファイルのみを対象とする(サブディレクトリ内は対象外)。
+    再帰的に走査する(サブディレクトリ内のファイルも対象)。
     """
     broken = []
     for filename in _list_project_files(project_dir):
@@ -5123,15 +5192,28 @@ def _resolve_explicit_fix_target(request_text: str, out_dir: str) -> tuple:
 
 
 def _list_project_files(project_dir: str) -> list:
-    """プロジェクトディレクトリ内の、PROGRESS.md以外のファイル名一覧を
-    ソート済みで返す。
+    """プロジェクトディレクトリ内(サブディレクトリを含む)の、
+    PROGRESS.md以外のファイルの相対パス一覧をソート済みで返す。
+    相対パスの区切りは常にスラッシュ('/')にする(read_file・write_file
+    等の引数としてそのまま使える、OS非依存の表記にするため)。
+
+    仮の判断(バグ報告への対応): `_resolve_safe_project_path`が
+    サブディレクトリ内のパスを許可するようになったことに合わせ、
+    直下だけでなく再帰的に走査する。これが無いと、サブディレクトリ内に
+    実際に書き込まれたファイルが、修正担当への「現在保存されている
+    ファイル一覧」やlist_dir・構文チェック(`_syntax_check_all_files`)
+    から見えなくなってしまう。
     """
     if not os.path.isdir(project_dir):
         return []
-    return sorted(
-        name for name in os.listdir(project_dir)
-        if name != PROGRESS_FILENAME and os.path.isfile(os.path.join(project_dir, name))
-    )
+    files = []
+    for root, _dirs, filenames in os.walk(project_dir):
+        for name in filenames:
+            if name == PROGRESS_FILENAME:
+                continue
+            rel = os.path.relpath(os.path.join(root, name), project_dir).replace(os.sep, "/")
+            files.append(rel)
+    return sorted(files)
 
 
 # 仮の判断: 依頼の項目2(既存のread_fileツールの仕組みを流用し、
