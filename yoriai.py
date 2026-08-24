@@ -1086,6 +1086,15 @@ def build_profile_card(agent_id: str) -> dict:
             "installed": _merge_model_lists(ollama_installed, mlx_lm_models, lmstudio_models),
             "loaded": _merge_model_lists(ollama_loaded, mlx_lm_models, lmstudio_models),
             "backends": backends,
+            # 仮の判断(対話プロトコル用): 寄合の対話プロトコルが役割
+            # (提案役・反論役・統合役)を動的に割り振る際の「得意分野」
+            # 情報。厳密な専門分野推定は大きなテーマになるため、既存の
+            # コーディング系モデル判定(_is_coding_model)を流用した
+            # 簡易な二値分類にとどめる。
+            "specialties": _infer_specialties(
+                _merge_model_lists(ollama_installed, mlx_lm_models, lmstudio_models)
+                + _merge_model_lists(ollama_loaded, mlx_lm_models, lmstudio_models)
+            ),
         },
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
@@ -1690,6 +1699,22 @@ def _is_coding_model(model_name: str) -> bool:
     return any(keyword in lowered for keyword in _CODING_MODEL_KEYWORDS)
 
 
+# 対話プロトコルの役割割り振りが参照する「得意分野(ファーストエッグ情報)」。
+# 仮の判断: 既存のコーディング系モデル判定をそのまま流用した二値分類に
+# とどめる(厳密な専門分野推定は今回のスコープ外)。
+DIALOGUE_SPECIALTY_CODING = "coding"
+DIALOGUE_SPECIALTY_GENERAL = "general"
+
+
+def _infer_specialties(model_names) -> list:
+    """インストール済み/ロード済みのモデル名一覧から、そのノードの
+    得意分野を簡易的に推定し、自己紹介カードに載せるリストを返す。
+    """
+    if any(_is_coding_model(name) for name in model_names):
+        return [DIALOGUE_SPECIALTY_CODING]
+    return [DIALOGUE_SPECIALTY_GENERAL]
+
+
 def _build_chat_candidate(card: dict, is_self: bool, address: str, port: int, task_type: str = TASK_TYPE_GENERAL):
     """自己紹介カードから、チャットの問い合わせ先候補(ロード済みモデルを
     持つメンバー)を作る。ロード済みモデルが無いメンバーはNoneを返す。
@@ -1721,6 +1746,7 @@ def _build_chat_candidate(card: dict, is_self: bool, address: str, port: int, ta
         "address": address,
         "port": port,
         "has_coding_model": has_coding_model,
+        "specialties": card.get("models", {}).get("specialties") or _infer_specialties(loaded),
     }
 
 
@@ -3345,6 +3371,407 @@ def _ask_organization_parallel(port: int, org_fingerprint: str, command_text: st
 
 
 # ---------------------------------------------------------------------------
+# 対話プロトコル(共通基盤) — 複数ノードによる合意形成の仕組み
+# ---------------------------------------------------------------------------
+#
+# これまでの寄合は、計画フェーズ(//agree)で1〜2往復程度のやり取りを
+# しただけで、そのまま実装フェーズに進んでしまっていた。「最初に思いついた
+# 案がそのまま最後まで固定される」「自己反証のループが実質ゼロ」という
+# 問題への対応として、複数ノードが役割(提案役・反論役・統合役)を持って
+# 議論し、合意形成する対話プロトコルを実装する。特定のフェーズ専用の
+# 機構にはせず、計画フェーズ(//agree)・修正フェーズ(//fix)・
+# レビューフェーズ・計画のみモード(//plan-only)から共通で呼び出せる
+# 基盤として1つだけ実装する。
+
+DIALOGUE_ROLE_PROPOSER = "proposer"
+DIALOGUE_ROLE_CRITIC = "critic"
+DIALOGUE_ROLE_INTEGRATOR = "integrator"
+
+_DIALOGUE_ROLE_LABEL_JA = {
+    DIALOGUE_ROLE_PROPOSER: "提案役",
+    DIALOGUE_ROLE_CRITIC: "反論役",
+    DIALOGUE_ROLE_INTEGRATOR: "統合役",
+}
+
+# セーフティリミット: 「1つの議題」についての対話1回あたり、参加している
+# 全ノードの発言回数の合計がこれを超えたら強制的に一時停止し、それまでの
+# 議事録全文と要約を人間に提示して判断を仰ぐ(寄合全体を通しての累積では
+# なく、_run_dialogue呼び出し1回ごとに数える)。
+DIALOGUE_SAFETY_LIMIT_UTTERANCES = 50
+
+DIALOGUE_STATUS_CONSENSUS = "consensus"
+DIALOGUE_STATUS_SAFETY_LIMIT = "safety_limit"
+DIALOGUE_STATUS_NEEDS_HUMAN = "needs_human"
+# 提案役からすら実のある応答が一度も得られなかった場合(問い合わせの失敗・
+# 空応答)。これは議論が難航した結果ではなく単純な疎通の問題である可能性が
+# 高いため、他の3状態(議論の結果として人間の判断を仰ぐべき状態)とは区別し、
+# 呼び出し元がこれまで通りの経路に安全側フォールバックできるようにする。
+DIALOGUE_STATUS_NO_ENGAGEMENT = "no_engagement"
+
+_DIALOGUE_STATUS_LABEL_JA = {
+    DIALOGUE_STATUS_CONSENSUS: "合意",
+    DIALOGUE_STATUS_SAFETY_LIMIT: "セーフティリミットにより一時停止",
+    DIALOGUE_STATUS_NEEDS_HUMAN: "人間の確認が必要",
+    DIALOGUE_STATUS_NO_ENGAGEMENT: "応答なし",
+}
+
+
+def _assign_discourse_roles(candidates: list) -> dict:
+    """優先順位順(得意分野・空きメモリ順)に並んだ候補から、提案役・
+    反論役・統合役を割り当てる。
+
+    仮の判断: 役割は固定人格ではなく、議題ごとに候補の並び順
+    (`_select_chat_candidates`が得意分野・空きメモリで並べた順)に基づいて
+    動的に決める。候補が3台に満たない場合は、同じノードが複数の役割を
+    兼務する(2台なら2台目が反論役・統合役を兼務、1台なら1台がすべての
+    役割を兼務する自己対話になる。組織に1台しかいない場合でも対話
+    プロトコル自体は動作する)。
+    """
+    if not candidates:
+        return {}
+    proposer = candidates[0]
+    critic = candidates[1] if len(candidates) >= 2 else candidates[0]
+    integrator = candidates[2] if len(candidates) >= 3 else critic
+    return {
+        DIALOGUE_ROLE_PROPOSER: proposer,
+        DIALOGUE_ROLE_CRITIC: critic,
+        DIALOGUE_ROLE_INTEGRATOR: integrator,
+    }
+
+
+_DIALOGUE_PROPOSER_ROUND1_TEMPLATE = """あなたは{speaker_label}さんとして、複数のメンバーによる対話(寄合の対話プロトコル)に「提案役」として参加しています。以下の議題について、具体的な提案をしてください。
+
+【議題】
+{topic}
+
+【背景・参考情報】
+{background}
+
+【出力形式についての指示】
+{output_instruction}
+
+他の説明文や前置きは不要です。指示された出力形式のみで答えてください。
+"""
+
+_DIALOGUE_PROPOSER_REVISE_TEMPLATE = """あなたは{speaker_label}さんとして、複数のメンバーによる対話(寄合の対話プロトコル)に「提案役」として参加しています。以下はこれまでの議論の経過です。反論役からの指摘を踏まえ、提案を改善してください。
+
+【議題】
+{topic}
+
+【背景・参考情報】
+{background}
+
+【これまでの議論】
+{transcript}
+
+【出力形式についての指示】
+{output_instruction}
+
+他の説明文や前置きは不要です。指示された出力形式のみで、改善した提案を答えてください。
+"""
+
+_DIALOGUE_CRITIC_TEMPLATE = """あなたは{speaker_label}さんとして、複数のメンバーによる対話(寄合の対話プロトコル)に「反論役」として参加しています。あえて穴やリスクを探し、批判的に検討する役目です。
+
+【議題】
+{topic}
+
+【背景・参考情報】
+{background}
+
+【これまでの議論】
+{transcript}
+
+提案の問題点・リスク・抜け漏れを具体的に指摘してください。問題が無ければその旨を書いてください。
+
+出力の最後に、次のいずれか1つを必ず独立した行として書いてください:
+評価: 合意
+評価: 要修正
+評価: 情報不足
+
+(「評価: 情報不足」は、議論を重ねてもアイデアが出尽くしており、人間の追加の助言が必要だと判断した場合に使ってください。)
+"""
+
+_DIALOGUE_INTEGRATOR_TEMPLATE = """あなたは{speaker_label}さんとして、複数のメンバーによる対話(寄合の対話プロトコル)に「統合役」として参加しています。複数の意見を俯瞰し、まとめる役目です。
+
+【議題】
+{topic}
+
+【背景・参考情報】
+{background}
+
+【これまでの議論】
+{transcript}
+
+これまでの議論を踏まえ、次のいずれか1つを独立した行として必ず書いてください:
+判定: 合意
+判定: 継続
+判定: 人間に確認
+
+「判定: 合意」の場合は、続けて「最終合意内容:」という見出しの下に、以下の指示に従って最終的な合意内容を書いてください:
+{output_instruction}
+
+「判定: 人間に確認」の場合は、続けて「人間への確認事項:」という見出しの下に、人間に確認・相談したい内容を具体的に書いてください(議論を進める上で人間の判断が必要な場合、または議論を重ねてもアイデアが出尽くした場合)。
+
+それ以外(「判定: 継続」)の場合は、続けて議論の現状を2〜3文で要約してください。
+"""
+
+_CRITIC_VERDICT_PATTERN = re.compile(r"評価:\s*(合意|要修正|情報不足)")
+_INTEGRATOR_VERDICT_PATTERN = re.compile(r"判定:\s*(合意|継続|人間に確認)")
+
+
+def _parse_critic_verdict(answer: str) -> str:
+    """反論役の回答から評価(合意/要修正/情報不足)を取り出す。見つから
+    ない場合は、暴走(誤った合意判定)より安全な「要修正」に倒す。
+    """
+    match = _CRITIC_VERDICT_PATTERN.search(answer or "")
+    return match.group(1) if match else "要修正"
+
+
+def _parse_integrator_verdict(answer: str) -> str:
+    """統合役の回答から判定(合意/継続/人間に確認)を取り出す。見つから
+    ない場合は「継続」に倒し、誤って合意扱いにしないようにする。
+    """
+    match = _INTEGRATOR_VERDICT_PATTERN.search(answer or "")
+    return match.group(1) if match else "継続"
+
+
+def _extract_dialogue_section(answer: str, heading: str) -> str:
+    """統合役の回答から`heading`(例: "最終合意内容:")直後の本文を取り
+    出す。見出しが見つからない場合は回答全体を返す(見出しの付け忘れに
+    対するフォールバック)。
+    """
+    text = answer or ""
+    idx = text.find(heading)
+    if idx == -1:
+        return text.strip()
+    return text[idx + len(heading):].strip()
+
+
+def _format_dialogue_transcript_for_prompt(transcript: list) -> str:
+    lines = []
+    for utterance in transcript:
+        role_ja = _DIALOGUE_ROLE_LABEL_JA.get(utterance["role"], utterance["role"])
+        lines.append(f"[{utterance['speaker_label']}さん・{role_ja}・ラウンド{utterance['round']}]")
+        lines.append(utterance["content"] or "(応答なし)")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _summarize_dialogue(status: str, transcript: list, final_content: str, human_message: str) -> str:
+    """要約(サマリー)を組み立てる。
+
+    仮の判断: 要約専用に追加のLLM問い合わせを行うと、対話プロトコル
+    自体が消費する発言回数の枠(セーフティリミット)を圧迫してしまう。
+    統合役が最後に述べた内容(最終合意内容、または未合意の場合はその
+    時点の要約・人間への確認事項)をそのまま要約として再利用すること
+    で、追加の問い合わせを発生させない。
+    """
+    if status == DIALOGUE_STATUS_CONSENSUS:
+        return f"{len(transcript)}件の発言を経て合意に達しました。\n\n{final_content or ''}".strip()
+    if status == DIALOGUE_STATUS_NEEDS_HUMAN:
+        return (human_message or "合意に至りませんでした。").strip()
+    if status == DIALOGUE_STATUS_SAFETY_LIMIT:
+        last_content = transcript[-1]["content"] if transcript else ""
+        base = human_message or f"発言回数の合計が上限({DIALOGUE_SAFETY_LIMIT_UTTERANCES}回)に達したため一時停止しました。"
+        return f"{base}\n\n直近の発言:\n{last_content}".strip() if last_content else base
+    return "議論への応答が得られませんでした。"
+
+
+def _finish_dialogue(status: str, transcript: list, total_utterances: int, final_content: str, human_message: str) -> dict:
+    return {
+        "status": status,
+        "transcript": transcript,
+        "summary": _summarize_dialogue(status, transcript, final_content, human_message),
+        "final_content": final_content,
+        "human_message": human_message,
+        "total_utterances": total_utterances,
+    }
+
+
+def _run_dialogue(
+    org_fingerprint: str, topic: str, background: str, candidates: list, output_instruction: str,
+    print_lock: threading.Lock = None, tag: str = None, min_rounds: int = 2, max_rounds: int = 8,
+) -> dict:
+    """複数ノードが役割(提案役・反論役・統合役)を持って議論し、合意形成
+    する対話プロトコルの中核。寄合全体で使い回せる共通基盤として、計画
+    フェーズ・修正フェーズ・レビューフェーズ・計画のみモードから共通で
+    呼び出される。
+
+    ラウンド数は固定せず、統合役が「判定: 合意」(かつ反論役も「評価:
+    合意」)と判断し、`min_rounds`以上のラウンドを経ている場合に終了する。
+    暴走防止のため、全ノードの発言回数の合計が
+    `DIALOGUE_SAFETY_LIMIT_UTTERANCES`を超えた時点で強制的に一時停止する。
+    どちらの終了条件でも、統合役(または反論役)が「人間に確認」したい
+    事項があると判断した場合は、その時点で打ち切って人間に判断を仰ぐ。
+
+    戻り値は次のキーを持つ辞書:
+    - "status": DIALOGUE_STATUS_* のいずれか
+    - "transcript": [{"round", "role", "speaker_label", "content"}, ...]
+      (議事録。誰が・どの役割で・何を発言したかを発言順に保持する)
+    - "summary": 短い要約(人間が素早く全体像を把握するためのもの)
+    - "final_content": 合意に達した場合の最終合意内容(それ以外はNone)
+    - "human_message": 人間への確認事項がある場合のメッセージ(それ以外はNone)
+    - "total_utterances": 実際に行われた発言(問い合わせ)の回数
+
+    ログ(議事録)・要約の実際のファイルへの永続化は、この関数自身では
+    行わない(呼び出し元が`_write_dialogue_log`/`_write_dialogue_summary`
+    を使って、用途に応じた保存先に書き出す)。
+    """
+    roles = _assign_discourse_roles(candidates)
+    if not roles:
+        return _finish_dialogue(DIALOGUE_STATUS_NO_ENGAGEMENT, [], 0, None, None)
+
+    transcript = []
+    state = {"total_utterances": 0, "any_real_content": False}
+
+    def speak(role_key: str, prompt: str, round_num: int) -> str:
+        candidate = roles[role_key]
+        answer, _error, _truncated = _collect_answer_from_candidate(
+            candidate, org_fingerprint, [{"role": "user", "content": prompt}],
+        )
+        state["total_utterances"] += 1
+        answer = (answer or "").strip()
+        if answer:
+            state["any_real_content"] = True
+        role_ja = _DIALOGUE_ROLE_LABEL_JA[role_key]
+        _print_tagged(
+            print_lock, tag or topic,
+            f"[💬 {candidate['label']}さん({role_ja}・ラウンド{round_num})] "
+            + (answer if answer else "(応答がありませんでした)"),
+        )
+        transcript.append({
+            "round": round_num, "role": role_key, "speaker_label": candidate["label"], "content": answer,
+        })
+        return answer
+
+    round_num = 1
+    while True:
+        if state["total_utterances"] >= DIALOGUE_SAFETY_LIMIT_UTTERANCES:
+            return _finish_dialogue(DIALOGUE_STATUS_SAFETY_LIMIT, transcript, state["total_utterances"], None, None)
+
+        if round_num == 1:
+            proposer_prompt = _DIALOGUE_PROPOSER_ROUND1_TEMPLATE.format(
+                speaker_label=roles[DIALOGUE_ROLE_PROPOSER]["label"], topic=topic, background=background,
+                output_instruction=output_instruction,
+            )
+        else:
+            proposer_prompt = _DIALOGUE_PROPOSER_REVISE_TEMPLATE.format(
+                speaker_label=roles[DIALOGUE_ROLE_PROPOSER]["label"], topic=topic, background=background,
+                transcript=_format_dialogue_transcript_for_prompt(transcript), output_instruction=output_instruction,
+            )
+        speak(DIALOGUE_ROLE_PROPOSER, proposer_prompt, round_num)
+        if not state["any_real_content"]:
+            # 提案役からすら一度も実のある応答が得られていない場合、
+            # これ以上反論役・統合役に問い合わせても無駄になる可能性が
+            # 高いため、早期に切り上げる(疎通の問題であって議論の
+            # 結果ではないため、呼び出し元は安全側フォールバックしてよい)。
+            return _finish_dialogue(DIALOGUE_STATUS_NO_ENGAGEMENT, transcript, state["total_utterances"], None, None)
+        if state["total_utterances"] >= DIALOGUE_SAFETY_LIMIT_UTTERANCES:
+            return _finish_dialogue(DIALOGUE_STATUS_SAFETY_LIMIT, transcript, state["total_utterances"], None, None)
+
+        critic_prompt = _DIALOGUE_CRITIC_TEMPLATE.format(
+            speaker_label=roles[DIALOGUE_ROLE_CRITIC]["label"], topic=topic, background=background,
+            transcript=_format_dialogue_transcript_for_prompt(transcript),
+        )
+        critic_answer = speak(DIALOGUE_ROLE_CRITIC, critic_prompt, round_num)
+        critic_verdict = _parse_critic_verdict(critic_answer)
+        if state["total_utterances"] >= DIALOGUE_SAFETY_LIMIT_UTTERANCES:
+            return _finish_dialogue(DIALOGUE_STATUS_SAFETY_LIMIT, transcript, state["total_utterances"], None, None)
+
+        integrator_prompt = _DIALOGUE_INTEGRATOR_TEMPLATE.format(
+            speaker_label=roles[DIALOGUE_ROLE_INTEGRATOR]["label"], topic=topic, background=background,
+            transcript=_format_dialogue_transcript_for_prompt(transcript), output_instruction=output_instruction,
+        )
+        integrator_answer = speak(DIALOGUE_ROLE_INTEGRATOR, integrator_prompt, round_num)
+        integrator_verdict = _parse_integrator_verdict(integrator_answer)
+
+        if critic_verdict == "情報不足" or integrator_verdict == "人間に確認":
+            human_message = _extract_dialogue_section(integrator_answer, "人間への確認事項:")
+            return _finish_dialogue(DIALOGUE_STATUS_NEEDS_HUMAN, transcript, state["total_utterances"], None, human_message)
+
+        if integrator_verdict == "合意" and critic_verdict == "合意" and round_num >= min_rounds:
+            final_content = _extract_dialogue_section(integrator_answer, "最終合意内容:")
+            return _finish_dialogue(DIALOGUE_STATUS_CONSENSUS, transcript, state["total_utterances"], final_content, None)
+
+        round_num += 1
+        if round_num > max_rounds:
+            return _finish_dialogue(
+                DIALOGUE_STATUS_NEEDS_HUMAN, transcript, state["total_utterances"], None,
+                "議論を重ねましたが、まだアイデアが不足しており合意に至りませんでした。アドバイスをください。",
+            )
+
+
+def _format_dialogue_log_markdown(topic: str, transcript: list) -> str:
+    """議事録(逐語ログ)を組み立てる。誰が・どの役割で・何を発言したかを
+    発言順にすべて保持する(後から「なぜこの結論になったのか」を遡れる
+    ようにするための、要約とは別に必ず保存する記録)。
+    """
+    lines = [f"# 対話ログ: {topic}", ""]
+    for utterance in transcript:
+        role_ja = _DIALOGUE_ROLE_LABEL_JA.get(utterance["role"], utterance["role"])
+        lines.append(f"## ラウンド{utterance['round']} - {utterance['speaker_label']}さん({role_ja})")
+        lines.append("")
+        lines.append(utterance["content"] or "(応答なし)")
+        lines.append("")
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def _format_dialogue_summary_markdown(topic: str, result: dict) -> str:
+    lines = [
+        f"# 対話サマリー: {topic}", "",
+        "## ステータス", "", _DIALOGUE_STATUS_LABEL_JA.get(result["status"], result["status"]), "",
+        "## 要約", "", result["summary"] or "(要約なし)", "",
+    ]
+    if result.get("human_message"):
+        lines += ["## 人間への確認事項", "", result["human_message"], ""]
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def _write_dialogue_log(project_dir: str, dialogue_id: str, topic: str, transcript: list) -> str:
+    os.makedirs(project_dir, exist_ok=True)
+    path = os.path.join(project_dir, f"DIALOGUE_LOG_{dialogue_id}.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(_format_dialogue_log_markdown(topic, transcript))
+    return path
+
+
+def _write_dialogue_summary(project_dir: str, dialogue_id: str, topic: str, result: dict) -> str:
+    os.makedirs(project_dir, exist_ok=True)
+    path = os.path.join(project_dir, f"DIALOGUE_SUMMARY_{dialogue_id}.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(_format_dialogue_summary_markdown(topic, result))
+    return path
+
+
+def _report_dialogue_result(result: dict, project_dir: str, dialogue_id: str, topic: str) -> None:
+    """対話の結果を画面に表示し、議事録・要約を(与えられた場合は)
+    ディスクに保存する共通処理。
+
+    合意に達した場合(DIALOGUE_STATUS_CONSENSUS)以外は、それまでの
+    議事録全文と要約を人間に提示し、続行するか終了するかの判断を
+    人間に委ねる(対話プロトコルだけで次のフェーズへ自動的に進む
+    ことはしない)。
+    """
+    if result["status"] == DIALOGUE_STATUS_NO_ENGAGEMENT:
+        return
+    if project_dir:
+        log_path = _write_dialogue_log(project_dir, dialogue_id, topic, result["transcript"])
+        summary_path = _write_dialogue_summary(project_dir, dialogue_id, topic, result)
+        print(f"[📜 対話の議事録を保存しました: {log_path}]")
+        print(f"[📄 対話の要約を保存しました: {summary_path}]")
+    if result["status"] == DIALOGUE_STATUS_CONSENSUS:
+        print(f"[🤝 対話プロトコル: {result['total_utterances']}件の発言を経て合意に達しました]")
+        return
+    if result["status"] == DIALOGUE_STATUS_SAFETY_LIMIT:
+        print(f"[⏸️ 対話プロトコル: {_DIALOGUE_STATUS_LABEL_JA[DIALOGUE_STATUS_SAFETY_LIMIT]}]")
+    else:
+        print("[🙋 対話プロトコル: 合意に至らず、人間の確認が必要です]")
+    if result.get("human_message"):
+        print(result["human_message"])
+    print("[👤 続行するか終了するかは人間の判断です。内容を確認のうえ、必要であれば依頼文を調整して再度お試しください]")
+
+
+# ---------------------------------------------------------------------------
 # 制作依頼の事前すり合わせ("//agree"コマンド・協業モード、実験2)
 # ---------------------------------------------------------------------------
 #
@@ -3357,6 +3784,11 @@ def _ask_organization_parallel(port: int, org_fingerprint: str, command_text: st
 # 減らすことを狙った仕組み。
 
 AGREE_COMMAND = "//agree"
+
+# 対話プロトコルを使い、成果物(コード等)は作らず計画だけを出力する単体
+# モード(依頼の「計画のみを出す単体モード」)。既存の新規作成モード
+# (//agree)・修正モード(//fix)とは独立したコマンドとして実装する。
+PLAN_ONLY_COMMAND = "//plan-only"
 
 # 仮の判断: 設計担当への指示は、出力形式をできるだけ単純な1行1ファイル形式に
 # 寄せるために日本語のプロンプトテンプレートとして持つ。ただし実際には
@@ -3434,6 +3866,136 @@ def _build_module_breakdown_prompt(request: str) -> str:
             "ファイルの拡張子もその言語に合わせてください。"
         )
     return _MODULE_BREAKDOWN_PROMPT_TEMPLATE.format(request=request, language_instruction=language_instruction)
+
+
+def _build_design_dialogue_background(request: str) -> str:
+    return (
+        "以下の制作依頼について、複数人で分担して実装できるよう、複数のファイルに分割する"
+        f"実装計画を検討しています。\n\n依頼内容: {request}"
+    )
+
+
+def _build_design_dialogue_output_instruction(request: str) -> str:
+    """対話プロトコルの提案役・統合役に渡す、計画の出力形式についての
+    指示。既存の`_MODULE_BREAKDOWN_PROMPT_TEMPLATE`の言語判定・出力形式の
+    指示をそのまま踏襲し、統合役が出す「最終合意内容」が既存の
+    `_parse_module_breakdown`でそのまま解析できる形式になるようにする。
+    """
+    requested_language = _detect_requested_language(request)
+    if requested_language:
+        language_instruction = f"必ず{requested_language}を使って実装してください。ファイルの拡張子もこの言語に合わせてください。"
+    else:
+        language_instruction = (
+            "依頼内容から、実装に最も適した言語・技術を判断してください"
+            "(Pythonとは限りません。HTML/CSS/JavaScript・C言語等、依頼の内容に応じて適切なものを選んでください)。"
+            "ファイルの拡張子もその言語に合わせてください。"
+        )
+    return (
+        f"{language_instruction} 各ファイルが実装すべき内容には、他のファイルから呼び出される関数のシグネチャ"
+        "(関数名・引数名・型・戻り値の型)や、やり取りするデータの形式(辞書のキー名など)を具体的に明記してください。"
+        "複数のファイルの説明に同じ関数が登場する場合、その関数名・引数名・戻り値の型はすべてのファイルの説明文で"
+        "一字一句まったく同じ表記に揃えてください。\n\n"
+        "出力は次の形式のみとし、他の説明文や前置き・後書きは一切含めないでください。ファイルごとに1行、"
+        "「ファイル名: 実装すべき内容(インターフェースの詳細を含む)」という形式で出力してください"
+        "(2〜4ファイル程度を想定します):\n"
+        "<ファイル名1>: <実装すべき内容をここに>\n"
+        "<ファイル名2>: <実装すべき内容をここに(<ファイル名1>の行と完全に同じ関数名を使うこと)>"
+    )
+
+
+def _run_design_dialogue(org_fingerprint: str, request: str, candidates: list, project_dir: str) -> tuple:
+    """//agreeの合意フェーズを、対話プロトコル(`_run_dialogue`)による
+    複数ノード・複数ラウンドの合意形成に置き換える(依頼の「計画フェーズ
+    での利用」)。戻り値は`(合意した計画テキスト, 中断すべきかどうか)`。
+
+    合意に至らなかった場合(セーフティリミット・人間の確認が必要)は、
+    議事録・要約をディスクに保存したうえで中断を指示する(呼び出し元は
+    実装フェーズに進まない)。対話プロトコルだけで次のフェーズへ自動的に
+    進むことはしないという要件のため、最終的な続行判断は人間に委ねる。
+    """
+    architect = candidates[0]
+    print(
+        f"[🧭 対話プロトコルによる合意フェーズ開始: {architect['label']}さんを中心に、"
+        "モジュール分割案とインターフェース設計について議論します...]"
+    )
+    result = _run_dialogue(
+        org_fingerprint=org_fingerprint,
+        topic=f"制作依頼「{request}」のモジュール分割・インターフェース設計",
+        background=_build_design_dialogue_background(request),
+        candidates=candidates,
+        output_instruction=_build_design_dialogue_output_instruction(request),
+        tag="設計",
+    )
+    _report_dialogue_result(result, project_dir, "design", "モジュール分割・インターフェース設計")
+
+    if result["status"] == DIALOGUE_STATUS_NO_ENGAGEMENT:
+        print("設計担当から応答が得られませんでした。")
+        return "", True
+    if result["status"] != DIALOGUE_STATUS_CONSENSUS:
+        return "", True
+
+    final_content = result["final_content"] or ""
+    print("[🧭 対話プロトコルで合意した計画(そのまま表示)]")
+    print(final_content)
+    return final_content, False
+
+
+def _build_plan_only_output_instruction() -> str:
+    return (
+        "計画は人間が読んで判断するためのものです。次の観点を含めて、箇条書き中心に具体的にまとめてください:\n"
+        "- 全体方針・アプローチ\n"
+        "- 主要な作業項目・手順(ファイル分割案がある場合はファイル名ごとに)\n"
+        "- 想定されるリスク・懸念点\n"
+        "- 決めきれなかった点・人間に確認したいことがあれば明記する\n\n"
+        "他の説明文や前置きは不要です。上記の観点に沿った計画の本文のみを出力してください。"
+    )
+
+
+def _ask_organization_plan_only(port: int, org_fingerprint: str, request: str, out_dir: str) -> None:
+    """成果物(コード等)を実際に作る・作らないに関わらず、対話プロトコル
+    だけを使って計画を出力する単体モード(`//plan-only`、依頼の「計画のみ
+    を出す単体モード」)。実装フェーズには一切進まず、対話の結果としての
+    計画書(要約+議事録)を人間に提示して終了する。既存の新規作成モード
+    (//agree)・修正モード(//fix)とは独立したコマンドとして実装する。
+    """
+    data = _fetch_org_snapshot(port, org_fingerprint)
+    if data is None:
+        return
+
+    candidates = _select_chat_candidates(data.get("self", {}), data.get("peers", []), port, TASK_TYPE_CODING)
+    if not candidates:
+        print("組織内にロード済みモデルを持つメンバーがいません。")
+        return
+
+    # 仮の判断: 計画のみモードは実装を行わないため、専用のプロジェクト
+    # ディレクトリ名に"-plan"を付け、同名の//agreeによる実装プロジェクトと
+    # 区別できるようにする(議事録・要約だけが保存され、コード等の
+    # 成果物は一切生成されない)。
+    projects_root = os.path.join(out_dir, PROJECTS_SUBDIR_NAME)
+    project_name = _generate_project_name(request) + "-plan"
+    project_dir = _resolve_project_dir(projects_root, project_name)
+
+    architect = candidates[0]
+    print(
+        f"[🧭 計画のみモード開始: {architect['label']}さんを中心に、対話プロトコルで"
+        "計画について議論します(成果物の実装は行いません)...]"
+    )
+    result = _run_dialogue(
+        org_fingerprint=org_fingerprint,
+        topic=request,
+        background=f"以下の依頼について、実装には進まず計画のみを検討しています。\n\n依頼内容: {request}",
+        candidates=candidates,
+        output_instruction=_build_plan_only_output_instruction(),
+        tag="計画",
+    )
+    _report_dialogue_result(result, project_dir, "plan", request)
+
+    if result["status"] == DIALOGUE_STATUS_NO_ENGAGEMENT:
+        print("計画についての応答が得られませんでした。")
+        return
+    if result["status"] == DIALOGUE_STATUS_CONSENSUS:
+        print("[🧭 対話プロトコルでまとまった計画(そのまま表示)]")
+        print(result["final_content"] or "")
 
 
 # 仮の判断: PROGRESS.mdに記録する「使用言語」は、依頼文から推測した言語
@@ -4029,7 +4591,7 @@ def _find_incomplete_projects(out_dir: str) -> list:
     return incomplete
 
 
-def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str, out_dir: str) -> None:
+def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str, out_dir: str, enable_dialogue: bool = False) -> None:
     """「〇〇を作って」のような制作依頼用: まず優先順位が最も高い1台に
     モジュール分割案とインターフェース設計を相談し(合意フェーズ)、
     その結果をタスクキュー方式(`_run_collaborative_task_queue`)で異なる
@@ -4044,6 +4606,13 @@ def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str,
     - 設計担当の回答が期待した形式(「ファイル名: 内容」の行)で
       1件も得られなかった場合は、その旨と回答全文を表示して中断する
       (フォーマットの自動修正・再質問までは今回のスコープ外)。
+
+    `enable_dialogue=True`の場合、単一の設計担当への1回きりの相談では
+    なく、対話プロトコル(`_run_dialogue`)による複数ノード・複数
+    ラウンドの合意形成を経て計画を決める(依頼の「計画フェーズでの
+    利用」)。既定は`False`のまま(既存の呼び出し元・テストとの後方
+    互換性のため)で、対話モードのREPLから`//agree`・自動判定経由で
+    呼ばれる際にのみ`True`を渡す。
     """
     data = _fetch_org_snapshot(port, org_fingerprint)
     if data is None:
@@ -4055,29 +4624,43 @@ def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str,
         return
 
     architect = candidates[0]
-    print(
-        f"[🧭 合意フェーズ開始: まず {architect['label']} (モデル: {architect['model']}) に"
-        f"モジュール分割案とインターフェース設計を相談しています...]"
-    )
 
-    breakdown_prompt = _build_module_breakdown_prompt(request)
-    answer, error, truncated = _collect_answer_from_candidate(
-        architect, org_fingerprint, [{"role": "user", "content": breakdown_prompt}],
-    )
-    if error:
-        print(f"設計担当への問い合わせに失敗しました: {error}")
-        return
-    if not answer:
-        print("設計担当から応答が得られませんでした。")
-        return
-    if truncated:
-        print(f"[⚠️ 設計担当の応答が長すぎたため、{CHAT_MAX_OUTPUT_TOKENS}トークンで打ち切られました。以下は不完全な内容の可能性があります]")
+    # 仮の判断: プロジェクトディレクトリは、対話プロトコルによる議事録・
+    # 要約の保存先としても使うため、設計フェーズより前にここで確定させる
+    # (後段で改めて`_resolve_project_dir`を呼び直すと、対話ログの保存で
+    # 既にディレクトリが作られてしまっているために連番がずれて、生成物と
+    # 対話ログが別のディレクトリに散らばってしまう)。
+    projects_root = os.path.join(out_dir, PROJECTS_SUBDIR_NAME)
+    project_name = _generate_project_name(request)
+    project_dir = _resolve_project_dir(projects_root, project_name)
 
-    # 仮の判断: 解析後の内容だけでなく、設計担当の回答そのもの(生テキスト)も
-    # 表示する。パース処理(_parse_module_breakdown)の解釈が意図と異なって
-    # いないか、実機での動作確認時に見比べられるようにするため。
-    print(f"[🧭 {architect['label']} の回答(合意フェーズの結果、そのまま表示)]")
-    print(answer)
+    if enable_dialogue:
+        answer, aborted = _run_design_dialogue(org_fingerprint, request, candidates, project_dir)
+        if aborted:
+            return
+    else:
+        print(
+            f"[🧭 合意フェーズ開始: まず {architect['label']} (モデル: {architect['model']}) に"
+            f"モジュール分割案とインターフェース設計を相談しています...]"
+        )
+        breakdown_prompt = _build_module_breakdown_prompt(request)
+        answer, error, truncated = _collect_answer_from_candidate(
+            architect, org_fingerprint, [{"role": "user", "content": breakdown_prompt}],
+        )
+        if error:
+            print(f"設計担当への問い合わせに失敗しました: {error}")
+            return
+        if not answer:
+            print("設計担当から応答が得られませんでした。")
+            return
+        if truncated:
+            print(f"[⚠️ 設計担当の応答が長すぎたため、{CHAT_MAX_OUTPUT_TOKENS}トークンで打ち切られました。以下は不完全な内容の可能性があります]")
+
+        # 仮の判断: 解析後の内容だけでなく、設計担当の回答そのもの(生テキスト)も
+        # 表示する。パース処理(_parse_module_breakdown)の解釈が意図と異なって
+        # いないか、実機での動作確認時に見比べられるようにするため。
+        print(f"[🧭 {architect['label']} の回答(合意フェーズの結果、そのまま表示)]")
+        print(answer)
 
     tasks = _parse_module_breakdown(answer)
     if not tasks:
@@ -4117,11 +4700,8 @@ def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str,
     print(_format_task_checklist(checklist))
 
     # 仮の判断: 生成物はYoriai本体と混ざらないよう、projects/<プロジェクト名>/
-    # というサブディレクトリにまとめる。プロジェクト名は依頼文から簡易的に
-    # 生成し、同名の既存プロジェクトがあれば連番で衝突を避ける。
-    projects_root = os.path.join(out_dir, PROJECTS_SUBDIR_NAME)
-    project_name = _generate_project_name(request)
-    project_dir = _resolve_project_dir(projects_root, project_name)
+    # というサブディレクトリにまとめる(プロジェクト名からのディレクトリ
+    # 解決自体は、対話プロトコル用に関数冒頭で既に済んでいる)。
     print(f"[📁 生成物の保存先: {project_dir}]")
 
     _run_collaborative_project(
@@ -4218,7 +4798,7 @@ _REVIEW_PROMPT_TEMPLATE = """あなたはコードレビュー担当です。以
 ```python
 {code}
 ```
-
+{self_explanation_section}
 以下の観点でレビューしてください:
 1. 実装計画で合意した内容(関数名・引数・戻り値の型・データ形式)と、実際のコードが一致しているか
 2. あなたが担当した{reviewer_own_filename}と正しく連携できそうか
@@ -4247,11 +4827,24 @@ _FIX_PROMPT_TEMPLATE = """以下はあなたが実装した{filename}のコー�
 """
 
 
-def _build_review_prompt(filename: str, code: str, reviewer_own_filename: str, reviewer_own_code: str, full_plan: str) -> str:
+def _build_review_prompt(
+    filename: str, code: str, reviewer_own_filename: str, reviewer_own_code: str, full_plan: str,
+    self_explanation: str = "",
+) -> str:
+    # 仮の判断(対話プロトコルの「レビュー用途での再利用」): レビュー本番の
+    # 前に実装担当・レビュー担当の間で行った軽量な自己説明対話
+    # (`_run_review_self_explanation`)の申し送り事項があれば、参考情報
+    # として追記する。無い場合(既定)は既存のプロンプトと一字一句同じ
+    # になるよう、空文字列のまま何も追記しない。
+    self_explanation_section = (
+        f"\n【実装担当の設計判断についての申し送り事項(事前の自己説明・質疑より)】\n{self_explanation}\n"
+        if self_explanation else ""
+    )
     return _REVIEW_PROMPT_TEMPLATE.format(
         filename=filename, code=code,
         reviewer_own_filename=reviewer_own_filename, reviewer_own_code=reviewer_own_code,
         full_plan=full_plan, search_then_read_guidance=f" {_SEARCH_THEN_READ_GUIDANCE}",
+        self_explanation_section=self_explanation_section,
     )
 
 
@@ -4500,6 +5093,7 @@ def _print_tagged(print_lock: threading.Lock, tag: str, text: str) -> None:
 def _check_and_review_one_round(
     filename: str, code: str, reviewer: dict, reviewer_own_filename: str, reviewer_own_code: str,
     full_plan: str, org_fingerprint: str, round_label: str, out_dir: str, print_lock: threading.Lock = None,
+    self_explanation: str = "",
 ) -> tuple:
     """1回分の「構文チェック→(通れば)内容レビュー」を実行し、
     (問題なしかどうか, 指摘内容)を返す。
@@ -4526,12 +5120,14 @@ def _check_and_review_one_round(
 
     return _review_one_file(
         filename, code, reviewer, reviewer_own_filename, reviewer_own_code, full_plan, org_fingerprint, round_label, out_dir, print_lock,
+        self_explanation,
     )
 
 
 def _review_one_file(
     filename: str, code: str, reviewer: dict, reviewer_own_filename: str, reviewer_own_code: str,
     full_plan: str, org_fingerprint: str, round_label: str, out_dir: str, print_lock: threading.Lock = None,
+    self_explanation: str = "",
 ) -> tuple:
     """1回分のレビューを実行し、(問題なしかどうか, 指摘内容)を返す。
     問い合わせ自体が失敗した場合も「問題あり」として扱う(暴走防止のため
@@ -4556,7 +5152,9 @@ def _review_one_file(
             f"\n... (以下省略。トークン使用量を抑えるため先頭{_FILE_CONTENT_TRUNCATE_CHARS}文字のみ表示)"
         )
     _print_tagged(print_lock, filename, f"[🔎 {round_label}] {reviewer['label']} が {filename} をレビューしています...")
-    prompt = _build_review_prompt(filename, code, reviewer_own_filename, truncated_reviewer_own_code, full_plan)
+    prompt = _build_review_prompt(
+        filename, code, reviewer_own_filename, truncated_reviewer_own_code, full_plan, self_explanation,
+    )
     answer, error, answer_truncated = _collect_review_answer_with_read_file(
         reviewer, org_fingerprint, [{"role": "user", "content": prompt}], out_dir,
         print_lock=print_lock, tag=filename,
@@ -4624,9 +5222,43 @@ def _request_fix(
     return fixed_code
 
 
+def _run_review_self_explanation(
+    filename: str, owner: dict, reviewer: dict, code: str, full_plan: str, org_fingerprint: str,
+    print_lock: threading.Lock = None,
+) -> str:
+    """レビュー本番の前に、実装担当(提案役)に設計判断を短く説明させ、
+    レビュー担当(反論役・統合役を兼務)がその場で疑問点をぶつける、
+    軽量な自己説明対話を行う(対話プロトコルの「レビュー用途での
+    再利用」)。説明に詰まる・要領を得ない場合、そのことが申し送り事項
+    として本番のレビューに引き継がれ、レビュー担当の最終判断の材料になる。
+
+    仮の判断: 本番のレビュー(`_review_one_file`)とは異なり、ここでの
+    対話は「問題あり/問題なし」の最終判定そのものではなく、あくまで
+    本番レビューへの参考情報を作ることが目的のため、`min_rounds`/
+    `max_rounds`を小さくして往復を短く抑える。議事録・要約のディスクへの
+    保存も行わない(ファイルごとに議事録ファイルが量産されるのを避ける
+    ため。永続化が必須なのは計画フェーズ・修正フェーズのような、
+    プロジェクト全体に関わる議題に対してのみ)。
+    """
+    background = f"【実装計画全体】\n{full_plan}\n\n【{filename}のコード】\n{_truncate_file_content(code)[0]}"
+    result = _run_dialogue(
+        org_fingerprint=org_fingerprint,
+        topic=f"{filename} の設計判断についての自己説明",
+        background=background,
+        candidates=[owner, reviewer],
+        output_instruction=(
+            "実装者の説明とレビュー担当の疑問点を踏まえ、レビュー本番で確認すべき懸念点があれば"
+            "2〜3文で書いてください(特に無ければ「特になし」とだけ書いてください)。"
+        ),
+        print_lock=print_lock, tag=filename, min_rounds=1, max_rounds=2,
+    )
+    return (result.get("final_content") or result.get("summary") or "").strip()
+
+
 def _review_and_fix_one_file(
     filename: str, owner: dict, code: str, reviewer: dict, reviewer_own_filename: str, reviewer_own_code: str,
     full_plan: str, org_fingerprint: str, out_dir: str, print_lock: threading.Lock = None,
+    enable_self_explanation: bool = False,
 ) -> tuple:
     """1ファイル分のレビュー→(必要なら)修正→再レビューを行い、
     (最終的に「問題なし」になったかどうか, 未解決の場合の指摘内容)を返す
@@ -4646,13 +5278,28 @@ def _review_and_fix_one_file(
     レビュー・修正の全出力に`filename`のタグが付き、他のワーカー
     スレッドの出力と混ざらないよう1ブロックずつまとめて出力される。
 
+    `enable_self_explanation=True`の場合、本番のレビューの前に
+    `_run_review_self_explanation`による軽量な自己説明対話を1回だけ
+    行い、その申し送り事項を1回目・再レビューの両方のレビュープロンプトに
+    渡す(修正のたびに説明をやり直す必要は無いため、対話は1ファイル
+    あたり1回に留める)。既定は`False`のまま(既存の呼び出し元・
+    テストとの後方互換性のため)で、タスクキュー方式
+    (`_run_collaborative_task_queue`)からのみ`True`が渡る。
+
     仮の判断(PROGRESS.md用): 最終的に未解決だった指摘内容も呼び出し元に
     返すようにした(以前は合否のみ`bool`で返していた)。PROGRESS.mdの
     「直近のレビュー指摘」セクションに、未完了のファイルがなぜ未完了
     なのかを記録するために必要になったための変更。
     """
+    self_explanation = ""
+    if enable_self_explanation:
+        self_explanation = _run_review_self_explanation(
+            filename, owner, reviewer, code, full_plan, org_fingerprint, print_lock,
+        )
+
     ok, feedback = _check_and_review_one_round(
         filename, code, reviewer, reviewer_own_filename, reviewer_own_code, full_plan, org_fingerprint, "1回目のレビュー", out_dir, print_lock,
+        self_explanation,
     )
     if ok:
         return True, None
@@ -4663,6 +5310,7 @@ def _review_and_fix_one_file(
 
     ok, feedback = _check_and_review_one_round(
         filename, fixed_code, reviewer, reviewer_own_filename, reviewer_own_code, full_plan, org_fingerprint, "修正後の再レビュー", out_dir, print_lock,
+        self_explanation,
     )
     return ok, (None if ok else feedback)
 
@@ -4841,6 +5489,11 @@ def _run_collaborative_task_queue(
                 filename=filename, owner=candidate, code=code,
                 reviewer=reviewer, reviewer_own_filename=reviewer_own_filename, reviewer_own_code=reviewer_own_code,
                 full_plan=full_plan, org_fingerprint=org_fingerprint, out_dir=project_dir, print_lock=print_lock,
+                # 対話プロトコルの「レビュー用途での再利用」(依頼2.3): タスク
+                # キュー方式による実装・レビューでは、実装担当に設計判断を
+                # 短く説明させ、レビュー担当が疑問点をぶつける自己説明対話を
+                # 常に行う。
+                enable_self_explanation=True,
             )
             if ok:
                 _set_task_status(checklist, filename, "review", _TASK_STATUS_COMPLETED)
@@ -5347,16 +6000,75 @@ def _resolve_and_validate_fix_target(request_text: str, out_dir: str) -> tuple:
     return project_dir, request
 
 
-def _ask_organization_fix_project(port: int, org_fingerprint: str, request_text: str, out_dir: str) -> None:
+def _build_fix_dialogue_output_instruction() -> str:
+    return (
+        "合意した修正方針を、担当メンバーへの依頼文にそのまま使える形で2〜5文程度にまとめてください。"
+        "変更すべき箇所・手順・(あれば)検証方法を具体的に書いてください。他の説明文や前置きは不要です。"
+    )
+
+
+def _run_fix_approach_dialogue(
+    org_fingerprint: str, request: str, candidates: list, full_plan: str, file_list: list, language: str,
+    project_dir: str,
+) -> tuple:
+    """//fixの修正方針についても、対話プロトコルによる事前合意を挟む
+    (依頼の「//fix修正フェーズでの利用」)。戻り値は
+    `(修正方針を反映した依頼文, 中断すべきかどうか)`。
+
+    仮の判断: バックエンドへの疎通自体ができていない場合にまで対話の
+    不調を理由に修正を止めてしまうと、既存の`_decide_fix_task_split`
+    (問い合わせに失敗した場合は安全側にフォールバックする)と一貫しない
+    体験になる。そのため、提案役から一度も実のある応答が得られなかった
+    場合(`DIALOGUE_STATUS_NO_ENGAGEMENT`)は、対話を行わなかったことに
+    して元の依頼文のまま処理を続行する。実際に議論が行われたが合意に
+    至らなかった場合(セーフティリミット・人間の確認が必要)は、依頼の
+    要件通り議事録・要約を保存したうえで中断する。
+    """
+    architect = candidates[0]
+    print(f"[🧭 対話プロトコルによる修正方針の事前合意: {architect['label']}さんを中心に議論します...]")
+    background = (
+        f"【このプロジェクトの使用言語】\n{language}\n\n【実装計画全体】\n{full_plan}\n\n"
+        f"【現在保存されているファイル一覧】\n{chr(10).join(file_list)}\n\n【ユーザーからの修正依頼】\n{request}"
+    )
+    result = _run_dialogue(
+        org_fingerprint=org_fingerprint,
+        topic=f"修正依頼「{request}」の方針",
+        background=background,
+        candidates=candidates,
+        output_instruction=_build_fix_dialogue_output_instruction(),
+        tag="修正方針",
+    )
+    if result["status"] == DIALOGUE_STATUS_NO_ENGAGEMENT:
+        return request, False
+
+    _report_dialogue_result(result, project_dir, "fix", f"修正依頼「{request}」の方針")
+
+    if result["status"] != DIALOGUE_STATUS_CONSENSUS:
+        return request, True
+
+    agreed_approach = (result["final_content"] or "").strip()
+    if not agreed_approach:
+        return request, False
+    print("[🧭 対話プロトコルで合意した修正方針]")
+    print(agreed_approach)
+    return f"{request}\n\n[対話プロトコルで事前合意した修正方針]\n{agreed_approach}", False
+
+
+def _ask_organization_fix_project(
+    port: int, org_fingerprint: str, request_text: str, out_dir: str, enable_dialogue: bool = False,
+) -> None:
     """既存の完成済みプロジェクトへの修正依頼(//fixの単発呼び出し)を
     処理する。対象プロジェクトの解決は`_resolve_and_validate_fix_target`、
     実際の修正の実行は`_run_fix_on_project`に委ねる(分割の理由は
     `_resolve_and_validate_fix_target`のdocstringを参照)。
+
+    `enable_dialogue`は`_run_fix_on_project`にそのまま引き継ぐ(既定は
+    `False`のまま、既存の呼び出し元・テストとの後方互換性のため)。
     """
     project_dir, request = _resolve_and_validate_fix_target(request_text, out_dir)
     if project_dir is None:
         return
-    _run_fix_on_project(port, org_fingerprint, project_dir, request, out_dir)
+    _run_fix_on_project(port, org_fingerprint, project_dir, request, out_dir, enable_dialogue=enable_dialogue)
 
 
 # ---------------------------------------------------------------------------
@@ -5755,7 +6467,9 @@ def _run_fix_task_queue(
     )
 
 
-def _run_fix_on_project(port: int, org_fingerprint: str, project_dir: str, request: str, out_dir: str) -> None:
+def _run_fix_on_project(
+    port: int, org_fingerprint: str, project_dir: str, request: str, out_dir: str, enable_dialogue: bool = False,
+) -> None:
     """既に対象が確定した`project_dir`に対して、実際の修正を実行する。
 
     仮の判断:
@@ -5853,6 +6567,19 @@ def _run_fix_on_project(port: int, org_fingerprint: str, project_dir: str, reque
         return
 
     implementer = candidates[0]
+
+    # 仮の判断(依頼の「//fix修正フェーズでの利用」への対応): 対話プロト
+    # コルによる修正方針の事前合意を、規模判定(_decide_fix_task_split)
+    # より前に挟む。合意できた場合はその方針を依頼文に追記し、以降の
+    # 規模判定・実装依頼にそのまま引き継がれる。既定は`enable_dialogue=False`
+    # (`_begin_fix_session`・`_continue_fix_session`経由の実際のREPL操作
+    # からのみ`True`が渡る)。
+    if enable_dialogue:
+        request, aborted = _run_fix_approach_dialogue(
+            org_fingerprint, request, candidates, full_plan, file_list, language, project_dir,
+        )
+        if aborted:
+            return
 
     # 仮の判断(依頼への対応: //fixにも規模に応じたタスク分割を導入する):
     # 実際に修正を依頼する前に、まず依頼の規模を判定する。分割すべきと
@@ -6074,7 +6801,7 @@ def _continue_fix_session(port: int, org_fingerprint: str, out_dir: str, job_run
     project_dir = fix_session.project_dir
     job_runner.submit(
         lambda project_dir=project_dir, request=request_text: _run_fix_on_project(
-            port, org_fingerprint, project_dir, request, out_dir,
+            port, org_fingerprint, project_dir, request, out_dir, enable_dialogue=True,
         ),
         queued_notice=_BACKGROUND_QUEUED_NOTICE,
     )
@@ -6132,7 +6859,7 @@ def _begin_fix_session(port: int, org_fingerprint: str, out_dir: str, job_runner
     print(_format_fix_session_marker(fix_session))
     job_runner.submit(
         lambda project_dir=project_dir, request=request: _run_fix_on_project(
-            port, org_fingerprint, project_dir, request, out_dir,
+            port, org_fingerprint, project_dir, request, out_dir, enable_dialogue=True,
         ),
         queued_notice=_BACKGROUND_QUEUED_NOTICE,
     )
@@ -6711,7 +7438,8 @@ def _format_startup_banner(out_dir: str, member_count, use_color: bool) -> str:
         _ansi("コマンド", _ANSI_BOLD, use_color=use_color),
         "  (コマンドを付けずに話しかけると、単発/比較/協業のどのモードかを自動判断します)",
         f"  {MULTI_QUERY_COMMAND} <質問文>: 空きリソース上位{MULTI_QUERY_TARGET_COUNT}台に同時に質問",
-        f"  {AGREE_COMMAND} <制作依頼>: 事前すり合わせを経て協業モードで実装",
+        f"  {AGREE_COMMAND} <制作依頼>: 対話プロトコルによる事前すり合わせを経て協業モードで実装",
+        f"  {PLAN_ONLY_COMMAND} <依頼>: 対話プロトコルで計画のみ議論し、実装せず計画書を出力",
         f"  {FIX_PROJECT_COMMAND} <修正依頼>: 完成済みプロジェクトの一部を修正(プロジェクト名を",
         f"    先頭に付けて{FIX_PROJECT_COMMAND} <プロジェクト名>: <修正依頼>のように明示指定も可能)",
         f"    ({FIX_PROJECT_COMMAND}後は修正セッションが始まり、続けてコマンド無しで話しかけても",
@@ -6720,8 +7448,8 @@ def _format_startup_banner(out_dir: str, member_count, use_color: bool) -> str:
         f"  {RESUME_ALL_COMMAND}: 未完了プロジェクトを検出して再開",
         "",
         f"生成物の保存先: {os.path.join(out_dir, PROJECTS_SUBDIR_NAME)}/<プロジェクト名>/",
-        "協業モード・//fix・//parallel・//resume-allはバックグラウンドで処理され、",
-        "処理中も次の依頼を入力できます。",
+        "協業モード・//plan-only・//fix・//parallel・//resume-allはバックグラウンドで",
+        "処理され、処理中も次の依頼を入力できます。",
     ]
     return "\n".join(lines)
 
@@ -6803,7 +7531,20 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                     )
                     fix_session = None
                 job_runner.submit(
-                    lambda request=request: _ask_organization_collaborate(port, org_fingerprint, request, out_dir),
+                    lambda request=request: _ask_organization_collaborate(
+                        port, org_fingerprint, request, out_dir, enable_dialogue=True,
+                    ),
+                    queued_notice=_BACKGROUND_QUEUED_NOTICE,
+                )
+                continue
+
+            if text.startswith(PLAN_ONLY_COMMAND):
+                plan_request = text[len(PLAN_ONLY_COMMAND):].strip()
+                if not plan_request:
+                    print(f"使い方: {PLAN_ONLY_COMMAND} <検討したい依頼>  (例: {PLAN_ONLY_COMMAND} ToDoリストのCLIツールを作って)")
+                    continue
+                job_runner.submit(
+                    lambda plan_request=plan_request: _ask_organization_plan_only(port, org_fingerprint, plan_request, out_dir),
                     queued_notice=_BACKGROUND_QUEUED_NOTICE,
                 )
                 continue
@@ -6894,7 +7635,9 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
 
             if mode == EXECUTION_MODE_COLLABORATE:
                 job_runner.submit(
-                    lambda text=text: _ask_organization_collaborate(port, org_fingerprint, text, out_dir),
+                    lambda text=text: _ask_organization_collaborate(
+                        port, org_fingerprint, text, out_dir, enable_dialogue=True,
+                    ),
                     queued_notice=_BACKGROUND_QUEUED_NOTICE,
                 )
                 continue
