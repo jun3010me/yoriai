@@ -278,7 +278,7 @@ def _run_repl_with_keys(keystrokes, out_dir, run_fix_side_effect=None,
     original_ask_multi = yoriai._ask_organization_multi
     original_ask_collaborate = yoriai._ask_organization_collaborate
 
-    def stub_run_fix(port, org_fingerprint, project_dir, request, out_dir_arg):
+    def stub_run_fix(port, org_fingerprint, project_dir, request, out_dir_arg, **_kwargs):
         calls["run_fix"] += 1
         fix_calls.append((project_dir, request))
         if run_fix_side_effect:
