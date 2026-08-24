@@ -3666,11 +3666,22 @@ _PROGRESS_SECTION_CHECKLIST = "## タスク状況"
 _PROGRESS_SECTION_AUTO_RESUME_COUNT = "## 自動再開の試行回数"
 _PROGRESS_SECTION_REVIEW = "## 直近のレビュー指摘"
 _PROGRESS_SECTION_CHANGELOG = "## 更新履歴"
+# 仮の判断(バグ報告への対応): //fixのタスク分割(_run_fix_task_queue)が
+# ツール呼び出しの往復回数の上限等で一部のサブタスクを完了させられずに
+# 終わった場合、この2節に「元の修正依頼」と「まだ完了していないサブ
+# タスクの一覧」を記録する。これが無いと、//resume-allが従来通り
+# モジュール分割案のチェックリスト(_PROGRESS_SECTION_CHECKLIST、合意
+# フェーズ由来で//fixでは書き換えない)しか見ないため、大規模な//fixが
+# 一部のサブタスクを残したまま終わっても「未完了のプロジェクトなし」
+# として扱われ、再開する手段が無くなってしまう。
+_PROGRESS_SECTION_PENDING_FIX_REQUEST = "## 未完了の修正依頼"
+_PROGRESS_SECTION_PENDING_FIX_SUBTASKS = "## 未完了の修正サブタスク"
 
 
 def _format_progress_markdown(
     request: str, tasks: list, checklist: list, review_feedback: dict, auto_resume_count: int = 0,
     changelog: list = None, language: str = "",
+    pending_fix_request: str = "", pending_fix_subtasks: list = None,
 ) -> str:
     """PROGRESS.mdの内容を組み立てる。
 
@@ -3733,16 +3744,27 @@ def _format_progress_markdown(
         lines.append("")
         lines.extend(changelog)
         lines.append("")
+    if pending_fix_subtasks:
+        lines.append(_PROGRESS_SECTION_PENDING_FIX_REQUEST)
+        lines.append("")
+        lines.append(pending_fix_request)
+        lines.append("")
+        lines.append(_PROGRESS_SECTION_PENDING_FIX_SUBTASKS)
+        lines.append("")
+        lines.extend(f"- {subtask}" for subtask in pending_fix_subtasks)
+        lines.append("")
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
 def _write_progress_md(
     project_dir: str, request: str, tasks: list, checklist: list, review_feedback: dict, auto_resume_count: int = 0,
     changelog: list = None, language: str = "",
+    pending_fix_request: str = "", pending_fix_subtasks: list = None,
 ) -> None:
     os.makedirs(project_dir, exist_ok=True)
     content = _format_progress_markdown(
         request, tasks, checklist, review_feedback, auto_resume_count, changelog, language,
+        pending_fix_request, pending_fix_subtasks,
     )
     with open(os.path.join(project_dir, PROGRESS_FILENAME), "w", encoding="utf-8") as f:
         f.write(content)
@@ -3820,18 +3842,41 @@ def _parse_changelog_markdown(text: str) -> list:
     return [line for line in text.splitlines() if line.strip()]
 
 
+def _parse_bullet_lines(text: str) -> list:
+    """箇条書き(-・*)の各行の内容だけを、件数による足切りをせず
+    そのまま取り出す。//fixのタスク分割の判定担当への問い合わせ結果を
+    解釈する`_parse_fix_split_subtasks`(2件未満は「分割不要」とみなし
+    空リストに切り捨てる)とは異なり、こちらはPROGRESS.mdに自分自身が
+    書き出した「未完了の修正サブタスク」を読み戻すための単純な抽出用
+    途で、1件しか無くても正しく読み戻せる必要がある。
+    """
+    items = []
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if line and line[0] in "-・*":
+            content = line.lstrip("-・*").strip()
+            if content:
+                items.append(content)
+    return items
+
+
 def _parse_progress_markdown(path: str):
     """PROGRESS.mdを読み込み、`{"request":, "language":, "tasks":,
-    "checklist":, "auto_resume_count":, "changelog":}`の辞書として返す。
-    ファイルが存在しない・想定した形式で解析できない場合は`None`を返す
-    (呼び出し元は、そのプロジェクトの再開をスキップすべきというシグナル
-    として扱う)。
+    "checklist":, "auto_resume_count":, "changelog":, "pending_fix_request":,
+    "pending_fix_subtasks":}`の辞書として返す。ファイルが存在しない・
+    想定した形式で解析できない場合は`None`を返す(呼び出し元は、その
+    プロジェクトの再開をスキップすべきというシグナルとして扱う)。
 
     仮の判断: `language`は、この節が無い旧バージョンのPROGRESS.mdでは
     空文字列になる(この機能追加より前に作られた既存プロジェクトを
     エラー扱いにしない後方互換のため)。空文字列の場合、構文チェックは
     ファイルの拡張子で判定するため実害は無く、`_ask_organization_
     fix_project`のプロンプトでは「不明」として扱う。
+
+    仮の判断: `pending_fix_subtasks`も同じ理由でこの節が無いPROGRESS.md
+    では空リストになる(//fixのタスク分割機能より前に作られたプロジェクト・
+    分割が発生したことのないプロジェクトのどちらも、単に「未完了の
+    修正サブタスクは無い」として扱われる)。
     """
     try:
         with open(path, encoding="utf-8") as f:
@@ -3849,11 +3894,31 @@ def _parse_progress_markdown(path: str):
         "language": _extract_progress_section(text, _PROGRESS_SECTION_LANGUAGE).strip(),
         "auto_resume_count": _parse_auto_resume_count(text),
         "changelog": _parse_changelog_markdown(_extract_progress_section(text, _PROGRESS_SECTION_CHANGELOG)),
+        "pending_fix_request": _extract_progress_section(text, _PROGRESS_SECTION_PENDING_FIX_REQUEST).strip(),
+        "pending_fix_subtasks": _parse_bullet_lines(_extract_progress_section(text, _PROGRESS_SECTION_PENDING_FIX_SUBTASKS)),
     }
 
 
 def _progress_checklist_is_incomplete(checklist: list) -> bool:
     return any(task["status"] != _TASK_STATUS_COMPLETED for task in checklist)
+
+
+def _project_has_pending_work(parsed: dict) -> bool:
+    """`_parse_progress_markdown`の解析結果から、このプロジェクトに
+    再開すべき作業が残っているかどうかを判定する。従来の(合意フェーズ
+    由来の)モジュールタスクのチェックリストの未完了に加え、//fixの
+    タスク分割(`_run_fix_task_queue`)が往復回数の上限等で完了させ
+    られなかった「未完了の修正サブタスク」(`pending_fix_subtasks`)も
+    合わせて確認する。
+
+    仮の判断(バグ報告への対応): 大規模な//fixが一部のサブタスクを
+    残したまま終わった場合、モジュールタスクのチェックリスト自体は
+    (//fixでは書き換えないため)完了したままになっている。この関数を
+    使わず`_progress_checklist_is_incomplete`だけで判定していた箇所
+    (`_find_incomplete_projects`等)では、この未完了状態が一切見えず、
+    `//resume-all`から再開する手段が無くなってしまっていた。
+    """
+    return _progress_checklist_is_incomplete(parsed["checklist"]) or bool(parsed.get("pending_fix_subtasks"))
 
 
 def _pending_tasks_from_checklist(tasks: list, checklist: list) -> list:
@@ -3887,7 +3952,7 @@ def _find_incomplete_projects(out_dir: str) -> list:
     for name in sorted(os.listdir(projects_root)):
         project_dir = os.path.join(projects_root, name)
         parsed = _parse_progress_markdown(os.path.join(project_dir, PROGRESS_FILENAME))
-        if parsed is not None and _progress_checklist_is_incomplete(parsed["checklist"]):
+        if parsed is not None and _project_has_pending_work(parsed):
             incomplete.append(project_dir)
     return incomplete
 
@@ -4738,6 +4803,52 @@ def _run_collaborative_task_queue(
 RESUME_ALL_COMMAND = "//resume-all"
 
 
+def _resume_fix_project(project_dir: str, port: int, org_fingerprint: str, parsed: dict) -> bool:
+    """//fixのタスク分割(`_run_fix_task_queue`)が、ツール呼び出しの
+    往復回数の上限等で一部のサブタスクを完了させられなかった場合に、
+    `//resume-all`から再開する経路(バグ報告への対応)。
+
+    仮の判断: 合意フェーズ由来のモジュールタスクの再開
+    (`_resume_project`本体、`_run_collaborative_project`を使う)とは
+    全く別の仕組みが必要になる。fixのサブタスクは「ファイルを1から
+    生成する」タスクではなく「既存のプロジェクトにプロジェクトツール
+    (read_file/write_file等)で修正を加える」タスクのため、
+    `_run_collaborative_project`にそのまま乗せると「サブタスクN」という
+    仮の識別子をファイル名として扱ってしまい、そのファイル名で新規
+    ファイルを作ろうとする誤動作になる。そのため`_resume_project`の
+    入口でこちらに分岐し、//fix本来の実行経路(`_run_fix_task_queue`)を
+    そのまま再利用する。
+    """
+    tasks = parsed["tasks"]
+    language = parsed["language"] or _infer_language_from_tasks(tasks)
+    full_plan = "\n".join(f"{fn}: {content}" for fn, content in tasks)
+    file_list = _list_project_files(project_dir)
+    pending_subtasks = parsed["pending_fix_subtasks"]
+    pending_request = parsed["pending_fix_request"] or "(元の修正依頼の記録がありません。各サブタスクの説明を手がかりに判断してください)"
+
+    if not file_list:
+        print(f"[⚠️ {project_dir} にファイルが見つからないため、修正の再開をスキップします]")
+        return False
+
+    data = _fetch_org_snapshot(port, org_fingerprint)
+    if data is None:
+        print(f"[⚠️ {project_dir}] 組織への問い合わせに失敗したため、修正の再開をスキップします。")
+        return False
+    candidates = _select_chat_candidates(data.get("self", {}), data.get("peers", []), port, TASK_TYPE_CODING)
+    if not candidates:
+        print(f"[⚠️ {project_dir}] 組織内にロード済みモデルを持つメンバーがいないため、修正の再開をスキップします。")
+        return False
+
+    print(
+        f"[🔁 {project_dir} の未完了の修正サブタスクを再開します: {len(pending_subtasks)}件"
+        f" ({', '.join(pending_subtasks)})]"
+    )
+    _run_fix_task_queue(
+        pending_subtasks, candidates, org_fingerprint, project_dir, pending_request, parsed, full_plan, file_list, language,
+    )
+    return True
+
+
 def _resume_project(project_dir: str, port: int, org_fingerprint: str, auto_resume_count: int = None) -> bool:
     """1つのプロジェクトディレクトリのPROGRESS.mdを読み込み、未完了の
     ファイルだけを対象にタスクキュー方式を再開する。PROGRESS.mdが
@@ -4752,12 +4863,25 @@ def _resume_project(project_dir: str, port: int, org_fingerprint: str, auto_resu
     (`_run_resume_all`)はこの既定のまま呼び出すため、自動再開の
     試行回数カウンタには一切触れない(依頼の要件5)。自動再開
     (`_maybe_auto_resume`)だけが、増分後の値を明示的に渡す。
+
+    仮の判断(バグ報告への対応): PROGRESS.mdに未完了の修正サブタスク
+    (`pending_fix_subtasks`、//fixのタスク分割が一部を完了させられ
+    なかった場合に記録される)が残っている場合は、モジュールタスクの
+    再開ロジックより先にそちらを`_resume_fix_project`へ委ねる。両者は
+    独立した状態(前者はモジュールタスクのチェックリスト、後者は//fixの
+    タスク分割の結果)のため、両方が同時に残っていることは通常無いが、
+    仮に両方残っていた場合も、まず修正サブタスクを再開し、モジュール
+    タスクの再開は次回の`//resume-all`に譲る(1回の再開で欲張らず、
+    確実に完了させる)。
     """
     progress_path = os.path.join(project_dir, PROGRESS_FILENAME)
     parsed = _parse_progress_markdown(progress_path)
     if parsed is None:
         print(f"[⚠️ {progress_path} を読み取れなかったため、このプロジェクトの再開をスキップします]")
         return False
+
+    if parsed.get("pending_fix_subtasks"):
+        return _resume_fix_project(project_dir, port, org_fingerprint, parsed)
 
     request, tasks, checklist = parsed["request"], parsed["tasks"], parsed["checklist"]
     if auto_resume_count is None:
@@ -4960,7 +5084,7 @@ def _identify_target_project(request_text: str, out_dir: str) -> tuple:
     for name in sorted(os.listdir(projects_root)):
         project_dir = os.path.join(projects_root, name)
         parsed = _parse_progress_markdown(os.path.join(project_dir, PROGRESS_FILENAME))
-        if parsed is None or _progress_checklist_is_incomplete(parsed["checklist"]):
+        if parsed is None or _project_has_pending_work(parsed):
             continue
         score = _text_similarity_score(request_text, _project_summary_text(parsed))
         scored.append((score, project_dir))
@@ -5099,7 +5223,7 @@ def _resolve_and_validate_fix_target(request_text: str, out_dir: str) -> tuple:
     if parsed is None:
         print(f"[⚠️ {project_dir} のPROGRESS.mdを読み取れなかったため、修正を中断します]")
         return None, None
-    if _progress_checklist_is_incomplete(parsed["checklist"]):
+    if _project_has_pending_work(parsed):
         print(
             f"[⚠️ {project_dir} はまだ未完了のタスクが残っています。"
             f"先に{RESUME_ALL_COMMAND}で完了させてから修正を依頼してください]"
@@ -5194,19 +5318,17 @@ def _decide_fix_task_split(
 
 
 def _parse_fix_split_subtasks(text: str) -> list:
-    """判定担当の回答から、分割後の各サブタスクの説明を取り出す。行頭が
-    箇条書き記号(-・*)の行だけを対象にする。2件未満しか取り出せない
-    場合は「分割不要」の判断とみなし空リストを返す(「分割不要」という
-    見出し文言そのものではなく、実際に列挙されたサブタスクの件数を見る
-    ことで、モデルの言い回しの揺れに対しても頑健に判定する)。
+    """判定担当の回答から、分割後の各サブタスクの説明を取り出す
+    (`_parse_bullet_lines`で行頭が箇条書き記号(-・*)の行だけを抽出)。
+    2件未満しか取り出せない場合は「分割不要」の判断とみなし空リストを
+    返す(「分割不要」という見出し文言そのものではなく、実際に列挙
+    されたサブタスクの件数を見ることで、モデルの言い回しの揺れに対しても
+    頑健に判定する)。PROGRESS.mdに書き出した「未完了の修正サブタスク」を
+    読み戻す用途では、この2件未満の足切りは不適切(1件だけ残っている
+    正当なケースを消してしまう)なため、そちらは`_parse_bullet_lines`を
+    直接使う。
     """
-    subtasks = []
-    for raw_line in (text or "").splitlines():
-        line = raw_line.strip()
-        if line and line[0] in "-・*":
-            content = line.lstrip("-・*").strip()
-            if content:
-                subtasks.append(content)
+    subtasks = _parse_bullet_lines(text)
     return subtasks if len(subtasks) >= 2 else []
 
 
@@ -5237,6 +5359,7 @@ def _build_fix_subtask_review_prompt(subtask: str, full_plan: str, language: str
 
 def _finalize_fix_changes(
     project_dir: str, request: str, parsed: dict, language: str, modified_files: list, error: str,
+    pending_fix_request: str = "", pending_fix_subtasks: list = None,
 ) -> None:
     """//fixで実際に確認された変更を受けて、プロジェクト全体の構文チェック・
     PROGRESS.mdへの更新履歴の追記・最終報告までを行う。通常の単一実装
@@ -5248,6 +5371,14 @@ def _finalize_fix_changes(
     呼び出し前に`modified_files`が空でないことは呼び出し元が保証すること。
     1件も変更が無い場合の「実行されませんでした」という報告は、単一実装・
     分割それぞれの文脈で言い回しが異なるため、呼び出し元側で行う。
+
+    `pending_fix_subtasks`(バグ報告への対応: `_run_fix_task_queue`が
+    往復回数の上限等で一部のサブタスクを完了させられなかった場合に、
+    その説明のリストを渡す)を渡すと、`pending_fix_request`とあわせて
+    PROGRESS.mdに「未完了の修正サブタスク」として記録し、次回の
+    `//resume-all`で再開できるようにする。空リスト・省略時は、この節を
+    書かない(=既に記録されていた未完了状態も、今回すべて完了したなら
+    正しくクリアされる)。
     """
     broken_files = _syntax_check_all_files(project_dir)
 
@@ -5270,6 +5401,8 @@ def _finalize_fix_changes(
         project_dir, latest_parsed["request"], latest_parsed["tasks"], latest_parsed["checklist"],
         review_feedback={}, auto_resume_count=latest_parsed["auto_resume_count"], changelog=changelog,
         language=latest_parsed["language"] or language,
+        pending_fix_request=pending_fix_request if pending_fix_subtasks else "",
+        pending_fix_subtasks=pending_fix_subtasks or [],
     )
 
     if error:
@@ -5281,6 +5414,56 @@ def _finalize_fix_changes(
         print(f"[✅ 修正が完了しました (プロジェクト: {project_dir}, 変更したファイル: {', '.join(unique_modified_files)})]")
     else:
         print(f"[⚠️ 修正は保存されましたが、構文エラーが残っているファイルがあります: {', '.join(broken_files)}]")
+
+    if pending_fix_subtasks:
+        print(
+            f"[🔁 {len(pending_fix_subtasks)}件のサブタスクが未完了のため、"
+            f"{RESUME_ALL_COMMAND}で再開できます]"
+        )
+
+
+def _persist_pending_fix_subtasks(
+    project_dir: str, parsed: dict, request: str, pending_fix_subtasks: list, language: str,
+) -> None:
+    """`_run_fix_task_queue`が1件もファイルを変更できないまま終わった
+    場合(`_finalize_fix_changes`は呼ばれない)でも、未完了のサブタスクは
+    見失わずPROGRESS.mdに記録して`//resume-all`から再開できるようにする。
+
+    仮の判断: ここでは構文チェック・changelogへの追記は行わない。
+    「未完了のサブタスクが残っている」という事実と「実際に何らかの変更が
+    行われた」という事実は別物であり、後者の記録・報告は
+    (呼ばれる場合の)`_finalize_fix_changes`の責務のままにする
+    (changelogのエントリが実際の変更を伴わずに記録されることを防ぐ、
+    既存の設計方針を崩さないため)。
+    """
+    latest_parsed = _parse_progress_markdown(os.path.join(project_dir, PROGRESS_FILENAME)) or parsed
+    _write_progress_md(
+        project_dir, latest_parsed["request"], latest_parsed["tasks"], latest_parsed["checklist"],
+        review_feedback={}, auto_resume_count=latest_parsed["auto_resume_count"],
+        changelog=latest_parsed["changelog"], language=latest_parsed["language"] or language,
+        pending_fix_request=request if pending_fix_subtasks else "",
+        pending_fix_subtasks=pending_fix_subtasks,
+    )
+    if pending_fix_subtasks:
+        print(
+            f"[🔁 {len(pending_fix_subtasks)}件のサブタスクが未完了のため、"
+            f"{RESUME_ALL_COMMAND}で再開できます]"
+        )
+
+
+def _pending_subtask_descriptions(checklist: list, numbered_subtasks: list) -> list:
+    """タスクキュー実行後のチェックリストから、まだ完了していない
+    (実装・レビューのいずれかが未完了の)サブタスクの説明文を返す。
+    チェックリスト上の仮の識別子(「サブタスクN」)を、`numbered_subtasks`
+    (`[(N, サブタスクの説明文), ...]`)を使って元の説明文に逆引きする。
+    """
+    pending = []
+    for index, subtask in numbered_subtasks:
+        task_key = f"サブタスク{index}"
+        statuses = [task["status"] for task in checklist if task["filename"] == task_key]
+        if any(status != _TASK_STATUS_COMPLETED for status in statuses):
+            pending.append(subtask)
+    return pending
 
 
 def _run_fix_task_queue(
@@ -5431,6 +5614,14 @@ def _run_fix_task_queue(
     if incomplete_labels:
         print(f"[⚠️ 未完了のサブタスクが残っています: {', '.join(incomplete_labels)}]")
 
+    # 仮の判断(バグ報告への対応): 完了しなかったサブタスク(実装・レビュー
+    # のいずれかが未完了)の説明文を、チェックリスト上の仮の識別子
+    # (「サブタスクN」)から逆引きしておく。このリストをPROGRESS.mdに
+    # 記録しない場合、往復回数の上限等で一部だけ未完了のまま終わっても
+    # `//resume-all`からはその状態が一切見えず、再開する手段が無くなって
+    # しまう(実機で報告された不具合)。
+    still_pending_subtasks = _pending_subtask_descriptions(checklist, numbered_subtasks)
+
     combined_error = "; ".join(session_errors) if session_errors else None
     if not all_modified_files:
         if combined_error:
@@ -5441,9 +5632,13 @@ def _run_fix_task_queue(
                 "(修正は実行されませんでした)。"
                 "もう少し具体的に(ファイル名や、直したい場所を)教えてください]"
             )
+        _persist_pending_fix_subtasks(project_dir, parsed, request, still_pending_subtasks, language)
         return
 
-    _finalize_fix_changes(project_dir, request, parsed, language, all_modified_files, combined_error)
+    _finalize_fix_changes(
+        project_dir, request, parsed, language, all_modified_files, combined_error,
+        pending_fix_request=request, pending_fix_subtasks=still_pending_subtasks,
+    )
 
 
 def _run_fix_on_project(port: int, org_fingerprint: str, project_dir: str, request: str, out_dir: str) -> None:
@@ -5520,7 +5715,7 @@ def _run_fix_on_project(port: int, org_fingerprint: str, project_dir: str, reque
     if parsed is None:
         print(f"[⚠️ {project_dir} のPROGRESS.mdを読み取れなかったため、修正を中断します]")
         return
-    if _progress_checklist_is_incomplete(parsed["checklist"]):
+    if _project_has_pending_work(parsed):
         print(
             f"[⚠️ {project_dir} はまだ未完了のタスクが残っています。"
             f"先に{RESUME_ALL_COMMAND}で完了させてから修正を依頼してください]"
@@ -5644,7 +5839,7 @@ def _has_any_completed_projects(out_dir: str) -> bool:
     for name in os.listdir(projects_root):
         progress_path = os.path.join(projects_root, name, PROGRESS_FILENAME)
         parsed = _parse_progress_markdown(progress_path)
-        if parsed is not None and not _progress_checklist_is_incomplete(parsed["checklist"]):
+        if parsed is not None and not _project_has_pending_work(parsed):
             return True
     return False
 

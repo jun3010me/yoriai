@@ -1444,6 +1444,223 @@ def test_fix_project_small_request_stays_on_single_implementer_path():
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# //fixのタスク分割が一部だけ未完了で終わった場合の再開可能性
+# ---------------------------------------------------------------------------
+#
+# 実機のバグ報告: 分割された//fixの一部のサブタスクがツール呼び出しの
+# 往復回数の上限に達して未完了のまま終わった場合、//resume-allが
+# 「未完了のプロジェクトは見つかりませんでした」と報告してしまい、
+# 再開する手段が無かった。原因は、分割された修正のサブタスクの進捗が
+# 一時的なチェックリスト(画面表示専用)としてしか存在せず、PROGRESS.md
+# 側の「未完了プロジェクト判定」(モジュール分割案のチェックリストのみを
+# 見る)に一切反映されていなかったこと。
+
+def test_parse_bullet_lines_keeps_single_item_unlike_split_subtasks():
+    """`_parse_fix_split_subtasks`は2件未満を安全側で「分割不要」に
+    切り捨てるが、PROGRESS.mdへ書き戻した未完了サブタスクを読み戻す用途
+    (`_parse_bullet_lines`)では、1件だけ残っているケースを消してはならない
+    ことを確認する。
+    """
+    text = "- lesson2.htmlに新しいレッスン2のコンテンツを追加する"
+    assert yoriai._parse_bullet_lines(text) == ["lesson2.htmlに新しいレッスン2のコンテンツを追加する"]
+    assert yoriai._parse_fix_split_subtasks(text) == []
+
+
+def test_progress_markdown_round_trips_pending_fix_subtasks():
+    tasks = [("a.py", "説明")]
+    checklist = yoriai._build_task_checklist(tasks)
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        yoriai._write_progress_md(
+            out_dir, "何か作って", tasks, checklist, {},
+            pending_fix_request="バグを直して", pending_fix_subtasks=["lesson1.htmlを直す", "lesson2.htmlを直す"],
+        )
+        parsed = yoriai._parse_progress_markdown(os.path.join(out_dir, yoriai.PROGRESS_FILENAME))
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+    assert parsed["pending_fix_request"] == "バグを直して"
+    assert parsed["pending_fix_subtasks"] == ["lesson1.htmlを直す", "lesson2.htmlを直す"]
+
+
+def test_progress_markdown_defaults_pending_fix_fields_to_empty():
+    """未完了の修正サブタスクが無い(または旧バージョンのPROGRESS.md)場合、
+    後方互換のため空文字列・空リストになることを確認する。
+    """
+    tasks = [("a.py", "説明")]
+    checklist = yoriai._build_task_checklist(tasks)
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        yoriai._write_progress_md(out_dir, "何か作って", tasks, checklist, {})
+        parsed = yoriai._parse_progress_markdown(os.path.join(out_dir, yoriai.PROGRESS_FILENAME))
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+    assert parsed["pending_fix_request"] == ""
+    assert parsed["pending_fix_subtasks"] == []
+
+
+def test_project_has_pending_work_detects_pending_fix_subtasks_even_when_module_checklist_is_complete():
+    """バグ再現の核心: モジュール分割案のチェックリストは全項目完了済み
+    でも、未完了の修正サブタスクが記録されていれば「再開すべき作業が
+    残っている」と判定されることを確認する。
+    """
+    tasks = [("a.py", "説明")]
+    checklist = yoriai._build_task_checklist(tasks)
+    yoriai._set_task_status(checklist, "a.py", "impl", yoriai._TASK_STATUS_COMPLETED)
+    yoriai._set_task_status(checklist, "a.py", "review", yoriai._TASK_STATUS_COMPLETED)
+    parsed_without_pending = {"checklist": checklist, "pending_fix_subtasks": []}
+    parsed_with_pending = {"checklist": checklist, "pending_fix_subtasks": ["lesson2.htmlを直す"]}
+    assert yoriai._project_has_pending_work(parsed_without_pending) is False
+    assert yoriai._project_has_pending_work(parsed_with_pending) is True
+
+
+_SPLIT_FAILING_SUBTASK_INDEX = 1  # _SPLIT_SUBTASKS[1] == lesson2.html担当
+
+
+def _fake_stream_fix_split_one_subtask_never_finishes(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
+    """`_fake_stream_fix_split`と同じシナリオだが、lesson2.html担当の
+    サブタスクだけは、実機の往復回数上限到達を再現するため、
+    list_dirの呼び出しを無限に繰り返して終わらない(_collect_answer_
+    with_project_toolsがMAX_PROJECT_TOOL_ROUNDSで打ち切るまで続く)。
+    """
+    prompt = messages[0]["content"] if messages else ""
+    tool_round = _tool_round(messages)
+
+    if "1人のメンバーが一度に実行できる規模か" in prompt:
+        yield {"content": "\n".join(f"- {s}" for s in _SPLIT_SUBTASKS)}
+        yield {"done": True}
+        return
+
+    if "改修レビュー担当です" in prompt:
+        yield {"content": "問題なし"}
+        yield {"done": True}
+        return
+
+    if _SPLIT_SUBTASKS[_SPLIT_FAILING_SUBTASK_INDEX] in prompt:
+        yield {"pending_tool_calls": [
+            {"id": f"call_{tool_round}", "type": "function", "function": {"name": "list_dir", "arguments": {}}},
+        ]}
+        return
+
+    for filename, subtask_text in zip(_SPLIT_TARGET_FILES, _SPLIT_SUBTASKS):
+        if subtask_text in prompt:
+            if tool_round == 0:
+                yield {"pending_tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {
+                        "name": "write_file",
+                        "arguments": {"filename": filename, "content": f"<!-- {filename} updated -->\n"},
+                    }},
+                ]}
+                return
+            yield {"content": f"{filename}を更新しました。"}
+            yield {"done": True}
+            return
+
+    yield {"content": "問題なし"}
+    yield {"done": True}
+
+
+def test_fix_project_split_persists_pending_subtasks_so_resume_all_finds_it():
+    """バグ報告の再現と修正の確認: 分割された//fixが一部のサブタスクを
+    (往復回数の上限到達により)未完了のまま終えた場合、//resume-allが
+    それを正しく「未完了のプロジェクト」として検出できることを確認する。
+    """
+    original_snapshot = yoriai._fetch_org_snapshot
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False: _two_member_snapshot()
+    yoriai._stream_chat_from_candidate = _fake_stream_fix_split_one_subtask_never_finishes
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        projects_root = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME)
+        project_dir = _write_completed_project(
+            projects_root, "html-course",
+            [("lesson1.html", "レッスン1"), ("lesson2.html", "レッスン2"), ("progress.js", "進捗保存")],
+            files={fn: f"<!-- {fn} placeholder -->\n" for fn in _SPLIT_TARGET_FILES},
+        )
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            yoriai._ask_organization_fix_project(
+                47120, "fingerprint", "レッスンを2つ追加して進捗保存機能もつけて", out_dir,
+            )
+        output = buf.getvalue()
+
+        assert "[✅ 修正が完了しました" not in output, (
+            "一部のサブタスクが未完了のまま終わったはずです: " + output
+        )
+        assert "[⚠️ 修正セッションが最後まで正常に完了しませんでした" in output, output
+        assert f"[🔁 1件のサブタスクが未完了のため、{yoriai.RESUME_ALL_COMMAND}で再開できます]" in output, output
+
+        # バグの核心: モジュール分割案のチェックリストは完了済みのままだが、
+        # 未完了の修正サブタスクは検出できなければならない。
+        parsed = yoriai._parse_progress_markdown(os.path.join(project_dir, yoriai.PROGRESS_FILENAME))
+        assert yoriai._progress_checklist_is_incomplete(parsed["checklist"]) is False, (
+            "モジュールタスク自体は完了済みのままのはずです"
+        )
+        assert parsed["pending_fix_subtasks"] == [_SPLIT_SUBTASKS[_SPLIT_FAILING_SUBTASK_INDEX]], parsed
+        assert parsed["pending_fix_request"] == "レッスンを2つ追加して進捗保存機能もつけて"
+
+        incomplete = yoriai._find_incomplete_projects(out_dir)
+        assert incomplete == [project_dir], (
+            f"//resume-allは未完了のプロジェクトとしてこれを検出できるはずです: {incomplete}"
+        )
+    finally:
+        yoriai._fetch_org_snapshot = original_snapshot
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_resume_all_completes_previously_pending_fix_subtask_and_clears_it():
+    """//resume-allが実際に未完了の修正サブタスクを再開し、成功すれば
+    PROGRESS.mdの未完了記録がクリアされる(=再度//resume-allしても
+    「未完了のプロジェクトなし」に戻る)ことを確認する。
+    """
+    original_snapshot = yoriai._fetch_org_snapshot
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False: _two_member_snapshot()
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        projects_root = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME)
+        project_dir = _write_completed_project(
+            projects_root, "html-course",
+            [("lesson1.html", "レッスン1"), ("lesson2.html", "レッスン2"), ("progress.js", "進捗保存")],
+            files={fn: f"<!-- {fn} placeholder -->\n" for fn in _SPLIT_TARGET_FILES},
+        )
+
+        # 1回目: lesson2.html担当のサブタスクが未完了のまま終わる。
+        yoriai._stream_chat_from_candidate = _fake_stream_fix_split_one_subtask_never_finishes
+        with contextlib.redirect_stdout(io.StringIO()):
+            yoriai._ask_organization_fix_project(
+                47120, "fingerprint", "レッスンを2つ追加して進捗保存機能もつけて", out_dir,
+            )
+        assert yoriai._find_incomplete_projects(out_dir) == [project_dir]
+
+        # 2回目: //resume-allでは、今度はlesson2.html担当も正常に完了する
+        # フェイクに差し替える(実機で言えば、次のポーリングまでに応答が
+        # 返るようになった状況を模擬)。
+        yoriai._stream_chat_from_candidate = _fake_stream_fix_split
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            yoriai._run_resume_all(47120, "fingerprint", out_dir)
+        output = buf.getvalue()
+
+        assert "未完了のプロジェクトは見つかりませんでした" not in output, output
+        assert "[✅ 全プロジェクトの未完了タスクが完了しました]" in output, output
+
+        with open(os.path.join(project_dir, "lesson2.html"), encoding="utf-8") as f:
+            assert f.read() == "<!-- lesson2.html updated -->\n"
+
+        parsed = yoriai._parse_progress_markdown(os.path.join(project_dir, yoriai.PROGRESS_FILENAME))
+        assert parsed["pending_fix_subtasks"] == [], parsed
+        assert yoriai._find_incomplete_projects(out_dir) == []
+    finally:
+        yoriai._fetch_org_snapshot = original_snapshot
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
 def main():
     tests = [
         test_text_similarity_score_rewards_shared_substrings,
@@ -1502,6 +1719,12 @@ def main():
         test_fix_project_split_shows_subtask_checklist_progress,
         test_fix_project_split_works_with_single_member_and_skips_review,
         test_fix_project_small_request_stays_on_single_implementer_path,
+        test_parse_bullet_lines_keeps_single_item_unlike_split_subtasks,
+        test_progress_markdown_round_trips_pending_fix_subtasks,
+        test_progress_markdown_defaults_pending_fix_fields_to_empty,
+        test_project_has_pending_work_detects_pending_fix_subtasks_even_when_module_checklist_is_complete,
+        test_fix_project_split_persists_pending_subtasks_so_resume_all_finds_it,
+        test_resume_all_completes_previously_pending_fix_subtask_and_clears_it,
     ]
     failures = 0
     for test in tests:
