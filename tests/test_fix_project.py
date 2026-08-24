@@ -332,6 +332,45 @@ def test_execute_project_tool_call_dispatches_to_write_file():
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
+def test_execute_project_tool_call_dispatches_to_read_file_with_range():
+    """依頼の項目2: //fixの修正担当がread_fileにstart_line/end_lineを
+    指定した場合、_execute_project_tool_call経由でもその範囲だけが
+    返されることを確認する。
+    """
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        with open(os.path.join(out_dir, "a.py"), "w", encoding="utf-8") as f:
+            f.write("\n".join(f"line{i}" for i in range(1, 11)) + "\n")
+        tool_call = {
+            "id": "call_1", "type": "function",
+            "function": {"name": "read_file", "arguments": {"filename": "a.py", "start_line": 3, "end_line": 5}},
+        }
+        result = json.loads(yoriai._execute_project_tool_call(out_dir, tool_call))
+        assert result["exists"] is True, result
+        assert result["content"] == "3: line3\n4: line4\n5: line5", result
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_execute_project_tool_call_dispatches_to_search_in_file():
+    """依頼の項目1: //fixの修正担当がsearch_in_fileを呼んだ場合も、
+    _execute_project_tool_call経由で一致行が返されることを確認する。
+    """
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        with open(os.path.join(out_dir, "a.py"), "w", encoding="utf-8") as f:
+            f.write("def foo():\n    pass\n\ndef target_func():\n    pass\n")
+        tool_call = {
+            "id": "call_1", "type": "function",
+            "function": {"name": "search_in_file", "arguments": {"filename": "a.py", "query": "target_func"}},
+        }
+        result = json.loads(yoriai._execute_project_tool_call(out_dir, tool_call))
+        assert result["exists"] is True and result["match_count"] == 1, result
+        assert result["matched_lines"] == [4], result
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # プロジェクト特定(_identify_target_project)
 # ---------------------------------------------------------------------------
@@ -1150,6 +1189,8 @@ def main():
         test_list_project_directory_excludes_progress_md,
         test_syntax_check_all_files_reports_broken_files_only,
         test_execute_project_tool_call_dispatches_to_write_file,
+        test_execute_project_tool_call_dispatches_to_read_file_with_range,
+        test_execute_project_tool_call_dispatches_to_search_in_file,
         test_identify_target_project_matches_unique_high_scoring_project,
         test_identify_target_project_reports_ambiguous_on_tie,
         test_identify_target_project_reports_not_found_when_no_overlap,
