@@ -2947,8 +2947,11 @@ def _execute_project_tool_call(
 # 仮の判断: rename→import修正→テスト実行のような複数手順が必要な
 # 修正依頼に対応するため、read_file専用のMAX_READ_FILE_CALLS_PER_REVIEW
 # (3回)より多くのラウンドを許容する。それでも無制限にはせず、暴走防止の
-# 上限を設ける。
-MAX_PROJECT_TOOL_ROUNDS = 12
+# 上限を設ける。当初は12回としていたが、大規模なタスクの分解・レビュー・
+# 修正では実機で頻繁に上限に達してしまうことが分かった。CHAT_MAX_OUTPUT_TOKENS
+# 等のトークン数上限による暴走防止は別途効いているため、往復回数の上限は
+# 50回まで緩和する。
+MAX_PROJECT_TOOL_ROUNDS = 50
 
 # 仮の判断: 実機で、//fixが「修正が完了しました」と表示し、PROGRESS.mdにも
 # 更新履歴を記録したにもかかわらず、実際にはファイルの中身が一切変更
