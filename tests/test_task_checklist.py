@@ -85,7 +85,7 @@ def test_queue_ensures_all_tasks_complete_even_with_fewer_members_than_tasks():
 
         # タスクキュー方式により、3台のメンバーしかいなくても4ファイル
         # すべてが最終的に実装されるはず(切り捨てが起きない)。
-        project_dir = os.path.join(out_dir, "projects", yoriai._generate_project_name("4つのモジュールに分かれたツールを作って"))
+        project_dir = os.path.join(out_dir, "projects", yoriai._project_name_with_date_prefix("4つのモジュールに分かれたツールを作って"))
         saved_files = set(os.listdir(project_dir)) if os.path.isdir(project_dir) else set()
         assert saved_files == {"storage.py", "cli.py", "utils.py", "config.py", "PROGRESS.md"}, (
             f"候補が3台でも、キューにより4ファイルすべてが実装されるはずです: {saved_files}"
@@ -116,7 +116,7 @@ def test_complete_plan_reports_all_tasks_done():
             yoriai._ask_organization_collaborate(47120, "fingerprint", "4つのモジュールに分かれたツールを作って", out_dir)
         output = buf.getvalue()
 
-        project_dir = os.path.join(out_dir, "projects", yoriai._generate_project_name("4つのモジュールに分かれたツールを作って"))
+        project_dir = os.path.join(out_dir, "projects", yoriai._project_name_with_date_prefix("4つのモジュールに分かれたツールを作って"))
         assert set(os.listdir(project_dir)) == {"storage.py", "cli.py", "utils.py", "config.py", "PROGRESS.md"}
     finally:
         yoriai._fetch_org_snapshot = original_snapshot

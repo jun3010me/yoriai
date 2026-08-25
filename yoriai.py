@@ -3972,7 +3972,7 @@ def _ask_organization_plan_only(port: int, org_fingerprint: str, request: str, o
     # 区別できるようにする(議事録・要約だけが保存され、コード等の
     # 成果物は一切生成されない)。
     projects_root = os.path.join(out_dir, PROJECTS_SUBDIR_NAME)
-    project_name = _generate_project_name(request) + "-plan"
+    project_name = _project_name_with_date_prefix(request, suffix="-plan")
     project_dir = _resolve_project_dir(projects_root, project_name)
 
     architect = candidates[0]
@@ -4202,6 +4202,22 @@ def _generate_project_name(request: str) -> str:
     tokens = [t.lower() for t in _PROJECT_NAME_TOKEN_PATTERN.findall(request) if len(t) >= 2]
     name = "-".join(tokens[:_PROJECT_NAME_MAX_TOKENS]) if tokens else _DEFAULT_PROJECT_NAME
     return name[:_PROJECT_NAME_MAX_LENGTH]
+
+
+def _project_name_with_date_prefix(request: str, suffix: str = "") -> str:
+    """新規に作るプロジェクトディレクトリの名前を、依頼文由来の名前
+    (`_generate_project_name`)の先頭に`YYMMDD`形式の日付を付けた形で
+    返す(依頼: プロジェクトフォルダを作るたびに日付が先頭に付くように
+    してほしい、への対応)。
+
+    仮の判断: `_generate_project_name`自体には日付を混ぜず、依頼文からの
+    命名という既存の役割のまま単体でテスト・再利用できるようにし、日付を
+    付けるかどうかは「新規にディレクトリを作る」呼び出し元
+    (`_ask_organization_collaborate`・`_ask_organization_plan_only`)側の
+    関心事として分離した。日付は生成した瞬間の実時刻を使う(依頼文からの
+    推測ではなく、実際にディレクトリを作る時点を正とする)。
+    """
+    return f"{time.strftime('%y%m%d')}-{_generate_project_name(request)}{suffix}"
 
 
 def _resolve_project_dir(projects_root: str, name: str) -> str:
@@ -4631,7 +4647,7 @@ def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str,
     # 既にディレクトリが作られてしまっているために連番がずれて、生成物と
     # 対話ログが別のディレクトリに散らばってしまう)。
     projects_root = os.path.join(out_dir, PROJECTS_SUBDIR_NAME)
-    project_name = _generate_project_name(request)
+    project_name = _project_name_with_date_prefix(request)
     project_dir = _resolve_project_dir(projects_root, project_name)
 
     if enable_dialogue:
@@ -6789,26 +6805,30 @@ def _is_fix_session_end_phrase(text: str) -> bool:
 
 
 def _continue_fix_session(port: int, org_fingerprint: str, out_dir: str, job_runner: "_BackgroundJobRunner",
-                           fix_session: "_FixSession", request_text: str) -> None:
+                           fix_session: "_FixSession", request_text: str, chat_log: "_ChatLog" = None) -> None:
     """既に有効な`fix_session`に対して、対象の再特定を行わずそのまま
     対象プロジェクトへの継続的な修正依頼を投入する。コマンド無しの発言
     (`_run_repl_client`)と、プロジェクト名を省略した`//fix <依頼>`
     (`_begin_fix_session`)の両方から、同じ「今のセッション対象へ続ける」
     処理として共有される。
+
+    `chat_log`(既定`None`)を渡すと、この依頼と結果が対話モード全体の
+    会話履歴にも記録される(`_run_job_with_conversation_log`参照)。
     """
     fix_session.touch()
     print(_format_fix_session_marker(fix_session))
     project_dir = fix_session.project_dir
     job_runner.submit(
-        lambda project_dir=project_dir, request=request_text: _run_fix_on_project(
-            port, org_fingerprint, project_dir, request, out_dir, enable_dialogue=True,
+        lambda project_dir=project_dir, request=request_text: _run_job_with_conversation_log(
+            chat_log, request,
+            lambda: _run_fix_on_project(port, org_fingerprint, project_dir, request, out_dir, enable_dialogue=True),
         ),
         queued_notice=_BACKGROUND_QUEUED_NOTICE,
     )
 
 
 def _begin_fix_session(port: int, org_fingerprint: str, out_dir: str, job_runner: "_BackgroundJobRunner",
-                        fix_session, request_text: str):
+                        fix_session, request_text: str, chat_log: "_ChatLog" = None):
     """`//fix`(明示コマンド・コマンド無しの自然文どちらの経由でも)による
     修正依頼を処理する。
 
@@ -6838,7 +6858,7 @@ def _begin_fix_session(port: int, org_fingerprint: str, out_dir: str, job_runner
     """
     explicit_project_dir, _rest = _resolve_explicit_fix_target(request_text, out_dir)
     if explicit_project_dir is None and fix_session is not None:
-        _continue_fix_session(port, org_fingerprint, out_dir, job_runner, fix_session, request_text)
+        _continue_fix_session(port, org_fingerprint, out_dir, job_runner, fix_session, request_text, chat_log=chat_log)
         return fix_session
 
     project_dir, request = _resolve_and_validate_fix_target(request_text, out_dir)
@@ -6858,8 +6878,9 @@ def _begin_fix_session(port: int, org_fingerprint: str, out_dir: str, job_runner
 
     print(_format_fix_session_marker(fix_session))
     job_runner.submit(
-        lambda project_dir=project_dir, request=request: _run_fix_on_project(
-            port, org_fingerprint, project_dir, request, out_dir, enable_dialogue=True,
+        lambda project_dir=project_dir, request=request: _run_job_with_conversation_log(
+            chat_log, request,
+            lambda: _run_fix_on_project(port, org_fingerprint, project_dir, request, out_dir, enable_dialogue=True),
         ),
         queued_notice=_BACKGROUND_QUEUED_NOTICE,
     )
@@ -7268,6 +7289,139 @@ _BACKGROUND_QUEUED_NOTICE = "[⏳ 実行中の処理があるため、この依�
 
 
 # ---------------------------------------------------------------------------
+# 対話モードの会話履歴の一本化と、起動時刻ベースのログファイルへの保存
+# ---------------------------------------------------------------------------
+#
+# 以前は、単発質問・//multi(比較質問)だけが会話履歴(messages)を
+# 共有・追記しており、協業モード(//agree)・//fix・//plan-only・
+# //parallel・//resume-allはmessagesに一切触れず、それぞれ独立した
+# 1回きりのやり取りとして処理されていた。そのため、対話プロトコルが
+# 「人間の確認が必要です」と表示していったん立ち止まった直後に、
+# ユーザーが感想や追加の指示を送っても、それは全く無関係な新規の単発
+# 質問として扱われてしまい、直前まで何を話していたかをメンバー側が
+# 一切踏まえられないという不具合が実機で報告された(依頼: 過去の
+# 「修正セッション」のような限定的な継続機能ではなく、`--chat`の1回の
+# 起動中は常に会話の記録を保持して引き継いでほしい)。
+#
+# `--chat`の1回の起動中は、どのコマンド経由のやり取りもすべて同じ会話
+# 履歴に積み上げ、単発質問がこの履歴を会話コンテキストとして踏まえられる
+# ようにする。あわせて、起動時刻をファイル名に持つログファイルへも
+# 逐次書き出す(依頼: 別のセッションで見返せるように記録を残したい)。
+
+_CHAT_LOG_SUBDIR_NAME = "chat_logs"
+# 仮の判断: 会話履歴に積み上げる協業モード等の出力(対話プロトコルの
+# 逐語ログを含みうる)は長大になりうる。無制限に積み上げるとトークン
+# 使用量が際限なく増えてしまうため、既存のread_file等と同じ考え方
+# (_FILE_CONTENT_TRUNCATE_CHARS)を踏襲し、会話履歴(=LLMへの問い合わせに
+# 使われる部分)に載せる分だけ上限を設ける。ログファイル自体には
+# 切り詰めずそのまま書き出す(あくまで「LLMに毎回送り直す会話履歴」の
+# トークン量対策であり、人間が見返す記録を欠落させたくないため)。
+_BACKGROUND_JOB_HISTORY_TRUNCATE_CHARS = 8000
+
+
+class _ChatLog(list):
+    """`--chat`の1回の起動中の会話履歴。
+
+    仮の判断: 既存の`messages`(単なる`list`)と完全互換の`list`の
+    サブクラスとして実装し、`append()`だけをフックしてログファイルへの
+    書き出しを行う設計にした。これにより、既存の`_ask_organization`/
+    `_ask_organization_multi`が行う素朴な`messages.append(...)`をはじめ、
+    `messages`を単なる`list`として読み書きする既存コード・既存テストを
+    一切変更せずに済む。
+    """
+
+    def __init__(self, log_path: str):
+        super().__init__()
+        self._log_path = log_path
+        self._lock = threading.Lock()
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(self._log_path, "w", encoding="utf-8") as f:
+            f.write(f"# Yoriai 対話ログ ({time.strftime('%Y-%m-%d %H:%M:%S')} 開始)\n\n")
+
+    def append(self, entry: dict) -> None:
+        with self._lock:
+            super().append(entry)
+            self._append_to_file(entry)
+
+    def _append_to_file(self, entry: dict) -> None:
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        role = entry.get("role", "?")
+        content = entry.get("content", "")
+        with open(self._log_path, "a", encoding="utf-8") as f:
+            f.write(f"## [{timestamp}] {role}\n\n{content}\n\n")
+
+
+def _create_chat_log(out_dir: str) -> "_ChatLog":
+    """起動時刻(`YYYYMMDD_HHMMSS`)をファイル名に持つ会話ログを作る
+    (依頼: 別のセッションで見返せるように、起動時刻をファイル名に
+    入れて記録を残す)。
+    """
+    log_dir = os.path.join(out_dir, _CHAT_LOG_SUBDIR_NAME)
+    log_path = os.path.join(log_dir, f"chat_{time.strftime('%Y%m%d_%H%M%S')}.md")
+    return _ChatLog(log_path)
+
+
+class _StdoutTee:
+    """標準出力への書き込みを、実際の出力(端末やテストの
+    `redirect_stdout`等、その時点の`sys.stdout`が何であっても)はそのまま
+    行いつつ、文字列としても捕捉するためのラッパー。バックグラウンド
+    ジョブの出力を会話履歴に取り込むために使う。
+    """
+
+    def __init__(self, original):
+        self._original = original
+        self.captured = []
+
+    def write(self, text: str):
+        self.captured.append(text)
+        return self._original.write(text)
+
+    def flush(self) -> None:
+        self._original.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._original, name)
+
+
+def _truncate_for_history(text: str, limit: int = _BACKGROUND_JOB_HISTORY_TRUNCATE_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n... (以下省略。会話履歴への記録は先頭{limit}文字まで。詳細は実際の出力・議事録ファイルを参照してください)"
+
+
+def _run_job_with_conversation_log(chat_log: "_ChatLog", user_label: str, job: callable) -> None:
+    """`job`を実行しつつ、その依頼文と(標準出力から捕捉した)結果を
+    会話履歴(`chat_log`)に積み上げる。`chat_log`が`None`の場合は、
+    これまで通り会話履歴への記録を一切行わずに`job`を実行するだけ
+    (既存の呼び出し元・テストとの後方互換性のため)。
+
+    仮の判断: 標準出力を丸ごと差し替えるのではなく、実際の書き込みは
+    そのまま転送しつつ文字列としても集める`_StdoutTee`を使うため、
+    `patch_stdout()`(バックグラウンドジョブの出力を安全に差し込む
+    既存の仕組み)やテストの`contextlib.redirect_stdout`など、呼び出し
+    時点の`sys.stdout`が何であっても壊さずに済む。
+    """
+    if chat_log is None:
+        job()
+        return
+
+    chat_log.append({"role": "user", "content": user_label})
+    original_stdout = sys.stdout
+    tee = _StdoutTee(original_stdout)
+    sys.stdout = tee
+    try:
+        job()
+    finally:
+        sys.stdout = original_stdout
+
+    captured = "".join(tee.captured).strip()
+    chat_log.append({
+        "role": "assistant",
+        "content": _truncate_for_history(captured) if captured else "(出力はありませんでした)",
+    })
+
+
+# ---------------------------------------------------------------------------
 # 起動時の案内文(見た目の改善)
 # ---------------------------------------------------------------------------
 #
@@ -7483,9 +7637,16 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
     # 出力が最初の呼び出し時点の(既に閉じられた)出力先に書き込まれて
     # 消えてしまう不具合が実際に発生した。
     with create_app_session(), patch_stdout():
-        # 仮の判断: 会話履歴(messages)はこのセッション内でのみ保持し、終了したら破棄する。
-        # 次回起動時に前回の会話を引き継ぐ機能は今回のスコープ外。
-        messages = []
+        # 仮の判断(依頼への対応): 会話履歴(messages)は、この起動中は
+        # 単発質問・//multiだけでなく、//agree・//fix・//plan-only・
+        # //parallel・//resume-allも含めたすべてのやり取りを共有・
+        # 蓄積する(`_ChatLog`参照)。起動時刻をファイル名に持つログ
+        # ファイルにも逐次書き出されるため、対話モードのプロセスを
+        # 終了しても記録自体はディスク上に残る(次回起動時に自動で
+        # 読み込んで引き継ぐ機能は今回のスコープ外。ログファイルを
+        # 見返せば、別のセッションでも過去の会話内容を確認できる)。
+        chat_log = _create_chat_log(out_dir)
+        messages = chat_log
         session = _create_repl_prompt_session()
         # 仮の判断: 入力編集中・組織への問い合わせ中(応答待ち)のどちらで
         # Ctrl+Cが発生しても「2回連続」を正しく検出できるよう、対話モードの
@@ -7512,7 +7673,9 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
 
             if text.startswith(RESUME_ALL_COMMAND):
                 job_runner.submit(
-                    lambda: _run_resume_all(port, org_fingerprint, out_dir),
+                    lambda: _run_job_with_conversation_log(
+                        messages, text, lambda: _run_resume_all(port, org_fingerprint, out_dir),
+                    ),
                     queued_notice=_BACKGROUND_QUEUED_NOTICE,
                 )
                 continue
@@ -7531,8 +7694,11 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                     )
                     fix_session = None
                 job_runner.submit(
-                    lambda request=request: _ask_organization_collaborate(
-                        port, org_fingerprint, request, out_dir, enable_dialogue=True,
+                    lambda request=request: _run_job_with_conversation_log(
+                        messages, text,
+                        lambda: _ask_organization_collaborate(
+                            port, org_fingerprint, request, out_dir, enable_dialogue=True,
+                        ),
                     ),
                     queued_notice=_BACKGROUND_QUEUED_NOTICE,
                 )
@@ -7544,7 +7710,10 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                     print(f"使い方: {PLAN_ONLY_COMMAND} <検討したい依頼>  (例: {PLAN_ONLY_COMMAND} ToDoリストのCLIツールを作って)")
                     continue
                 job_runner.submit(
-                    lambda plan_request=plan_request: _ask_organization_plan_only(port, org_fingerprint, plan_request, out_dir),
+                    lambda plan_request=plan_request: _run_job_with_conversation_log(
+                        messages, text,
+                        lambda: _ask_organization_plan_only(port, org_fingerprint, plan_request, out_dir),
+                    ),
                     queued_notice=_BACKGROUND_QUEUED_NOTICE,
                 )
                 continue
@@ -7557,13 +7726,18 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                         f"(例: {FIX_PROJECT_COMMAND} ID生成のロジックにバグがあるので直して)"
                     )
                     continue
-                fix_session = _begin_fix_session(port, org_fingerprint, out_dir, job_runner, fix_session, fix_request)
+                fix_session = _begin_fix_session(
+                    port, org_fingerprint, out_dir, job_runner, fix_session, fix_request, chat_log=messages,
+                )
                 continue
 
             if text.startswith(PARALLEL_QUERY_COMMAND):
                 command_text = text[len(PARALLEL_QUERY_COMMAND):].strip()
                 job_runner.submit(
-                    lambda command_text=command_text: _ask_organization_parallel(port, org_fingerprint, command_text, out_dir),
+                    lambda command_text=command_text: _run_job_with_conversation_log(
+                        messages, text,
+                        lambda: _ask_organization_parallel(port, org_fingerprint, command_text, out_dir),
+                    ),
                     queued_notice=_BACKGROUND_QUEUED_NOTICE,
                 )
                 continue
@@ -7618,7 +7792,7 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                         fix_session = None
                     continue
                 else:
-                    _continue_fix_session(port, org_fingerprint, out_dir, job_runner, fix_session, text)
+                    _continue_fix_session(port, org_fingerprint, out_dir, job_runner, fix_session, text, chat_log=messages)
                     continue
             elif fix_session is not None:
                 # _is_fix_session_end_phrase(text) が真だった場合。
@@ -7635,15 +7809,20 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
 
             if mode == EXECUTION_MODE_COLLABORATE:
                 job_runner.submit(
-                    lambda text=text: _ask_organization_collaborate(
-                        port, org_fingerprint, text, out_dir, enable_dialogue=True,
+                    lambda text=text: _run_job_with_conversation_log(
+                        messages, text,
+                        lambda: _ask_organization_collaborate(
+                            port, org_fingerprint, text, out_dir, enable_dialogue=True,
+                        ),
                     ),
                     queued_notice=_BACKGROUND_QUEUED_NOTICE,
                 )
                 continue
 
             if mode == EXECUTION_MODE_FIX_PROJECT:
-                fix_session = _begin_fix_session(port, org_fingerprint, out_dir, job_runner, fix_session, text)
+                fix_session = _begin_fix_session(
+                    port, org_fingerprint, out_dir, job_runner, fix_session, text, chat_log=messages,
+                )
                 continue
 
             messages.append({"role": "user", "content": text})

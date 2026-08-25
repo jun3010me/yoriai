@@ -28,6 +28,7 @@ import contextlib
 import io
 import os
 import sys
+import tempfile
 import threading
 import time
 
@@ -178,8 +179,14 @@ def _run_repl_with_keys(keystrokes: str, ask_collaborate_side_effect=None, ask_s
         pipe_input.send_text(keystrokes)
 
         buf = io.StringIO()
+        # 仮の判断: この関数はバックグラウンドジョブの完了(呼び出し元が
+        # `runner.join()`する)を待たずに返るため、ここで一時ディレクトリを
+        # 作ってもこの関数内では削除しない(ジョブが後から書き込む可能性が
+        # ある)。OSが定期的に掃除する/tmp配下に作ることで、少なくとも
+        # リポジトリの作業ディレクトリを汚さないようにする。
+        out_dir = tempfile.mkdtemp(prefix="yoriai_background_collaborate_test_")
         with contextlib.redirect_stdout(buf):
-            yoriai._run_repl_client(47120, "fingerprint", ".")
+            yoriai._run_repl_client(47120, "fingerprint", out_dir)
         yoriai._create_repl_prompt_session = original_create_session
         yoriai._create_background_job_runner = original_create_runner
 

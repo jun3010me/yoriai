@@ -211,7 +211,7 @@ def test_collaborate_dispatches_exactly_two_files_when_architect_uses_nested_for
         # 生成物はYoriai本体と混ざらないよう projects/<プロジェクト名>/ 配下に
         # 保存される(プロジェクト名は依頼文から自動生成されるため、実際の
         # 生成ロジックを呼んで期待値を求める)。
-        project_dir = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME, yoriai._generate_project_name("ToDoリストのCLIツールを作って"))
+        project_dir = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME, yoriai._project_name_with_date_prefix("ToDoリストのCLIツールを作って"))
         assert set(os.listdir(project_dir)) == {"storage.py", "cli.py", "PROGRESS.md"}, (
             f"storage.py/cli.py/PROGRESS.mdの3件だけが保存されるはずです: {os.listdir(project_dir)}"
         )
@@ -298,7 +298,7 @@ def test_agree_uses_top_candidate_as_architect_and_propagates_interface_to_imple
             f"設計担当が決めたインターフェースが実装依頼に引き継がれていません: {cli_requests[0]!r}"
         )
 
-        project_dir = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME, yoriai._generate_project_name("ToDoリストのCLIツールを作って"))
+        project_dir = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME, yoriai._project_name_with_date_prefix("ToDoリストのCLIツールを作って"))
         with open(os.path.join(project_dir, "cli.py"), encoding="utf-8") as f:
             saved_cli = f.read()
         assert "import storage" in saved_cli
