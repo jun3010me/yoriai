@@ -3591,6 +3591,7 @@ def _finish_dialogue(status: str, transcript: list, total_utterances: int, final
 def _run_dialogue(
     org_fingerprint: str, topic: str, background: str, candidates: list, output_instruction: str,
     print_lock: threading.Lock = None, tag: str = None, min_rounds: int = 2, max_rounds: int = 8,
+    resume_transcript: list = None, resume_round: int = 1,
 ) -> dict:
     """複数ノードが役割(提案役・反論役・統合役)を持って議論し、合意形成
     する対話プロトコルの中核。寄合全体で使い回せる共通基盤として、計画
@@ -3616,12 +3617,19 @@ def _run_dialogue(
     ログ(議事録)・要約の実際のファイルへの永続化は、この関数自身では
     行わない(呼び出し元が`_write_dialogue_log`/`_write_dialogue_summary`
     を使って、用途に応じた保存先に書き出す)。
+
+    `resume_transcript`/`resume_round`(既定はNone/1、通常の新規対話)を
+    渡すと、以前一時停止した対話の議事録をそのまま引き継ぎ、指定した
+    ラウンド番号から続きとして再開する(一時停止直後に人間の回答を得た
+    場合の再開ルーティング用。提案役・反論役・統合役のやり取りや合意
+    判定のロジック自体はここを起点に始まる各ラウンドの処理としてそのまま
+    再利用され、変更しない)。
     """
     roles = _assign_discourse_roles(candidates)
     if not roles:
         return _finish_dialogue(DIALOGUE_STATUS_NO_ENGAGEMENT, [], 0, None, None)
 
-    transcript = []
+    transcript = list(resume_transcript) if resume_transcript else []
     state = {"total_utterances": 0, "any_real_content": False}
 
     def speak(role_key: str, prompt: str, round_num: int) -> str:
@@ -3644,7 +3652,7 @@ def _run_dialogue(
         })
         return answer
 
-    round_num = 1
+    round_num = resume_round
     while True:
         if state["total_utterances"] >= DIALOGUE_SAFETY_LIMIT_UTTERANCES:
             return _finish_dialogue(DIALOGUE_STATUS_SAFETY_LIMIT, transcript, state["total_utterances"], None, None)
@@ -3917,7 +3925,10 @@ def _build_design_dialogue_output_instruction(request: str) -> str:
 def _run_design_dialogue(org_fingerprint: str, request: str, candidates: list, project_dir: str) -> tuple:
     """//agreeの合意フェーズを、対話プロトコル(`_run_dialogue`)による
     複数ノード・複数ラウンドの合意形成に置き換える(依頼の「計画フェーズ
-    での利用」)。戻り値は`(合意した計画テキスト, 中断すべきかどうか)`。
+    での利用」)。戻り値は`(合意した計画テキスト, 中断すべきかどうか, 対話の
+    生の結果`_run_dialogue`の戻り値)`。3つ目の値は、一時停止(中断)した
+    場合に人間の回答を受けて対話を再開する`_resume_design_dialogue`が、
+    それまでの議事録・要約を引き継ぐために使う。
 
     合意に至らなかった場合(セーフティリミット・人間の確認が必要)は、
     議事録・要約をディスクに保存したうえで中断を指示する(呼び出し元は
@@ -3941,14 +3952,124 @@ def _run_design_dialogue(org_fingerprint: str, request: str, candidates: list, p
 
     if result["status"] == DIALOGUE_STATUS_NO_ENGAGEMENT:
         print("設計担当から応答が得られませんでした。")
-        return "", True
+        return "", True, result
     if result["status"] != DIALOGUE_STATUS_CONSENSUS:
-        return "", True
+        return "", True, result
 
     final_content = result["final_content"] or ""
     print("[🧭 対話プロトコルで合意した計画(そのまま表示)]")
     print(final_content)
-    return final_content, False
+    return final_content, False, result
+
+
+# 仮の判断(不具合修正: 対話プロトコル一時停止後、実装フェーズに繋がらない
+# 問題への対応): 一時停止(セーフティリミット・人間に確認)した合意フェーズに
+# 続く人間の発言は、`_run_dialogue`へそれまでの議事録とラウンド番号を渡して
+# 「続きから」再開する。ここで対話プロトコル自体のロジック(提案役・反論役・
+# 統合役のやり取り、ラウンドの進み方)には一切手を入れず、`_run_dialogue`
+# 側に用意した再開用の引数(`resume_transcript`/`resume_round`)を渡すだけに
+# とどめる。
+_DIALOGUE_RESUME_EXTRA_ROUNDS = 4
+
+
+def _build_design_dialogue_resume_background(request: str, prior_result: dict, human_reply: str) -> str:
+    background = _build_design_dialogue_background(request)
+    if prior_result.get("summary"):
+        background += f"\n\n【一時停止までの議論の要約】\n{prior_result['summary']}"
+    if prior_result.get("human_message"):
+        background += f"\n\n【人間に確認したかった事項】\n{prior_result['human_message']}"
+    background += f"\n\n【人間からの回答】\n{human_reply}"
+    return background
+
+
+def _resume_design_dialogue(pending: "_PendingDesignDialogue", human_reply: str) -> tuple:
+    """一時停止した//agreeの合意フェーズ(対話プロトコル)を、人間の回答を
+    踏まえて続きから再開する。戻り値は`(計画テキスト, 中断すべきかどうか)`。
+
+    `_run_dialogue`に一時停止までの議事録(`pending.result["transcript"]`)と
+    続きのラウンド番号を渡すだけで「続きから」の再開を実現し、対話プロト
+    コル自体のラウンド進行ロジックは変更しない。
+
+    再開後もなお合意に至らなかった場合(それでも人間に確認したい・セーフ
+    ティリミットに再度到達した等)は、これ以上一時停止を人間との往復で
+    重ねることはせず、それまでの議論と人間の回答を踏まえて設計担当1名が
+    単独で計画を確定させ、実装フェーズへ進む(要件: 既に議論が十分尽くされ
+    ている場合は対話フェーズを再開せずそのままEXECUTION_MODE_COLLABORATE
+    相当の実装フェーズへ直接進む、に相当する扱い)。応答が一切得られな
+    かった場合(`DIALOGUE_STATUS_NO_ENGAGEMENT`)のみ、中断を指示する。
+    """
+    request = pending.request
+    candidates = pending.candidates
+    project_dir = pending.project_dir
+    prior_result = pending.result
+    architect = candidates[0]
+
+    prior_transcript = prior_result.get("transcript") or []
+    resume_round = (prior_transcript[-1]["round"] if prior_transcript else 0) + 1
+    print(f"[🧭 対話プロトコルを再開します: 人間の回答を踏まえてラウンド{resume_round}から続けます...]")
+    result = _run_dialogue(
+        org_fingerprint=pending.org_fingerprint,
+        topic=f"制作依頼「{request}」のモジュール分割・インターフェース設計",
+        background=_build_design_dialogue_resume_background(request, prior_result, human_reply),
+        candidates=candidates,
+        output_instruction=_build_design_dialogue_output_instruction(request),
+        tag="設計",
+        min_rounds=1,
+        max_rounds=resume_round + _DIALOGUE_RESUME_EXTRA_ROUNDS,
+        resume_transcript=prior_transcript,
+        resume_round=resume_round,
+    )
+    _report_dialogue_result(result, project_dir, "design", "モジュール分割・インターフェース設計(再開)")
+
+    if result["status"] == DIALOGUE_STATUS_CONSENSUS:
+        final_content = result["final_content"] or ""
+        print("[🧭 対話プロトコルで合意した計画(そのまま表示)]")
+        print(final_content)
+        return final_content, False
+
+    if result["status"] == DIALOGUE_STATUS_NO_ENGAGEMENT:
+        print("設計担当から応答が得られませんでした。")
+        return "", True
+
+    print(
+        f"[🧭 再開後も合意には至りませんでしたが、{architect['label']}さんが人間の回答を踏まえて"
+        "計画を単独で確定し、実装フェーズへ進みます...]"
+    )
+    fallback_prompt = (
+        f"{_build_module_breakdown_prompt(request)}\n\n"
+        f"【これまでの議論の経緯】\n{_format_dialogue_transcript_for_prompt(result['transcript'])}\n\n"
+        f"【人間からの回答】\n{human_reply}\n\n"
+        "上記を踏まえて、あなた一人の判断でファイル分割案を確定してください。"
+    )
+    answer, error, truncated = _collect_answer_from_candidate(
+        architect, pending.org_fingerprint, [{"role": "user", "content": fallback_prompt}],
+    )
+    if error or not answer:
+        print(f"設計担当への問い合わせに失敗しました: {error or '応答がありませんでした'}")
+        return "", True
+    if truncated:
+        print(f"[⚠️ 設計担当の応答が長すぎたため、{CHAT_MAX_OUTPUT_TOKENS}トークンで打ち切られました。以下は不完全な内容の可能性があります]")
+    print(f"[🧭 {architect['label']} の回答(単独での計画確定、そのまま表示)]")
+    print(answer)
+    return answer, False
+
+
+def _resume_organization_collaborate(pending: "_PendingDesignDialogue", human_reply: str) -> None:
+    """一時停止した//agreeの合意フェーズへの人間の回答を受け取り、対話
+    プロトコルを続きから再開したうえで、合意(または単独での計画確定)が
+    得られ次第そのままタスク分解・実装フェーズへ橋渡しする。
+
+    橋渡し先(`_run_collaborate_implementation_phase`)は、新規の`//agree`が
+    一発で合意に達した場合(`_ask_organization_collaborate`)と完全に同じ
+    関数であり、一時停止からの再開でも既存の正常系と同じ実装フェーズに
+    合流する。
+    """
+    answer, aborted = _resume_design_dialogue(pending, human_reply)
+    if aborted:
+        return
+    _run_collaborate_implementation_phase(
+        pending.request, answer, pending.candidates, pending.org_fingerprint, pending.project_dir, pending.port,
+    )
 
 
 def _build_plan_only_output_instruction() -> str:
@@ -4618,77 +4739,68 @@ def _find_incomplete_projects(out_dir: str) -> list:
     return incomplete
 
 
-def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str, out_dir: str, enable_dialogue: bool = False) -> None:
-    """「〇〇を作って」のような制作依頼用: まず優先順位が最も高い1台に
-    モジュール分割案とインターフェース設計を相談し(合意フェーズ)、
-    その結果をタスクキュー方式(`_run_collaborative_task_queue`)で異なる
-    メンバーに実装・相互レビューさせる。タスク数がメンバー数を超えても、
-    メンバーの手が空くたびに次のタスクが割り当てられるため、最終的に
-    全タスクが実装される。
-
-    仮の判断:
-    - 「設計担当」の選び方は他の候補選びと同じ優先順位ロジック
-      (コーディング系タスクとして最優先の候補)をそのまま流用する。
-      設計専用のモデルを分けて選ぶ仕組みは今回のスコープ外。
-    - 設計担当の回答が期待した形式(「ファイル名: 内容」の行)で
-      1件も得られなかった場合は、その旨と回答全文を表示して中断する
-      (フォーマットの自動修正・再質問までは今回のスコープ外)。
-
-    `enable_dialogue=True`の場合、単一の設計担当への1回きりの相談では
-    なく、対話プロトコル(`_run_dialogue`)による複数ノード・複数
-    ラウンドの合意形成を経て計画を決める(依頼の「計画フェーズでの
-    利用」)。既定は`False`のまま(既存の呼び出し元・テストとの後方
-    互換性のため)で、対話モードのREPLから`//agree`・自動判定経由で
-    呼ばれる際にのみ`True`を渡す。
+class _PendingDesignDialogue:
+    """//agreeの合意フェーズ(対話プロトコル)が「セーフティリミット」または
+    「人間に確認」で一時停止した状態を保持し、次の人間の発言をその一時停止
+    への回答として合意フェーズに合流させ、合意(または単独での計画確定)に
+    達し次第そのままタスク分解・実装フェーズへ橋渡しするためのセッション
+    情報。一時停止時点までに確定していた情報一式(対象組織・依頼文・候補
+    メンバー・プロジェクトディレクトリ・議事録)をここに保持する。
     """
-    data = _fetch_org_snapshot(port, org_fingerprint)
-    if data is None:
-        return
 
-    candidates = _select_chat_candidates(data.get("self", {}), data.get("peers", []), port, TASK_TYPE_CODING)
-    if not candidates:
-        print("組織内にロード済みモデルを持つメンバーがいません。")
-        return
+    def __init__(
+        self, port: int, org_fingerprint: str, request: str, candidates: list, project_dir: str, result: dict,
+    ):
+        self.port = port
+        self.org_fingerprint = org_fingerprint
+        self.request = request
+        self.candidates = candidates
+        self.project_dir = project_dir
+        self.result = result
 
-    architect = candidates[0]
 
-    # 仮の判断: プロジェクトディレクトリは、対話プロトコルによる議事録・
-    # 要約の保存先としても使うため、設計フェーズより前にここで確定させる
-    # (後段で改めて`_resolve_project_dir`を呼び直すと、対話ログの保存で
-    # 既にディレクトリが作られてしまっているために連番がずれて、生成物と
-    # 対話ログが別のディレクトリに散らばってしまう)。
-    projects_root = os.path.join(out_dir, PROJECTS_SUBDIR_NAME)
-    project_name = _project_name_with_date_prefix(request)
-    project_dir = _resolve_project_dir(projects_root, project_name)
+class _PendingDesignDialogueBox:
+    """`_ask_organization_collaborate`はバックグラウンドジョブ
+    (`_BackgroundJobRunner`の別スレッド)として実行されるため、対話プロト
+    コルが一時停止した状態(`_PendingDesignDialogue`)をそのスレッドから
+    `_run_repl_client`のメインループへ安全に受け渡すための箱。`_ChatLog`と
+    同様、別スレッドからの書き込みを想定してロックで保護する。
+    """
 
-    if enable_dialogue:
-        answer, aborted = _run_design_dialogue(org_fingerprint, request, candidates, project_dir)
-        if aborted:
-            return
-    else:
-        print(
-            f"[🧭 合意フェーズ開始: まず {architect['label']} (モデル: {architect['model']}) に"
-            f"モジュール分割案とインターフェース設計を相談しています...]"
-        )
-        breakdown_prompt = _build_module_breakdown_prompt(request)
-        answer, error, truncated = _collect_answer_from_candidate(
-            architect, org_fingerprint, [{"role": "user", "content": breakdown_prompt}],
-        )
-        if error:
-            print(f"設計担当への問い合わせに失敗しました: {error}")
-            return
-        if not answer:
-            print("設計担当から応答が得られませんでした。")
-            return
-        if truncated:
-            print(f"[⚠️ 設計担当の応答が長すぎたため、{CHAT_MAX_OUTPUT_TOKENS}トークンで打ち切られました。以下は不完全な内容の可能性があります]")
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._pending = None
 
-        # 仮の判断: 解析後の内容だけでなく、設計担当の回答そのもの(生テキスト)も
-        # 表示する。パース処理(_parse_module_breakdown)の解釈が意図と異なって
-        # いないか、実機での動作確認時に見比べられるようにするため。
-        print(f"[🧭 {architect['label']} の回答(合意フェーズの結果、そのまま表示)]")
-        print(answer)
+    def set(self, pending: "_PendingDesignDialogue") -> None:
+        with self._lock:
+            self._pending = pending
 
+    def take(self):
+        """保持している`_PendingDesignDialogue`(無ければ`None`)を取り出し、
+        箱を空にする(一度きりの消費。同じ一時停止に対して二重に反応しない
+        ようにするため)。
+        """
+        with self._lock:
+            pending, self._pending = self._pending, None
+            return pending
+
+    def peek(self):
+        with self._lock:
+            return self._pending
+
+
+def _run_collaborate_implementation_phase(
+    request: str, answer: str, candidates: list, org_fingerprint: str, project_dir: str, port: int,
+) -> None:
+    """合意フェーズ(対話プロトコルによる複数ラウンドの議論・設計担当1名への
+    1回きりの相談・一時停止後に人間の回答を踏まえて再開した議論、のいずれ
+    であっても)がまとめた計画テキストを受け取り、タスク分解・実装・レビュー
+    フェーズへ橋渡しする、正常系の共通処理。
+
+    `_ask_organization_collaborate`が一発で合意に達した場合と、一時停止
+    からの再開(`_resume_organization_collaborate`)が合意(または単独での
+    計画確定)に達した場合の両方から呼ばれ、同じ実装フェーズに合流させる。
+    """
     tasks = _parse_module_breakdown(answer)
     if not tasks:
         print("設計担当の回答からファイル分割案を読み取れませんでした。上記の回答内容を確認してください。")
@@ -4728,7 +4840,7 @@ def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str,
 
     # 仮の判断: 生成物はYoriai本体と混ざらないよう、projects/<プロジェクト名>/
     # というサブディレクトリにまとめる(プロジェクト名からのディレクトリ
-    # 解決自体は、対話プロトコル用に関数冒頭で既に済んでいる)。
+    # 解決自体は、対話プロトコル用に呼び出し元で既に済んでいる)。
     print(f"[📁 生成物の保存先: {project_dir}]")
 
     _run_collaborative_project(
@@ -4740,6 +4852,95 @@ def _ask_organization_collaborate(port: int, org_fingerprint: str, request: str,
     # 呼ばない(依頼の要件5: 手動実行はこの試行回数カウンタと無関係に
     # 何度でもできるようにする、という区別を素直に実装するため)。
     _maybe_auto_resume(project_dir, port, org_fingerprint)
+
+
+def _ask_organization_collaborate(
+    port: int, org_fingerprint: str, request: str, out_dir: str, enable_dialogue: bool = False,
+    pending_box: "_PendingDesignDialogueBox" = None,
+) -> None:
+    """「〇〇を作って」のような制作依頼用: まず優先順位が最も高い1台に
+    モジュール分割案とインターフェース設計を相談し(合意フェーズ)、
+    その結果をタスクキュー方式(`_run_collaborative_task_queue`)で異なる
+    メンバーに実装・相互レビューさせる。タスク数がメンバー数を超えても、
+    メンバーの手が空くたびに次のタスクが割り当てられるため、最終的に
+    全タスクが実装される。
+
+    仮の判断:
+    - 「設計担当」の選び方は他の候補選びと同じ優先順位ロジック
+      (コーディング系タスクとして最優先の候補)をそのまま流用する。
+      設計専用のモデルを分けて選ぶ仕組みは今回のスコープ外。
+    - 設計担当の回答が期待した形式(「ファイル名: 内容」の行)で
+      1件も得られなかった場合は、その旨と回答全文を表示して中断する
+      (フォーマットの自動修正・再質問までは今回のスコープ外)。
+
+    `enable_dialogue=True`の場合、単一の設計担当への1回きりの相談では
+    なく、対話プロトコル(`_run_dialogue`)による複数ノード・複数
+    ラウンドの合意形成を経て計画を決める(依頼の「計画フェーズでの
+    利用」)。既定は`False`のまま(既存の呼び出し元・テストとの後方
+    互換性のため)で、対話モードのREPLから`//agree`・自動判定経由で
+    呼ばれる際にのみ`True`を渡す。
+
+    `pending_box`(既定`None`)を渡すと、対話プロトコルがセーフティ
+    リミット・人間の確認待ちで一時停止した場合に、再開に必要な情報
+    (`_PendingDesignDialogue`)をそこへ格納する。`_run_repl_client`は
+    これを使って、次の人間の発言を「一時停止への回答」として合意フェーズ
+    に合流させる(`_resume_organization_collaborate`)。
+    """
+    data = _fetch_org_snapshot(port, org_fingerprint)
+    if data is None:
+        return
+
+    candidates = _select_chat_candidates(data.get("self", {}), data.get("peers", []), port, TASK_TYPE_CODING)
+    if not candidates:
+        print("組織内にロード済みモデルを持つメンバーがいません。")
+        return
+
+    architect = candidates[0]
+
+    # 仮の判断: プロジェクトディレクトリは、対話プロトコルによる議事録・
+    # 要約の保存先としても使うため、設計フェーズより前にここで確定させる
+    # (後段で改めて`_resolve_project_dir`を呼び直すと、対話ログの保存で
+    # 既にディレクトリが作られてしまっているために連番がずれて、生成物と
+    # 対話ログが別のディレクトリに散らばってしまう)。
+    projects_root = os.path.join(out_dir, PROJECTS_SUBDIR_NAME)
+    project_name = _project_name_with_date_prefix(request)
+    project_dir = _resolve_project_dir(projects_root, project_name)
+
+    if enable_dialogue:
+        answer, aborted, dialogue_result = _run_design_dialogue(org_fingerprint, request, candidates, project_dir)
+        if aborted:
+            if pending_box is not None and dialogue_result["status"] in (
+                DIALOGUE_STATUS_NEEDS_HUMAN, DIALOGUE_STATUS_SAFETY_LIMIT,
+            ):
+                pending_box.set(_PendingDesignDialogue(
+                    port, org_fingerprint, request, candidates, project_dir, dialogue_result,
+                ))
+            return
+    else:
+        print(
+            f"[🧭 合意フェーズ開始: まず {architect['label']} (モデル: {architect['model']}) に"
+            f"モジュール分割案とインターフェース設計を相談しています...]"
+        )
+        breakdown_prompt = _build_module_breakdown_prompt(request)
+        answer, error, truncated = _collect_answer_from_candidate(
+            architect, org_fingerprint, [{"role": "user", "content": breakdown_prompt}],
+        )
+        if error:
+            print(f"設計担当への問い合わせに失敗しました: {error}")
+            return
+        if not answer:
+            print("設計担当から応答が得られませんでした。")
+            return
+        if truncated:
+            print(f"[⚠️ 設計担当の応答が長すぎたため、{CHAT_MAX_OUTPUT_TOKENS}トークンで打ち切られました。以下は不完全な内容の可能性があります]")
+
+        # 仮の判断: 解析後の内容だけでなく、設計担当の回答そのもの(生テキスト)も
+        # 表示する。パース処理(_parse_module_breakdown)の解釈が意図と異なって
+        # いないか、実機での動作確認時に見比べられるようにするため。
+        print(f"[🧭 {architect['label']} の回答(合意フェーズの結果、そのまま表示)]")
+        print(answer)
+
+    _run_collaborate_implementation_phase(request, answer, candidates, org_fingerprint, project_dir, port)
 
 
 def _run_collaborative_project(
@@ -7420,8 +7621,25 @@ class _StdoutTee:
 
 
 def _truncate_for_history(text: str, limit: int = _BACKGROUND_JOB_HISTORY_TRUNCATE_CHARS) -> str:
+    """会話履歴に積む前に、長すぎる出力を`limit`文字までに切り詰める。
+
+    仮の判断(不具合修正: `_last_turn_is_dialogue_pause`が長い対話の後の
+    一時停止を検出できない問題への対応): 単純に先頭`limit`文字だけを
+    残すと、対話プロトコルの一時停止を示すマーカー
+    (`_DIALOGUE_PAUSE_HUMAN_JUDGEMENT_MARKER`)は`_report_dialogue_result`
+    により出力の末尾付近に印字されるため、議事録が長い(=このマーカーが
+    `limit`文字より後ろに来る)場合に丸ごと切り捨てられてしまい、次の
+    ターンで「一時停止直後の発言かどうか」を会話履歴から判別できなく
+    なる。マーカーが含まれる場合は、先頭部分を短縮してでもマーカー以降を
+    必ず残す。
+    """
     if len(text) <= limit:
         return text
+    marker_pos = text.find(_DIALOGUE_PAUSE_HUMAN_JUDGEMENT_MARKER)
+    if marker_pos != -1:
+        tail = text[marker_pos:]
+        head_limit = max(limit - len(tail), 0)
+        return text[:head_limit] + "\n... (中略。会話履歴への記録の一部を省略しましたが、対話プロトコルの一時停止に関するメッセージは末尾に保持しています)\n" + tail
     return text[:limit] + f"\n... (以下省略。会話履歴への記録は先頭{limit}文字まで。詳細は実際の出力・議事録ファイルを参照してください)"
 
 
@@ -7641,7 +7859,8 @@ def _format_startup_banner(out_dir: str, member_count, use_color: bool) -> str:
         "",
         _ansi("コマンド", _ANSI_BOLD, use_color=use_color),
         "  (コマンドを付けずに話しかけると、単発/比較/協業のどのモードかを自動判断します)",
-        "  (対話プロトコルの一時停止直後の発言は、自動的に会話の続きとして扱われます)",
+        "  (//agreeの一時停止直後の発言は合意フェーズの続きとして扱われ、合意でき",
+        "   次第そのまま実装に進みます。それ以外の一時停止は会話の続きとして扱われます)",
         f"  {MULTI_QUERY_COMMAND} <質問文>: 空きリソース上位{MULTI_QUERY_TARGET_COUNT}台に同時に質問",
         f"  {AGREE_COMMAND} <制作依頼>: 対話プロトコルによる事前すり合わせを経て協業モードで実装",
         f"  {PLAN_ONLY_COMMAND} <依頼>: 対話プロトコルで計画のみ議論し、実装せず計画書を出力",
@@ -7710,6 +7929,14 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
         # 発言はこれが有効な間、優先的にそのプロジェクトへの継続的な修正
         # 依頼として扱う(詳細は`_FixSession`・`_begin_fix_session`を参照)。
         fix_session = None
+        # 仮の判断(不具合修正: 対話プロトコル一時停止後、実装フェーズに
+        # 繋がらない問題への対応): //agreeの合意フェーズ(対話プロトコル)が
+        # セーフティリミット・人間の確認待ちで一時停止した場合、
+        # `_ask_organization_collaborate`(バックグラウンドジョブとして実行
+        # される)がこの箱へ再開に必要な情報を格納する。次の人間の発言が
+        # 来た時点でこの箱を確認し、値があれば「一時停止への回答」として
+        # 合意フェーズを続きから再開する(`_resume_organization_collaborate`)。
+        pending_design_box = _PendingDesignDialogueBox()
         while True:
             text, terminate = _read_multiline_input(session, interrupt_guard)
             if terminate:
@@ -7721,6 +7948,19 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                     "操作がしばらく無かったため)]"
                 )
                 fix_session = None
+
+            # 仮の判断: 一時停止中の合意フェーズがある状態で、人間が明示的な
+            # コマンド(//agree・//fix等)を新たに入力した場合は、「今の一時
+            # 停止への回答」ではなく別の新しい指示だと判断できるため、再開待ち
+            # 状態を破棄する(新規の//agreeが進行中の修正セッションを終了
+            # させるのと同じ考え方)。
+            if pending_design_box.peek() is not None and (
+                text.startswith(RESUME_ALL_COMMAND) or text.startswith(AGREE_COMMAND)
+                or text.startswith(PLAN_ONLY_COMMAND) or text.startswith(FIX_PROJECT_COMMAND)
+                or text.startswith(PARALLEL_QUERY_COMMAND) or text.startswith(MULTI_QUERY_COMMAND)
+            ):
+                pending_design_box.take()
+                print("[🧭 新しいコマンドが入力されたため、一時停止中だった合意フェーズの再開待ちを終了しました]")
 
             if text.startswith(RESUME_ALL_COMMAND):
                 job_runner.submit(
@@ -7749,6 +7989,7 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                         messages, text,
                         lambda: _ask_organization_collaborate(
                             port, org_fingerprint, request, out_dir, enable_dialogue=True,
+                            pending_box=pending_design_box,
                         ),
                     ),
                     queued_notice=_BACKGROUND_QUEUED_NOTICE,
@@ -7829,6 +8070,25 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                 fix_session = None
                 continue
 
+            # 仮の判断(不具合修正: 対話プロトコル一時停止後、実装フェーズに
+            # 繋がらない問題への対応): //agreeの合意フェーズが一時停止した
+            # 直後であれば、`_last_turn_is_dialogue_pause`によるテキストの
+            # マーカー判定を待たず、構造化された再開情報(`pending_design_box`)を
+            # 優先的に使う。この発言を一時停止への回答として合意フェーズを
+            # 続きから再開し、合意(または単独での計画確定)が得られ次第その
+            # まま実装フェーズへ進む(`_resume_organization_collaborate`)。
+            pending_design = pending_design_box.take()
+            if pending_design is not None:
+                print("[💬 対話プロトコルの一時停止直後の発言のため、合意フェーズを続きから再開します]")
+                job_runner.submit(
+                    lambda pending=pending_design, text=text: _run_job_with_conversation_log(
+                        messages, text,
+                        lambda: _resume_organization_collaborate(pending, text),
+                    ),
+                    queued_notice=_BACKGROUND_QUEUED_NOTICE,
+                )
+                continue
+
             if _last_turn_is_dialogue_pause(messages):
                 print("[💬 対話プロトコルの一時停止直後の発言のため、会話の続きとして扱います]")
                 mode = EXECUTION_MODE_SINGLE
@@ -7842,6 +8102,7 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                         messages, text,
                         lambda: _ask_organization_collaborate(
                             port, org_fingerprint, text, out_dir, enable_dialogue=True,
+                            pending_box=pending_design_box,
                         ),
                     ),
                     queued_notice=_BACKGROUND_QUEUED_NOTICE,

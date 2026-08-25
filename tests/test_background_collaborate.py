@@ -27,6 +27,7 @@ Claude Code等のツールのように「処理はバックグラウンドで進
 import contextlib
 import io
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -267,6 +268,117 @@ def test_followup_right_after_a_dialogue_pause_is_not_reclassified():
     assert calls["ask_single"] == 1, calls
 
 
+def test_followup_right_after_a_design_dialogue_pause_resumes_instead_of_single_question():
+    """不具合修正の回帰検知(対話プロトコル一時停止後、実装フェーズに
+    繋がらない不具合、パターンA): //agreeの合意フェーズが構造化された
+    再開情報(`pending_box`)を残して一時停止した場合、直後の発言は単発
+    質問(`_ask_organization`)にはルーティングされず、合意フェーズの再開
+    (`_resume_organization_collaborate`)にルーティングされることを確認
+    する。
+
+    仮の判断: `_run_repl_with_keys`(全キーストロークを起動前に一括で
+    パイプへ送り込む既存の共通ハーネス)をそのまま使うと、「一時停止を
+    知らせるバックグラウンドジョブの完了」と「2件目の発言の読み取り」の
+    間に本質的な競合(どちらが先に進むかはOSのスレッドスケジューリング
+    次第)が生じ、テストとして不安定になる(既存の類似テスト
+    `test_followup_right_after_a_dialogue_pause_is_not_reclassified`も
+    同じ競合を抱えている)。この不具合修正の回帰検知としては安定して
+    動作させたいため、`_run_repl_client`を別スレッドで動かし、1件目の
+    ジョブが完了した(`paused_ready`が立った)ことを確認してから2件目の
+    キー入力を送り込むことで、競合を避けて決定的にする。
+    """
+    calls = {"classify": 0, "ask_single": 0, "ask_collaborate": 0, "resume_organization_collaborate": 0}
+    paused_ready = threading.Event()
+
+    original_create_session = yoriai._create_repl_prompt_session
+    original_create_runner = yoriai._create_background_job_runner
+    original_classify = yoriai._classify_execution_mode
+    original_ask = yoriai._ask_organization
+    original_ask_collaborate = yoriai._ask_organization_collaborate
+    original_resume_organization_collaborate = yoriai._resume_organization_collaborate
+
+    def spy_classify(text, out_dir=None):
+        calls["classify"] += 1
+        return original_classify(text, out_dir)
+
+    def stub_ask(*args, **kwargs):
+        calls["ask_single"] += 1
+
+    def stub_ask_collaborate(port, org_fingerprint, request, out_dir, enable_dialogue=False, pending_box=None):
+        calls["ask_collaborate"] += 1
+        pending = yoriai._PendingDesignDialogue(
+            port, org_fingerprint, request, [{"label": "設計担当"}], "/tmp/fake-project-dir",
+            {
+                "status": yoriai.DIALOGUE_STATUS_NEEDS_HUMAN, "transcript": [], "summary": "",
+                "human_message": "方向性を決めてください。",
+            },
+        )
+        pending_box.set(pending)
+        print(yoriai._DIALOGUE_PAUSE_HUMAN_JUDGEMENT_MARKER)
+        paused_ready.set()
+
+    def stub_resume_organization_collaborate(*args, **kwargs):
+        calls["resume_organization_collaborate"] += 1
+
+    yoriai._classify_execution_mode = spy_classify
+    yoriai._ask_organization = stub_ask
+    yoriai._ask_organization_collaborate = stub_ask_collaborate
+    yoriai._resume_organization_collaborate = stub_resume_organization_collaborate
+
+    runner_holder = {}
+
+    def fake_create_runner():
+        runner = original_create_runner()
+        runner_holder["runner"] = runner
+        return runner
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_design_pause_resume_repl_test_")
+    buf = io.StringIO()
+    try:
+        with create_pipe_input() as pipe_input:
+            def fake_create_session():
+                return PromptSession(
+                    input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
+                )
+
+            yoriai._create_repl_prompt_session = fake_create_session
+            yoriai._create_background_job_runner = fake_create_runner
+
+            def run_client():
+                with contextlib.redirect_stdout(buf):
+                    yoriai._run_repl_client(47120, "fingerprint", out_dir)
+
+            thread = threading.Thread(target=run_client)
+            thread.start()
+            try:
+                pipe_input.send_text(f"{yoriai.AGREE_COMMAND} ToDoリストを作って" + _SUBMIT)
+                assert paused_ready.wait(timeout=5), "合意フェーズの一時停止(バックグラウンドジョブ)がタイムアウトしました"
+                runner_holder["runner"].join()
+                pipe_input.send_text("方向性はAでお願いします" + _SUBMIT + "exit" + _SUBMIT)
+                thread.join(timeout=5)
+                assert not thread.is_alive(), "対話モードがexitで終了しませんでした"
+                runner_holder["runner"].join()
+            finally:
+                yoriai._create_repl_prompt_session = original_create_session
+                yoriai._create_background_job_runner = original_create_runner
+    finally:
+        yoriai._classify_execution_mode = original_classify
+        yoriai._ask_organization = original_ask
+        yoriai._ask_organization_collaborate = original_ask_collaborate
+        yoriai._resume_organization_collaborate = original_resume_organization_collaborate
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+    output = buf.getvalue()
+    assert "対話モードを終了します。" in output, output
+    assert "[💬 対話プロトコルの一時停止直後の発言のため、合意フェーズを続きから再開します]" in output, output
+    assert calls["classify"] == 0, calls
+    assert calls["ask_collaborate"] == 1, calls
+    # 単発質問(_ask_organization)ではなく、合意フェーズの再開へルーティング
+    # されるはずです(不具合修正前は誤ってask_singleへ流れていた)。
+    assert calls["ask_single"] == 0, calls
+    assert calls["resume_organization_collaborate"] == 1, calls
+
+
 def test_parallel_command_is_backgrounded():
     output, calls, runner, restore = _run_repl_with_keys(
         f"{yoriai.PARALLEL_QUERY_COMMAND} a.py:aを作って" + _SUBMIT + "exit" + _SUBMIT,
@@ -370,6 +482,7 @@ def main():
         test_agree_command_returns_to_prompt_before_the_job_finishes,
         test_auto_classified_collaborate_mode_is_also_backgrounded,
         test_followup_right_after_a_dialogue_pause_is_not_reclassified,
+        test_followup_right_after_a_design_dialogue_pause_resumes_instead_of_single_question,
         test_parallel_command_is_backgrounded,
         test_resume_all_command_is_backgrounded,
         test_second_agree_while_first_still_running_shows_queued_notice,
