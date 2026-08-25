@@ -6914,6 +6914,18 @@ _COMPARE_MODE_KEYWORDS = (
 # 場合にのみこの判定を有効にする。
 _FIX_PROJECT_MODE_KEYWORDS = ("直して", "修正して", "直したい", "修正したい", "なおして")
 
+# 仮の判断: 「バグを直して」のような明示的な修正依頼ではなく、既存
+# プロジェクトへの作業継続・追加実装を求める自然な言い回し(「では作業
+# してください」「充実させて」等)を拾うためのキーワード。これらは
+# 「作って」等の新規制作キーワードとは重ならないため、既存プロジェクトが
+# 実在する場合に限り`_FIX_PROJECT_MODE_KEYWORDS`と同様の扱い(FIX_PROJECT
+# モード)にする。実在しない場合にまで倒すと空振りになる点も同様のため、
+# 同じガード(`out_dir`にプロジェクトが実在する場合のみ有効)を共有する。
+_CONTINUE_PROJECT_MODE_KEYWORDS = (
+    "作業して", "作業をして", "作業を進めて", "進めて", "進めてください",
+    "充実させて", "続けて", "続きをやって", "取り組んで", "実装して", "仕上げて",
+)
+
 
 def _has_any_completed_projects(out_dir: str) -> bool:
     projects_root = os.path.join(out_dir, PROJECTS_SUBDIR_NAME)
@@ -6932,16 +6944,20 @@ def _classify_execution_mode(text: str, out_dir: str = None) -> str:
     判定する。
 
     仮の判断: キーワードベースの単純な判定にとどめる。既存プロジェクトへの
-    修正依頼キーワード(「直して」等)を最優先で確認するが、これは
-    `out_dir`が渡され、かつ完成済みのプロジェクトが実際に1件以上
-    存在する場合のみ有効にする(`out_dir`省略時はこの判定を行わない。
-    既存の呼び出し元・テストとの後方互換のための既定値)。次に協業系
-    キーワード(「作って」等)、その次に比較系キーワード(「意見を聞かせて」等)を
-    確認する。どれにも該当しなければ単発モードとする。
+    修正依頼キーワード(「直して」等)・作業継続キーワード(「作業して」
+    「充実させて」等)を最優先で確認するが、これは`out_dir`が渡され、
+    かつ完成済みのプロジェクトが実際に1件以上存在する場合のみ有効にする
+    (`out_dir`省略時はこの判定を行わない。既存の呼び出し元・テストとの
+    後方互換のための既定値)。次に協業系キーワード(「作って」等)、その次に
+    比較系キーワード(「意見を聞かせて」等)を確認する。どれにも該当しなければ
+    単発モードとする。
     """
-    if out_dir is not None:
+    if out_dir is not None and _has_any_completed_projects(out_dir):
         for keyword in _FIX_PROJECT_MODE_KEYWORDS:
-            if keyword in text and _has_any_completed_projects(out_dir):
+            if keyword in text:
+                return EXECUTION_MODE_FIX_PROJECT
+        for keyword in _CONTINUE_PROJECT_MODE_KEYWORDS:
+            if keyword in text:
                 return EXECUTION_MODE_FIX_PROJECT
     for keyword in _COLLABORATE_MODE_KEYWORDS:
         if keyword in text:
