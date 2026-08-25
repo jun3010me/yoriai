@@ -20,6 +20,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import tools  # noqa: E402
 import yoriai  # noqa: E402
 
 
@@ -63,9 +64,9 @@ def test_web_search_queries_searxng_json_api_with_expected_params():
     finally:
         yoriai.requests.get = original
 
-    assert captured["url"] == f"{yoriai.SEARXNG_BASE_URL}/search", captured["url"]
+    assert captured["url"] == f"{tools.SEARXNG_BASE_URL}/search", captured["url"]
     assert captured["params"] == {"q": "obsidian markdown", "format": "json"}, captured["params"]
-    assert captured["timeout"] == (yoriai.CHAT_CONNECT_TIMEOUT_SEC, yoriai.WEB_SEARCH_TIMEOUT_SEC), captured["timeout"]
+    assert captured["timeout"] == (yoriai.CHAT_CONNECT_TIMEOUT_SEC, tools.WEB_SEARCH_TIMEOUT_SEC), captured["timeout"]
 
 
 def test_web_search_maps_content_field_to_snippet():

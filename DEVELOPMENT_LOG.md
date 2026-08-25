@@ -4036,3 +4036,70 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   直前のプロジェクトへの修正セッションとして継続することを確認する
   テストを追加した。既存の全テストファイル(36ファイル)を実行し、
   リグレッションが無いことを確認した。
+- **モジュール分割 第一弾: `tools.py`の切り出し(web_search・プロジェクト
+  ファイル操作ツール群)**。`yoriai.py`(約9,630行)が単一ファイルに全機能を
+  持つ状態が続いており、今後の改修(num_ctx指定・edit_fileツールの強化・
+  統合検証ループ・リサーチフェーズ新設等)に備え、依存が少なく独立性の
+  高い塊から段階的にモジュール分割することにした。1PR=1モジュール分割、
+  ロジック変更なし(コピー＆import配線の変更のみ)の方針で、第一弾として
+  以下を`yoriai.py`から`tools.py`(新設)へ移動した。
+  - web_search関連: `WEB_SEARCH_TOOL_NAME`・`WEB_SEARCH_TOOL_SCHEMA`・
+    `WEB_SEARCH_MAX_RESULTS`・`WEB_SEARCH_TIMEOUT_SEC`・`SEARXNG_BASE_URL`・
+    `_looks_like_tools_related_error`・`web_search`・`_execute_tool_call`。
+  - プロジェクトファイル操作ツール群: `_resolve_safe_project_path`・
+    `_project_relpath`・`_list_project_directory`・
+    `_syntax_check_result_fields`・`_write_project_file`・
+    `_edit_project_file`・`_move_project_file`・`_delete_project_file`・
+    `_make_project_directory`・`_validate_run_command`・
+    `_run_subprocess_with_output_cap`・`_check_html_with_playwright`・
+    `_run_project_command`・`_execute_project_tool_call`・
+    `_mutated_filename_from_tool_result`・`_collect_answer_with_project_tools`・
+    `_syntax_check_all_files`・`_ask_organization_multi`(付随するツール
+    スキーマ・`PROJECT_TOOLS_SCHEMAS`/`PROJECT_TOOLS_CLIENT_NAMES`を含む)。
+  - 分割の過程で、`tools.py`側の関数と`yoriai.py`側にまだ残っている関数
+    (今回は移動しない範囲)との間で双方向の依存関係が見つかった箇所は、
+    循環importを避けるため新設の`yoriai_types.py`に共有の定数・ツール
+    スキーマ(`CHAT_CONNECT_TIMEOUT_SEC`・`CHAT_MAX_OUTPUT_TOKENS`・
+    `MULTI_QUERY_TARGET_COUNT`・`PROGRESS_FILENAME`・`READ_FILE_TOOL_NAME`・
+    `READ_FILE_TOOL_SCHEMA`・`SEARCH_IN_FILE_TOOL_NAME`・
+    `SEARCH_IN_FILE_TOOL_SCHEMA`)を切り出し、両側からimportする形で解消
+    した。逆に`tools.py`側の関数が、まだ`yoriai.py`に残っている関数
+    (`_check_file_syntax`・`_list_project_files`・`_print_tagged`・
+    `_read_project_file_fresh`・`_search_in_project_file`・
+    `_planned_filenames_from_progress`・`_parse_progress_markdown`・
+    `_write_progress_md`・`_fetch_org_snapshot`・`_classify_task`・
+    `_select_chat_candidates`・`_selection_reason_label`・
+    `_stream_chat_from_candidate`・`_collect_answer_from_candidate`)を
+    呼ぶ必要がある箇所は、モジュールのトップレベルではなく関数内部での
+    遅延import(`from yoriai import ...`を呼び出し時に行う)で解消した
+    (両モジュールの読み込みが完了した後に呼ばれるため問題なく解決できる)。
+  - `yoriai.py`側は、他のコードから引き続き呼ばれる`tools.py`側の関数・
+    定数(`web_search`・`_execute_tool_call`・`_looks_like_tools_related_error`・
+    `WEB_SEARCH_TOOL_NAME`・`WEB_SEARCH_TOOL_SCHEMA`・
+    `_resolve_safe_project_path`・`_write_project_file`・
+    `_run_project_command`・`_collect_answer_with_project_tools`・
+    `_syntax_check_all_files`・`_ask_organization_multi`・
+    `PROJECT_TOOLS_SCHEMAS`・`PROJECT_TOOLS_CLIENT_NAMES`)をファイル冒頭で
+    `from tools import (...)`と明示import した(`import *`は使っていない)。
+    移動した箇所には元の位置にコメントのみ残した。
+  - 分割に伴い、テスト側で`yoriai.<関数名>`のように直接参照・monkeypatch
+    していた箇所のうち、`tools.py`に移動して`yoriai.py`から再export
+    されなくなった名前(`_edit_project_file`・`_move_project_file`・
+    `_delete_project_file`・`_make_project_directory`・
+    `_list_project_directory`・`_execute_project_tool_call`・
+    `_validate_run_command`・`_run_subprocess_with_output_cap`・
+    `_check_html_with_playwright`・`RUN_COMMAND_TOOL_NAME`・
+    `EDIT_FILE_TOOL_NAME`・`EDIT_FILE_TOOL_SCHEMA`・`SEARXNG_BASE_URL`・
+    `WEB_SEARCH_TIMEOUT_SEC`)は、`tests/test_edit_file.py`・
+    `tests/test_fix_project.py`・`tests/test_run_command.py`・
+    `tests/test_web_search.py`・`tests/test_web_search_visibility.py`で
+    `tools.<関数名>`を参照するようにimport文・参照箇所のみ修正した
+    (テストの中身・アサーションは変更していない)。特に
+    `test_web_search_visibility.py`の`web_search`のmonkeypatchは、
+    `_execute_tool_call`が`tools.py`内部で`web_search`をバインドして
+    呼ぶようになったため、`yoriai.web_search`ではなく`tools.web_search`
+    を差し替える必要があった。
+  - 動作確認: `python3 -m pytest tests/`が479件全てパス。`python3 -c
+    "import tools"`・`python3 -c "import yoriai_types"`・`python3 -c
+    "import yoriai"`がいずれもエラー無く成功することを確認した。
+    `yoriai.py`は9,630行から8,430行(約1,200行減)になった。

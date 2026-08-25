@@ -28,6 +28,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import tools  # noqa: E402
 import yoriai  # noqa: E402
 
 
@@ -53,27 +54,27 @@ def _uninstall_fake_playwright():
 
 def test_validate_run_command_rejects_network_tools():
     for cmd in ("curl http://example.com", "wget http://example.com", "ssh host", "scp a b", "git push"):
-        argv, error = yoriai._validate_run_command(cmd)
+        argv, error = tools._validate_run_command(cmd)
         assert argv is None, (cmd, argv)
         assert error is not None, cmd
 
 
 def test_validate_run_command_rejects_destructive_file_ops():
     for cmd in ("rm -rf /", "mv a.py b.py", "cp a.py b.py", "dd if=/dev/zero"):
-        argv, error = yoriai._validate_run_command(cmd)
+        argv, error = tools._validate_run_command(cmd)
         assert argv is None, (cmd, argv)
         assert "write_file" in error or "move_file" in error or "delete_file" in error, error
 
 
 def test_validate_run_command_rejects_privilege_escalation():
-    argv, error = yoriai._validate_run_command("sudo rm -rf /")
+    argv, error = tools._validate_run_command("sudo rm -rf /")
     assert argv is None, argv
     assert error is not None
 
 
 def test_validate_run_command_rejects_shell_invocation():
     for cmd in ("bash -c 'rm -rf /'", "sh script.sh", "cd /tmp"):
-        argv, error = yoriai._validate_run_command(cmd)
+        argv, error = tools._validate_run_command(cmd)
         assert argv is None, (cmd, argv)
 
 
@@ -83,26 +84,26 @@ def test_validate_run_command_rejects_wrapper_bypass_commands():
     確認する。
     """
     for cmd in ("env curl http://example.com", "timeout 5 curl http://example.com", "xargs rm -rf"):
-        argv, error = yoriai._validate_run_command(cmd)
+        argv, error = tools._validate_run_command(cmd)
         assert argv is None, (cmd, argv)
 
 
 def test_validate_run_command_rejects_shell_metacharacters():
     for cmd in ("python3 a.py; rm -rf /", "python3 a.py && rm -rf /", "python3 a.py | tee out",
                 "python3 a.py > out.txt", "echo `whoami`", "echo $(whoami)"):
-        argv, error = yoriai._validate_run_command(cmd)
+        argv, error = tools._validate_run_command(cmd)
         assert argv is None, (cmd, argv)
 
 
 def test_validate_run_command_rejects_absolute_and_traversal_paths():
-    argv, error = yoriai._validate_run_command("python3 /etc/passwd")
+    argv, error = tools._validate_run_command("python3 /etc/passwd")
     assert argv is None, argv
-    argv, error = yoriai._validate_run_command("gcc ../../evil.c -o ../../evil")
+    argv, error = tools._validate_run_command("gcc ../../evil.c -o ../../evil")
     assert argv is None, argv
 
 
 def test_validate_run_command_rejects_interpreter_inline_eval_flags():
-    argv, error = yoriai._validate_run_command("python3 -c 'import os; os.system(\"ls\")'")
+    argv, error = tools._validate_run_command("python3 -c 'import os; os.system(\"ls\")'")
     assert argv is None, argv
     # 仮の判断(統合検証ループへの対応): -mは全面禁止から「許可リストに
     # あるモジュールのみ通す」方式に緩和したため、許可リストに無い
@@ -110,9 +111,9 @@ def test_validate_run_command_rejects_interpreter_inline_eval_flags():
     # 使って引き続き拒否されることを確認する。python3 -m pytest等の
     # 許可されるケースはtest_validate_run_command_allows_python_dash_m_
     # for_allowlisted_modulesで確認する。
-    argv, error = yoriai._validate_run_command("python3 -m os")
+    argv, error = tools._validate_run_command("python3 -m os")
     assert argv is None, argv
-    argv, error = yoriai._validate_run_command("node -e 'console.log(1)'")
+    argv, error = tools._validate_run_command("node -e 'console.log(1)'")
     assert argv is None, argv
 
 
@@ -121,8 +122,8 @@ def test_validate_run_command_allows_python_dash_m_for_allowlisted_modules():
     ような正当な検証手段は、-mの直後のモジュール名が許可リスト
     (_PYTHON_ALLOWED_MODULES)にあれば通ることを確認する。
     """
-    assert yoriai._validate_run_command("python3 -m pytest") == (["python3", "-m", "pytest"], None)
-    assert yoriai._validate_run_command("python3 -m py_compile app.py") == (
+    assert tools._validate_run_command("python3 -m pytest") == (["python3", "-m", "pytest"], None)
+    assert tools._validate_run_command("python3 -m py_compile app.py") == (
         ["python3", "-m", "py_compile", "app.py"], None,
     )
 
@@ -132,7 +133,7 @@ def test_validate_run_command_rejects_python_dash_m_for_disallowed_modules():
     引き続き拒否されることを確認する(-mの全面禁止から条件付き許可への
     緩和が、無条件の許可になっていないことの確認)。
     """
-    argv, error = yoriai._validate_run_command("python3 -m os")
+    argv, error = tools._validate_run_command("python3 -m os")
     assert argv is None, argv
     assert error is not None and "os" in error, error
 
@@ -141,7 +142,7 @@ def test_validate_run_command_does_not_block_gccs_unrelated_dash_c_flag():
     """gccの-c(リンクなしコンパイル)は、python3の-c(インラインコード
     実行)とは無関係の正当なフラグであり、誤って禁止されないことを確認する。
     """
-    argv, error = yoriai._validate_run_command("gcc -c calc.c -o calc.o")
+    argv, error = tools._validate_run_command("gcc -c calc.c -o calc.o")
     assert argv == ["gcc", "-c", "calc.c", "-o", "calc.o"], (argv, error)
     assert error is None, error
 
@@ -151,12 +152,12 @@ def test_validate_run_command_accepts_flexible_validation_commands():
     適切なコマンドを選んで実行できることを確認する(拡張子ごとの決め打ち
     ではなく、任意のコマンドとして受理される)。
     """
-    assert yoriai._validate_run_command("python3 app.py") == (["python3", "app.py"], None)
-    assert yoriai._validate_run_command("node --check app.js") == (["node", "--check", "app.js"], None)
-    assert yoriai._validate_run_command("gcc -fsyntax-only calc.c") == (["gcc", "-fsyntax-only", "calc.c"], None)
-    assert yoriai._validate_run_command("pytest") == (["pytest"], None)
-    assert yoriai._validate_run_command("check_html index.html") == (["check_html", "index.html"], None)
-    assert yoriai._validate_run_command("./calc") == (["./calc"], None)
+    assert tools._validate_run_command("python3 app.py") == (["python3", "app.py"], None)
+    assert tools._validate_run_command("node --check app.js") == (["node", "--check", "app.js"], None)
+    assert tools._validate_run_command("gcc -fsyntax-only calc.c") == (["gcc", "-fsyntax-only", "calc.c"], None)
+    assert tools._validate_run_command("pytest") == (["pytest"], None)
+    assert tools._validate_run_command("check_html index.html") == (["check_html", "index.html"], None)
+    assert tools._validate_run_command("./calc") == (["./calc"], None)
 
 
 def test_validate_run_command_allows_unrecognized_validator_tools():
@@ -164,16 +165,16 @@ def test_validate_run_command_allows_unrecognized_validator_tools():
     検証ツールでも(ブロックリストに無ければ)自由に試せることを確認する
     (拡張子ごとの決め打ちホワイトリストをやめたことの裏返し)。
     """
-    assert yoriai._validate_run_command("html5validator index.html") == (
+    assert tools._validate_run_command("html5validator index.html") == (
         ["html5validator", "index.html"], None,
     )
-    assert yoriai._validate_run_command("tidy -q -e index.html") == (
+    assert tools._validate_run_command("tidy -q -e index.html") == (
         ["tidy", "-q", "-e", "index.html"], None,
     )
 
 
 def test_validate_run_command_rejects_empty_command():
-    argv, error = yoriai._validate_run_command("")
+    argv, error = tools._validate_run_command("")
     assert argv is None
     assert error is not None
 
@@ -190,7 +191,7 @@ def test_run_subprocess_with_output_cap_kills_infinite_loop_on_timeout():
     """
     out_dir = tempfile.mkdtemp(prefix="yoriai_run_command_test_")
     try:
-        returncode, output, timed_out = yoriai._run_subprocess_with_output_cap(
+        returncode, output, timed_out = tools._run_subprocess_with_output_cap(
             ["yes"], out_dir, timeout_sec=1, read_cap_chars=2000,
         )
         assert timed_out is True, (returncode, len(output), timed_out)
@@ -209,7 +210,7 @@ def test_run_subprocess_with_output_cap_kills_silent_hang_on_timeout():
     """
     out_dir = tempfile.mkdtemp(prefix="yoriai_run_command_test_")
     try:
-        returncode, output, timed_out = yoriai._run_subprocess_with_output_cap(
+        returncode, output, timed_out = tools._run_subprocess_with_output_cap(
             ["sleep", "5"], out_dir, timeout_sec=1, read_cap_chars=2000,
         )
         assert timed_out is True, (returncode, output, timed_out)
@@ -220,7 +221,7 @@ def test_run_subprocess_with_output_cap_kills_silent_hang_on_timeout():
 def test_run_subprocess_with_output_cap_returns_normally_when_fast():
     out_dir = tempfile.mkdtemp(prefix="yoriai_run_command_test_")
     try:
-        returncode, output, timed_out = yoriai._run_subprocess_with_output_cap(
+        returncode, output, timed_out = tools._run_subprocess_with_output_cap(
             ["echo", "hello"], out_dir, timeout_sec=5, read_cap_chars=2000,
         )
         assert timed_out is False, (returncode, output, timed_out)
@@ -324,8 +325,8 @@ def test_run_project_command_check_html_detects_console_error():
     # コンソールエラーの内容を個々のテストごとに変えたいので、
     # _check_html_with_playwright自体を差し替える(playwrightモジュールの
     # 差し込みだけでは検証したいエラー内容の制御がしづらいため)。
-    original = yoriai._check_html_with_playwright
-    yoriai._check_html_with_playwright = lambda path: ("error", "id 'preview-frame' not found")
+    original = tools._check_html_with_playwright
+    tools._check_html_with_playwright = lambda path: ("error", "id 'preview-frame' not found")
     out_dir = tempfile.mkdtemp(prefix="yoriai_run_command_test_")
     try:
         with open(os.path.join(out_dir, "index.html"), "w", encoding="utf-8") as f:
@@ -334,7 +335,7 @@ def test_run_project_command_check_html_detects_console_error():
         assert result["ok"] is False, result
         assert "preview-frame" in result["output"], result
     finally:
-        yoriai._check_html_with_playwright = original
+        tools._check_html_with_playwright = original
         _uninstall_fake_playwright()
         shutil.rmtree(out_dir, ignore_errors=True)
 
@@ -374,7 +375,7 @@ def test_execute_project_tool_call_dispatches_run_command():
             "id": "call_1", "type": "function",
             "function": {"name": "run_command", "arguments": {"command": "python3 app.py"}},
         }
-        result = json.loads(yoriai._execute_project_tool_call(out_dir, tool_call))
+        result = json.loads(tools._execute_project_tool_call(out_dir, tool_call))
         assert result["ok"] is True, result
         assert "hi" in result["output"], result
     finally:
@@ -385,7 +386,7 @@ def test_project_tools_schemas_use_run_command_not_run_test():
     tool_names = {schema["function"]["name"] for schema in yoriai.PROJECT_TOOLS_SCHEMAS}
     assert "run_command" in tool_names, tool_names
     assert "run_test" not in tool_names, tool_names
-    assert yoriai.RUN_COMMAND_TOOL_NAME in yoriai.PROJECT_TOOLS_CLIENT_NAMES
+    assert tools.RUN_COMMAND_TOOL_NAME in yoriai.PROJECT_TOOLS_CLIENT_NAMES
 
 
 def main():
