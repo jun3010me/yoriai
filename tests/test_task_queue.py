@@ -189,6 +189,67 @@ def test_reviewer_is_first_other_candidate_following_fixed_rule():
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
+def test_task_queue_saves_files_in_nested_subdirectories():
+    """タスクキュー方式の実装ワーカーが`_write_project_file`(既存の安全な
+    共通書き込み処理)を経由するようになったことで、`data/content.json`の
+    ようにサブディレクトリを含むファイル名(さらに`data/sub/deeper.json`の
+    ような多段のネストでも)、親ディレクトリが無くても自動的に作成され、
+    正しく保存できることを確認する(バグ報告: 以前は素朴な`open(..., "w")`
+    直書きだったため、親ディレクトリが存在せず`FileNotFoundError`で失敗
+    していた)。
+    """
+    tasks = [
+        ("data/content.json", "設定データを担当"),
+        ("data/sub/deeper.json", "ネストしたデータを担当"),
+    ]
+    candidate = _candidate("MacStudio(自分)", "qwen2.5-coder-32b")
+
+    output, out_dir, checklist = _run_queue(tasks, [candidate])
+    try:
+        assert os.path.isfile(os.path.join(out_dir, "data", "content.json")), (
+            f"サブディレクトリ内のファイルが保存されているはずです: {output}"
+        )
+        assert os.path.isfile(os.path.join(out_dir, "data", "sub", "deeper.json")), (
+            f"多段にネストしたサブディレクトリ内のファイルも保存されているはずです: {output}"
+        )
+        # メンバーが1台のみのためレビューはスキップされ「未完了」のまま残る
+        # (test_single_candidate_skips_review_but_leaves_review_task_incompleteと
+        # 同じ理由)。ここで確認したいのは実装(impl)側が完了していることのみ。
+        assert yoriai._incomplete_task_labels(checklist) == [
+            "data/content.json のレビュー", "data/sub/deeper.json のレビュー",
+        ], (
+            f"実装は完了し、レビューだけが未完了のまま残るはずです: {checklist}"
+        )
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_task_queue_rejects_path_traversal_filename():
+    """合意フェーズ(モデルの応答)が`../outside.txt`のようなパス
+    トラバーサルを狙ったファイル名を返してきた場合でも、タスクキュー方式の
+    実装ワーカーが`_write_project_file`経由になったことで
+    `_resolve_safe_project_path`のパストラバーサル対策が効き、
+    `out_dir`の外には一切書き込まれないことを確認する(修正前は
+    `os.path.join(project_dir, filename)`を素朴に`open`していたため、
+    この対策を経由しない抜け道になっていた)。
+    """
+    tasks = [("../outside.txt", "プロジェクト外への書き込みを試みる")]
+    candidate = _candidate("MacStudio(自分)", "qwen2.5-coder-32b")
+
+    output, out_dir, checklist = _run_queue(tasks, [candidate])
+    try:
+        forbidden_path = os.path.join(os.path.dirname(out_dir), "outside.txt")
+        assert not os.path.exists(forbidden_path), (
+            f"project_dirの外に書き込まれてはいけません: {forbidden_path}"
+        )
+        assert not os.listdir(out_dir), f"project_dir内にも何も保存されないはずです: {os.listdir(out_dir)}"
+        assert yoriai._incomplete_task_labels(checklist) == [
+            "../outside.txt の実装", "../outside.txt のレビュー",
+        ], checklist
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
 def test_single_candidate_skips_review_but_leaves_review_task_incomplete():
     """メンバーが1台しかいない場合、担当外のレビュー担当を選べないため、
     レビューはスキップされる(実装だけは行われる)。この場合、タスク
@@ -214,6 +275,8 @@ def main():
         test_single_worker_processes_queue_in_descending_weight_order,
         test_two_members_four_tasks_queue_completes_all_files_via_reassignment,
         test_reviewer_is_first_other_candidate_following_fixed_rule,
+        test_task_queue_saves_files_in_nested_subdirectories,
+        test_task_queue_rejects_path_traversal_filename,
         test_single_candidate_skips_review_but_leaves_review_task_incomplete,
     ]
     failures = 0
