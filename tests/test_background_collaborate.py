@@ -43,6 +43,21 @@ from prompt_toolkit.output import DummyOutput  # noqa: E402
 _SUBMIT = "\r"  # Enterキー単体(送信)
 
 
+def _wait_until(predicate, timeout=5, interval=0.02):
+    """`predicate()`が真になるまで短い間隔でポーリングする(`time.sleep`の
+    決め打ちではなく、実際に条件が満たされた時点で先に進めるようにする
+    ための共通ヘルパー)。タイムアウトしても例外は投げず、最後の判定結果を
+    そのまま返す(呼び出し元がその後のアサーションで詳細な失敗理由を
+    報告できるようにするため)。
+    """
+    deadline = time.monotonic() + timeout
+    result = predicate()
+    while not result and time.monotonic() < deadline:
+        time.sleep(interval)
+        result = predicate()
+    return result
+
+
 def test_background_job_runner_runs_job_without_blocking_submit():
     runner = yoriai._BackgroundJobRunner()
     started = threading.Event()
@@ -463,6 +478,157 @@ def test_followup_right_after_a_design_dialogue_pause_resumes_instead_of_single_
     assert calls["resume_organization_collaborate"] == 1, calls
 
 
+def test_second_followup_during_slow_resume_still_avoids_tool_less_single_chat():
+    """重大なバグ報告への対応の回帰検知: 「続けて」の後、実際のファイル
+    書き込みが一切行われず、write_file等のツールを持たない単発チャットの
+    文章だけで"完了したふり"になってしまう不具合。
+
+    再現条件: (1)`//agree`の合意フェーズが一時停止し、一時停止マーカーが
+    `messages`(会話履歴)に記録され`pending_box`にも再開情報が格納される、
+    (2)ユーザーが「続けて」を送ると、メインループはその場で同期的に
+    `pending_box.take()`して空にし、再開ジョブをバックグラウンドキューに
+    積む、(3)この再開ジョブが実際に`messages`へ「続けて」を追記する
+    (`_run_job_with_conversation_log`)より前に、ユーザーがさらに3件目の
+    発言を送る。
+
+    この場合、`pending_box`は既に空(2で消費済み)、かつ`messages`の
+    末尾はまだ一時停止マーカーのまま(3で再開ジョブの追記がまだ)という
+    状態になり、`_last_turn_is_dialogue_pause`は真と判定される。修正前は
+    ここでwrite_file等のツールを一切持たない単発質問(`_ask_organization`)
+    に落ちてしまっていたが、`_PendingDesignDialogueBox.last_project_dir()`
+    (`take()`後も保持され続ける)を使って、直前に一時停止していた
+    プロジェクトへの修正セッション(`_run_fix_on_project`、write_file等の
+    ツールを実際に持つ)として継続することを確認する。
+
+    仮の判断: この一瞬の競合状態を`time.sleep`頼みではなく決定的に
+    再現するため、`_run_job_with_conversation_log`自体を差し替え、
+    「続けて」ジョブに限って`messages`への追記の直前で
+    `threading.Event`により意図的に足止めする。
+    """
+    calls = {"ask_single": 0, "run_fix_on_project": 0, "project_dir": None, "request": None}
+    paused_ready = threading.Event()
+    resume_job_dequeued = threading.Event()
+    release_resume_job = threading.Event()
+
+    original_ask = yoriai._ask_organization
+    original_ask_collaborate = yoriai._ask_organization_collaborate
+    original_resume_organization_collaborate = yoriai._resume_organization_collaborate
+    original_run_fix_on_project = yoriai._run_fix_on_project
+    original_run_job_with_conversation_log = yoriai._run_job_with_conversation_log
+    original_create_session = yoriai._create_repl_prompt_session
+    original_create_runner = yoriai._create_background_job_runner
+
+    stale_project_dir = tempfile.mkdtemp(prefix="yoriai_stale_paused_project_")
+
+    def stub_ask(*args, **kwargs):
+        calls["ask_single"] += 1
+
+    def stub_ask_collaborate(
+        port, org_fingerprint, request, out_dir, enable_dialogue=False, pending_box=None, completed_box=None,
+    ):
+        pending = yoriai._PendingDesignDialogue(
+            port, org_fingerprint, request, [{"label": "設計担当"}], stale_project_dir,
+            {
+                "status": yoriai.DIALOGUE_STATUS_NEEDS_HUMAN, "transcript": [], "summary": "",
+                "human_message": "方向性を決めてください。",
+            },
+        )
+        pending_box.set(pending)
+        print(yoriai._DIALOGUE_PAUSE_HUMAN_JUDGEMENT_MARKER)
+        paused_ready.set()
+
+    def stub_resume_organization_collaborate(*args, **kwargs):
+        pass
+
+    def stub_run_fix_on_project(port, org_fingerprint, project_dir, request, out_dir, enable_dialogue=True):
+        calls["run_fix_on_project"] += 1
+        calls["project_dir"] = project_dir
+        calls["request"] = request
+
+    def delayed_run_job_with_conversation_log(chat_log, user_label, job):
+        if user_label == "続けて":
+            # 「続けて」ジョブがバックグラウンドワーカーに実際に着手された
+            # (=キューから取り出された)ことをテスト側に伝えたうえで、
+            # `messages`への追記(一時停止マーカーの上書き)の直前で
+            # 意図的に足止めする。
+            resume_job_dequeued.set()
+            release_resume_job.wait(timeout=5)
+        return original_run_job_with_conversation_log(chat_log, user_label, job)
+
+    yoriai._ask_organization = stub_ask
+    yoriai._ask_organization_collaborate = stub_ask_collaborate
+    yoriai._resume_organization_collaborate = stub_resume_organization_collaborate
+    yoriai._run_fix_on_project = stub_run_fix_on_project
+    yoriai._run_job_with_conversation_log = delayed_run_job_with_conversation_log
+
+    runner_holder = {}
+
+    def fake_create_runner():
+        runner = original_create_runner()
+        runner_holder["runner"] = runner
+        return runner
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_race_followup_test_")
+    buf = io.StringIO()
+    try:
+        with create_pipe_input() as pipe_input:
+            def fake_create_session():
+                return PromptSession(
+                    input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
+                )
+
+            yoriai._create_repl_prompt_session = fake_create_session
+            yoriai._create_background_job_runner = fake_create_runner
+
+            def run_client():
+                with contextlib.redirect_stdout(buf):
+                    yoriai._run_repl_client(47120, "fingerprint", out_dir)
+
+            thread = threading.Thread(target=run_client)
+            thread.start()
+            try:
+                pipe_input.send_text(f"{yoriai.AGREE_COMMAND} ToDoリストを作って" + _SUBMIT)
+                assert paused_ready.wait(timeout=5), "合意フェーズの一時停止(バックグラウンドジョブ)がタイムアウトしました"
+                # 一時停止ジョブは(このスタブでは)ブロックせずすぐ完了する
+                # ため、まずキューが空になる(=マーカーがmessagesに記録
+                # される)のを待つ。
+                runner_holder["runner"].join()
+                pipe_input.send_text("続けて" + _SUBMIT)
+                assert resume_job_dequeued.wait(timeout=5), (
+                    "「続けて」ジョブがバックグラウンドワーカーに着手されませんでした"
+                )
+                # ここでpending_boxは既に空、かつ再開ジョブはmessagesへの
+                # 追記直前で足止めされている(=messagesの末尾はまだ一時
+                # 停止マーカーのまま)。この状態で3件目の発言を送る。
+                pipe_input.send_text("早く終わらせて" + _SUBMIT)
+                _wait_until(lambda: "直前のプロジェクト" in buf.getvalue() or calls["ask_single"] > 0, timeout=5)
+                release_resume_job.set()
+                pipe_input.send_text("exit" + _SUBMIT)
+                thread.join(timeout=5)
+                assert not thread.is_alive(), "対話モードがexitで終了しませんでした"
+                runner_holder["runner"].join()
+            finally:
+                yoriai._create_repl_prompt_session = original_create_session
+                yoriai._create_background_job_runner = original_create_runner
+    finally:
+        yoriai._ask_organization = original_ask
+        yoriai._ask_organization_collaborate = original_ask_collaborate
+        yoriai._resume_organization_collaborate = original_resume_organization_collaborate
+        yoriai._run_fix_on_project = original_run_fix_on_project
+        yoriai._run_job_with_conversation_log = original_run_job_with_conversation_log
+        shutil.rmtree(out_dir, ignore_errors=True)
+        shutil.rmtree(stale_project_dir, ignore_errors=True)
+
+    output = buf.getvalue()
+    assert "対話モードを終了します。" in output, output
+    assert "直前のプロジェクト" in output, output
+    # write_file等を持たない単発質問(_ask_organization)には落ちないはずです。
+    assert calls["ask_single"] == 0, calls
+    assert calls["run_fix_on_project"] == 1, calls
+    assert calls["project_dir"] == stale_project_dir, calls
+    assert calls["request"] == "早く終わらせて", calls
+
+
 def test_followup_right_after_collaborate_completion_becomes_a_fix_session():
     """不具合修正の回帰検知: 「〇〇を作って」の協業モードが実装フェーズまで
     完了した直後、`直して`・`修正して`・`作業して`等のキーワードを一切
@@ -664,6 +830,8 @@ def main():
         test_followup_right_after_a_dialogue_pause_is_not_reclassified,
         test_followup_right_after_a_dialogue_pause_fallback_disables_web_search,
         test_followup_right_after_a_design_dialogue_pause_resumes_instead_of_single_question,
+        test_second_followup_during_slow_resume_still_avoids_tool_less_single_chat,
+        test_followup_right_after_collaborate_completion_becomes_a_fix_session,
         test_parallel_command_is_backgrounded,
         test_resume_all_command_is_backgrounded,
         test_second_agree_while_first_still_running_shows_queued_notice,

@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import ast
 import datetime
+import difflib
 import json
 import locale
 import logging
@@ -3862,21 +3863,117 @@ _DIALOGUE_ROLE_LABEL_JA = {
 # なく、_run_dialogue呼び出し1回ごとに数える)。
 DIALOGUE_SAFETY_LIMIT_UTTERANCES = 50
 
+# 仮の判断(重大なバグ報告への対応: 長時間の対話プロトコルで応答が
+# 文字化けに崩壊する): ラウンドを重ねるたびに「これまでの議論」全文を
+# 累積してプロンプトに埋め込む設計のため、ラウンド数が多いほど1回あたりの
+# 入力トークン数が線形に増え、モデルの生成能力(特にコンテキストウィンドウの
+# 実効的な上限に近いローカルLLM)を超えて出力が意味不明な文字列に崩壊する
+# 実害が実機(MacStudio上のqwen3-235b、8ラウンド)で報告された。以前は
+# `max_rounds`の既定値が8(=最大24発言)だったが、名前付きの定数に切り出した
+# うえで5(=最大15発言)に引き下げ、「明確な上限がある」ことをコードからも
+# 追いやすくした。個別の呼び出し元(`min_rounds`を1にして早期再開する
+# `_resume_design_dialogue`等)は、必要に応じてこの既定値を上書きできる。
+DIALOGUE_MAX_ROUNDS_DEFAULT = 5
+
 DIALOGUE_STATUS_CONSENSUS = "consensus"
 DIALOGUE_STATUS_SAFETY_LIMIT = "safety_limit"
 DIALOGUE_STATUS_NEEDS_HUMAN = "needs_human"
 # 提案役からすら実のある応答が一度も得られなかった場合(問い合わせの失敗・
 # 空応答)。これは議論が難航した結果ではなく単純な疎通の問題である可能性が
-# 高いため、他の3状態(議論の結果として人間の判断を仰ぐべき状態)とは区別し、
+# 高いため、他の状態(議論の結果として人間の判断を仰ぐべき状態)とは区別し、
 # 呼び出し元がこれまで通りの経路に安全側フォールバックできるようにする。
 DIALOGUE_STATUS_NO_ENGAGEMENT = "no_engagement"
+# 仮の判断(バグ報告への対応: 同じ内容の繰り返しで議論が"進化"しない):
+# 直前のラウンドと今回のラウンドの発言(提案役・反論役)がほぼ同一と判定
+# された場合に使う状態。合意には至っていないが、これ以上ラウンドを重ねても
+# 進展が見込めないと機械的に判断できるため、`DIALOGUE_STATUS_CONSENSUS`と
+# 同様に「その時点までの最も具体的な提案(直近の提案役の発言)」を
+# `final_content`としてそのまま採用し、追加の(単独確定の)問い合わせを
+# 挟まずに次のフェーズへ進める。
+DIALOGUE_STATUS_STAGNANT = "stagnant"
+# 仮の判断(バグ報告への対応: 長時間の対話で応答が文字化けに崩壊する):
+# いずれかの発言が明らかな文字化け・異常な繰り返しパターン(`_looks_garbled`)
+# と判定された場合に使う状態。それ以降の発言(特に統合役の合意判定)を
+# 文字化けした内容に基づいて行わせても意味が無いため、その時点で打ち切る。
+# `DIALOGUE_STATUS_NEEDS_HUMAN`/`DIALOGUE_STATUS_SAFETY_LIMIT`と同様、
+# 各呼び出し元は人間の確認を待たずに代表1名による単独確定
+# (`_finalize_dialogue_solo`)へそのまま進む。
+DIALOGUE_STATUS_GARBLED = "garbled"
 
 _DIALOGUE_STATUS_LABEL_JA = {
     DIALOGUE_STATUS_CONSENSUS: "合意",
     DIALOGUE_STATUS_SAFETY_LIMIT: "セーフティリミットにより一時停止",
     DIALOGUE_STATUS_NEEDS_HUMAN: "人間の確認が必要",
     DIALOGUE_STATUS_NO_ENGAGEMENT: "応答なし",
+    DIALOGUE_STATUS_STAGNANT: "内容の繰り返しにより打ち切り",
+    DIALOGUE_STATUS_GARBLED: "文字化けの疑いにより打ち切り",
 }
+
+
+# 仮の判断: 文字化け・生成崩壊の検出は、正規のトークナイザや言語判定
+# ライブラリを新たな依存として増やさずに済む、粗いヒューリスティックに
+# とどめる。(1)極端に短い文字種の繰り返し(同じ数文字が連続して大部分を
+# 占める)、(2)長さの割に使われている文字の種類が極端に少ない、の
+# いずれかに該当する場合を「文字化けの疑い」とする。短い応答(既定
+# 40文字未満)は判断材料が少なく誤検知しやすいため対象外にする。
+_GARBLED_MIN_LENGTH = 40
+_GARBLED_UNIQUE_CHAR_RATIO_THRESHOLD = 0.06
+_GARBLED_REPEATED_RUN_RATIO_THRESHOLD = 0.4
+_GARBLED_REPEATED_RUN_PATTERN_LENGTHS = range(1, 7)
+
+
+def _has_dominant_repeated_run(text: str) -> bool:
+    """`text`の中に、短い(1〜6文字の)パターンが連続して大部分を占める
+    箇所が無いかを調べる。トークン生成が同じ短い断片をひたすら繰り返す
+    典型的な崩壊パターン(例: "呵呵呵呵呵呵..."・"あああ..."・記号の連続)を
+    検出するための簡易な走査で、正規表現の破局的バックトラックを避けるため
+    自前でループを回す。
+    """
+    length = len(text)
+    if length == 0:
+        return False
+    for pattern_len in _GARBLED_REPEATED_RUN_PATTERN_LENGTHS:
+        if pattern_len * 3 > length:
+            break
+        i = 0
+        while i < length:
+            pattern = text[i:i + pattern_len]
+            run_len = pattern_len
+            j = i + pattern_len
+            while j + pattern_len <= length and text[j:j + pattern_len] == pattern:
+                run_len += pattern_len
+                j += pattern_len
+            if run_len / length >= _GARBLED_REPEATED_RUN_RATIO_THRESHOLD:
+                return True
+            i = j if run_len > pattern_len else i + 1
+    return False
+
+
+def _looks_garbled(text: str) -> bool:
+    """発言`text`が文字化け・生成崩壊している疑いが強いかどうかを返す。"""
+    stripped = (text or "").strip()
+    if len(stripped) < _GARBLED_MIN_LENGTH:
+        return False
+    unique_ratio = len(set(stripped)) / len(stripped)
+    if unique_ratio < _GARBLED_UNIQUE_CHAR_RATIO_THRESHOLD:
+        return True
+    return _has_dominant_repeated_run(stripped)
+
+
+# 仮の判断(バグ報告への対応: 同じ内容の繰り返しで議論が"進化"しない):
+# 「ほぼ一字一句同じ」かどうかの判定に、標準ライブラリの`difflib`による
+# 文字列類似度(0〜1)を使う。しきい値0.92は、多少の言い回しの変化(語尾・
+# 接続詞の違い等)までは同一とみなさず、実質コピー&ペーストに近い場合のみ
+# 検出することを狙った値(厳密な根拠のある値ではなく、実機での調整を
+# 前提にした初期値)。
+_DIALOGUE_STAGNATION_SIMILARITY_THRESHOLD = 0.92
+
+
+def _utterances_are_near_duplicate(a: str, b: str) -> bool:
+    a, b = (a or "").strip(), (b or "").strip()
+    if not a or not b:
+        return False
+    return difflib.SequenceMatcher(None, a, b).ratio() >= _DIALOGUE_STAGNATION_SIMILARITY_THRESHOLD
 
 
 def _assign_discourse_roles(candidates: list) -> dict:
@@ -3930,6 +4027,8 @@ _DIALOGUE_PROPOSER_REVISE_TEMPLATE = """あなたは{speaker_label}さんとし�
 【出力形式についての指示】
 {output_instruction}
 
+重要: 前回の自分の提案から、反論役の指摘を踏まえて具体的にどこをどう変えたかが分かる内容にしてください。前回とほぼ同じ内容をそのまま繰り返すことは禁止します(指摘に対してこれ以上変更の余地が無いと判断した場合も、その理由を明示したうえで、記述をより具体的にするなど、提案の内容自体は必ず更新してください)。
+
 他の説明文や前置きは不要です。指示された出力形式のみで、改善した提案を答えてください。
 """
 
@@ -3945,6 +4044,8 @@ _DIALOGUE_CRITIC_TEMPLATE = """あなたは{speaker_label}さんとして、複�
 {transcript}
 
 提案の問題点・リスク・抜け漏れを具体的に指摘してください。問題が無ければその旨を書いてください。
+
+重要: 提案役が前回からどう変更したか(【これまでの議論】の直近のラウンドを確認してください)を踏まえ、前回の自分の指摘のうち解消された点・まだ残っている点を明確に区別してください。前回の自分の指摘をそのまま繰り返すのではなく、提案の変化に応じて指摘の内容・粒度を更新してください。既に指摘した点が解消されているのに同じ指摘を繰り返すことは禁止します。
 
 指摘は、依頼の規模・目的に見合った範囲にとどめてください。個人利用・学習用・
 実験的な小さな依頼に対して、大規模なサービス運用を前提にしたセキュリティ
@@ -4018,12 +4119,31 @@ def _extract_dialogue_section(answer: str, heading: str) -> str:
     return text[idx + len(heading):].strip()
 
 
+# 仮の判断(重大なバグ報告への対応: 長時間の対話で応答が文字化けに崩壊
+# する): 以前はラウンドを重ねるたびに「これまでの議論」全文をそのまま
+# 毎回のプロンプトに埋め込んでいたため、ラウンドを重ねるほど入力トークン数が
+# 線形に増え続けていた。直近`_DIALOGUE_TRANSCRIPT_RECENT_ROUNDS_FULL`
+# ラウンド分の発言は判断に直結するため全文を残しつつ、それより古いラウンド
+# (既に検討済みで、直近の発言に要点が引き継がれているはずの発言)は
+# 要点(先頭`_DIALOGUE_TRANSCRIPT_OLDER_ROUND_CHARS`文字)だけに圧縮する。
+# 完全な逐語記録は`_format_dialogue_transcript_for_prompt`とは別に
+# `_format_dialogue_log_markdown`が議事録ファイルへそのまま保存するため、
+# ここで要点だけに圧縮しても「なぜこの結論になったか」を後から遡る手段は
+# 失われない。
+_DIALOGUE_TRANSCRIPT_RECENT_ROUNDS_FULL = 2
+_DIALOGUE_TRANSCRIPT_OLDER_ROUND_CHARS = 200
+
+
 def _format_dialogue_transcript_for_prompt(transcript: list) -> str:
+    latest_round = max((u["round"] for u in transcript), default=0)
     lines = []
     for utterance in transcript:
         role_ja = _DIALOGUE_ROLE_LABEL_JA.get(utterance["role"], utterance["role"])
         lines.append(f"[{utterance['speaker_label']}さん・{role_ja}・ラウンド{utterance['round']}]")
-        lines.append(utterance["content"] or "(応答なし)")
+        content = utterance["content"] or "(応答なし)"
+        if latest_round - utterance["round"] >= _DIALOGUE_TRANSCRIPT_RECENT_ROUNDS_FULL and len(content) > _DIALOGUE_TRANSCRIPT_OLDER_ROUND_CHARS:
+            content = content[:_DIALOGUE_TRANSCRIPT_OLDER_ROUND_CHARS] + "...(以下省略。古いラウンドのため要点のみ表示)"
+        lines.append(content)
         lines.append("")
     return "\n".join(lines).strip()
 
@@ -4039,6 +4159,13 @@ def _summarize_dialogue(status: str, transcript: list, final_content: str, human
     """
     if status == DIALOGUE_STATUS_CONSENSUS:
         return f"{len(transcript)}件の発言を経て合意に達しました。\n\n{final_content or ''}".strip()
+    if status == DIALOGUE_STATUS_STAGNANT:
+        return (
+            f"{len(transcript)}件の発言後、直前のラウンドとほぼ同じ内容が繰り返されたため、"
+            f"これ以上の議論では進展が見込めないと判断し、直近の提案を採用しました。\n\n{final_content or ''}"
+        ).strip()
+    if status == DIALOGUE_STATUS_GARBLED:
+        return (human_message or "発言が文字化けした疑いがあるため打ち切りました。").strip()
     if status == DIALOGUE_STATUS_NEEDS_HUMAN:
         return (human_message or "合意に至りませんでした。").strip()
     if status == DIALOGUE_STATUS_SAFETY_LIMIT:
@@ -4061,7 +4188,8 @@ def _finish_dialogue(status: str, transcript: list, total_utterances: int, final
 
 def _run_dialogue(
     org_fingerprint: str, topic: str, background: str, candidates: list, output_instruction: str,
-    print_lock: threading.Lock = None, tag: str = None, min_rounds: int = 2, max_rounds: int = 8,
+    print_lock: threading.Lock = None, tag: str = None, min_rounds: int = 2,
+    max_rounds: int = DIALOGUE_MAX_ROUNDS_DEFAULT,
     resume_transcript: list = None, resume_round: int = 1,
 ) -> dict:
     """複数ノードが役割(提案役・反論役・統合役)を持って議論し、合意形成
@@ -4075,6 +4203,18 @@ def _run_dialogue(
     `DIALOGUE_SAFETY_LIMIT_UTTERANCES`を超えた時点で強制的に一時停止する。
     どちらの終了条件でも、統合役(または反論役)が「人間に確認」したい
     事項があると判断した場合は、その時点で打ち切って人間に判断を仰ぐ。
+
+    暴走・崩壊対策として、以下の場合も合意を待たずにその時点で打ち切る:
+    - いずれかの発言が明らかな文字化け・異常な繰り返しパターンと判定された
+      場合(`_looks_garbled`、`DIALOGUE_STATUS_GARBLED`)。長時間の対話で
+      ローカルLLMの応答が意味不明な文字列に崩壊する実害への対応。
+    - 直前のラウンドと今回のラウンドの提案役・反論役の発言がいずれも
+      ほぼ同一(`_utterances_are_near_duplicate`)と判定された場合
+      (`DIALOGUE_STATUS_STAGNANT`)。ラウンドを重ねても実質的に同じ内容が
+      繰り返されるだけで議論が"進化"しない状態への対応。この場合は
+      「その時点までの最も具体的な提案」(直近の提案役の発言)を
+      `final_content`としてそのまま採用する(`DIALOGUE_STATUS_CONSENSUS`と
+      同様、追加の問い合わせ無しで次のフェーズへ進めてよい)。
 
     戻り値は次のキーを持つ辞書:
     - "status": DIALOGUE_STATUS_* のいずれか
@@ -4112,6 +4252,14 @@ def _run_dialogue(
         answer = (answer or "").strip()
         if answer:
             state["any_real_content"] = True
+            if _looks_garbled(answer):
+                # 仮の判断(バグ報告への対応): 文字化けした発言をそのまま
+                # 議事録・以降のプロンプトに混入させると、後続の役割の判定
+                # (特に統合役の合意判定)まで無意味な内容を根拠にしてしまう。
+                # ここでは発言自体は(何が起きたかを追えるよう)議事録には
+                # 残しつつ、`state["garbled_by"]`に記録して呼び出し元
+                # (メインループ)が直後に打ち切りを判断できるようにする。
+                state["garbled_by"] = candidate["label"]
         role_ja = _DIALOGUE_ROLE_LABEL_JA[role_key]
         _print_tagged(
             print_lock, tag or topic,
@@ -4122,6 +4270,14 @@ def _run_dialogue(
             "round": round_num, "role": role_key, "speaker_label": candidate["label"], "content": answer,
         })
         return answer
+
+    def garbled_finish():
+        speaker_label = state.get("garbled_by", "")
+        human_message = (
+            f"{speaker_label}さんの発言が文字化け・異常な繰り返しパターンと判定されたため、"
+            "この時点で議論を打ち切りました。"
+        )
+        return _finish_dialogue(DIALOGUE_STATUS_GARBLED, transcript, state["total_utterances"], None, human_message)
 
     round_num = resume_round
     while True:
@@ -4145,6 +4301,8 @@ def _run_dialogue(
             # 高いため、早期に切り上げる(疎通の問題であって議論の
             # 結果ではないため、呼び出し元は安全側フォールバックしてよい)。
             return _finish_dialogue(DIALOGUE_STATUS_NO_ENGAGEMENT, transcript, state["total_utterances"], None, None)
+        if state.get("garbled_by"):
+            return garbled_finish()
         if state["total_utterances"] >= DIALOGUE_SAFETY_LIMIT_UTTERANCES:
             return _finish_dialogue(DIALOGUE_STATUS_SAFETY_LIMIT, transcript, state["total_utterances"], None, None)
 
@@ -4154,6 +4312,8 @@ def _run_dialogue(
         )
         critic_answer = speak(DIALOGUE_ROLE_CRITIC, critic_prompt, round_num)
         critic_verdict = _parse_critic_verdict(critic_answer)
+        if state.get("garbled_by"):
+            return garbled_finish()
         if state["total_utterances"] >= DIALOGUE_SAFETY_LIMIT_UTTERANCES:
             return _finish_dialogue(DIALOGUE_STATUS_SAFETY_LIMIT, transcript, state["total_utterances"], None, None)
 
@@ -4162,6 +4322,8 @@ def _run_dialogue(
             transcript=_format_dialogue_transcript_for_prompt(transcript), output_instruction=output_instruction,
         )
         integrator_answer = speak(DIALOGUE_ROLE_INTEGRATOR, integrator_prompt, round_num)
+        if state.get("garbled_by"):
+            return garbled_finish()
         integrator_verdict = _parse_integrator_verdict(integrator_answer)
 
         if critic_verdict == "情報不足" or integrator_verdict == "人間に確認":
@@ -4171,6 +4333,32 @@ def _run_dialogue(
         if integrator_verdict == "合意" and critic_verdict == "合意" and round_num >= min_rounds:
             final_content = _extract_dialogue_section(integrator_answer, "最終合意内容:")
             return _finish_dialogue(DIALOGUE_STATUS_CONSENSUS, transcript, state["total_utterances"], final_content, None)
+
+        # 仮の判断(バグ報告への対応: 同じ内容の繰り返しで議論が"進化"しない):
+        # 合意にも人間への確認にも至らなかった("判定: 継続"のまま)場合に
+        # 限り、直前のラウンドの提案役・反論役の発言と、今回のラウンドの
+        # 同じ役割の発言がいずれもほぼ同一かどうかを確認する。合意が正当に
+        # 成立した場合(提案が変わらないまま両者が合意した、という真っ当な
+        # 収束)まで巻き込んで打ち切ってしまわないよう、この判定は必ず統合役の
+        # 判定(合意判定・人間に確認判定)の後に置く(統合役への問い合わせ
+        # 自体は毎ラウンド行う。事前に打ち切ってしまうと、統合役が今回は
+        # 実際に合意と判断したかもしれないケースまで潰してしまうため)。
+        # 該当する場合は、これ以上ラウンドを重ねても実質的に同じやり取りが
+        # 続くだけと判断し、その時点までで最も具体的な提案(今回の提案役の
+        # 発言)をそのまま採用してこの場で打ち切る。
+        if round_num > resume_round:
+            prev_round_by_role = {u["role"]: u["content"] for u in transcript if u["round"] == round_num - 1}
+            this_round_by_role = {u["role"]: u["content"] for u in transcript if u["round"] == round_num}
+            if (
+                _utterances_are_near_duplicate(
+                    this_round_by_role.get(DIALOGUE_ROLE_PROPOSER), prev_round_by_role.get(DIALOGUE_ROLE_PROPOSER),
+                )
+                and _utterances_are_near_duplicate(
+                    this_round_by_role.get(DIALOGUE_ROLE_CRITIC), prev_round_by_role.get(DIALOGUE_ROLE_CRITIC),
+                )
+            ):
+                final_content = this_round_by_role.get(DIALOGUE_ROLE_PROPOSER) or ""
+                return _finish_dialogue(DIALOGUE_STATUS_STAGNANT, transcript, state["total_utterances"], final_content, None)
 
         round_num += 1
         if round_num > max_rounds:
@@ -4256,8 +4444,13 @@ def _report_dialogue_result(result: dict, project_dir: str, dialogue_id: str, to
     if result["status"] == DIALOGUE_STATUS_CONSENSUS:
         print(f"[🤝 対話プロトコル: {result['total_utterances']}件の発言を経て合意に達しました]")
         return
+    if result["status"] == DIALOGUE_STATUS_STAGNANT:
+        print(f"[🔁 対話プロトコル: {result['total_utterances']}件の発言後、{_DIALOGUE_STATUS_LABEL_JA[DIALOGUE_STATUS_STAGNANT]}、直近の提案を採用します]")
+        return
     if result["status"] == DIALOGUE_STATUS_SAFETY_LIMIT:
         print(f"[⏸️ 対話プロトコル: {_DIALOGUE_STATUS_LABEL_JA[DIALOGUE_STATUS_SAFETY_LIMIT]}]")
+    elif result["status"] == DIALOGUE_STATUS_GARBLED:
+        print(f"[⚠️ 対話プロトコル: {_DIALOGUE_STATUS_LABEL_JA[DIALOGUE_STATUS_GARBLED]}]")
     else:
         print(f"[🙋 対話プロトコル: {_DIALOGUE_STATUS_LABEL_JA[DIALOGUE_STATUS_NEEDS_HUMAN]}]")
     if result.get("human_message"):
@@ -4267,28 +4460,52 @@ def _report_dialogue_result(result: dict, project_dir: str, dialogue_id: str, to
 # 仮の判断(依頼: 対話プロトコルへの人間の介入を必須にしない): 反論役・
 # 統合役が合意に至らなかった場合(セーフティリミット到達・情報不足の
 # 表明等)でも、そこで立ち止まって人間の回答を待つのではなく、代表1名
-# (`architect`、各対話の提案役)がそれまでの議論を踏まえて単独で結論を
-# 確定し、そのまま後続のフェーズ(実装等)へ進む。人間が関わるのは対話の
-# 途中ではなく、議事録・要約という記録と最終的な成果物を見た後になる
-# (中断するのは、この単独確定の問い合わせ自体が失敗した=疎通の問題が
-# あった場合のみ。これは議論が難航した結果ではないため、人間に確認するに
-# 値する)。
-def _finalize_dialogue_solo(architect: dict, org_fingerprint: str, prompt: str) -> tuple:
-    """合意に至らなかった対話を、代表1名(`architect`)の単独判断で確定
-    させる。戻り値は`(確定した内容, 中断すべきかどうか)`。
+# (`candidates`の先頭、各対話の提案役)がそれまでの議論を踏まえて単独で
+# 結論を確定し、そのまま後続のフェーズ(実装等)へ進む。人間が関わるのは
+# 対話の途中ではなく、議事録・要約という記録と最終的な成果物を見た後になる
+# (中断するのは、以下で全候補への単独確定の問い合わせが尽く失敗した=
+# 組織全体への疎通の問題があった場合のみ。これは議論が難航した結果では
+# ないため、人間に確認するに値する)。
+#
+# 仮の判断(重大なバグ報告への対応: 「続けて」の後に実装フェーズへ
+# 引き継がれない不具合): 以前は代表1名(architect)への問い合わせのみで、
+# そこが(一時的な不調・文字化け等で)失敗した瞬間に即座に人間の確認待ちの
+# 一時停止へ倒れていた。対話プロトコルは既に複数候補
+# (`_select_chat_candidates`が優先順位付けした`candidates`)を把握して
+# いるため、`_ask_organization`の候補フォールバックと同じ考え方で、
+# 1台が失敗しても次の候補に自動的に切り替えるようにした。これにより、
+# 「対話は合意に至らなかったが、代表1名への単独確認だけがたまたま失敗した」
+# というだけの理由で人間の確認を必須にする(=`_last_turn_is_dialogue_pause`
+# 経由でツールを持たない単発チャットに落ちてしまう)頻度そのものを減らす。
+def _finalize_dialogue_solo(candidates: list, org_fingerprint: str, prompt: str) -> tuple:
+    """合意に至らなかった対話を、`candidates`の優先順位順に問い合わせ、
+    最初に有効な応答が得られた1台の単独判断で確定させる。戻り値は
+    `(確定した内容, 中断すべきかどうか)`。
+
+    いずれかの候補の応答が明らかに文字化けしている(`_looks_garbled`)場合も
+    問い合わせ失敗と同様に扱い、次の候補に切り替える(崩壊した内容を
+    そのまま最終合意内容として採用してしまわないため)。
     """
-    answer, error, truncated = _collect_answer_from_candidate(
-        architect, org_fingerprint, [{"role": "user", "content": prompt}],
-    )
-    if error or not answer:
-        print(f"{architect['label']} への単独確定の問い合わせに失敗しました: {error or '応答がありませんでした'}")
-        print(_DIALOGUE_PAUSE_HUMAN_JUDGEMENT_MARKER)
-        return "", True
-    if truncated:
-        print(f"[⚠️ {architect['label']} の応答が長すぎたため、{CHAT_MAX_OUTPUT_TOKENS}トークンで打ち切られました。以下は不完全な内容の可能性があります]")
-    print(f"[🧭 {architect['label']} の回答(対話プロトコルは合意に至りませんでしたが、単独で結論を確定してそのまま続行します)]")
-    print(answer)
-    return answer, False
+    last_error = "応答がありませんでした"
+    for candidate in candidates:
+        answer, error, truncated = _collect_answer_from_candidate(
+            candidate, org_fingerprint, [{"role": "user", "content": prompt}],
+        )
+        if error or not answer:
+            last_error = error or "応答がありませんでした"
+            continue
+        if _looks_garbled(answer):
+            last_error = f"{candidate['label']}の応答が文字化けしている疑いがありました"
+            continue
+        if truncated:
+            print(f"[⚠️ {candidate['label']} の応答が長すぎたため、{CHAT_MAX_OUTPUT_TOKENS}トークンで打ち切られました。以下は不完全な内容の可能性があります]")
+        print(f"[🧭 {candidate['label']} の回答(対話プロトコルは合意に至りませんでしたが、単独で結論を確定してそのまま続行します)]")
+        print(answer)
+        return answer, False
+
+    print(f"単独確定の問い合わせに失敗しました(候補{len(candidates)}台すべてで失敗): {last_error}")
+    print(_DIALOGUE_PAUSE_HUMAN_JUDGEMENT_MARKER)
+    return "", True
 
 
 # ---------------------------------------------------------------------------
@@ -4462,7 +4679,7 @@ def _run_design_dialogue(org_fingerprint: str, request: str, candidates: list, p
     if result["status"] == DIALOGUE_STATUS_NO_ENGAGEMENT:
         print("設計担当から応答が得られませんでした。")
         return "", True, result
-    if result["status"] == DIALOGUE_STATUS_CONSENSUS:
+    if result["status"] in (DIALOGUE_STATUS_CONSENSUS, DIALOGUE_STATUS_STAGNANT):
         final_content = result["final_content"] or ""
         print("[🧭 対話プロトコルで合意した計画(そのまま表示)]")
         print(final_content)
@@ -4477,7 +4694,7 @@ def _run_design_dialogue(org_fingerprint: str, request: str, candidates: list, p
         f"【これまでの議論の経緯】\n{_format_dialogue_transcript_for_prompt(result['transcript'])}\n\n"
         "上記を踏まえて、あなた一人の判断でファイル分割案を確定してください。"
     )
-    final_content, aborted = _finalize_dialogue_solo(architect, org_fingerprint, finalize_prompt)
+    final_content, aborted = _finalize_dialogue_solo(candidates, org_fingerprint, finalize_prompt)
     return final_content, aborted, result
 
 
@@ -4540,7 +4757,7 @@ def _resume_design_dialogue(pending: "_PendingDesignDialogue", human_reply: str)
     )
     _report_dialogue_result(result, project_dir, "design", "モジュール分割・インターフェース設計(再開)")
 
-    if result["status"] == DIALOGUE_STATUS_CONSENSUS:
+    if result["status"] in (DIALOGUE_STATUS_CONSENSUS, DIALOGUE_STATUS_STAGNANT):
         final_content = result["final_content"] or ""
         print("[🧭 対話プロトコルで合意した計画(そのまま表示)]")
         print(final_content)
@@ -4560,17 +4777,7 @@ def _resume_design_dialogue(pending: "_PendingDesignDialogue", human_reply: str)
         f"【人間からの回答】\n{human_reply}\n\n"
         "上記を踏まえて、あなた一人の判断でファイル分割案を確定してください。"
     )
-    answer, error, truncated = _collect_answer_from_candidate(
-        architect, pending.org_fingerprint, [{"role": "user", "content": fallback_prompt}],
-    )
-    if error or not answer:
-        print(f"設計担当への問い合わせに失敗しました: {error or '応答がありませんでした'}")
-        return "", True
-    if truncated:
-        print(f"[⚠️ 設計担当の応答が長すぎたため、{CHAT_MAX_OUTPUT_TOKENS}トークンで打ち切られました。以下は不完全な内容の可能性があります]")
-    print(f"[🧭 {architect['label']} の回答(単独での計画確定、そのまま表示)]")
-    print(answer)
-    return answer, False
+    return _finalize_dialogue_solo(candidates, pending.org_fingerprint, fallback_prompt)
 
 
 def _resume_organization_collaborate(
@@ -4648,7 +4855,7 @@ def _ask_organization_plan_only(port: int, org_fingerprint: str, request: str, o
     if result["status"] == DIALOGUE_STATUS_NO_ENGAGEMENT:
         print("計画についての応答が得られませんでした。")
         return
-    if result["status"] == DIALOGUE_STATUS_CONSENSUS:
+    if result["status"] in (DIALOGUE_STATUS_CONSENSUS, DIALOGUE_STATUS_STAGNANT):
         print("[🧭 対話プロトコルでまとまった計画(そのまま表示)]")
         print(result["final_content"] or "")
         return
@@ -4664,7 +4871,7 @@ def _ask_organization_plan_only(port: int, org_fingerprint: str, request: str, o
         f"【これまでの議論の経緯】\n{_format_dialogue_transcript_for_prompt(result['transcript'])}\n\n"
         "上記を踏まえて、あなた一人の判断で計画を確定してください。"
     )
-    final_content, aborted = _finalize_dialogue_solo(architect, org_fingerprint, finalize_prompt)
+    final_content, aborted = _finalize_dialogue_solo(candidates, org_fingerprint, finalize_prompt)
     if not aborted:
         print("[🧭 対話プロトコルでまとまった計画(そのまま表示)]")
         print(final_content)
@@ -5446,20 +5653,35 @@ class _PendingDesignDialogueBox:
     コルが一時停止した状態(`_PendingDesignDialogue`)をそのスレッドから
     `_run_repl_client`のメインループへ安全に受け渡すための箱。`_ChatLog`と
     同様、別スレッドからの書き込みを想定してロックで保護する。
+
+    仮の判断(重大なバグ報告への対応: 「続けて」の後に実際のファイル書き込み
+    が一切行われず、ツールを持たない単発チャットの文章だけで終わってしまう
+    不具合): `take()`は一度きりの消費のため、一時停止への回答(「続けて」
+    等)を処理する再開ジョブが完了する前に、さらに次の発言が届いた場合
+    (`take()`が既に空を返した後)、`_run_repl_client`側は
+    `_last_turn_is_dialogue_pause`のテキストマーカー判定だけを頼りにする
+    しかなく、その先で「どのプロジェクトへの継続なのか」を見失って
+    write_file等のツールを持たない単発チャットに落ちてしまっていた。
+    `_last_project_dir`は`take()`で消費されても(`set()`されている限り)
+    保持し続けることで、この状況でも「直前に一時停止していたプロジェクト」
+    への修正セッションとして継続できるようにする(`_run_repl_client`参照)。
     """
 
     def __init__(self):
         self._lock = threading.Lock()
         self._pending = None
+        self._last_project_dir = None
 
     def set(self, pending: "_PendingDesignDialogue") -> None:
         with self._lock:
             self._pending = pending
+            self._last_project_dir = pending.project_dir
 
     def take(self):
         """保持している`_PendingDesignDialogue`(無ければ`None`)を取り出し、
         箱を空にする(一度きりの消費。同じ一時停止に対して二重に反応しない
-        ようにするため)。
+        ようにするため)。`last_project_dir()`が返す値はこれとは別に保持され
+        続けるため、ここでは消えない。
         """
         with self._lock:
             pending, self._pending = self._pending, None
@@ -5468,6 +5690,14 @@ class _PendingDesignDialogueBox:
     def peek(self):
         with self._lock:
             return self._pending
+
+    def last_project_dir(self):
+        """一時停止が一度でも発生していれば、その時点のプロジェクト
+        ディレクトリを返す(`take()`されても消えない)。一度も一時停止して
+        いなければ`None`。
+        """
+        with self._lock:
+            return self._last_project_dir
 
 
 class _CompletedBuildBox:
@@ -7183,7 +7413,7 @@ def _run_fix_approach_dialogue(
 
     _report_dialogue_result(result, project_dir, "fix", f"修正依頼「{request}」の方針")
 
-    if result["status"] == DIALOGUE_STATUS_CONSENSUS:
+    if result["status"] in (DIALOGUE_STATUS_CONSENSUS, DIALOGUE_STATUS_STAGNANT):
         agreed_approach = (result["final_content"] or "").strip()
         if not agreed_approach:
             return request, False
@@ -7200,7 +7430,7 @@ def _run_fix_approach_dialogue(
         f"【これまでの議論の経緯】\n{_format_dialogue_transcript_for_prompt(result['transcript'])}\n\n"
         f"上記を踏まえて、あなた一人の判断で修正方針を確定してください。{_build_fix_dialogue_output_instruction()}"
     )
-    agreed_approach, aborted = _finalize_dialogue_solo(architect, org_fingerprint, finalize_prompt)
+    agreed_approach, aborted = _finalize_dialogue_solo(candidates, org_fingerprint, finalize_prompt)
     if aborted:
         return request, True
     agreed_approach = agreed_approach.strip()
@@ -9065,12 +9295,35 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                 )
                 continue
 
+            # 仮の判断(重大なバグ報告への対応: 「続けて」の後、実際の
+            # ファイル書き込みが一切行われず、write_file等のツールを持たない
+            # 単発チャットの文章だけで"完了したふり"になってしまう不具合):
+            # 上のpending_design_box(構造化された再開情報)は既に無いが、
+            # `_last_turn_is_dialogue_pause`のテキストマーカー判定は真、
+            # という状況(直前の再開ジョブが完了する前にさらに発言が届いた
+            # 場合等)でも、`pending_design_box.last_project_dir()`(一度
+            # `set()`されていれば`take()`後も保持され続ける)が分かれば、
+            # そのプロジェクトへの修正セッションとして継続する。これにより
+            # write_file・edit_file等のプロジェクトツールを実際に持つ経路
+            # (`_run_fix_on_project`)へ確実に橋渡しでき、「実際にツールが
+            # 呼ばれてファイルへの書き込みが確認できた場合のみ完了を報告する」
+            # という既存の安全網(`_finalize_fix_changes`等)がそのまま働く。
+            stale_project_dir = pending_design_box.last_project_dir()
+            if _last_turn_is_dialogue_pause(messages) and stale_project_dir and os.path.isdir(stale_project_dir):
+                print(
+                    "[💬 対話プロトコルの一時停止直後の発言のため、直前のプロジェクト"
+                    f"({os.path.basename(stale_project_dir)})への継続的な修正依頼として扱います]"
+                )
+                fix_session = _FixSession(stale_project_dir)
+                _continue_fix_session(port, org_fingerprint, out_dir, job_runner, fix_session, text, chat_log=messages)
+                continue
+
             # 仮の判断(不具合修正: 対話プロトコル一時停止後、実装フェーズに
-            # 繋がらない問題への対応、副作用の是正): 上のpending_design_box
-            # (構造化された再開情報)が既に無く、やむを得ずこの単発質問
-            # フォールバックへ進む場合でも、一時停止直後の発言はスコープの
-            # 確定・補足情報の伝達が主目的でモデルが自発的に外部情報を
-            # 調べる必要性は低い。web_searchツールを繰り返し要求して
+            # 繋がらない問題への対応、副作用の是正): 継続先のプロジェクトが
+            # 特定できない場合(一度も一時停止していない等)にのみ、やむを
+            # 得ずこの単発質問フォールバックへ進む。この場合、一時停止直後の
+            # 発言はスコープの確定・補足情報の伝達が主目的でモデルが自発的に
+            # 外部情報を調べる必要性は低い。web_searchツールを繰り返し要求して
             # MAX_TOOL_CALL_ROUNDSに達し、空の応答で打ち切られる現象を
             # 避けるため、この問い合わせに限りweb_searchをオファーしない。
             post_pause_single_fallback = False
