@@ -1,18 +1,37 @@
-"""yoriai.py と tools.py・network.py の間で共有される定数・ツールスキーマ。
+"""yoriai.py と tools.py・network.py・llm_stream.py の間で共有される
+定数・ツールスキーマ。
 
-仮の判断(モジュール分割第一弾・第二弾への対応): tools.py・network.py への
-切り出しにあたり、以下の定数は「tools.py/network.py 側の関数が使うが、
-yoriai.py 側の関数(まだ移動していないコードや、将来 llm_stream.py に
-移動する予定のコード)からも参照される」という双方向の依存関係にある。
-tools.py/network.py に置いたまま yoriai.py からimportさせる、あるいは
-その逆にすると、`yoriai.py`⇔`tools.py`/`network.py`の循環importが
-発生してしまうため、依存の無いこのモジュールに切り出し、両側から参照する
-形で解消する。値そのものは元のyoriai.py上の定義から変更していない。
+仮の判断(モジュール分割第一弾〜第三弾への対応): tools.py・network.py・
+llm_stream.py への切り出しにあたり、以下の定数は「切り出し先の関数が
+使うが、yoriai.py 側にまだ残っている関数からも参照される」という
+双方向の依存関係にある。切り出し先に置いたまま yoriai.py から
+importさせる、あるいはその逆にすると、`yoriai.py`⇔各モジュールの
+循環importが発生してしまうため、依存の無いこのモジュールに切り出し、
+両側から参照する形で解消する。値そのものは元のyoriai.py上の定義から
+変更していない。
 """
 
-# 仮の判断: チャットの接続確立自体はカード取得と同程度の速さで判定してよい
-# (詳細はyoriai.py側のCHAT_READ_TIMEOUT_SECのコメントを参照)。
+# 仮の判断: チャットの接続確立自体はカード取得と同程度の速さで判定してよいが、
+# LLMの生成そのものは(モデルサイズや質問内容によっては)数十秒かかることが
+# あるため、読み取りタイムアウトは長めに取る。tools.py・llm_stream.py側と
+# yoriai.py側(_stream_chat_from_candidate等)の双方から参照される。
 CHAT_CONNECT_TIMEOUT_SEC = 5
+
+# 仮の判断: 上記CHAT_CONNECT_TIMEOUT_SECと対になる読み取りタイムアウト。
+# トークンが実際に流れ続けている間は働かない(データが届く限り
+# 「タイムアウト」にはならない)ため、応答が延々と続く問題への歯止めには
+# ならない(そちらはCHAT_MAX_OUTPUT_TOKENSで別途対応する)。llm_stream.py側
+# (_stream_ollama_turn等)とyoriai.py側(_stream_chat_from_candidate)の
+# 双方から参照される。
+CHAT_READ_TIMEOUT_SEC = 120
+
+# 仮の判断: 各バックエンドのベースURL。llm_stream.py側(_stream_ollama_turn等)
+# と、yoriai.py側に残るシステム情報取得系(get_ollama_installed_models等)の
+# 双方から参照される。
+OLLAMA_BASE_URL = "http://localhost:11434"
+LMSTUDIO_BASE_URL = "http://localhost:1234"
+# 仮の判断: mlx_lm.serverの既定ポート(8080)を前提とする。
+MLX_LM_BASE_URL = "http://localhost:8080"
 
 # 仮の判断: mDNS/カード取得サーバーが名乗るサービス種別。network.py側の
 # YoriaiListener・CardRequestHandlerと、yoriai.py側にまだ残っているmDNS

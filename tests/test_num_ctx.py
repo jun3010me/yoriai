@@ -27,6 +27,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import llm_stream  # noqa: E402
 import yoriai  # noqa: E402
 
 
@@ -245,14 +246,14 @@ def test_stream_ollama_turn_includes_num_ctx_and_keep_alive():
     yoriai.requests.post = fake_post
     yoriai._decide_num_ctx = lambda model: 32768
     try:
-        _drain(yoriai._stream_ollama_turn("qwen3-coder", [{"role": "user", "content": "こんにちは"}], []))
+        _drain(llm_stream._stream_ollama_turn("qwen3-coder", [{"role": "user", "content": "こんにちは"}], []))
     finally:
         yoriai.requests.post = original_post
         yoriai._decide_num_ctx = original_decide
 
     assert captured["json"]["options"]["num_ctx"] == 32768, captured["json"]
     assert captured["json"]["options"]["num_predict"] == yoriai.CHAT_MAX_OUTPUT_TOKENS, captured["json"]
-    assert captured["json"]["keep_alive"] == yoriai.KEEP_ALIVE, captured["json"]
+    assert captured["json"]["keep_alive"] == llm_stream.KEEP_ALIVE, captured["json"]
 
 
 def test_stream_ollama_turn_omits_num_ctx_key_when_none():
@@ -268,7 +269,7 @@ def test_stream_ollama_turn_omits_num_ctx_key_when_none():
     yoriai.requests.post = fake_post
     yoriai._decide_num_ctx = lambda model: None
     try:
-        _drain(yoriai._stream_ollama_turn("some-model", [{"role": "user", "content": "hi"}], []))
+        _drain(llm_stream._stream_ollama_turn("some-model", [{"role": "user", "content": "hi"}], []))
     finally:
         yoriai.requests.post = original_post
         yoriai._decide_num_ctx = original_decide
@@ -281,7 +282,7 @@ def test_estimate_tokens_counts_ascii_and_non_ascii_differently():
         {"role": "user", "content": "abcd" * 4},  # 16 ASCII chars -> 4トークン
         {"role": "assistant", "content": "こんにちは"},  # 5 non-ASCII chars -> 5トークン
     ]
-    assert yoriai._estimate_tokens(messages) == 9, yoriai._estimate_tokens(messages)
+    assert llm_stream._estimate_tokens(messages) == 9, llm_stream._estimate_tokens(messages)
 
 
 def main():

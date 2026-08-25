@@ -30,6 +30,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import llm_stream  # noqa: E402
 import yoriai  # noqa: E402
 
 
@@ -72,7 +73,7 @@ def test_stream_ollama_turn_sends_num_predict_and_detects_length_truncation():
     original_post = yoriai.requests.post
     yoriai.requests.post = fake_post
     try:
-        events = list(yoriai._stream_ollama_turn("qwen3-235b", [{"role": "user", "content": "直して"}], []))
+        events = list(llm_stream._stream_ollama_turn("qwen3-235b", [{"role": "user", "content": "直して"}], []))
     finally:
         yoriai.requests.post = original_post
 
@@ -92,7 +93,7 @@ def test_stream_ollama_turn_reports_not_truncated_on_normal_stop():
     original_post = yoriai.requests.post
     yoriai.requests.post = fake_post
     try:
-        events = list(yoriai._stream_ollama_turn("qwen3-235b", [{"role": "user", "content": "直して"}], []))
+        events = list(llm_stream._stream_ollama_turn("qwen3-235b", [{"role": "user", "content": "直して"}], []))
     finally:
         yoriai.requests.post = original_post
 
@@ -115,7 +116,7 @@ def test_stream_openai_compatible_turn_sends_max_tokens_and_detects_length_trunc
     original_post = yoriai.requests.post
     yoriai.requests.post = fake_post
     try:
-        events = list(yoriai._stream_openai_compatible_turn(
+        events = list(llm_stream._stream_openai_compatible_turn(
             yoriai.LMSTUDIO_BASE_URL, "qwen3-235b", [{"role": "user", "content": "直して"}], [],
         ))
     finally:
@@ -138,7 +139,7 @@ def test_stream_openai_compatible_turn_reports_not_truncated_on_normal_stop():
     original_post = yoriai.requests.post
     yoriai.requests.post = fake_post
     try:
-        events = list(yoriai._stream_openai_compatible_turn(
+        events = list(llm_stream._stream_openai_compatible_turn(
             yoriai.LMSTUDIO_BASE_URL, "qwen3-235b", [{"role": "user", "content": "直して"}], [],
         ))
     finally:
@@ -158,16 +159,16 @@ def test_stream_chat_completion_propagates_truncated_flag_to_done_event():
 
     original_ollama = yoriai.get_ollama_loaded_models
     original_mlx = yoriai.get_mlx_lm_models
-    original_turn = yoriai._stream_lmstudio_turn
+    original_turn = llm_stream._stream_lmstudio_turn
     yoriai.get_ollama_loaded_models = lambda: []
     yoriai.get_mlx_lm_models = lambda: []
-    yoriai._stream_lmstudio_turn = fake_lmstudio_turn
+    llm_stream._stream_lmstudio_turn = fake_lmstudio_turn
     try:
-        events = list(yoriai.stream_chat_completion("qwen3-235b", [{"role": "user", "content": "直して"}]))
+        events = list(llm_stream.stream_chat_completion("qwen3-235b", [{"role": "user", "content": "直して"}]))
     finally:
         yoriai.get_ollama_loaded_models = original_ollama
         yoriai.get_mlx_lm_models = original_mlx
-        yoriai._stream_lmstudio_turn = original_turn
+        llm_stream._stream_lmstudio_turn = original_turn
 
     done_events = [e for e in events if e.get("done")]
     assert len(done_events) == 1, events

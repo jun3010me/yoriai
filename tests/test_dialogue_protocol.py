@@ -19,6 +19,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import llm_stream  # noqa: E402
 import yoriai  # noqa: E402
 
 
@@ -1047,7 +1048,7 @@ def test_build_profile_card_includes_specialties_field(monkeypatch=None):
     yoriai.get_lmstudio_models = lambda: []
     yoriai.get_mlx_lm_models = lambda: []
     try:
-        card = yoriai.build_profile_card("agent-1")
+        card = llm_stream.build_profile_card("agent-1")
         assert card["models"]["specialties"] == [yoriai.DIALOGUE_SPECIALTY_CODING]
     finally:
         yoriai.get_ollama_installed_models = original_ollama_installed

@@ -177,7 +177,7 @@ def test_execute_tool_call_passes_through_web_search_results_unchanged():
     })
     original = _patch_requests_get(lambda url, params=None, timeout=None: fake_response)
     try:
-        result_str = yoriai._execute_tool_call({
+        result_str = tools._execute_tool_call({
             "function": {"name": "web_search", "arguments": {"query": "test"}}
         })
     finally:

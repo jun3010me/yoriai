@@ -4139,3 +4139,69 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
     `tests/test_peer_dedup.py`を確認)。`python3 -c "import network"`が
     単体でエラー無く成功することを確認した。`yoriai.py`は8,430行から
     7,926行(約500行減)になった。
+- **モジュール分割 第三弾: `llm_stream.py`の切り出し(Ollama/LM Studioへの
+  ストリーミング問い合わせ)**。第二弾のPRがマージされたことを確認し、
+  ジュンさんに`num_ctx`改修の進捗を確認した(このモジュール分割自体が
+  `num_ctx`改修の作業中に思いついたもので、他ブランチでの並行改修による
+  コンフリクトの懸念は無いとのことだったため優先して着手)。`yoriai.py`
+  から以下を新設の`llm_stream.py`へ移動した(第一弾・第二弾と同じく
+  ロジック変更なし)。
+  - `_log_and_build_http_error`・`_estimate_tokens`・`_stream_ollama_turn`・
+    `_stream_openai_compatible_turn`・`_stream_lmstudio_turn`・
+    `_stream_mlx_lm_turn`・`_run_turn_with_leak_detection`・
+    `stream_chat_completion`・`build_profile_card`。付随して、この9関数
+    でしか使われていなかった`CHAT_TOOLS`・`MAX_TOOL_CALL_ROUNDS`・
+    `TOOLS_UNSUPPORTED_STATUS_CODES`・`KEEP_ALIVE`(・関連コメント)も
+    一緒に移動した。
+  - 循環import解消: `OLLAMA_BASE_URL`・`LMSTUDIO_BASE_URL`・
+    `MLX_LM_BASE_URL`・`CHAT_READ_TIMEOUT_SEC`(llm_stream.py側のストリーム
+    関数と、yoriai.py側に残るシステム情報取得系関数の双方が使う)を
+    `yoriai_types.py`に追加した。逆に`_stream_ollama_turn`が呼ぶ
+    `_decide_num_ctx`、`stream_chat_completion`が呼ぶ
+    `get_ollama_loaded_models`/`get_mlx_lm_models`、`build_profile_card`が
+    呼ぶシステム情報取得系一式(`get_ollama_installed_models`等)は、
+    いずれもyoriai.py側に残る関数のため、各関数内部での遅延importで
+    解消した。
+  - 気づいた点: 第二弾の時点で`stream_chat_completion`・
+    `build_profile_card`を実際に呼んでいたのは`CardRequestHandler`
+    (第二弾で`network.py`へ移動済み)だけで、`yoriai.py`自身の残りの
+    コードはこの9関数を一切呼んでいなかった。そのため`yoriai.py`は
+    `llm_stream.py`をトップレベルでimportしていない(逆に`network.py`は
+    `llm_stream.py`との間に循環が無いため、`build_profile_card`・
+    `stream_chat_completion`を`llm_stream`からトップレベルで直接import
+    するよう変更した)。また、この整理の過程で`PROJECT_TOOLS_SCHEMAS`・
+    `PROJECT_TOOLS_CLIENT_NAMES`・`READ_FILE_TOOL_SCHEMA`・
+    `SEARCH_IN_FILE_TOOL_SCHEMA`・`_execute_tool_call`・
+    `_looks_like_tools_related_error`・`WEB_SEARCH_TOOL_SCHEMA`・
+    `import tailscale`が、第二弾の時点で既に`yoriai.py`自身のコードからは
+    使われなくなっていた(消費元が`network.py`/`llm_stream.py`へ移動済み
+    だった)ことにも気づいたため、`yoriai.py`のimportから合わせて削除した
+    (未使用import; `pyflakes`で確認)。
+  - 分割でテストの`yoriai.<関数名>`直接参照・monkeypatchが壊れた
+    箇所(`test_num_ctx.py`・`test_response_truncation.py`・
+    `test_model_backend_priority.py`・`test_dialogue_protocol.py`・
+    `test_edit_file.py`・`test_run_command.py`・
+    `test_reviewer_read_file_tool.py`・`test_tools_fallback_logging.py`・
+    `test_final_no_tool_retry.py`・`test_web_search.py`・
+    `test_web_search_visibility.py`)は、`llm_stream.<関数名>`
+    /`tools.<関数名>`/`yoriai_types.<定数名>`を参照するようimport文・
+    参照箇所のみ修正した(アサーションは無変更)。特に
+    `test_final_no_tool_retry.py`の`web_search`のmonkeypatchは、第一弾と
+    同じ理由(`_execute_tool_call`が`tools.py`内部で`web_search`を
+    バインドして呼ぶ)で`yoriai.web_search`ではなく`tools.web_search`を
+    差し替える必要があった(従来は`yoriai.web_search`を差し替えても
+    実際には効かず、実機のSearXNGへの接続を試みて失敗していたが
+    アサーション自体には影響しなかったため気づかれていなかった。今回
+    修正して本来の「ネットワークに一切アクセスしない」動作に戻した)。
+  - 動作確認: `python3 -m pytest tests/`が479件全てパス(`test_num_ctx.py`・
+    `test_model_backend_priority.py`・`test_response_truncation.py`を含む。
+    なお`test_background_collaborate.py`・
+    `test_double_ctrl_c_emergency_exit.py`・`test_fix_session.py`・
+    `test_task_queue.py`のスレッド・タイミング依存のテストが、フルスイート
+    実行時にたまに1件だけ失敗することがあったが、いずれも単体実行では
+    必ず成功し、失敗する組み合わせも実行のたびに変わったため、今回の
+    分割とは無関係な環境依存のflakinessと判断した)。`grep -rn
+    "stream_chat_completion" yoriai.py`で呼び出し元が残っていないことを
+    確認済み。`python3 -c "import llm_stream"`が単体でエラー無く成功する
+    ことを確認した。`yoriai.py`は7,926行から7,291行に削減され、3分割
+    開始前(9,630行)からトータルで2,339行減った。

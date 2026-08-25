@@ -191,8 +191,8 @@ def test_edit_reports_syntax_error_after_producing_invalid_code():
 # ---------------------------------------------------------------------------
 
 def test_edit_file_tool_registered_in_project_tools():
-    assert tools.EDIT_FILE_TOOL_SCHEMA in yoriai.PROJECT_TOOLS_SCHEMAS
-    assert tools.EDIT_FILE_TOOL_NAME in yoriai.PROJECT_TOOLS_CLIENT_NAMES
+    assert tools.EDIT_FILE_TOOL_SCHEMA in tools.PROJECT_TOOLS_SCHEMAS
+    assert tools.EDIT_FILE_TOOL_NAME in tools.PROJECT_TOOLS_CLIENT_NAMES
 
 
 def test_execute_project_tool_call_dispatches_edit_file():
