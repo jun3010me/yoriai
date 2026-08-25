@@ -5,6 +5,20 @@
 対象OS: macOS (Apple Silicon) / Linux (Raspberry Pi 4を含むDebian系など)。
 """
 
+# 仮の判断(バグ報告への対応): 実機のRaspberry Pi 4(Python 3.9系)で
+# `def get_ollama_context_length(model: str) -> int | None:` が
+# `TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'`で
+# 起動時に落ちる不具合が報告された。PEP 604のX | Y共用体記法は関数注釈が
+# 実行時に評価されるPython 3.9以前では使えず(3.10で導入)、README.mdが
+# 明記する動作環境(Python 3.9以降)を壊してしまっていた。`typing.Optional`に
+# 書き換える代わりに、`from __future__ import annotations`をファイル冒頭
+# (docstringの直後、他のimportより前という言語仕様上の制約がある)に
+# 追加した。これにより全ての注釈が実行時には評価されない文字列として
+# 扱われるため、`int | None`のような3.10以降の記法を含む注釈があっても
+# 3.9以前で例外にならない(本体はこの注釈を`typing.get_type_hints`等で
+# 実行時に解決していないため、この変更で動作が変わる箇所は無い)。
+from __future__ import annotations
+
 import argparse
 import ast
 import datetime
