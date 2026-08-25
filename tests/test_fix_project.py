@@ -25,6 +25,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import tools  # noqa: E402
 import yoriai  # noqa: E402
 
 
@@ -221,7 +222,7 @@ def test_move_project_file_renames_within_project_dir():
     try:
         with open(os.path.join(out_dir, "utils.py"), "w", encoding="utf-8") as f:
             f.write("def f():\n    pass\n")
-        result = json.loads(yoriai._move_project_file(out_dir, "utils.py", "helpers.py"))
+        result = json.loads(tools._move_project_file(out_dir, "utils.py", "helpers.py"))
         assert result["ok"] is True, result
         assert not os.path.exists(os.path.join(out_dir, "utils.py"))
         assert os.path.isfile(os.path.join(out_dir, "helpers.py"))
@@ -234,7 +235,7 @@ def test_move_project_file_rejects_traversal_in_either_name():
     try:
         with open(os.path.join(out_dir, "utils.py"), "w", encoding="utf-8") as f:
             f.write("def f():\n    pass\n")
-        result = json.loads(yoriai._move_project_file(out_dir, "utils.py", "../../outside.py"))
+        result = json.loads(tools._move_project_file(out_dir, "utils.py", "../../outside.py"))
         assert result["ok"] is False, result
         assert os.path.isfile(os.path.join(out_dir, "utils.py")), "拒否された場合、元のファイルはそのまま残るはずです"
     finally:
@@ -253,7 +254,7 @@ def test_delete_project_file_logs_to_progress_md_before_deleting():
         with open(os.path.join(out_dir, "utils.py"), "w", encoding="utf-8") as f:
             f.write("def f():\n    pass\n")
 
-        result = json.loads(yoriai._delete_project_file(out_dir, "utils.py"))
+        result = json.loads(tools._delete_project_file(out_dir, "utils.py"))
         assert result["ok"] is True, result
         assert not os.path.exists(os.path.join(out_dir, "utils.py"))
 
@@ -270,7 +271,7 @@ def test_delete_project_file_rejects_progress_md_itself():
         tasks = [("a.py", "説明")]
         checklist = yoriai._build_task_checklist(tasks)
         yoriai._write_progress_md(out_dir, "何か作って", tasks, checklist, {})
-        result = json.loads(yoriai._delete_project_file(out_dir, yoriai.PROGRESS_FILENAME))
+        result = json.loads(tools._delete_project_file(out_dir, yoriai.PROGRESS_FILENAME))
         assert result["ok"] is False, result
         assert os.path.isfile(os.path.join(out_dir, yoriai.PROGRESS_FILENAME))
     finally:
@@ -280,7 +281,7 @@ def test_delete_project_file_rejects_progress_md_itself():
 def test_make_project_directory_creates_subdirectory():
     out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
     try:
-        result = json.loads(yoriai._make_project_directory(out_dir, "sub"))
+        result = json.loads(tools._make_project_directory(out_dir, "sub"))
         assert result["ok"] is True, result
         assert os.path.isdir(os.path.join(out_dir, "sub"))
     finally:
@@ -293,7 +294,7 @@ def test_list_project_directory_excludes_progress_md():
         for name in ("a.py", "b.py", yoriai.PROGRESS_FILENAME):
             with open(os.path.join(out_dir, name), "w", encoding="utf-8") as f:
                 f.write("x")
-        result = json.loads(yoriai._list_project_directory(out_dir))
+        result = json.loads(tools._list_project_directory(out_dir))
         assert result["files"] == ["a.py", "b.py"], result
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -385,7 +386,7 @@ def test_write_project_file_populates_directory_created_via_make_directory():
     """
     out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
     try:
-        mkdir_result = json.loads(yoriai._make_project_directory(out_dir, "lessons"))
+        mkdir_result = json.loads(tools._make_project_directory(out_dir, "lessons"))
         assert mkdir_result["ok"] is True, mkdir_result
         write_result = json.loads(yoriai._write_project_file(out_dir, "lessons/lesson1.html", "<p>lesson1</p>\n"))
         assert write_result["ok"] is True, write_result
@@ -400,7 +401,7 @@ def test_move_project_file_into_subdirectory_creates_it_automatically():
     try:
         with open(os.path.join(out_dir, "base.html"), "w", encoding="utf-8") as f:
             f.write("<html></html>\n")
-        result = json.loads(yoriai._move_project_file(out_dir, "base.html", "templates/base.html"))
+        result = json.loads(tools._move_project_file(out_dir, "base.html", "templates/base.html"))
         assert result["ok"] is True, result
         assert result["new_filename"] == "templates/base.html", result
         assert not os.path.exists(os.path.join(out_dir, "base.html"))
@@ -419,7 +420,7 @@ def test_delete_project_file_from_subdirectory_records_relative_path_in_changelo
         with open(os.path.join(out_dir, "lessons", "old.html"), "w", encoding="utf-8") as f:
             f.write("<p>old</p>\n")
 
-        result = json.loads(yoriai._delete_project_file(out_dir, "lessons/old.html"))
+        result = json.loads(tools._delete_project_file(out_dir, "lessons/old.html"))
         assert result["ok"] is True, result
         assert not os.path.exists(os.path.join(out_dir, "lessons", "old.html"))
 
@@ -492,7 +493,7 @@ def test_execute_project_tool_call_dispatches_to_write_file():
             "id": "call_1", "type": "function",
             "function": {"name": "write_file", "arguments": {"filename": "a.py", "content": "x = 1\n"}},
         }
-        result = json.loads(yoriai._execute_project_tool_call(out_dir, tool_call))
+        result = json.loads(tools._execute_project_tool_call(out_dir, tool_call))
         assert result["ok"] is True, result
         with open(os.path.join(out_dir, "a.py"), encoding="utf-8") as f:
             assert f.read() == "x = 1\n"
@@ -511,7 +512,7 @@ def test_execute_project_tool_call_writes_into_subdirectory_via_write_file():
             "id": "call_1", "type": "function",
             "function": {"name": "make_directory", "arguments": {"dirname": "templates"}},
         }
-        mkdir_result = json.loads(yoriai._execute_project_tool_call(out_dir, mkdir_call))
+        mkdir_result = json.loads(tools._execute_project_tool_call(out_dir, mkdir_call))
         assert mkdir_result["ok"] is True, mkdir_result
 
         write_call = {
@@ -521,7 +522,7 @@ def test_execute_project_tool_call_writes_into_subdirectory_via_write_file():
                 "arguments": {"filename": "templates/base.html", "content": "<html></html>\n"},
             },
         }
-        write_result = json.loads(yoriai._execute_project_tool_call(out_dir, write_call))
+        write_result = json.loads(tools._execute_project_tool_call(out_dir, write_call))
         assert write_result["ok"] is True, write_result
         with open(os.path.join(out_dir, "templates", "base.html"), encoding="utf-8") as f:
             assert f.read() == "<html></html>\n"
@@ -542,7 +543,7 @@ def test_execute_project_tool_call_dispatches_to_read_file_with_range():
             "id": "call_1", "type": "function",
             "function": {"name": "read_file", "arguments": {"filename": "a.py", "start_line": 3, "end_line": 5}},
         }
-        result = json.loads(yoriai._execute_project_tool_call(out_dir, tool_call))
+        result = json.loads(tools._execute_project_tool_call(out_dir, tool_call))
         assert result["exists"] is True, result
         assert result["content"] == "3: line3\n4: line4\n5: line5", result
     finally:
@@ -561,7 +562,7 @@ def test_execute_project_tool_call_dispatches_to_search_in_file():
             "id": "call_1", "type": "function",
             "function": {"name": "search_in_file", "arguments": {"filename": "a.py", "query": "target_func"}},
         }
-        result = json.loads(yoriai._execute_project_tool_call(out_dir, tool_call))
+        result = json.loads(tools._execute_project_tool_call(out_dir, tool_call))
         assert result["exists"] is True and result["match_count"] == 1, result
         assert result["matched_lines"] == [4], result
     finally:

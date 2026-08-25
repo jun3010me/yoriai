@@ -25,6 +25,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import tools  # noqa: E402
 import yoriai  # noqa: E402
 
 
@@ -45,7 +46,7 @@ def _make_project(files: dict) -> str:
 def test_edit_replaces_unique_match():
     out_dir = _make_project({"app.py": "def add(a, b):\n    return a - b\n"})
     try:
-        result = json.loads(yoriai._edit_project_file(out_dir, "app.py", "return a - b", "return a + b"))
+        result = json.loads(tools._edit_project_file(out_dir, "app.py", "return a - b", "return a + b"))
         assert result["ok"] is True, result
         with open(os.path.join(out_dir, "app.py"), encoding="utf-8") as f:
             content = f.read()
@@ -57,7 +58,7 @@ def test_edit_replaces_unique_match():
 def test_edit_reports_syntax_ok_field():
     out_dir = _make_project({"app.py": "x = 1\n"})
     try:
-        result = json.loads(yoriai._edit_project_file(out_dir, "app.py", "x = 1", "x = 2"))
+        result = json.loads(tools._edit_project_file(out_dir, "app.py", "x = 1", "x = 2"))
         assert result["ok"] is True and result.get("syntax_ok") is True, result
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -66,7 +67,7 @@ def test_edit_reports_syntax_ok_field():
 def test_edit_with_empty_new_string_deletes():
     out_dir = _make_project({"app.py": "import os\nimport sys\n\nprint('hi')\n"})
     try:
-        result = json.loads(yoriai._edit_project_file(out_dir, "app.py", "import sys\n", ""))
+        result = json.loads(tools._edit_project_file(out_dir, "app.py", "import sys\n", ""))
         assert result["ok"] is True, result
         with open(os.path.join(out_dir, "app.py"), encoding="utf-8") as f:
             content = f.read()
@@ -83,7 +84,7 @@ def test_edit_fails_with_no_match_and_leaves_file_untouched():
     original = "def add(a, b):\n    return a - b\n"
     out_dir = _make_project({"app.py": original})
     try:
-        result = json.loads(yoriai._edit_project_file(out_dir, "app.py", "return x + y", "return a + b"))
+        result = json.loads(tools._edit_project_file(out_dir, "app.py", "return x + y", "return a + b"))
         assert result["ok"] is False, result
         assert "見つかりませんでした" in result["message"], result
         with open(os.path.join(out_dir, "app.py"), encoding="utf-8") as f:
@@ -97,7 +98,7 @@ def test_edit_fails_with_multiple_matches_and_reports_line_numbers():
     original = "x = 1\ny = 1\nz = 1\n"
     out_dir = _make_project({"app.py": original})
     try:
-        result = json.loads(yoriai._edit_project_file(out_dir, "app.py", "= 1", "= 2"))
+        result = json.loads(tools._edit_project_file(out_dir, "app.py", "= 1", "= 2"))
         assert result["ok"] is False, result
         assert "3箇所" in result["message"], result
         assert result["matched_lines"] == [1, 2, 3], result
@@ -115,7 +116,7 @@ def test_edit_fails_with_multiple_matches_and_reports_line_numbers():
 def test_edit_rejects_parent_directory_traversal():
     out_dir = _make_project({"app.py": "x = 1\n"})
     try:
-        result = json.loads(yoriai._edit_project_file(out_dir, "../outside.py", "x", "y"))
+        result = json.loads(tools._edit_project_file(out_dir, "../outside.py", "x", "y"))
         assert result["ok"] is False, result
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -124,7 +125,7 @@ def test_edit_rejects_parent_directory_traversal():
 def test_edit_rejects_absolute_path():
     out_dir = _make_project({"app.py": "x = 1\n"})
     try:
-        result = json.loads(yoriai._edit_project_file(out_dir, "/etc/passwd", "x", "y"))
+        result = json.loads(tools._edit_project_file(out_dir, "/etc/passwd", "x", "y"))
         assert result["ok"] is False, result
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -133,7 +134,7 @@ def test_edit_rejects_absolute_path():
 def test_edit_rejects_progress_md():
     out_dir = _make_project({yoriai.PROGRESS_FILENAME: "# プロジェクト進行状況\n"})
     try:
-        result = json.loads(yoriai._edit_project_file(out_dir, yoriai.PROGRESS_FILENAME, "進行状況", "状況"))
+        result = json.loads(tools._edit_project_file(out_dir, yoriai.PROGRESS_FILENAME, "進行状況", "状況"))
         assert result["ok"] is False, result
         assert "PROGRESS.md" in result["message"], result
     finally:
@@ -150,7 +151,7 @@ def test_edit_missing_planned_file_reports_not_yet_implemented():
         tasks = [("app.py", "..."), ("utils.py", "...")]
         checklist = yoriai._build_task_checklist(tasks)
         yoriai._write_progress_md(out_dir, "何か作って", tasks, checklist, {})
-        result = json.loads(yoriai._edit_project_file(out_dir, "utils.py", "x", "y"))
+        result = json.loads(tools._edit_project_file(out_dir, "utils.py", "x", "y"))
         assert result["ok"] is False, result
         assert result["message"] == "そのファイルはまだ存在しません(未実装です)。新規作成の場合はwrite_fileを使ってください。", result
     finally:
@@ -163,7 +164,7 @@ def test_edit_missing_undeclared_file_reports_not_in_plan():
         tasks = [("app.py", "...")]
         checklist = yoriai._build_task_checklist(tasks)
         yoriai._write_progress_md(out_dir, "何か作って", tasks, checklist, {})
-        result = json.loads(yoriai._edit_project_file(out_dir, "script.js", "x", "y"))
+        result = json.loads(tools._edit_project_file(out_dir, "script.js", "x", "y"))
         assert result["ok"] is False, result
         assert "計画" in result["message"] and "app.py" in result["message"], result
     finally:
@@ -177,7 +178,7 @@ def test_edit_missing_undeclared_file_reports_not_in_plan():
 def test_edit_reports_syntax_error_after_producing_invalid_code():
     out_dir = _make_project({"app.py": "def add(a, b):\n    return a + b\n"})
     try:
-        result = json.loads(yoriai._edit_project_file(out_dir, "app.py", "def add(a, b):", "def add(a, b)"))
+        result = json.loads(tools._edit_project_file(out_dir, "app.py", "def add(a, b):", "def add(a, b)"))
         assert result["ok"] is True, result  # 書き込み自体は成功する
         assert result.get("syntax_ok") is False, result
         assert result.get("syntax_error"), result
@@ -190,8 +191,8 @@ def test_edit_reports_syntax_error_after_producing_invalid_code():
 # ---------------------------------------------------------------------------
 
 def test_edit_file_tool_registered_in_project_tools():
-    assert yoriai.EDIT_FILE_TOOL_SCHEMA in yoriai.PROJECT_TOOLS_SCHEMAS
-    assert yoriai.EDIT_FILE_TOOL_NAME in yoriai.PROJECT_TOOLS_CLIENT_NAMES
+    assert tools.EDIT_FILE_TOOL_SCHEMA in yoriai.PROJECT_TOOLS_SCHEMAS
+    assert tools.EDIT_FILE_TOOL_NAME in yoriai.PROJECT_TOOLS_CLIENT_NAMES
 
 
 def test_execute_project_tool_call_dispatches_edit_file():
@@ -201,7 +202,7 @@ def test_execute_project_tool_call_dispatches_edit_file():
             "id": "call_1", "type": "function",
             "function": {"name": "edit_file", "arguments": {"filename": "app.py", "old_string": "x = 1", "new_string": "x = 2"}},
         }
-        result = json.loads(yoriai._execute_project_tool_call(out_dir, tool_call))
+        result = json.loads(tools._execute_project_tool_call(out_dir, tool_call))
         assert result["ok"] is True, result
         with open(os.path.join(out_dir, "app.py"), encoding="utf-8") as f:
             assert f.read() == "x = 2\n"
@@ -212,10 +213,10 @@ def test_execute_project_tool_call_dispatches_edit_file():
 def test_mutated_filename_from_tool_result_recognizes_successful_edit_file():
     tool_call = {"function": {"name": "edit_file"}}
     success_result = json.dumps({"ok": True, "filename": "app.py"})
-    assert yoriai._mutated_filename_from_tool_result(tool_call, success_result) == "app.py"
+    assert tools._mutated_filename_from_tool_result(tool_call, success_result) == "app.py"
 
     failure_result = json.dumps({"ok": False, "message": "見つかりませんでした"})
-    assert yoriai._mutated_filename_from_tool_result(tool_call, failure_result) == ""
+    assert tools._mutated_filename_from_tool_result(tool_call, failure_result) == ""
 
 
 # ---------------------------------------------------------------------------

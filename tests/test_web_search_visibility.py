@@ -25,6 +25,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import tools  # noqa: E402
 import yoriai  # noqa: E402
 
 
@@ -60,9 +61,9 @@ def test_stream_chat_completion_yields_tool_result_event_for_web_search():
             yield {"tool_calls": []}
 
     original_turn = yoriai._stream_openai_compatible_turn
-    original_search = yoriai.web_search
+    original_search = tools.web_search
     yoriai._stream_openai_compatible_turn = fake_turn
-    yoriai.web_search = lambda query: [
+    tools.web_search = lambda query: [
         {"title": "Obsidian公式", "url": "https://obsidian.md/", "snippet": "Obsidianの公式サイト"},
     ]
     try:
@@ -71,7 +72,7 @@ def test_stream_chat_completion_yields_tool_result_event_for_web_search():
         ))
     finally:
         yoriai._stream_openai_compatible_turn = original_turn
-        yoriai.web_search = original_search
+        tools.web_search = original_search
 
     tool_result_events = [e for e in events if e.get("tool_result") == "web_search"]
     assert len(tool_result_events) == 1, f"tool_resultイベントが1件流れるはずです: {events}"
