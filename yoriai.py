@@ -81,6 +81,30 @@ CHAT_READ_TIMEOUT_SEC = 120
 # 被害(待ち時間・トークン消費)を現実的な範囲に抑えられる値として選んだ。
 CHAT_MAX_OUTPUT_TOKENS = 8192
 
+# 仮の判断: Ollamaへの/api/chat問い合わせにnum_ctx(コンテキストウィンドウの
+# 長さ)を指定していなかったため、Ollamaはモデルの学習上の上限ではなく
+# Ollama側のデフォルト(バージョンにより4096または2048)でコンテキスト
+# ウィンドウを開いていた。超過した入力はエラーにならず先頭から黙って
+# 切り捨てられるため、協業モードの実装計画や、read_fileが返す最大
+# _FILE_CONTENT_TRUNCATE_CHARS(12000文字)のコードがまるごと捨てられる、
+# CHAT_MAX_OUTPUT_TOKENSを設定していても実際の出力上限がそれ以下に
+# 頭打ちになる、といった実害につながっていた疑いがある。そのため
+# 明示的にnum_ctxを指定する(詳細は_decide_num_ctxを参照)。この値は
+# 「これ以上は指定しない」という絶対的な上限であり、モデルの学習上の
+# コンテキスト長・実機の空きメモリのどちらがこれより小さくても、
+# 小さい方が優先される(_decide_num_ctx参照)。
+MAX_NUM_CTX = 65536
+
+# 仮の判断: Ollamaの既定のkeep_alive(モデルをメモリに保持する時間)は
+# 5分で、それを過ぎるとモデルがアンロードされる。Yoriaiの協業モードは
+# 合意・実装・レビュー・修正のフェーズ間で人間の入力待ちが挟まったり、
+# 大規模なタスクキューの処理に数時間かかったりするため、フェーズの
+# 合間にモデルの再ロード(実機で数十秒〜)が毎回発生してしまう。そこで
+# 既定より長い30分をYoriai全体の既定値とする。環境変数
+# YORIAI_OLLAMA_KEEP_ALIVEで上書きできるようにする(SEARXNG_BASE_URLと
+# 同じ流儀)。
+KEEP_ALIVE = os.environ.get("YORIAI_OLLAMA_KEEP_ALIVE", "30m")
+
 # 仮の判断: 起動時1回だけのスキャンだと、たまたま相手のYoriaiがまだ起動しきっていない
 # タイミングで実行してしまった場合に「Connection refused」で失敗し、その後相手が
 # 起動してもずっと0件のまま固定されてしまう問題が実機検証で見つかった。
@@ -276,6 +300,86 @@ def get_ollama_loaded_models() -> list:
     except Exception as exc:
         logger.warning("Ollamaのロード済みモデル一覧の取得に失敗しました: %s", exc)
         return []
+
+
+# 仮の判断: get_ollama_context_length()はチャット1往復ごと(_stream_ollama_turn
+# 経由)に呼ばれる位置に入るため、モデルごとに結果をメモ化する。/api/showは
+# モデルのメタデータであり、プロセスが生きている間に値が変わることは
+# 想定しないため(Ollamaのバージョンアップやモデルの再pull等で変わりうるが、
+# その場合はYoriai自体の再起動を前提とする)、TTLは設けず1回取得したら
+# 使い回す。
+_OLLAMA_CONTEXT_LENGTH_CACHE = {}
+
+
+def get_ollama_context_length(model: str) -> int | None:
+    """Ollamaの`/api/show`から、モデルの学習上のコンテキスト長を取得する。
+
+    仮の判断: レスポンスの`model_info`はアーキテクチャ名がプレフィックスに
+    付いたキー("llama.context_length"・"qwen2.context_length"・
+    "gemma3.context_length"等)でコンテキスト長を返す。プレフィックスは
+    モデルのアーキテクチャによって変わり決め打ちできないため、キー名が
+    ".context_length"で終わるものを探す方式にする(複数見つかった場合は
+    最初に見つかったものを使う)。取得できなければ(接続失敗・該当キー
+    無し等)例外を握りつぶしてNoneを返す(既存のget_ollama_installed_models
+    等と同じ方針)。
+    """
+    if model in _OLLAMA_CONTEXT_LENGTH_CACHE:
+        return _OLLAMA_CONTEXT_LENGTH_CACHE[model]
+    context_length = None
+    try:
+        resp = requests.post(f"{OLLAMA_BASE_URL}/api/show", json={"model": model}, timeout=5)
+        resp.raise_for_status()
+        model_info = resp.json().get("model_info", {})
+        for key, value in model_info.items():
+            if key.endswith(".context_length"):
+                context_length = int(value)
+                break
+    except Exception as exc:
+        logger.warning("モデル '%s' のコンテキスト長の取得に失敗しました: %s", model, exc)
+    _OLLAMA_CONTEXT_LENGTH_CACHE[model] = context_length
+    return context_length
+
+
+# 仮の判断: 空きメモリに応じたnum_ctxの段階表。この数字に厳密な根拠は無く、
+# 実機(Mac mini 32GB・MacBook Pro 128GB・Mac Studio 512GB・Raspberry Pi 4)
+# で実際に動かしながら調整する前提の初期値。空きメモリが少ない機体
+# (Raspberry Pi 4等)で無指定のモデル上限(数万〜十数万トークン)を
+# そのまま使うと、KVキャッシュだけでメモリを使い果たしてOOM(または
+# 極端な速度低下)を招く恐れがあるため、大まかな安全弁として設ける。
+_NUM_CTX_MEMORY_TIERS = (
+    (4.0, 8192),
+    (8.0, 16384),
+    (16.0, 32768),
+)
+
+
+def _num_ctx_limit_from_memory(free_gb) -> int:
+    if free_gb is None:
+        return MAX_NUM_CTX
+    for threshold_gb, limit in _NUM_CTX_MEMORY_TIERS:
+        if free_gb < threshold_gb:
+            return limit
+    return MAX_NUM_CTX
+
+
+def _decide_num_ctx(model: str) -> int | None:
+    """実際にOllamaへ指定するnum_ctxを決める。次の3つの最小値を採用する:
+    (1) モデルの学習上のコンテキスト長(取得できなければこの条件は無視)、
+    (2) 実機の空きメモリから許せる上限(_num_ctx_limit_from_memory)、
+    (3) 絶対的な上限MAX_NUM_CTX。
+    ただし、CHAT_MAX_OUTPUT_TOKENSを下回る値になってしまう場合は
+    CHAT_MAX_OUTPUT_TOKENS * 2を下限として持ち上げる(出力の余地が
+    無くなるのを防ぐため)。モデル上限が全く取得できなかった場合は、
+    メモリ由来の上限とMAX_NUM_CTXの小さい方を使う(Noneは返さない。
+    メモリ由来の上限は常に有効な値を返すため)。
+    """
+    model_limit = get_ollama_context_length(model)
+    memory_limit = _num_ctx_limit_from_memory(get_memory_info().get("free_gb"))
+    candidates = [memory_limit, MAX_NUM_CTX]
+    if model_limit:
+        candidates.append(model_limit)
+    num_ctx = min(candidates)
+    return max(num_ctx, CHAT_MAX_OUTPUT_TOKENS * 2)
 
 
 def get_lmstudio_models() -> list:
@@ -586,19 +690,66 @@ def _log_and_build_http_error(base_url: str, resp) -> dict:
     return {"error": f"{resp.status_code}: {detail}", "status_code": resp.status_code}
 
 
+def _estimate_tokens(messages: list) -> int:
+    """`messages`に含まれる全文字列から、雑にトークン数を概算する。
+
+    仮の判断: 厳密なトークナイザ(モデルごとに異なる)を新たな依存として
+    requirements.txtに追加するのは避けたい。目的は「切り捨てが起きて
+    いることに人間が気づけるようにする」ことであり、桁が合っていれば
+    十分なため、日本語などの非ASCII文字は1文字≒1トークン、ASCII文字は
+    4文字≒1トークンとして数える簡易な概算にとどめる。
+    """
+    total_chars_ascii = 0
+    total_chars_non_ascii = 0
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, str):
+            continue
+        for ch in content:
+            if ord(ch) < 128:
+                total_chars_ascii += 1
+            else:
+                total_chars_non_ascii += 1
+    return (total_chars_ascii // 4) + total_chars_non_ascii
+
+
+# 仮の判断: num_ctxの何割を超えたら警告するかの閾値。厳密な根拠は無く、
+# 「まだ余裕があるうちは黙っておき、実際に切り捨てが起きていそうな
+# 水準に近づいたら知らせる」というバランスで8割とした。
+_NUM_CTX_WARNING_RATIO = 0.8
+
+
 def _stream_ollama_turn(model: str, messages: list, tools: list):
     """OllamaのネイティブAPI(/api/chat、NDJSONストリーミング)に1往復だけ
     問い合わせ、正規化したイベント({"content": ...} / {"error": ...})を
     順にyieldし、最後にそのターンで要求されたtool_calls一覧と、応答が
     CHAT_MAX_OUTPUT_TOKENS上限に達して打ち切られたかどうか
     ({"tool_calls": [...], "truncated": bool})をyieldする。
+
+    仮の判断: options.num_ctx(コンテキストウィンドウの長さ)とkeep_alive
+    (モデルをメモリに保持する時間)を明示的に指定する(詳細はMAX_NUM_CTX・
+    KEEP_ALIVE定義部のコメントを参照)。num_ctxが決定できなかった場合
+    (_decide_num_ctxがNoneを返した場合)はキー自体を送らず、Ollama側の
+    デフォルト挙動に委ねる(従来の挙動のまま)。
     """
+    num_ctx = _decide_num_ctx(model)
+    options = {"num_predict": CHAT_MAX_OUTPUT_TOKENS}
+    if num_ctx is not None:
+        options["num_ctx"] = num_ctx
+        estimated_tokens = _estimate_tokens(messages)
+        if estimated_tokens > num_ctx * _NUM_CTX_WARNING_RATIO:
+            logger.warning(
+                "モデル '%s' への問い合わせが概算%dトークンで、num_ctx(%d)の%d%%を"
+                "超えています。入力がコンテキスト長を超えると、Ollamaは先頭から"
+                "黙って切り捨てます。",
+                model, estimated_tokens, num_ctx, int(_NUM_CTX_WARNING_RATIO * 100),
+            )
     try:
         resp = requests.post(
             f"{OLLAMA_BASE_URL}/api/chat",
             json={
                 "model": model, "messages": messages, "tools": tools, "stream": True,
-                "options": {"num_predict": CHAT_MAX_OUTPUT_TOKENS},
+                "options": options, "keep_alive": KEEP_ALIVE,
             },
             stream=True,
             timeout=(CHAT_CONNECT_TIMEOUT_SEC, CHAT_READ_TIMEOUT_SEC),
@@ -645,6 +796,16 @@ def _stream_openai_compatible_turn(base_url: str, model: str, messages: list, to
     仮の判断: OpenAI互換のストリーミングではtool_callsが複数チャンクに
     分割されて送られてくる(引数のJSON文字列が少しずつ届く)ため、
     indexごとに文字列を連結して組み立てる。
+
+    仮の判断: Ollamaのようにここではnum_ctx相当のオプションを指定して
+    いない。LM Studio・MLX-LMはどちらもコンテキスト長をモデルの
+    ロード時設定(LM StudioのUIでの「Context Length」設定、
+    `mlx_lm.server`の起動オプション)としてサーバー側で固定しており、
+    OpenAI互換のchat completions APIのリクエストボディにその場で
+    指定できるパラメータが無い(`max_tokens`はあくまで出力側の上限で、
+    入力側のコンテキスト長とは別物)。そのため、この2バックエンドに
+    関しては「モデルロード時に十分な長さを設定しておいてもらう」ことが
+    前提になり、Yoriai側からリクエスト単位で制御する手段は無い。
     """
     try:
         resp = requests.post(
@@ -1105,6 +1266,16 @@ def build_profile_card(agent_id: str) -> dict:
                 _merge_model_lists(ollama_installed, mlx_lm_models, lmstudio_models)
                 + _merge_model_lists(ollama_loaded, mlx_lm_models, lmstudio_models)
             ),
+            # 仮の判断: get_ollama_context_length()はキャッシュされるとはいえ、
+            # 未取得のモデルは/api/showへの実HTTP問い合わせが発生する。
+            # カード生成のたびにインストール済み全モデル分を問い合わせると、
+            # モデル数が多い環境でカード生成(ハートビート応答にも使われる)が
+            # 遅くなりかねないため、実際にロード済みのOllamaモデルだけに
+            # 限定する(インストール済みだが未ロードのモデルは、どのみち
+            # チャットの相手として選ばれるまでは表示する意味が薄い)。
+            "context_lengths": {
+                m: get_ollama_context_length(m) for m in ollama_loaded
+            },
         },
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
@@ -8508,6 +8679,7 @@ def _format_status_member(card: dict, index: int, label: str, last_seen: float =
     installed = card.get("models", {}).get("installed", [])
     loaded = card.get("models", {}).get("loaded", [])
     backends = card.get("models", {}).get("backends", [])
+    context_lengths = card.get("models", {}).get("context_lengths", {})
 
     if free_gb is not None and total_gb is not None:
         memory_line = f"    メモリ: 空き {free_gb}GB / 総 {total_gb}GB"
@@ -8522,6 +8694,12 @@ def _format_status_member(card: dict, index: int, label: str, last_seen: float =
         f"    ロード済みモデル: {', '.join(loaded) if loaded else 'なし'}",
         f"    インストール済みモデル({len(installed)}件): {', '.join(installed) if installed else 'なし'}",
     ]
+    # 仮の判断: context_lengthsはロード済みのOllamaモデルのみ(build_profile_card
+    # 参照)。値が取得できなかった(None)モデルは一覧から省く。
+    known_context_lengths = {m: n for m, n in context_lengths.items() if n}
+    if known_context_lengths:
+        formatted = ", ".join(f"{m}: {n}" for m, n in known_context_lengths.items())
+        lines.append(f"    コンテキスト長: {formatted}")
     if last_seen is not None:
         lines.append(f"    最終確認: {_format_seconds_ago(last_seen)}")
     return "\n".join(lines)

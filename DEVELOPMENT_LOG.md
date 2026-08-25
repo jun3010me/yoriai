@@ -3674,3 +3674,81 @@ completion`本体の根本問題(最終ラウンドでcontentを1文字も生成
   追加し、反論役・統合役のプロンプトに規模相応の指摘を促す文言が含まれる
   ことを確認するテストも追加した。既存の全テストファイル(32ファイル)を
   実行し、リグレッションが無いことを確認した。
+
+### Ollamaへのnum_ctx/keep_alive明示指定
+
+利用者から、「協業モードの実装計画がメンバーに正しく届いていないのでは
+ないか」「レビュー担当が実在するコードを見落としているのではないか」
+という疑いが報告された。調査したところ、`_stream_ollama_turn()`がOllamaの
+`/api/chat`に送るオプションが`{"num_predict": CHAT_MAX_OUTPUT_TOKENS}`
+だけで、コンテキストウィンドウの長さ`num_ctx`を一切指定していないことが
+分かった。`num_ctx`を指定しない場合、Ollamaはモデルの学習上の上限では
+なくOllama側のデフォルト(バージョンにより4096または2048)でウィンドウを
+開き、それを超える入力はエラーにならず先頭から黙って切り捨てられる。
+協業モードでは「実装計画全体(full_plan)+担当ファイルの指示+会話履歴」を
+先頭から送っているため、計画部分が真っ先に捨てられてモデルが計画に
+無いファイル名を書いたり、レビュー担当がread_fileの返す最大12000文字の
+コードのうち大半を見ずに誤検知したりする、といった実害につながって
+いた疑いがある。
+
+対応:
+
+- **`get_ollama_context_length(model)`を新設**し、Ollamaの`/api/show`に
+  問い合わせてモデルの学習上のコンテキスト長を取得するようにした。
+  レスポンスの`model_info`はアーキテクチャ名がプレフィックスに付いた
+  キー(`llama.context_length`・`qwen2.context_length`・
+  `gemma3.context_length`等)で返ってくるため、決め打ちせずキー名が
+  `.context_length`で終わるものを走査する方式にした。取得に失敗しても
+  例外は投げず`logger.warning`のみ出してNoneを返す(既存の
+  `get_ollama_installed_models`等と同じ方針)。この関数はチャット1往復
+  ごとに呼ばれる位置に入るため、`_OLLAMA_CONTEXT_LENGTH_CACHE`という
+  モジュールレベル辞書でモデルごとにメモ化し(取得失敗のNoneも含めて)、
+  プロセスが生きている間は再問い合わせしない。
+- **`_decide_num_ctx(model)`を新設**し、実際にOllamaへ指定する`num_ctx`を
+  「モデルの学習上のコンテキスト長(取得できなければ無視)」「実機の
+  空きメモリから許せる上限(`_num_ctx_limit_from_memory`、空き4GB未満→
+  8192/4〜8GB→16384/8〜16GB→32768/16GB以上→65536の段階表)」
+  「絶対的な上限`MAX_NUM_CTX`(初期値65536)」の3つの最小値として決める。
+  メモリの段階表の数字に厳密な根拠は無く、実機(Mac mini 32GB・
+  MacBook Pro 128GB・Mac Studio 512GB・Raspberry Pi 4)で実際に調整する
+  前提の初期値であることをコメントに明記した。決定した値が
+  `CHAT_MAX_OUTPUT_TOKENS`を下回ってしまう場合は`CHAT_MAX_OUTPUT_TOKENS
+  * 2`を下限として持ち上げ、出力の余地が無くなるのを防ぐ。
+- **`_stream_ollama_turn()`のリクエストに反映**し、`options.num_ctx`
+  (決定できた場合のみ、キーごと省略する場合もある)と、新設の`KEEP_ALIVE`
+  定数(初期値`"30m"`、環境変数`YORIAI_OLLAMA_KEEP_ALIVE`で上書き可能。
+  `SEARXNG_BASE_URL`と同じ流儀)を`keep_alive`として送るようにした。
+  Ollamaの既定keep_alive(5分)のままだと、協業モードのフェーズの合間に
+  モデルの再ロード(実機で数十秒〜)が毎回挟まってしまうための対応。
+- **コンテキスト超過の警告**: 送信直前に`_estimate_tokens()`(日本語などの
+  非ASCII文字は1文字≒1トークン、ASCII文字は4文字≒1トークンとする雑な
+  概算。厳密なトークナイザをrequirements.txtの新規依存として増やすのは
+  避けた)でおおよそのトークン数を数え、`num_ctx`の8割を超えていたら
+  モデル名・概算トークン数・`num_ctx`の値と、「入力がコンテキスト長を
+  超えると、Ollamaは先頭から黙って切り捨てます」という一文を含めて
+  `logger.warning`を出すようにした。
+- **LM Studio/MLX-LMは対象外**: この2バックエンドはコンテキスト長が
+  モデルのロード時設定(サーバー側)で決まり、OpenAI互換のchat
+  completions APIのリクエストボディから制御する手段が無いため、今回は
+  何もしていない。`_stream_openai_compatible_turn()`にその理由を
+  `# 仮の判断:`コメントとして残した。
+- **自己紹介カードへの掲載**: `build_profile_card()`の`models`に
+  `context_lengths`(モデル名→コンテキスト長の辞書)を追加した。
+  カード生成のたびにインストール済み全モデル分を`/api/show`に問い合わせる
+  とハートビート応答が遅くなりかねないため、実際にロード済みの
+  Ollamaモデルのみに絞った。`--status`の表示(`_format_status_member`)
+  にも、値が取得できたモデルがあれば「コンテキスト長: 〜」の行を追加した。
+- **テスト**: `tests/test_num_ctx.py`を新設し、(1)`/api/show`のレスポンス
+  から`.context_length`で終わるキーをプレフィックスによらず拾えること、
+  (2)`/api/show`が失敗しても例外にならずNoneが返ること(結果もキャッシュ
+  されること)、(3)2回目以降の呼び出しでHTTPリクエストが発生しないこと、
+  (4)`_decide_num_ctx`がモデル上限・メモリ由来上限・`MAX_NUM_CTX`の
+  最小値を返し、下限として`CHAT_MAX_OUTPUT_TOKENS * 2`を下回らないこと、
+  (5)`_stream_ollama_turn`のリクエストボディに`num_ctx`・`keep_alive`が
+  含まれ、`num_ctx`が`None`のときはキー自体が含まれないこと、
+  (6)`_estimate_tokens`の概算ロジック、を確認した。既存の全テスト
+  ファイル(33ファイル)を実行し、事前から存在していた
+  `tests/test_background_collaborate.py`・`tests/test_fix_session.py`の
+  タイミング依存の間欠的な失敗(今回の変更前・変更後で発生確率が変わらず、
+  背景スレッドが実際のTCP接続を試みる既存の設計に起因することを確認済み)
+  を除き、リグレッションが無いことを確認した。
