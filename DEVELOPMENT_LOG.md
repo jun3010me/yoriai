@@ -3912,3 +3912,33 @@ completion`本体の根本問題(最終ラウンドでcontentを1文字も生成
   `tests/test_background_collaborate.py`・`tests/test_fix_session.py`の
   タイミング依存の間欠的な失敗を除き、リグレッションが無いことを
   確認した。
+
+### Raspberry Pi 4(Python 3.9系)で起動時にTypeErrorになる不具合の修正
+
+実機のRaspberry Pi 4で`python3 yoriai.py --chat`が起動直後に
+`TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'`
+(`get_ollama_context_length`の関数注釈`-> int | None`の行)で落ちる
+不具合が報告された。原因は、統合検証ループ実装時に追加した
+`get_ollama_context_length`・`_decide_num_ctx`の返り値注釈がPEP 604の
+`X | Y`共用体記法(Python 3.10で導入)を使っていたこと。この記法は
+関数定義の実行時に注釈式そのものが評価されるPython 3.9以前では
+`TypeError`になる。開発環境がPython 3.11だったため見落としていたが、
+README.mdの動作環境は当初から「Python 3.9以降」と明記されている。
+
+対応:
+
+- **`from __future__ import annotations`をファイル冒頭に追加**した
+  (docstringの直後・他のimportより前。この位置に置く必要があるという
+  言語仕様上の制約がある)。これにより全ての関数注釈が実行時には評価
+  されない文字列として扱われるため、`int | None`のような3.10以降の
+  記法を含む注釈があっても3.9以前で例外にならない。本体側で
+  `typing.get_type_hints`等により注釈を実行時に解決している箇所は
+  無いことを確認済みのため、この変更で動作が変わる箇所は無い。
+  `typing.Optional`への個別の書き換えより変更範囲が小さく、今後
+  同種の記法を使ってしまう再発も防げる。
+- **テスト**: 実機のPython 3.9が無い開発環境のため、
+  `from __future__ import annotations`下では注釈が文字列として
+  格納され実行時評価されないことを、最小再現コードで確認した
+  (`f.__annotations__`が`{'return': 'int | None'}`という文字列に
+  なることを確認)。既存の全テストファイル(35ファイル)を実行し、
+  リグレッションが無いことを確認した。
