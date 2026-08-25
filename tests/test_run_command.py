@@ -104,10 +104,37 @@ def test_validate_run_command_rejects_absolute_and_traversal_paths():
 def test_validate_run_command_rejects_interpreter_inline_eval_flags():
     argv, error = yoriai._validate_run_command("python3 -c 'import os; os.system(\"ls\")'")
     assert argv is None, argv
-    argv, error = yoriai._validate_run_command("python3 -m http.server")
+    # 仮の判断(統合検証ループへの対応): -mは全面禁止から「許可リストに
+    # あるモジュールのみ通す」方式に緩和したため、許可リストに無い
+    # モジュール(osはファイル操作等の任意のコード実行につながりうる)を
+    # 使って引き続き拒否されることを確認する。python3 -m pytest等の
+    # 許可されるケースはtest_validate_run_command_allows_python_dash_m_
+    # for_allowlisted_modulesで確認する。
+    argv, error = yoriai._validate_run_command("python3 -m os")
     assert argv is None, argv
     argv, error = yoriai._validate_run_command("node -e 'console.log(1)'")
     assert argv is None, argv
+
+
+def test_validate_run_command_allows_python_dash_m_for_allowlisted_modules():
+    """統合検証ループへの対応: python3 -m pytest・python3 -m py_compileの
+    ような正当な検証手段は、-mの直後のモジュール名が許可リスト
+    (_PYTHON_ALLOWED_MODULES)にあれば通ることを確認する。
+    """
+    assert yoriai._validate_run_command("python3 -m pytest") == (["python3", "-m", "pytest"], None)
+    assert yoriai._validate_run_command("python3 -m py_compile app.py") == (
+        ["python3", "-m", "py_compile", "app.py"], None,
+    )
+
+
+def test_validate_run_command_rejects_python_dash_m_for_disallowed_modules():
+    """許可リストに無いモジュール(例: os)を-mで実行しようとした場合は
+    引き続き拒否されることを確認する(-mの全面禁止から条件付き許可への
+    緩和が、無条件の許可になっていないことの確認)。
+    """
+    argv, error = yoriai._validate_run_command("python3 -m os")
+    assert argv is None, argv
+    assert error is not None and "os" in error, error
 
 
 def test_validate_run_command_does_not_block_gccs_unrelated_dash_c_flag():
@@ -371,6 +398,8 @@ def main():
         test_validate_run_command_rejects_shell_metacharacters,
         test_validate_run_command_rejects_absolute_and_traversal_paths,
         test_validate_run_command_rejects_interpreter_inline_eval_flags,
+        test_validate_run_command_allows_python_dash_m_for_allowlisted_modules,
+        test_validate_run_command_rejects_python_dash_m_for_disallowed_modules,
         test_validate_run_command_does_not_block_gccs_unrelated_dash_c_flag,
         test_validate_run_command_accepts_flexible_validation_commands,
         test_validate_run_command_allows_unrecognized_validator_tools,

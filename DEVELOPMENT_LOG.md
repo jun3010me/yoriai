@@ -3674,3 +3674,241 @@ completion`本体の根本問題(最終ラウンドでcontentを1文字も生成
   追加し、反論役・統合役のプロンプトに規模相応の指摘を促す文言が含まれる
   ことを確認するテストも追加した。既存の全テストファイル(32ファイル)を
   実行し、リグレッションが無いことを確認した。
+
+### Ollamaへのnum_ctx/keep_alive明示指定
+
+利用者から、「協業モードの実装計画がメンバーに正しく届いていないのでは
+ないか」「レビュー担当が実在するコードを見落としているのではないか」
+という疑いが報告された。調査したところ、`_stream_ollama_turn()`がOllamaの
+`/api/chat`に送るオプションが`{"num_predict": CHAT_MAX_OUTPUT_TOKENS}`
+だけで、コンテキストウィンドウの長さ`num_ctx`を一切指定していないことが
+分かった。`num_ctx`を指定しない場合、Ollamaはモデルの学習上の上限では
+なくOllama側のデフォルト(バージョンにより4096または2048)でウィンドウを
+開き、それを超える入力はエラーにならず先頭から黙って切り捨てられる。
+協業モードでは「実装計画全体(full_plan)+担当ファイルの指示+会話履歴」を
+先頭から送っているため、計画部分が真っ先に捨てられてモデルが計画に
+無いファイル名を書いたり、レビュー担当がread_fileの返す最大12000文字の
+コードのうち大半を見ずに誤検知したりする、といった実害につながって
+いた疑いがある。
+
+対応:
+
+- **`get_ollama_context_length(model)`を新設**し、Ollamaの`/api/show`に
+  問い合わせてモデルの学習上のコンテキスト長を取得するようにした。
+  レスポンスの`model_info`はアーキテクチャ名がプレフィックスに付いた
+  キー(`llama.context_length`・`qwen2.context_length`・
+  `gemma3.context_length`等)で返ってくるため、決め打ちせずキー名が
+  `.context_length`で終わるものを走査する方式にした。取得に失敗しても
+  例外は投げず`logger.warning`のみ出してNoneを返す(既存の
+  `get_ollama_installed_models`等と同じ方針)。この関数はチャット1往復
+  ごとに呼ばれる位置に入るため、`_OLLAMA_CONTEXT_LENGTH_CACHE`という
+  モジュールレベル辞書でモデルごとにメモ化し(取得失敗のNoneも含めて)、
+  プロセスが生きている間は再問い合わせしない。
+- **`_decide_num_ctx(model)`を新設**し、実際にOllamaへ指定する`num_ctx`を
+  「モデルの学習上のコンテキスト長(取得できなければ無視)」「実機の
+  空きメモリから許せる上限(`_num_ctx_limit_from_memory`、空き4GB未満→
+  8192/4〜8GB→16384/8〜16GB→32768/16GB以上→65536の段階表)」
+  「絶対的な上限`MAX_NUM_CTX`(初期値65536)」の3つの最小値として決める。
+  メモリの段階表の数字に厳密な根拠は無く、実機(Mac mini 32GB・
+  MacBook Pro 128GB・Mac Studio 512GB・Raspberry Pi 4)で実際に調整する
+  前提の初期値であることをコメントに明記した。決定した値が
+  `CHAT_MAX_OUTPUT_TOKENS`を下回ってしまう場合は`CHAT_MAX_OUTPUT_TOKENS
+  * 2`を下限として持ち上げ、出力の余地が無くなるのを防ぐ。
+- **`_stream_ollama_turn()`のリクエストに反映**し、`options.num_ctx`
+  (決定できた場合のみ、キーごと省略する場合もある)と、新設の`KEEP_ALIVE`
+  定数(初期値`"30m"`、環境変数`YORIAI_OLLAMA_KEEP_ALIVE`で上書き可能。
+  `SEARXNG_BASE_URL`と同じ流儀)を`keep_alive`として送るようにした。
+  Ollamaの既定keep_alive(5分)のままだと、協業モードのフェーズの合間に
+  モデルの再ロード(実機で数十秒〜)が毎回挟まってしまうための対応。
+- **コンテキスト超過の警告**: 送信直前に`_estimate_tokens()`(日本語などの
+  非ASCII文字は1文字≒1トークン、ASCII文字は4文字≒1トークンとする雑な
+  概算。厳密なトークナイザをrequirements.txtの新規依存として増やすのは
+  避けた)でおおよそのトークン数を数え、`num_ctx`の8割を超えていたら
+  モデル名・概算トークン数・`num_ctx`の値と、「入力がコンテキスト長を
+  超えると、Ollamaは先頭から黙って切り捨てます」という一文を含めて
+  `logger.warning`を出すようにした。
+- **LM Studio/MLX-LMは対象外**: この2バックエンドはコンテキスト長が
+  モデルのロード時設定(サーバー側)で決まり、OpenAI互換のchat
+  completions APIのリクエストボディから制御する手段が無いため、今回は
+  何もしていない。`_stream_openai_compatible_turn()`にその理由を
+  `# 仮の判断:`コメントとして残した。
+- **自己紹介カードへの掲載**: `build_profile_card()`の`models`に
+  `context_lengths`(モデル名→コンテキスト長の辞書)を追加した。
+  カード生成のたびにインストール済み全モデル分を`/api/show`に問い合わせる
+  とハートビート応答が遅くなりかねないため、実際にロード済みの
+  Ollamaモデルのみに絞った。`--status`の表示(`_format_status_member`)
+  にも、値が取得できたモデルがあれば「コンテキスト長: 〜」の行を追加した。
+- **テスト**: `tests/test_num_ctx.py`を新設し、(1)`/api/show`のレスポンス
+  から`.context_length`で終わるキーをプレフィックスによらず拾えること、
+  (2)`/api/show`が失敗しても例外にならずNoneが返ること(結果もキャッシュ
+  されること)、(3)2回目以降の呼び出しでHTTPリクエストが発生しないこと、
+  (4)`_decide_num_ctx`がモデル上限・メモリ由来上限・`MAX_NUM_CTX`の
+  最小値を返し、下限として`CHAT_MAX_OUTPUT_TOKENS * 2`を下回らないこと、
+  (5)`_stream_ollama_turn`のリクエストボディに`num_ctx`・`keep_alive`が
+  含まれ、`num_ctx`が`None`のときはキー自体が含まれないこと、
+  (6)`_estimate_tokens`の概算ロジック、を確認した。既存の全テスト
+  ファイル(33ファイル)を実行し、事前から存在していた
+  `tests/test_background_collaborate.py`・`tests/test_fix_session.py`の
+  タイミング依存の間欠的な失敗(今回の変更前・変更後で発生確率が変わらず、
+  背景スレッドが実際のTCP接続を試みる既存の設計に起因することを確認済み)
+  を除き、リグレッションが無いことを確認した。
+
+### edit_fileツール(部分置換)の追加
+
+これまでプロジェクトファイルへの書き込み手段はwrite_file(全文上書き)
+のみで、スキーマにも「差分ではなくファイル全体を渡すこと」と明記して
+いた。これには2つの実害があった。(1)ファイル破壊: 300行のファイルの
+3行を直すために毎回300行を出力させるため、`CHAT_MAX_OUTPUT_TOKENS`に
+達して途中で切れると、切れたままのコードが書き込まれる。(2)意図しない
+改変: ローカルLLMは全文を通すたびに、触る必要のないコメントや実装を
+書き換えてしまいやすい。Claude Codeが`Write`とは別に`Edit`(一意な文字列の
+置換)を持っているのと同じ理由(便利さより事故防止)で、`edit_file`を
+新設した。
+
+対応:
+
+- **`EDIT_FILE_TOOL_SCHEMA`を新設**し、`filename`・`old_string`・
+  `new_string`(いずれも必須)を受け取るツールとして定義した。
+  `replace_all`のようなオプションは意図的に付けていない。一意マッチの
+  強制がこのツールの安全性の根拠であり、ローカルLLMに一括置換の権限を
+  渡すと、たまたま複数箇所に出現する短い文字列を指定してしまった場合に
+  意図しない箇所まで一斉に書き換えてしまう恐れがあるため。
+- **`_edit_project_file()`を新設**し、パス解決は既存の
+  `_resolve_safe_project_path()`を必ず経由するようにした(PROGRESS.mdの
+  保護もこれで効く)。ファイルが存在しない場合は`_read_project_file_fresh`
+  と同様に`_planned_filenames_from_progress()`で計画上のファイルかどうかを
+  確認して案内を出し分ける。`old_string`の出現回数を数え、0件は
+  「見つかりませんでした」、2件以上は「N箇所に一致しました」+一致箇所の
+  行番号一覧(モデルが次の試行で範囲を広げる判断材料にするため)を返し、
+  どちらの場合もファイルには一切触れない。1件のときだけ置換して書き込む。
+  書き込み後の即時構文チェック(`syntax_ok`/`syntax_error`/
+  `syntax_check_skipped`)は`_write_project_file`と処理内容が重複するため、
+  `_syntax_check_result_fields()`という共通ヘルパーに切り出して両方から
+  呼ぶようにした。
+- **各所への登録**: `PROJECT_TOOLS_SCHEMAS`・`PROJECT_TOOLS_CLIENT_NAMES`・
+  `_execute_project_tool_call()`・`_MUTATING_PROJECT_TOOL_NAMES`
+  (`_mutated_filename_from_tool_result()`がedit_fileの成功も「変更された
+  ファイル」として拾えるようにするため。`//fix`の`modified_files`への
+  反映に必要)に追加した。
+- **write_fileの説明文を反転**: 「既存ファイルの一部だけを直したい場合も
+  ファイル全体をここに渡すこと」という記述を、「新規ファイルの作成、
+  またはファイル全体を作り直す場合に使う。部分修正にはedit_fileを
+  使うこと」という逆向きの指示に書き換えた。`_SEARCH_THEN_READ_GUIDANCE`
+  と同様の共通の案内文`_EDIT_OVER_WRITE_GUIDANCE`を新設し、
+  プロジェクトツールを提供する全プロンプト(`_FIX_REQUEST_TOOL_PROMPT_
+  TEMPLATE`・`_FIX_SUBTASK_REVIEW_PROMPT_TEMPLATE`、3箇所の呼び出し)で
+  使い回すようにした。
+- **応答切れによるファイル破壊のガード**: `stream_chat_completion()`が
+  `pending_tool_calls`をyieldする際、そのラウンドが`CHAT_MAX_OUTPUT_TOKENS`
+  上限で打ち切られたかどうか(`truncated`)を今回新たに合わせて渡すように
+  した(これまでは`pending_tool_calls`イベントにこの情報が含まれておらず、
+  呼び出し元が判断できなかった)。`_collect_answer_with_project_tools()`は
+  この`truncated`が立ったラウンドに`write_file`呼び出しが含まれていた
+  場合、その`write_file`だけを実行せず(read_file等の読み取り系ツールは
+  通常どおり実行する)、「応答が長さ制限で途中までしか届いていないため、
+  この write_file は実行しませんでした」という理由をツール結果として
+  返すようにした。write_fileの`content`引数(ファイル全体)が生成の
+  途中で切れている可能性が高く、そのまま書き込むとファイルが壊れた状態で
+  保存されてしまうため。
+- **テスト**: `tests/test_edit_file.py`を新設し、(1)一意にマッチした
+  ときに置換されること、(2)0件・複数件のときはファイルが一切変更
+  されないこと(複数件のときは行番号がエラーに含まれること)、
+  (3)`new_string=""`で削除になること、(4)`../`・絶対パス・PROGRESS.mdが
+  既存ツールと同じく拒否されること、(5)計画上は存在するが未実装/計画に
+  無いファイルへの区別、(6)置換後に構文エラーになる場合は`syntax_ok:
+  false`と詳細が返ること、(7)ツール登録・`_execute_project_tool_call`
+  でのディスパッチ・`_mutated_filename_from_tool_result`での認識、
+  (8)`truncated`なラウンドの`write_file`が実行されず(read_fileは実行
+  され)、ファイルが変更されないこと、を確認した。既存の全テスト
+  ファイル(34ファイル)を実行し、事前から存在していた
+  `tests/test_background_collaborate.py`・`tests/test_fix_session.py`の
+  タイミング依存の間欠的な失敗を除き、リグレッションが無いことを
+  確認した。
+
+### 統合検証ループ(動かして、落ちたら直す)の実装
+
+これまでの品質保証は、`_check_file_syntax`によるファイル単位の機械的な
+構文チェックと、レビュー担当LLMによる内容レビュー(最大2回、読むだけで
+実行はしない)に限られていた。構文としては正しいが実行すると落ちる
+コード(import漏れ・未定義の関数呼び出し・モジュール間のシグネチャ
+不一致など)は誰も検出できないまま「✅ 全タスク完了」になってしまう
+不具合が、両方向(誤検知・見逃し)で報告されていた。`run_command`
+ツール自体は存在するが、`//fix`のセッション中にモデルが任意に呼べる
+だけで、「実行して落ちたら直す、通るまで繰り返す」という自動の輪には
+なっていなかった。ローカルLLMは一発で正しく書けないことが前提のため、
+実行結果を見て直す輪を、全タスク完了後にプロジェクト全体に対して
+1回だけ挟むことにした(ファイル単位の構文チェックは既にあり、実行しないと
+分からない不具合の大半は「複数ファイルを統合したとき」に現れるため)。
+
+対応:
+
+- **合意フェーズで検証コマンドを決めさせる**: `_MODULE_BREAKDOWN_PROMPT_
+  TEMPLATE`・`_build_design_dialogue_output_instruction`の出力形式に、
+  ファイル一覧の最後に「検証コマンド: <コマンド>」という行を1行追加する
+  よう指示を足した。対話型ツール(標準入力が必要)や適切なコマンドが
+  無い場合は「検証コマンド: なし」と書かせる。この行は拡張子付きの
+  ファイル名の形(`_FILE_HEADER_PATTERN`)に一致しないため、
+  `_parse_module_breakdown`に渡す前に`_extract_verify_command()`で
+  個別に抜き出す2段階の解析にした(`_run_collaborate_implementation_
+  phase`で、対話プロトコル経由・単一設計担当への相談経由のどちらの
+  `answer`に対しても同じ処理を通すため、両方の経路をまとめて対応できる)。
+  「なし」「無し」「特になし」やこの行自体が無い(旧形式)場合は
+  `_has_verify_command()`でまとめて「検証コマンド無し」として扱う。
+- **PROGRESS.mdへの永続化**: 新設の`## 検証コマンド`(1行、コマンド文字列)
+  ・`## 統合検証`(`✅ 成功 (N回目の試行で成功)` / `❌ 失敗 (N回試行)`+
+  失敗時は最後の出力の冒頭`_VERIFICATION_OUTPUT_RECORD_CHARS`(500)文字を
+  記録)の2節を`_format_progress_markdown`/`_write_progress_md`に追加し、
+  `_parse_progress_markdown`で`verify_command`/`verification`として
+  読み戻せるようにした。どちらも値が無ければ(旧バージョンのPROGRESS.md・
+  まだ統合検証を実行していない場合)節ごと省略する、既存の「直近の
+  レビュー指摘」等と同じ方針。
+- **`run_command`の`-m`フラグを限定的に緩和**: `_RUN_COMMAND_BLOCKED_
+  FLAGS_BY_INTERPRETER`がpython3/pythonの`-m`を全面禁止していたため、
+  `python3 -m pytest`のような検証ループに必要な正当な手段まで塞がれて
+  いた。`-m`は全面禁止をやめ、直後に来るモジュール名が新設の許可リスト
+  `_PYTHON_ALLOWED_MODULES`(`pytest`・`unittest`・`py_compile`・
+  `compileall`・`json.tool`・`http.server`)にある場合のみ通す方式に
+  変更した。`http.server`はサーバーが起動しっぱなしになるが、
+  `RUN_COMMAND_TIMEOUT_SEC`(10秒)で必ず強制終了されるため問題ない。
+  判断に迷うモジュール(`webbrowser`・`pdb`等)は含めず、必要になった
+  時点で追加する方針とした。
+- **`_run_integration_verification()`を新設**し、検証コマンドを実行して
+  失敗したら担当メンバー1名(`candidates`の先頭、最も空きメモリの多い
+  メンバー)に`_collect_answer_with_project_tools`(課題2で追加した
+  `edit_file`・`_EDIT_OVER_WRITE_GUIDANCE`を含むプロジェクトツール一式)で
+  修正を依頼し、再実行する、を最大`MAX_VERIFY_ATTEMPTS`(新設、3)回まで
+  繰り返すようにした。修正依頼プロンプトには実装計画全体・実行コマンド・
+  終了コード・出力を含め、「原因を推測で決めつけず、read_file・
+  search_in_fileで実際のコードを確認してから直すこと」を明記した。
+  スキップ判定(未完了タスクが残っている・検証コマンドが無い)は、
+  `checklist`という別の関心事を持ち込まないよう呼び出し元
+  (`_run_collaborative_project`)側で行う設計にした。
+- **`_run_collaborative_project`への統合**: `_run_collaborative_task_
+  queue`の完了後・最終チェックリスト表示の前に統合検証を挟んだ。
+  未完了タスクが残っている場合、検証コマンドが「なし」の場合はそれぞれ
+  その旨を表示してスキップする。結果は`## 統合検証`としてPROGRESS.mdに
+  記録し、`[✅ 全タスク完了]`の判定条件にも含めた。全タスク完了かつ
+  統合検証成功のときだけ「✅ 全タスク完了」を名乗り、実装は完了して
+  いても統合検証が失敗している場合は`[⚠️ 実装は完了しましたが、統合検証に
+  失敗しています]`と区別して報告する(未完了タスクが残っている場合の
+  既存の`[⚠️ 未完了のタスクが残っています]`と同じ、正直な報告という思想)。
+- **`//resume-all`での再開対応**: `_project_has_pending_work`の判定に
+  「全タスクは完了しているが、統合検証が失敗のまま記録されている」
+  ケースを追加した。`_resume_project`は、ファイル単位の未完了タスクが
+  無くても統合検証の再試行が必要な場合は早期リターンせず、`_run_
+  collaborative_project`に処理を渡す(タスクキューは空のため実質
+  スキップされ、統合検証だけが再実行される)ようにした。
+- **テスト**: `tests/test_integration_verification.py`を新設し、
+  (1)1回目/2回目の試行で成功する場合の修正依頼の発生回数、(2)3回とも
+  失敗した場合に無限に繰り返さず「成功」と報告されないこと、(3)未完了
+  タスク・検証コマンド未設定によるスキップ、(4)PROGRESS.mdへの記録・
+  再読み込み、(5)`_project_has_pending_work`が失敗した統合検証を
+  拾うこと、(6)`_extract_verify_command`の抜き出し、を確認した。
+  `tests/test_run_command.py`には`python3 -m pytest`が通り
+  `python3 -m os`のような許可外モジュールが拒否されるケースを追加し、
+  既存の`python3 -m http.server`を拒否する期待値(今回`http.server`を
+  許可リストに加えたため矛盾する)を`python3 -m os`に差し替えた。
+  既存の全テストファイル(35ファイル)を実行し、事前から存在していた
+  `tests/test_background_collaborate.py`・`tests/test_fix_session.py`の
+  タイミング依存の間欠的な失敗を除き、リグレッションが無いことを
+  確認した。

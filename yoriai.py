@@ -81,6 +81,30 @@ CHAT_READ_TIMEOUT_SEC = 120
 # 被害(待ち時間・トークン消費)を現実的な範囲に抑えられる値として選んだ。
 CHAT_MAX_OUTPUT_TOKENS = 8192
 
+# 仮の判断: Ollamaへの/api/chat問い合わせにnum_ctx(コンテキストウィンドウの
+# 長さ)を指定していなかったため、Ollamaはモデルの学習上の上限ではなく
+# Ollama側のデフォルト(バージョンにより4096または2048)でコンテキスト
+# ウィンドウを開いていた。超過した入力はエラーにならず先頭から黙って
+# 切り捨てられるため、協業モードの実装計画や、read_fileが返す最大
+# _FILE_CONTENT_TRUNCATE_CHARS(12000文字)のコードがまるごと捨てられる、
+# CHAT_MAX_OUTPUT_TOKENSを設定していても実際の出力上限がそれ以下に
+# 頭打ちになる、といった実害につながっていた疑いがある。そのため
+# 明示的にnum_ctxを指定する(詳細は_decide_num_ctxを参照)。この値は
+# 「これ以上は指定しない」という絶対的な上限であり、モデルの学習上の
+# コンテキスト長・実機の空きメモリのどちらがこれより小さくても、
+# 小さい方が優先される(_decide_num_ctx参照)。
+MAX_NUM_CTX = 65536
+
+# 仮の判断: Ollamaの既定のkeep_alive(モデルをメモリに保持する時間)は
+# 5分で、それを過ぎるとモデルがアンロードされる。Yoriaiの協業モードは
+# 合意・実装・レビュー・修正のフェーズ間で人間の入力待ちが挟まったり、
+# 大規模なタスクキューの処理に数時間かかったりするため、フェーズの
+# 合間にモデルの再ロード(実機で数十秒〜)が毎回発生してしまう。そこで
+# 既定より長い30分をYoriai全体の既定値とする。環境変数
+# YORIAI_OLLAMA_KEEP_ALIVEで上書きできるようにする(SEARXNG_BASE_URLと
+# 同じ流儀)。
+KEEP_ALIVE = os.environ.get("YORIAI_OLLAMA_KEEP_ALIVE", "30m")
+
 # 仮の判断: 起動時1回だけのスキャンだと、たまたま相手のYoriaiがまだ起動しきっていない
 # タイミングで実行してしまった場合に「Connection refused」で失敗し、その後相手が
 # 起動してもずっと0件のまま固定されてしまう問題が実機検証で見つかった。
@@ -278,6 +302,86 @@ def get_ollama_loaded_models() -> list:
         return []
 
 
+# 仮の判断: get_ollama_context_length()はチャット1往復ごと(_stream_ollama_turn
+# 経由)に呼ばれる位置に入るため、モデルごとに結果をメモ化する。/api/showは
+# モデルのメタデータであり、プロセスが生きている間に値が変わることは
+# 想定しないため(Ollamaのバージョンアップやモデルの再pull等で変わりうるが、
+# その場合はYoriai自体の再起動を前提とする)、TTLは設けず1回取得したら
+# 使い回す。
+_OLLAMA_CONTEXT_LENGTH_CACHE = {}
+
+
+def get_ollama_context_length(model: str) -> int | None:
+    """Ollamaの`/api/show`から、モデルの学習上のコンテキスト長を取得する。
+
+    仮の判断: レスポンスの`model_info`はアーキテクチャ名がプレフィックスに
+    付いたキー("llama.context_length"・"qwen2.context_length"・
+    "gemma3.context_length"等)でコンテキスト長を返す。プレフィックスは
+    モデルのアーキテクチャによって変わり決め打ちできないため、キー名が
+    ".context_length"で終わるものを探す方式にする(複数見つかった場合は
+    最初に見つかったものを使う)。取得できなければ(接続失敗・該当キー
+    無し等)例外を握りつぶしてNoneを返す(既存のget_ollama_installed_models
+    等と同じ方針)。
+    """
+    if model in _OLLAMA_CONTEXT_LENGTH_CACHE:
+        return _OLLAMA_CONTEXT_LENGTH_CACHE[model]
+    context_length = None
+    try:
+        resp = requests.post(f"{OLLAMA_BASE_URL}/api/show", json={"model": model}, timeout=5)
+        resp.raise_for_status()
+        model_info = resp.json().get("model_info", {})
+        for key, value in model_info.items():
+            if key.endswith(".context_length"):
+                context_length = int(value)
+                break
+    except Exception as exc:
+        logger.warning("モデル '%s' のコンテキスト長の取得に失敗しました: %s", model, exc)
+    _OLLAMA_CONTEXT_LENGTH_CACHE[model] = context_length
+    return context_length
+
+
+# 仮の判断: 空きメモリに応じたnum_ctxの段階表。この数字に厳密な根拠は無く、
+# 実機(Mac mini 32GB・MacBook Pro 128GB・Mac Studio 512GB・Raspberry Pi 4)
+# で実際に動かしながら調整する前提の初期値。空きメモリが少ない機体
+# (Raspberry Pi 4等)で無指定のモデル上限(数万〜十数万トークン)を
+# そのまま使うと、KVキャッシュだけでメモリを使い果たしてOOM(または
+# 極端な速度低下)を招く恐れがあるため、大まかな安全弁として設ける。
+_NUM_CTX_MEMORY_TIERS = (
+    (4.0, 8192),
+    (8.0, 16384),
+    (16.0, 32768),
+)
+
+
+def _num_ctx_limit_from_memory(free_gb) -> int:
+    if free_gb is None:
+        return MAX_NUM_CTX
+    for threshold_gb, limit in _NUM_CTX_MEMORY_TIERS:
+        if free_gb < threshold_gb:
+            return limit
+    return MAX_NUM_CTX
+
+
+def _decide_num_ctx(model: str) -> int | None:
+    """実際にOllamaへ指定するnum_ctxを決める。次の3つの最小値を採用する:
+    (1) モデルの学習上のコンテキスト長(取得できなければこの条件は無視)、
+    (2) 実機の空きメモリから許せる上限(_num_ctx_limit_from_memory)、
+    (3) 絶対的な上限MAX_NUM_CTX。
+    ただし、CHAT_MAX_OUTPUT_TOKENSを下回る値になってしまう場合は
+    CHAT_MAX_OUTPUT_TOKENS * 2を下限として持ち上げる(出力の余地が
+    無くなるのを防ぐため)。モデル上限が全く取得できなかった場合は、
+    メモリ由来の上限とMAX_NUM_CTXの小さい方を使う(Noneは返さない。
+    メモリ由来の上限は常に有効な値を返すため)。
+    """
+    model_limit = get_ollama_context_length(model)
+    memory_limit = _num_ctx_limit_from_memory(get_memory_info().get("free_gb"))
+    candidates = [memory_limit, MAX_NUM_CTX]
+    if model_limit:
+        candidates.append(model_limit)
+    num_ctx = min(candidates)
+    return max(num_ctx, CHAT_MAX_OUTPUT_TOKENS * 2)
+
+
 def get_lmstudio_models() -> list:
     """LM Studioのローカルサーバー(OpenAI互換API)からモデル一覧を取得する。
 
@@ -462,6 +566,20 @@ _SEARCH_THEN_READ_GUIDANCE = (
     "必要な範囲だけをread_fileで読むことを検討してください。"
 )
 
+# 仮の判断(edit_fileの追加に伴う対応): _SEARCH_THEN_READ_GUIDANCEと同様、
+# write_file・edit_fileの両方を提供するすべてのプロンプト(修正依頼専用・
+# タスクキュー・サブタスクレビューの3箇所)で同じ文言を使い回す共通の
+# 案内文。write_fileのツール説明文自体にもedit_fileへの誘導を書いたが、
+# プロンプト本文でも重ねて促すことで、モデルが「部分修正でも全文を
+# 書き直すもの」という思い込みに引っ張られにくくする(全文書き直しに
+# よるファイル破壊・意図しない改変を防ぐのが目的)。
+_EDIT_OVER_WRITE_GUIDANCE = (
+    "既存ファイルの一部だけを直す場合は、write_fileでファイル全体を書き直すのではなく、"
+    "edit_fileで変更したい箇所だけを置き換えてください。"
+    "write_fileで全体を書き直すと、直す必要のない箇所まで変わってしまったり、"
+    "応答の長さ制限で途中で切れてファイルが壊れたりする恐れがあります。"
+)
+
 # 仮の判断: 依頼の「1回のレビューにつき、ファイル読み取りツールの呼び出しは
 # 最大3回程度までに制限してほしい」という要件に対応する上限。MAX_TOOL_CALL_ROUNDS
 # (ツール呼び出しラウンド全体の上限、web_searchも含む)とは別に、read_file単体の
@@ -586,19 +704,66 @@ def _log_and_build_http_error(base_url: str, resp) -> dict:
     return {"error": f"{resp.status_code}: {detail}", "status_code": resp.status_code}
 
 
+def _estimate_tokens(messages: list) -> int:
+    """`messages`に含まれる全文字列から、雑にトークン数を概算する。
+
+    仮の判断: 厳密なトークナイザ(モデルごとに異なる)を新たな依存として
+    requirements.txtに追加するのは避けたい。目的は「切り捨てが起きて
+    いることに人間が気づけるようにする」ことであり、桁が合っていれば
+    十分なため、日本語などの非ASCII文字は1文字≒1トークン、ASCII文字は
+    4文字≒1トークンとして数える簡易な概算にとどめる。
+    """
+    total_chars_ascii = 0
+    total_chars_non_ascii = 0
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, str):
+            continue
+        for ch in content:
+            if ord(ch) < 128:
+                total_chars_ascii += 1
+            else:
+                total_chars_non_ascii += 1
+    return (total_chars_ascii // 4) + total_chars_non_ascii
+
+
+# 仮の判断: num_ctxの何割を超えたら警告するかの閾値。厳密な根拠は無く、
+# 「まだ余裕があるうちは黙っておき、実際に切り捨てが起きていそうな
+# 水準に近づいたら知らせる」というバランスで8割とした。
+_NUM_CTX_WARNING_RATIO = 0.8
+
+
 def _stream_ollama_turn(model: str, messages: list, tools: list):
     """OllamaのネイティブAPI(/api/chat、NDJSONストリーミング)に1往復だけ
     問い合わせ、正規化したイベント({"content": ...} / {"error": ...})を
     順にyieldし、最後にそのターンで要求されたtool_calls一覧と、応答が
     CHAT_MAX_OUTPUT_TOKENS上限に達して打ち切られたかどうか
     ({"tool_calls": [...], "truncated": bool})をyieldする。
+
+    仮の判断: options.num_ctx(コンテキストウィンドウの長さ)とkeep_alive
+    (モデルをメモリに保持する時間)を明示的に指定する(詳細はMAX_NUM_CTX・
+    KEEP_ALIVE定義部のコメントを参照)。num_ctxが決定できなかった場合
+    (_decide_num_ctxがNoneを返した場合)はキー自体を送らず、Ollama側の
+    デフォルト挙動に委ねる(従来の挙動のまま)。
     """
+    num_ctx = _decide_num_ctx(model)
+    options = {"num_predict": CHAT_MAX_OUTPUT_TOKENS}
+    if num_ctx is not None:
+        options["num_ctx"] = num_ctx
+        estimated_tokens = _estimate_tokens(messages)
+        if estimated_tokens > num_ctx * _NUM_CTX_WARNING_RATIO:
+            logger.warning(
+                "モデル '%s' への問い合わせが概算%dトークンで、num_ctx(%d)の%d%%を"
+                "超えています。入力がコンテキスト長を超えると、Ollamaは先頭から"
+                "黙って切り捨てます。",
+                model, estimated_tokens, num_ctx, int(_NUM_CTX_WARNING_RATIO * 100),
+            )
     try:
         resp = requests.post(
             f"{OLLAMA_BASE_URL}/api/chat",
             json={
                 "model": model, "messages": messages, "tools": tools, "stream": True,
-                "options": {"num_predict": CHAT_MAX_OUTPUT_TOKENS},
+                "options": options, "keep_alive": KEEP_ALIVE,
             },
             stream=True,
             timeout=(CHAT_CONNECT_TIMEOUT_SEC, CHAT_READ_TIMEOUT_SEC),
@@ -645,6 +810,16 @@ def _stream_openai_compatible_turn(base_url: str, model: str, messages: list, to
     仮の判断: OpenAI互換のストリーミングではtool_callsが複数チャンクに
     分割されて送られてくる(引数のJSON文字列が少しずつ届く)ため、
     indexごとに文字列を連結して組み立てる。
+
+    仮の判断: Ollamaのようにここではnum_ctx相当のオプションを指定して
+    いない。LM Studio・MLX-LMはどちらもコンテキスト長をモデルの
+    ロード時設定(LM StudioのUIでの「Context Length」設定、
+    `mlx_lm.server`の起動オプション)としてサーバー側で固定しており、
+    OpenAI互換のchat completions APIのリクエストボディにその場で
+    指定できるパラメータが無い(`max_tokens`はあくまで出力側の上限で、
+    入力側のコンテキスト長とは別物)。そのため、この2バックエンドに
+    関しては「モデルロード時に十分な長さを設定しておいてもらう」ことが
+    前提になり、Yoriai側からリクエスト単位で制御する手段は無い。
     """
     try:
         resp = requests.post(
@@ -848,8 +1023,8 @@ def stream_chat_completion(
 ):
     """モデル名からOllama/LM Studio/MLX-LMのどれにチャットを振るかを決め、
     正規化されたストリーミングイベント({"content": ...} / {"tool_call": <ツール名>} /
-    {"pending_tool_calls": [...]} / {"done": True, "truncated": bool} /
-    {"error": ...})を順にyieldする。`truncated`は、最後のラウンドの応答が
+    {"pending_tool_calls": [...], "truncated": bool} / {"done": True, "truncated": bool} /
+    {"error": ...})を順にyieldする。`truncated`は、それぞれそのラウンドの応答が
     CHAT_MAX_OUTPUT_TOKENS上限に達して途中で打ち切られたかどうかを表す。
 
     モデルがツール(既定ではweb_searchのみ)の呼び出しを要求した場合は、
@@ -1027,10 +1202,18 @@ def stream_chat_completion(
         # 呼び出し元に渡して終了する。1ラウンドでweb_searchとread_fileが
         # 混在するようなケースの部分実行は複雑さの割に実利が薄いため扱わず、
         # 呼び出し元側にラウンド全体の実行を委ねる単純な設計にした。
+        #
+        # 仮の判断(応答切れによるファイル破壊のガードへの対応): `round_truncated`
+        # (このラウンドの応答がCHAT_MAX_OUTPUT_TOKENS上限に達して途中で
+        # 打ち切られたかどうか)もあわせて渡す。tool_callsのJSON自体は
+        # (ツール呼び出しの構造化出力なので)途中で切れていても不完全な
+        # まま解析されうるが、その中身(特にwrite_fileのcontent引数)が
+        # 途中で切れている可能性があるかどうかは、呼び出し元
+        # (`_collect_answer_with_project_tools`)がここで初めて判断できる。
         if client_tool_names and any(
             tool_call.get("function", {}).get("name", "") in client_tool_names for tool_call in tool_calls
         ):
-            yield {"pending_tool_calls": tool_calls}
+            yield {"pending_tool_calls": tool_calls, "truncated": round_truncated}
             return
 
         messages.append({"role": "assistant", "content": "", "tool_calls": tool_calls})
@@ -1105,6 +1288,16 @@ def build_profile_card(agent_id: str) -> dict:
                 _merge_model_lists(ollama_installed, mlx_lm_models, lmstudio_models)
                 + _merge_model_lists(ollama_loaded, mlx_lm_models, lmstudio_models)
             ),
+            # 仮の判断: get_ollama_context_length()はキャッシュされるとはいえ、
+            # 未取得のモデルは/api/showへの実HTTP問い合わせが発生する。
+            # カード生成のたびにインストール済み全モデル分を問い合わせると、
+            # モデル数が多い環境でカード生成(ハートビート応答にも使われる)が
+            # 遅くなりかねないため、実際にロード済みのOllamaモデルだけに
+            # 限定する(インストール済みだが未ロードのモデルは、どのみち
+            # チャットの相手として選ばれるまでは表示する意味が薄い)。
+            "context_lengths": {
+                m: get_ollama_context_length(m) for m in ollama_loaded
+            },
         },
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
@@ -2438,18 +2631,27 @@ LIST_DIR_TOOL_SCHEMA = {
     },
 }
 
+# 仮の判断(edit_fileの追加に伴う変更): 以前は「既存ファイルの一部だけを
+# 直したい場合も、ファイル全体をここに渡すこと」と明示的に指示していたが、
+# これには2つの実害があった。(1)ファイル破壊: 数百行のファイルの数行を
+# 直すためだけに毎回全体を出力させるため、CHAT_MAX_OUTPUT_TOKENSに達して
+# 途中で切れると、切れたままのコードが書き込まれてしまう。(2)意図しない
+# 改変: ローカルLLMは全文を通すたびに、触る必要のないコメントや実装まで
+# 書き換えてしまいやすい。edit_file(一意な文字列の置換)を新設したことで、
+# 指示を逆転させ、部分修正にはedit_fileを使うよう促す。
 WRITE_FILE_TOOL_NAME = "write_file"
 WRITE_FILE_TOOL_SCHEMA = {
     "type": "function",
     "function": {
         "name": WRITE_FILE_TOOL_NAME,
         "description": (
-            "このプロジェクトディレクトリ内に、指定した内容でファイルを新規作成・上書きする。"
+            "新規ファイルの作成、またはファイル全体を作り直す場合に使う。"
             "'サブディレクトリ名/ファイル名'のようにサブディレクトリ内のパスを指定することもでき、"
             "そのサブディレクトリがまだ存在しなければ自動的に作成される"
             "(make_directoryを先に呼ぶ必要はない)。"
-            "既存ファイルの一部だけを直したい場合も、read_fileで現在の中身を確認したうえで"
-            "ファイル全体の新しい内容をここに渡すこと(差分ではなく全体を渡す)。"
+            "既存ファイルの一部だけを直したい場合はedit_fileを使うこと"
+            "(write_fileで全体を書き直すと、直す必要のない箇所まで変わってしまったり、"
+            "応答の長さ制限で途中で切れてファイルが壊れたりする恐れがある)。"
         ),
         "parameters": {
             "type": "object",
@@ -2461,6 +2663,47 @@ WRITE_FILE_TOOL_SCHEMA = {
                 "content": {"type": "string", "description": "ファイルの新しい中身(ファイル全体)"},
             },
             "required": ["filename", "content"],
+        },
+    },
+}
+
+# 仮の判断: replace_allのようなオプションは付けない。一意マッチを強制する
+# ことがこのツールの安全性の根拠であり、ローカルLLMに一括置換の権限を
+# 渡すと、たまたま複数箇所に出現する短い文字列(例: 変数名や共通の記法)を
+# old_stringに指定してしまった場合に、意図しない箇所まで一斉に書き換えて
+# しまう恐れがある。一意に定まらない場合は、呼び出し元に前後の文脈を
+# 広げて再試行させる(Claude CodeのEditツールと同じ設計方針)。
+EDIT_FILE_TOOL_NAME = "edit_file"
+EDIT_FILE_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": EDIT_FILE_TOOL_NAME,
+        "description": (
+            "既存ファイルの一部だけを置き換える(部分修正)。write_fileと違い、"
+            "ファイル全体ではなく変更したい箇所だけを渡せばよいため、ファイルが壊れたり"
+            "無関係な箇所まで書き換わったりする心配が無い。"
+            "old_stringはファイル内で一意に定まる必要があるので、変更したい行だけでなく、"
+            "その前後の行も含めて(インデント・空白も含めて実際のファイルと完全に一致する形で)"
+            "十分な文脈を含めること。new_stringに空文字列を渡すと、old_stringの箇所を"
+            "削除したことになる。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "filename": {
+                    "type": "string",
+                    "description": "編集するファイル名(例: utils.py、またはtemplates/base.htmlのようなサブディレクトリ内のパス)",
+                },
+                "old_string": {
+                    "type": "string",
+                    "description": "置換前の文字列。ファイル内で一意に定まるだけの前後の文脈を含めること(インデント・空白も含めて実際のファイルの中身と完全に一致させる)",
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "置換後の文字列。空文字列を渡すとold_stringの箇所を削除したことになる",
+                },
+            },
+            "required": ["filename", "old_string", "new_string"],
         },
     },
 }
@@ -2563,18 +2806,33 @@ RUN_COMMAND_TOOL_SCHEMA = {
 # として明確に分離する。
 PROJECT_TOOLS_SCHEMAS = [
     READ_FILE_TOOL_SCHEMA, SEARCH_IN_FILE_TOOL_SCHEMA, LIST_DIR_TOOL_SCHEMA, WRITE_FILE_TOOL_SCHEMA,
-    MOVE_FILE_TOOL_SCHEMA, DELETE_FILE_TOOL_SCHEMA, MAKE_DIRECTORY_TOOL_SCHEMA,
+    EDIT_FILE_TOOL_SCHEMA, MOVE_FILE_TOOL_SCHEMA, DELETE_FILE_TOOL_SCHEMA, MAKE_DIRECTORY_TOOL_SCHEMA,
     RUN_COMMAND_TOOL_SCHEMA,
 ]
 PROJECT_TOOLS_CLIENT_NAMES = {
     READ_FILE_TOOL_NAME, SEARCH_IN_FILE_TOOL_NAME, LIST_DIR_TOOL_NAME, WRITE_FILE_TOOL_NAME,
-    MOVE_FILE_TOOL_NAME, DELETE_FILE_TOOL_NAME, MAKE_DIRECTORY_TOOL_NAME,
+    EDIT_FILE_TOOL_NAME, MOVE_FILE_TOOL_NAME, DELETE_FILE_TOOL_NAME, MAKE_DIRECTORY_TOOL_NAME,
     RUN_COMMAND_TOOL_NAME,
 }
 
 
 def _list_project_directory(project_dir: str) -> str:
     return json.dumps({"files": _list_project_files(project_dir)}, ensure_ascii=False)
+
+
+def _syntax_check_result_fields(filename_for_syntax: str, text: str, file_path: str) -> dict:
+    """`_check_file_syntax`の結果を、ツールの返り値にそのまま混ぜ込める
+    フィールドの辞書にする共通ヘルパー。write_file・edit_fileの両方が
+    「書き込み直後にその場でフィードバックし、モデル自身が次のラウンドで
+    直せるようにする」という同じ設計を必要とするため、ここに切り出して
+    共有する。
+    """
+    status, detail = _check_file_syntax(filename_for_syntax, text, file_path=file_path)
+    if status == "ok":
+        return {"syntax_ok": True}
+    if status == "error":
+        return {"syntax_ok": False, "syntax_error": detail}
+    return {"syntax_check_skipped": detail}  # skipped
 
 
 def _write_project_file(project_dir: str, filename: str, content) -> str:
@@ -2603,14 +2861,88 @@ def _write_project_file(project_dir: str, filename: str, content) -> str:
     except Exception as exc:
         return json.dumps({"ok": False, "message": f"書き込みに失敗しました: {exc}"}, ensure_ascii=False)
     result = {"ok": True, "filename": _project_relpath(project_dir, safe_path)}
-    status, detail = _check_file_syntax(os.path.basename(safe_path), text, file_path=safe_path)
-    if status == "ok":
-        result["syntax_ok"] = True
-    elif status == "error":
-        result["syntax_ok"] = False
-        result["syntax_error"] = detail
-    else:  # skipped
-        result["syntax_check_skipped"] = detail
+    result.update(_syntax_check_result_fields(os.path.basename(safe_path), text, safe_path))
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _edit_project_file(project_dir: str, filename: str, old_string: str, new_string: str) -> str:
+    """edit_fileツールの応答本体。`old_string`がファイル内でちょうど1箇所に
+    一致する場合のみ`new_string`に置き換える(一意マッチの強制がこのツールの
+    安全性の根拠なので、0件・複数件はどちらもエラーとし、ファイルには
+    一切触れない)。
+
+    仮の判断: パス解決は他の全ツールと同じく`_resolve_safe_project_path`を
+    経由する(PROGRESS.mdの保護もこれで効く)。ファイルが存在しない場合は、
+    `_read_project_file_fresh`と同様にPROGRESS.mdの計画に含まれる名前かどうかを
+    確認し、「計画上は存在するがまだ未実装」なのか「そもそも計画に無い名前」
+    なのかを区別して伝える(read_fileと同じ理由。詳細は
+    `_planned_filenames_from_progress`定義部のコメントを参照)。
+    """
+    safe_path, error = _resolve_safe_project_path(project_dir, filename)
+    if error:
+        return json.dumps({"ok": False, "message": error}, ensure_ascii=False)
+    if not os.path.isfile(safe_path):
+        planned = _planned_filenames_from_progress(project_dir)
+        if planned and os.path.basename(filename or "") not in planned:
+            return json.dumps({
+                "ok": False,
+                "message": (
+                    f"'{filename}' は実装計画(PROGRESS.mdのモジュール分割案)に"
+                    "含まれていないファイル名です。新規に作成するつもりであれば"
+                    "write_fileを使ってください。そうでなければ、計画の記述ミスの"
+                    "可能性があります。計画に実在するファイル: "
+                    f"{', '.join(sorted(planned))}"
+                ),
+            }, ensure_ascii=False)
+        return json.dumps(
+            {"ok": False, "message": "そのファイルはまだ存在しません(未実装です)。新規作成の場合はwrite_fileを使ってください。"},
+            ensure_ascii=False,
+        )
+
+    try:
+        with open(safe_path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except Exception as exc:
+        return json.dumps({"ok": False, "message": f"読み取りに失敗しました: {exc}"}, ensure_ascii=False)
+
+    match_count = text.count(old_string) if old_string else 0
+    if match_count == 0:
+        return json.dumps({
+            "ok": False,
+            "message": (
+                "指定された文字列が見つかりませんでした。read_fileで現在の内容を確認してから、"
+                "実際のファイルの中身と完全に一致する文字列を指定してください"
+                "(インデントや空白も含めて一致する必要があります)。"
+            ),
+        }, ensure_ascii=False)
+    if match_count > 1:
+        # 仮の判断: モデルが次の試行で範囲を広げる判断材料になるよう、
+        # 一致した箇所の行番号一覧も返す(1-indexed。read_file/search_in_fileの
+        # 行番号表記と揃える)。
+        matched_lines = []
+        offset = 0
+        for _ in range(match_count):
+            idx = text.index(old_string, offset)
+            matched_lines.append(text.count("\n", 0, idx) + 1)
+            offset = idx + 1
+        return json.dumps({
+            "ok": False,
+            "message": (
+                f"指定された文字列が{match_count}箇所に一致しました。どの箇所を編集するか"
+                "一意に定まるよう、前後の行を含めて範囲を広げてください。"
+            ),
+            "matched_lines": matched_lines,
+        }, ensure_ascii=False)
+
+    new_text = text.replace(old_string, new_string, 1)
+    try:
+        with open(safe_path, "w", encoding="utf-8") as f:
+            f.write(new_text)
+    except Exception as exc:
+        return json.dumps({"ok": False, "message": f"書き込みに失敗しました: {exc}"}, ensure_ascii=False)
+
+    result = {"ok": True, "filename": _project_relpath(project_dir, safe_path)}
+    result.update(_syntax_check_result_fields(os.path.basename(safe_path), new_text, safe_path))
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -2759,13 +3091,25 @@ _RUN_COMMAND_BLOCKED_COMMAND_NAMES = {
 # -fsyntax-onlyのみ許可」のような決め打ちをやめ、モデルが自分でコマンドを
 # 選べるようにしたことの裏返しとして必要になった防御)。
 _RUN_COMMAND_BLOCKED_FLAGS_BY_INTERPRETER = {
-    "python3": {"-c", "-m", "-i"},
-    "python": {"-c", "-m", "-i"},
+    "python3": {"-c", "-i"},
+    "python": {"-c", "-i"},
     "node": {"-e", "--eval", "-p", "--print", "-r", "--require", "-i", "--interactive"},
     "ruby": {"-e"},
     "perl": {"-e", "-E"},
     "php": {"-r"},
 }
+
+# 仮の判断(統合検証ループへの対応): 以前は`-m`もインタプリタ全体への
+# ブロック対象フラグとして一律禁止していたが、これでは`python3 -m pytest`
+# `python3 -m py_compile`のような正当な検証手段まで塞いでしまい、
+# 統合検証ループ(実行して落ちたら直す)の実現の妨げになる。そこで`-m`は
+# 全面禁止をやめ、直後に来るモジュール名がこの許可リストにある場合のみ
+# 通す方式に緩和する(検証コマンド・run_commandの両方に効く)。
+# `http.server`はサーバーが起動しっぱなしになるが、RUN_COMMAND_TIMEOUT_SEC
+# (10秒)で必ず強制終了されるため問題ない。判断に迷うモジュール
+# (`webbrowser`・`pdb`・`venv`等、任意のコード実行や外部プロセス起動に
+# つながりうるもの)は含めず、必要になった時点で個別に追加する方針とする。
+_PYTHON_ALLOWED_MODULES = {"pytest", "unittest", "py_compile", "compileall", "json.tool", "http.server"}
 
 
 def _validate_run_command(command: str) -> tuple:
@@ -2806,6 +3150,15 @@ def _validate_run_command(command: str) -> tuple:
                 f"'{parts[0]}'の{'/'.join(sorted(used))}は任意のコード実行やネットワークアクセスに"
                 f"つながるため使用できません。検証したいファイルを直接指定してください"
                 f"(例: '{parts[0]} app.py')。"
+            )
+
+    if parts[0] in ("python3", "python") and "-m" in parts[1:]:
+        m_index = parts.index("-m")
+        module = parts[m_index + 1] if m_index + 1 < len(parts) else None
+        if module not in _PYTHON_ALLOWED_MODULES:
+            return None, (
+                f"'{parts[0]} -m {module or ''}'は使用できません。"
+                f"-mで実行できるのは次のモジュールのみです: {', '.join(sorted(_PYTHON_ALLOWED_MODULES))}"
             )
 
     return parts, None
@@ -3013,6 +3366,12 @@ def _execute_project_tool_call(
         filename = arguments.get("filename", "")
         _print_tagged(print_lock, tag, f"[✏️ {filename or '(不明なファイル)'} を書き込んでいます...]")
         return _write_project_file(project_dir, filename, arguments.get("content", ""))
+    if name == EDIT_FILE_TOOL_NAME:
+        filename = arguments.get("filename", "")
+        _print_tagged(print_lock, tag, f"[✂️ {filename or '(不明なファイル)'} の一部を編集しています...]")
+        return _edit_project_file(
+            project_dir, filename, arguments.get("old_string", ""), arguments.get("new_string", ""),
+        )
     if name == MOVE_FILE_TOOL_NAME:
         old_filename = arguments.get("old_filename", "")
         new_filename = arguments.get("new_filename", "")
@@ -3050,12 +3409,15 @@ MAX_PROJECT_TOOL_ROUNDS = 50
 # (JSON結果の"ok"フィールド)を追跡することで、「本当に何か変更されたか」
 # を機械的に判定できるようにする。make_directoryは空のディレクトリを
 # 作るだけで「修正の実体」とは言えないため含めない。read_file・list_dir・
-# run_commandはファイルを変更しないため対象外。
-_MUTATING_PROJECT_TOOL_NAMES = {WRITE_FILE_TOOL_NAME, MOVE_FILE_TOOL_NAME, DELETE_FILE_TOOL_NAME}
+# run_commandはファイルを変更しないため対象外。edit_fileはwrite_fileと
+# 同じくファイルの中身を実際に書き換えるツールのため、同様に含める。
+_MUTATING_PROJECT_TOOL_NAMES = {
+    WRITE_FILE_TOOL_NAME, EDIT_FILE_TOOL_NAME, MOVE_FILE_TOOL_NAME, DELETE_FILE_TOOL_NAME,
+}
 
 
 def _mutated_filename_from_tool_result(tool_call: dict, result: str) -> str:
-    """`tool_call`が実際にファイルを変更した(write_file/move_file/
+    """`tool_call`が実際にファイルを変更した(write_file/edit_file/move_file/
     delete_fileが成功した)場合、そのファイル名を返す。それ以外
     (対象外のツール・失敗した呼び出し・結果が解析できない場合)は
     空文字列を返す。
@@ -3114,6 +3476,15 @@ def _collect_answer_with_project_tools(
 
     モデルが説明文だけを返してツールを一度も呼ばなかった場合は、
     `_NO_TOOL_CALL_NUDGE_MESSAGE`参照。
+
+    仮の判断(応答切れによるファイル破壊のガード): あるラウンドの応答が
+    CHAT_MAX_OUTPUT_TOKENS上限に達して途中で打ち切られていた
+    (`pending_tool_calls`イベントの`truncated`)場合、そのラウンドに
+    write_file呼び出しが含まれていても実行しない。write_fileのcontent
+    引数(ファイル全体)が生成の途中で切れている可能性が高く、そのまま
+    書き込むとファイルが壊れた状態で保存されてしまうため。read_file等の
+    読み取り系ツールは(内容の生成ではなく既存ファイルの参照なので)
+    通常どおり実行する。
     """
     messages = list(messages)
     modified_files = []
@@ -3121,6 +3492,7 @@ def _collect_answer_with_project_tools(
     for _round_num in range(MAX_PROJECT_TOOL_ROUNDS):
         answer_parts = []
         pending_tool_calls = None
+        pending_truncated = False
         error = None
         truncated = False
         for event in _stream_chat_from_candidate(candidate, org_fingerprint, messages, offer_project_tools=True):
@@ -3129,6 +3501,7 @@ def _collect_answer_with_project_tools(
                 break
             if "pending_tool_calls" in event:
                 pending_tool_calls = event["pending_tool_calls"]
+                pending_truncated = bool(event.get("truncated"))
                 break
             content = event.get("content")
             if content:
@@ -3154,7 +3527,18 @@ def _collect_answer_with_project_tools(
 
         messages.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
         for tool_call in pending_tool_calls:
-            result = _execute_project_tool_call(project_dir, tool_call, print_lock, tag or candidate["label"])
+            function_name = tool_call.get("function", {}).get("name", "")
+            if pending_truncated and function_name == WRITE_FILE_TOOL_NAME:
+                result = json.dumps({
+                    "ok": False,
+                    "message": (
+                        "応答が長さ制限で途中までしか届いていないため、この write_file は実行しませんでした。"
+                        "ファイルが壊れるのを防ぐためです。edit_file で必要な箇所だけを直すか、"
+                        "複数回に分けて書き込んでください。"
+                    ),
+                }, ensure_ascii=False)
+            else:
+                result = _execute_project_tool_call(project_dir, tool_call, print_lock, tag or candidate["label"])
             messages.append({"role": "tool", "content": result, "tool_call_id": tool_call.get("id")})
             mutated_filename = _mutated_filename_from_tool_result(tool_call, result)
             if mutated_filename:
@@ -3932,6 +4316,8 @@ _MODULE_BREAKDOWN_PROMPT_TEMPLATE = """あなたはソフトウェア設計を�
 <ファイル名1>: <実装すべき内容をここに>
 <ファイル名2>: <実装すべき内容をここに(<ファイル名1>の行と完全に同じ関数名を使うこと)>
 
+最後にもう1行、「検証コマンド: <コマンド>」という形式で、このプロジェクトが正しく動くことを確認できる、1つのコマンドを書いてください(例: 検証コマンド: python3 main.py)。実行に人間の入力(標準入力)が必要な対話型ツールの場合や、適切なコマンドが無い場合は「検証コマンド: なし」と書いてください。
+
 依頼内容: {request}
 """
 
@@ -4021,7 +4407,11 @@ def _build_design_dialogue_output_instruction(request: str) -> str:
         "「ファイル名: 実装すべき内容(インターフェースの詳細を含む)」という形式で出力してください"
         "(2〜4ファイル程度を想定します):\n"
         "<ファイル名1>: <実装すべき内容をここに>\n"
-        "<ファイル名2>: <実装すべき内容をここに(<ファイル名1>の行と完全に同じ関数名を使うこと)>"
+        "<ファイル名2>: <実装すべき内容をここに(<ファイル名1>の行と完全に同じ関数名を使うこと)>\n\n"
+        "最後にもう1行、「検証コマンド: <コマンド>」という形式で、このプロジェクトが正しく動くことを"
+        "確認できる、1つのコマンドを書いてください(例: 検証コマンド: python3 main.py)。実行に人間の"
+        "入力(標準入力)が必要な対話型ツールの場合や、適切なコマンドが無い場合は"
+        "「検証コマンド: なし」と書いてください。"
     )
 
 
@@ -4345,6 +4735,52 @@ def _build_collaborative_implementation_request(filename: str, own_content: str,
 # まとめられる。
 _FILE_HEADER_PATTERN = re.compile(r"^([\w./\-]+\.[A-Za-z0-9]+):\s*(.*)$")
 
+# 仮の判断(統合検証ループへの対応): 設計担当への出力形式の指示
+# (`_MODULE_BREAKDOWN_PROMPT_TEMPLATE`・`_build_design_dialogue_output_
+# instruction`)に「検証コマンド: <コマンド>」という行を1行追加した。
+# この行は`_FILE_HEADER_PATTERN`(拡張子付きのファイル名がコロンの直前に
+# ある行)には一致しない(「検証コマンド」は拡張子を持たないため)ため、
+# `_parse_module_breakdown`にそのまま渡すと直前のファイルの詳細行として
+# 誤って取り込まれてしまう。そのため、`_parse_module_breakdown`を呼ぶ前に
+# この行だけを別途抜き出しておく、という2段階の解析にする。
+_VERIFY_COMMAND_LINE_PATTERN = re.compile(r"^検証コマンド\s*[:：]\s*(.*)$")
+
+
+def _extract_verify_command(text: str) -> tuple:
+    """設計担当の回答(モジュール分割案の生テキスト)から「検証コマンド: …」
+    行を抜き出し、`(検証コマンド, その行を取り除いた残りのテキスト)`を返す。
+
+    見つからない場合は`("", text)`を返す(この機能追加より前の出力形式との
+    後方互換。検証コマンドの行を書かないモデルに対しても、従来通り
+    `_parse_module_breakdown`でファイル一覧だけを解析できる)。複数回
+    登場した場合は最初の1件だけを採用し、以降の行はそのまま残す
+    (説明文中に偶然同じ文言が登場しても暴走しないようにするため)。
+    """
+    verify_command = ""
+    found = False
+    remaining_lines = []
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip().lstrip("-*・# ").strip().replace("`", "")
+        match = _VERIFY_COMMAND_LINE_PATTERN.match(stripped)
+        if match and not found:
+            verify_command = match.group(1).strip()
+            found = True
+            continue
+        remaining_lines.append(raw_line)
+    return verify_command, "\n".join(remaining_lines)
+
+
+# 仮の判断: 「検証コマンド: なし」(適切なコマンドが無い・対話型ツールで
+# 標準入力が必要、の2ケース)と、行自体が無かった場合(旧形式の出力・
+# 抜き出しに失敗した場合)を、どちらも「検証コマンド無し」として同じ
+# 扱いにする。呼び出し元でいちいち両方を意識せずに済むよう、判定は
+# ここに集約する。
+_NO_VERIFY_COMMAND_VALUES = ("", "なし", "無し", "特になし")
+
+
+def _has_verify_command(verify_command: str) -> bool:
+    return (verify_command or "").strip() not in _NO_VERIFY_COMMAND_VALUES
+
 
 def _parse_module_breakdown(text: str) -> list:
     """設計担当メンバーの回答を [(ファイル名, 内容), ...] のリストに変換する。
@@ -4580,8 +5016,21 @@ PROGRESS_FILENAME = "PROGRESS.md"
 _PROGRESS_SECTION_REQUEST = "## 元の依頼"
 _PROGRESS_SECTION_LANGUAGE = "## 使用言語"
 _PROGRESS_SECTION_PLAN = "## モジュール分割案"
+# 仮の判断(統合検証ループへの対応): 合意フェーズが決めた検証コマンドを
+# 「モジュール分割案」と同じ節にまとめず独立の節にする。検証コマンドは
+# ファイル単位の情報ではなくプロジェクト全体に対する1つの値のため、
+# `_parse_module_breakdown`(ファイル単位のリストを組み立てるパーサー)に
+# 混ぜて解析させるより、`_extract_progress_section`で単純に1行読み出す
+# 方が素直だと判断した。
+_PROGRESS_SECTION_VERIFY_COMMAND = "## 検証コマンド"
 _PROGRESS_SECTION_CHECKLIST = "## タスク状況"
 _PROGRESS_SECTION_AUTO_RESUME_COUNT = "## 自動再開の試行回数"
+# 仮の判断: 統合検証の結果(成功/失敗・試行回数・失敗時の出力冒頭)も、
+# 「自動再開の試行回数」と同じくPROGRESS.md自身に直接記録する(別ファイルは
+# 持たせない)。`//resume-all`が「実装は完了しているが統合検証だけ失敗した
+# ままのプロジェクト」を検出する(`_project_has_pending_work`)ために、
+# ディスク上の状態を正として扱う既存方針をそのまま踏襲する。
+_PROGRESS_SECTION_VERIFICATION = "## 統合検証"
 _PROGRESS_SECTION_REVIEW = "## 直近のレビュー指摘"
 _PROGRESS_SECTION_CHANGELOG = "## 更新履歴"
 # 仮の判断(バグ報告への対応): //fixのタスク分割(_run_fix_task_queue)が
@@ -4596,10 +5045,53 @@ _PROGRESS_SECTION_PENDING_FIX_REQUEST = "## 未完了の修正依頼"
 _PROGRESS_SECTION_PENDING_FIX_SUBTASKS = "## 未完了の修正サブタスク"
 
 
+_VERIFICATION_OUTPUT_RECORD_CHARS = 500
+
+
+def _format_verification_result(verification: dict) -> list:
+    """統合検証の結果(`{"success": bool, "attempts": int, "output": str}`)を、
+    PROGRESS.mdの「統合検証」節の本文行のリストにする。失敗時のみ、
+    最後の出力の冒頭(`_VERIFICATION_OUTPUT_RECORD_CHARS`文字まで)を
+    続けて記録する(成功時は出力を残す実益が薄いため省く)。
+    """
+    if verification["success"]:
+        return [f"✅ 成功 ({verification['attempts']}回目の試行で成功)"]
+    lines = [f"❌ 失敗 ({verification['attempts']}回試行)"]
+    output = (verification.get("output") or "").strip()
+    if output:
+        lines.append("")
+        lines.append(output[:_VERIFICATION_OUTPUT_RECORD_CHARS])
+    return lines
+
+
+_VERIFICATION_SUCCESS_PATTERN = re.compile(r"^✅ 成功 \((\d+)回目の試行で成功\)$")
+_VERIFICATION_FAILURE_PATTERN = re.compile(r"^❌ 失敗 \((\d+)回試行\)$")
+
+
+def _parse_verification_result(text: str):
+    """`_format_verification_result`の逆変換。節が無い・想定した形式で
+    解析できない場合は`None`を返す(「まだ統合検証を実行していない」
+    ことを表す。旧バージョンのPROGRESS.mdとの後方互換にもなる)。
+    """
+    lines = text.splitlines()
+    if not lines:
+        return None
+    first = lines[0].strip()
+    success_match = _VERIFICATION_SUCCESS_PATTERN.match(first)
+    if success_match:
+        return {"success": True, "attempts": int(success_match.group(1)), "output": ""}
+    failure_match = _VERIFICATION_FAILURE_PATTERN.match(first)
+    if failure_match:
+        output = "\n".join(lines[1:]).strip("\n")
+        return {"success": False, "attempts": int(failure_match.group(1)), "output": output}
+    return None
+
+
 def _format_progress_markdown(
     request: str, tasks: list, checklist: list, review_feedback: dict, auto_resume_count: int = 0,
     changelog: list = None, language: str = "",
     pending_fix_request: str = "", pending_fix_subtasks: list = None,
+    verify_command: str = "", verification: dict = None,
 ) -> str:
     """PROGRESS.mdの内容を組み立てる。
 
@@ -4629,6 +5121,10 @@ def _format_progress_markdown(
     (旧バージョンのPROGRESS.mdや、この節を省きたい呼び出し元)の場合は
     この節自体を出力しない(既存の「直近のレビュー指摘」等と同じ、
     値が無ければ節ごと省略する方針)。
+
+    仮の判断: 「検証コマンド」「統合検証」も同じく、値が無ければ節ごと
+    省略する(`verify_command`が空文字列、または`verification`が`None`
+    (まだ統合検証を実行していない)の場合)。
     """
     lines = ["# プロジェクト進行状況", "", _PROGRESS_SECTION_REQUEST, "", request, ""]
     if language:
@@ -4641,6 +5137,11 @@ def _format_progress_markdown(
     for filename, content in tasks:
         lines.append(f"{filename}: {content}")
     lines.append("")
+    if verify_command:
+        lines.append(_PROGRESS_SECTION_VERIFY_COMMAND)
+        lines.append("")
+        lines.append(verify_command)
+        lines.append("")
     lines.append(_PROGRESS_SECTION_CHECKLIST)
     lines.append("")
     lines.extend(_format_checklist_lines(checklist))
@@ -4649,6 +5150,11 @@ def _format_progress_markdown(
     lines.append("")
     lines.append(str(auto_resume_count))
     lines.append("")
+    if verification is not None:
+        lines.append(_PROGRESS_SECTION_VERIFICATION)
+        lines.append("")
+        lines.extend(_format_verification_result(verification))
+        lines.append("")
     if review_feedback:
         lines.append(_PROGRESS_SECTION_REVIEW)
         lines.append("")
@@ -4678,11 +5184,12 @@ def _write_progress_md(
     project_dir: str, request: str, tasks: list, checklist: list, review_feedback: dict, auto_resume_count: int = 0,
     changelog: list = None, language: str = "",
     pending_fix_request: str = "", pending_fix_subtasks: list = None,
+    verify_command: str = "", verification: dict = None,
 ) -> None:
     os.makedirs(project_dir, exist_ok=True)
     content = _format_progress_markdown(
         request, tasks, checklist, review_feedback, auto_resume_count, changelog, language,
-        pending_fix_request, pending_fix_subtasks,
+        pending_fix_request, pending_fix_subtasks, verify_command, verification,
     )
     with open(os.path.join(project_dir, PROGRESS_FILENAME), "w", encoding="utf-8") as f:
         f.write(content)
@@ -4781,9 +5288,10 @@ def _parse_bullet_lines(text: str) -> list:
 def _parse_progress_markdown(path: str):
     """PROGRESS.mdを読み込み、`{"request":, "language":, "tasks":,
     "checklist":, "auto_resume_count":, "changelog":, "pending_fix_request":,
-    "pending_fix_subtasks":}`の辞書として返す。ファイルが存在しない・
-    想定した形式で解析できない場合は`None`を返す(呼び出し元は、その
-    プロジェクトの再開をスキップすべきというシグナルとして扱う)。
+    "pending_fix_subtasks":, "verify_command":, "verification":}`の辞書として
+    返す。ファイルが存在しない・想定した形式で解析できない場合は`None`を
+    返す(呼び出し元は、そのプロジェクトの再開をスキップすべきという
+    シグナルとして扱う)。
 
     仮の判断: `language`は、この節が無い旧バージョンのPROGRESS.mdでは
     空文字列になる(この機能追加より前に作られた既存プロジェクトを
@@ -4795,6 +5303,12 @@ def _parse_progress_markdown(path: str):
     では空リストになる(//fixのタスク分割機能より前に作られたプロジェクト・
     分割が発生したことのないプロジェクトのどちらも、単に「未完了の
     修正サブタスクは無い」として扱われる)。
+
+    仮の判断: `verify_command`(この節が無ければ空文字列)・`verification`
+    (この節が無い、または統合検証がまだ実行されていなければ`None`)も
+    同じ後方互換の方針。統合検証機能より前に作られたプロジェクトは、
+    `//resume-all`で再開しても単に統合検証がスキップされるだけで、
+    エラー扱いにはならない。
     """
     try:
         with open(path, encoding="utf-8") as f:
@@ -4814,6 +5328,8 @@ def _parse_progress_markdown(path: str):
         "changelog": _parse_changelog_markdown(_extract_progress_section(text, _PROGRESS_SECTION_CHANGELOG)),
         "pending_fix_request": _extract_progress_section(text, _PROGRESS_SECTION_PENDING_FIX_REQUEST).strip(),
         "pending_fix_subtasks": _parse_bullet_lines(_extract_progress_section(text, _PROGRESS_SECTION_PENDING_FIX_SUBTASKS)),
+        "verify_command": _extract_progress_section(text, _PROGRESS_SECTION_VERIFY_COMMAND).strip(),
+        "verification": _parse_verification_result(_extract_progress_section(text, _PROGRESS_SECTION_VERIFICATION)),
     }
 
 
@@ -4835,8 +5351,23 @@ def _project_has_pending_work(parsed: dict) -> bool:
     使わず`_progress_checklist_is_incomplete`だけで判定していた箇所
     (`_find_incomplete_projects`等)では、この未完了状態が一切見えず、
     `//resume-all`から再開する手段が無くなってしまっていた。
+
+    仮の判断(統合検証ループへの対応): 全タスクのチェックリストが完了
+    していても、統合検証(`verification`)が記録されていて、その結果が
+    失敗のままの場合も「再開すべき作業が残っている」とみなす。統合検証は
+    ファイル単位のチェックリストとは独立した結果のため、これが無いと
+    「実装は完了しているが統合検証に失敗したまま放置されたプロジェクト」
+    が`//resume-all`から永久に拾えなくなってしまう。統合検証が一度も
+    実行されていない(`verification`が`None`。検証コマンドが「なし」
+    だった場合を含む)場合は、それ自体は「失敗」ではないため対象外とする。
     """
-    return _progress_checklist_is_incomplete(parsed["checklist"]) or bool(parsed.get("pending_fix_subtasks"))
+    verification = parsed.get("verification")
+    verification_failed = bool(verification) and not verification.get("success", True)
+    return (
+        _progress_checklist_is_incomplete(parsed["checklist"])
+        or bool(parsed.get("pending_fix_subtasks"))
+        or verification_failed
+    )
 
 
 def _pending_tasks_from_checklist(tasks: list, checklist: list) -> list:
@@ -4977,6 +5508,7 @@ def _run_collaborate_implementation_phase(
     判定に頼らず自動的にこのプロジェクトへの継続的な追加指示(`_FixSession`)
     として扱う(詳細は`_CompletedBuildBox`を参照)。
     """
+    verify_command, answer = _extract_verify_command(answer)
     tasks = _parse_module_breakdown(answer)
     if not tasks:
         print("設計担当の回答からファイル分割案を読み取れませんでした。上記の回答内容を確認してください。")
@@ -4985,6 +5517,10 @@ def _run_collaborate_implementation_phase(
     print(f"[📐 モジュール分割案がまとまりました({len(tasks)}ファイル): {', '.join(f for f, _ in tasks)}]")
     for filename, content in tasks:
         print(f"  - {filename}: {content}")
+    if _has_verify_command(verify_command):
+        print(f"[🔍 検証コマンド: {verify_command}]")
+    else:
+        print("[🔍 検証コマンドは指定されませんでした(統合検証はスキップされます)]")
 
     # 仮の判断(バグ報告への対応): 設計担当の説明文が、計画に無い架空の
     # ファイル名に言及していないかをここで機械的にチェックする。実装・
@@ -5021,6 +5557,7 @@ def _run_collaborate_implementation_phase(
 
     _run_collaborative_project(
         request, tasks, checklist, candidates, org_fingerprint, project_dir, tasks, language=language,
+        verify_command=verify_command,
     )
 
     # 仮の判断: 自動再開(有限の上限付き)は、この「新規の協業モード実行」
@@ -5134,36 +5671,143 @@ def _ask_organization_collaborate(
     )
 
 
+# ---------------------------------------------------------------------------
+# 統合検証ループ(全タスク完了後、プロジェクト全体を実際に動かして確認する)
+# ---------------------------------------------------------------------------
+#
+# 構文チェック(_check_file_syntax、ファイル単位)とレビュー担当による
+# 内容レビュー(読むだけで実行はしない)だけでは、構文としては正しいが
+# 実行すると落ちるコード(import漏れ・未定義の関数呼び出し・モジュール間の
+# シグネチャ不一致など)を誰も検出できない。ローカルLLMは一発で正しく
+# 書けないことが前提のため、実行結果を見て直す輪(検証コマンドの実行→
+# 失敗したら担当メンバーに修正を依頼→再実行、を上限回数まで繰り返す)を
+# 全タスク完了後に1回だけ挟む。ファイル単位ではなくプロジェクト全体に
+# 対して行う。ファイル単位の構文チェックは既に存在しており、実行しないと
+# 分からない不具合の大半は「複数ファイルを統合したとき」に現れるため。
+
+# 仮の判断: 依頼の指定通り3回。ファイル単位のレビュー往復(最大2回)とは
+# 独立した、プロジェクト全体に対する外側の歯止め。
+MAX_VERIFY_ATTEMPTS = 3
+
+_INTEGRATION_VERIFICATION_FIX_PROMPT_TEMPLATE = """あなたはこのプロジェクトの改修担当です。全タスクの実装が完了した後の統合検証で、以下の検証コマンドの実行に失敗しました。
+
+【このプロジェクトの実装計画全体】
+{full_plan}
+
+【実行した検証コマンド】
+{verify_command}
+
+【終了コード】
+{returncode}
+
+【出力】
+{output}
+
+原因を推測で決めつけず、read_file・search_in_fileで実際のコードを確認してから直してください。{edit_over_write_guidance}
+
+修正が完了したら、最後にツールを呼び出さずに、何が原因で何を直したかを簡潔な日本語の文章で報告してください。
+"""
+
+
+def _build_integration_verification_fix_prompt(full_plan: str, verify_command: str, run_result: dict) -> str:
+    output = run_result.get("output")
+    if output is None:
+        output = run_result.get("message", "(出力はありません)")
+    return _INTEGRATION_VERIFICATION_FIX_PROMPT_TEMPLATE.format(
+        full_plan=full_plan, verify_command=verify_command,
+        returncode=run_result.get("returncode", "不明"), output=output,
+        edit_over_write_guidance=f" {_EDIT_OVER_WRITE_GUIDANCE}",
+    )
+
+
+def _run_integration_verification(
+    verify_command: str, candidates: list, org_fingerprint: str, project_dir: str,
+    tasks: list, max_attempts: int = MAX_VERIFY_ATTEMPTS,
+) -> tuple:
+    """検証コマンドを実行し、失敗したら担当メンバー1名に修正を依頼して
+    再実行する、を最大`max_attempts`回まで繰り返す。
+    `(成功したか, 最後の出力, 試行回数)`を返す。
+
+    仮の判断: 修正を依頼する担当は`candidates`の先頭(=最も空きメモリの
+    多いメンバー、`_select_chat_candidates`の並び順)を固定で使う。
+    タスクキュー方式のように複数メンバーに分担させる必要は無く
+    (検証の失敗原因は通常1箇所ではなくプロジェクト全体の整合性の
+    問題であり、1人が一貫して見た方が良いと判断)、単純さを優先した。
+
+    仮の判断: 未完了タスクが残っている場合・検証コマンドが指定されて
+    いない場合のスキップ判定は、呼び出し元(`_run_collaborative_project`)
+    が行う。この関数自身は「検証コマンドを実行して、失敗したら直す」
+    という実行ループの責務だけに絞り、スキップ判定に必要な`checklist`を
+    引数に含めない(依頼で示された関数シグネチャの形をそのまま踏襲した)。
+    """
+    fixer = candidates[0]
+    full_plan = "\n".join(f"{fn}: {content}" for fn, content in tasks)
+    last_output = ""
+    for attempt in range(1, max_attempts + 1):
+        run_result = json.loads(_run_project_command(project_dir, verify_command))
+        if run_result.get("ok"):
+            return True, run_result.get("output", ""), attempt
+
+        last_output = run_result.get("output")
+        if last_output is None:
+            last_output = run_result.get("message", "")
+        if attempt >= max_attempts:
+            break
+
+        print(
+            f"[❌ 終了コード {run_result.get('returncode', '?')} で失敗しました。"
+            f"修正を依頼します ({attempt}回目/{max_attempts}回)]"
+        )
+        print(f"[🔧 {fixer['label']} (モデル: {fixer['model']}) が修正しています...]")
+        fix_prompt = _build_integration_verification_fix_prompt(full_plan, verify_command, run_result)
+        _collect_answer_with_project_tools(
+            fixer, org_fingerprint, [{"role": "user", "content": fix_prompt}], project_dir,
+        )
+        print(f"[🔍 統合検証: {verify_command} を再実行します]")
+
+    return False, last_output, max_attempts
+
+
 def _run_collaborative_project(
     request: str, tasks: list, checklist: list, candidates: list, org_fingerprint: str,
     project_dir: str, tasks_to_queue: list, auto_resume_count: int = 0, changelog: list = None,
-    language: str = "",
+    language: str = "", verify_command: str = "",
 ) -> None:
     """タスクキュー方式による実装・レビューを実行し、その間PROGRESS.mdを
     更新し続ける。新規プロジェクト(`_ask_organization_collaborate`)・
-    再開(`_resume_project`)の両方から共通で呼ばれる。
+    再開(`_resume_project`)の両方から共通で呼ばれる。全タスク完了後・
+    最終チェックリスト表示の前に、統合検証(`_run_integration_verification`)
+    を挟む。
 
     `tasks`は計画全体(PROGRESS.mdの「モジュール分割案」に書き出す対象)、
     `tasks_to_queue`は実際にタスクキューへ投入する対象(新規作成時は
     `tasks`と同じ、再開時は未完了だったファイルだけの部分集合)。
 
     `auto_resume_count`(自動再開の試行回数)・`changelog`(既存プロジェクト
-    への修正依頼の更新履歴)・`language`(使用言語)は、この関数自身は
-    変更せず、呼び出し元から渡された値をそのままPROGRESS.mdに書き戻すだけの、
-    素通しの値として扱う。新規プロジェクトでは既定値(`0`・空・空文字列)の
-    まま、手動`//resume-all`(`_resume_project`)経由ではディスク上の既存の
-    値がそのまま渡ってくる。これが無いと、修正依頼で追記した更新履歴や、
-    合意フェーズで決まった使用言語が、その後の(無関係な)`//resume-all`に
-    よるPROGRESS.mdの書き換えで消えてしまう。
+    への修正依頼の更新履歴)・`language`(使用言語)・`verify_command`
+    (統合検証コマンド)は、この関数自身は変更せず、呼び出し元から渡された
+    値をそのままPROGRESS.mdに書き戻すだけの、素通しの値として扱う。
+    新規プロジェクトでは既定値(`0`・空・空文字列)のまま、手動
+    `//resume-all`(`_resume_project`)経由ではディスク上の既存の値が
+    そのまま渡ってくる。これが無いと、修正依頼で追記した更新履歴や、
+    合意フェーズで決まった使用言語・検証コマンドが、その後の(無関係な)
+    `//resume-all`によるPROGRESS.mdの書き換えで消えてしまう。
     """
     changelog = list(changelog) if changelog else []
     review_feedback = {}
+    # 仮の判断: 統合検証の結果はクロージャ内(write_progress)から参照する
+    # 必要があるが、Pythonの関数はネストしたスコープの単純な代入
+    # (verification = ...)ができない(nonlocal宣言が要る)ため、書き換え
+    # 可能な入れ物として1要素の辞書に包む。既存のreview_feedback(dict、
+    # ミュータブルなオブジェクトをそのまま更新する)と同じ発想。
+    verification_holder = {"result": None}
     progress_lock = threading.Lock()
 
     def write_progress():
         with progress_lock:
             _write_progress_md(
                 project_dir, request, tasks, checklist, review_feedback, auto_resume_count, changelog, language,
+                verify_command=verify_command, verification=verification_holder["result"],
             )
 
     write_progress()
@@ -5177,6 +5821,28 @@ def _run_collaborative_project(
             on_update=write_progress, review_feedback=review_feedback,
         )
 
+    # 仮の判断: 統合検証は、未完了タスクが1件でも残っている場合はスキップ
+    # する(実装が揃っていない状態で実行しても失敗するに決まっており、
+    # 無駄な問い合わせと誤解を招く報告になるため)。検証コマンドが
+    # 「なし」または未設定の場合もスキップする。どちらもスキップした旨を
+    # 表示するにとどめ、エラーやタスクの未完了扱いにはしない。
+    incomplete_labels = _incomplete_task_labels(checklist)
+    if incomplete_labels:
+        print(f"[⏭️ 統合検証: 未完了のタスクが残っているためスキップします]")
+    elif not _has_verify_command(verify_command):
+        print("[⏭️ 統合検証: 検証コマンドが指定されていないためスキップします]")
+    else:
+        print(f"[🔍 統合検証: {verify_command} を実行します]")
+        success, last_output, attempts = _run_integration_verification(
+            verify_command, candidates, org_fingerprint, project_dir, tasks,
+        )
+        verification_holder["result"] = {"success": success, "attempts": attempts, "output": last_output}
+        if success:
+            print(f"[✅ 統合検証に成功しました ({attempts}回目の試行)]")
+        else:
+            print(f"[❌ 統合検証に失敗しました({attempts}回試行)]")
+        write_progress()
+
     # 【最重要】組織自身が立てた計画のうち、1つでも未完了のタスクが残って
     # いる場合は「✅ レビュー完了」を名乗らず、何が終わっていないかを
     # 明示して報告する。実装フェーズ・レビューフェーズがそれぞれ「自分の
@@ -5185,9 +5851,21 @@ def _run_collaborative_project(
     # を、このタスクリストによる最終チェックが最後の砦として検出する。
     print()
     print(_format_task_checklist(checklist))
-    incomplete_labels = _incomplete_task_labels(checklist)
+    verification_result = verification_holder["result"]
+    if verification_result is not None:
+        if verification_result["success"]:
+            print(f"[🔍 統合検証: 成功 ({verification_result['attempts']}回目の試行)]")
+        else:
+            print(f"[🔍 統合検証: 失敗 ({verification_result['attempts']}回試行)]")
     if incomplete_labels:
         print(f"[⚠️ 未完了のタスクが残っています: {', '.join(incomplete_labels)}]")
+    elif verification_result is not None and not verification_result["success"]:
+        # 仮の判断: 実装(ファイル単位のタスク)自体はすべて完了している
+        # ため「未完了のタスクが残っています」とは表示しない一方、
+        # 「✅ 全タスク完了」も名乗らない(統合検証で実際に動かないことが
+        # 判明しているものを完了扱いにすると、依頼の「品質保証の実効性」
+        # という趣旨に反するため)。両者を区別できる専用の表示にする。
+        print(f"[⚠️ 実装は完了しましたが、統合検証に失敗しています (保存先: {project_dir})]")
     else:
         print(f"[✅ 全タスク完了 (保存先: {project_dir})]")
     write_progress()
@@ -6049,7 +6727,16 @@ def _resume_project(project_dir: str, port: int, org_fingerprint: str, auto_resu
     # 後から自然に付与される)。
     language = parsed["language"] or _infer_language_from_tasks(tasks)
     tasks_to_queue = _pending_tasks_from_checklist(tasks, checklist)
-    if not tasks_to_queue:
+    verify_command = parsed.get("verify_command", "")
+    prior_verification = parsed.get("verification")
+    # 仮の判断(統合検証ループへの対応): ファイル単位のタスクはすべて
+    # 完了しているが、統合検証だけが失敗のまま残っているプロジェクトも
+    # ここで拾う(`_project_has_pending_work`が「未完了」と判定する条件と
+    # 揃える)。この場合`tasks_to_queue`は空になるが、そのまま
+    # `_run_collaborative_project`に処理を渡せば、タスクキュー
+    # (空なのでスキップされる)の後段の統合検証だけが再実行される。
+    verification_needs_retry = bool(prior_verification) and not prior_verification.get("success", True)
+    if not tasks_to_queue and not verification_needs_retry:
         print(f"[{project_dir}] 未完了のタスクは見つかりませんでした。")
         return True
 
@@ -6062,13 +6749,16 @@ def _resume_project(project_dir: str, port: int, org_fingerprint: str, auto_resu
         print(f"[⚠️ {project_dir}] 組織内にロード済みモデルを持つメンバーがいないため、再開をスキップします。")
         return False
 
-    print(
-        f"[🔁 {project_dir} を再開します: 未完了{len(tasks_to_queue)}件"
-        f" ({', '.join(fn for fn, _ in tasks_to_queue)})]"
-    )
+    if tasks_to_queue:
+        print(
+            f"[🔁 {project_dir} を再開します: 未完了{len(tasks_to_queue)}件"
+            f" ({', '.join(fn for fn, _ in tasks_to_queue)})]"
+        )
+    else:
+        print(f"[🔁 {project_dir} を再開します: 統合検証のみ再実行します]")
     _run_collaborative_project(
         request, tasks, checklist, candidates, org_fingerprint, project_dir, tasks_to_queue,
-        auto_resume_count, changelog, language,
+        auto_resume_count, changelog, language, verify_command=verify_command,
     )
     return True
 
@@ -6360,13 +7050,15 @@ _FIX_REQUEST_TOOL_PROMPT_TEMPLATE = """あなたはこのプロジェクトの�
 - search_in_file: 既存ファイル内でキーワードや関数名を検索し、該当行番号とその前後の抜粋だけを確認する。ファイルが大きい場合、read_fileでいきなり全体を読む前にまずこれで見当をつけると効率的。
 - read_file: 既存ファイルの中身を確認する(filenameのみ指定するとファイル全体、start_line/end_line(またはline+context_lines)を指定するとその範囲だけを読める)
 - list_dir: ファイル一覧を確認する
-- write_file: ファイルを新規作成・上書きする(部分修正の場合も、まずread_fileで現在の中身を確認したうえでファイル全体を書き直すこと)
+- write_file: ファイルを新規作成する、またはファイル全体を作り直す(部分修正にはedit_fileを使うこと)
+- edit_file: 既存ファイルの一部だけを置き換える(old_stringがファイル内で一意に定まるよう、前後の文脈を含めて指定すること。new_stringを空文字列にすると削除になる)
 - move_file: ファイル名を変更(移動)する
 - make_directory: サブディレクトリを作成する
 - delete_file: 不要になったファイルを削除する(取り消せないため、本当に不要な場合のみ使うこと)
 - run_command: ファイルの検証(動作確認)に使う。そのファイルの種類に適したコマンドを自分で判断して実行すること(例: .pyファイルなら'python3 <ファイル名>'、.jsファイルなら'node --check <ファイル名>'、.cファイルなら'gcc -fsyntax-only <ファイル名>'、.html/.cssファイルなら'check_html <HTMLファイル名>')。ただし、ネットワークアクセス(curl・wget・ssh等)・ファイルの削除や移動(rm・mv・cp等)・権限昇格(sudo等)を行うコマンドは実行できない(拒否される)。ファイルの削除・移動・作成・上書きは、run_commandではなく必ずdelete_file・move_file・write_fileを使うこと。
 
 {search_then_read_guidance}
+{edit_over_write_guidance}
 
 関連するファイル(import元・import先など)がある場合は、read_fileで確認したうえで、必要なファイルすべてに修正を反映してください。修正が完了したら、最後にツールを呼び出さずに、何をどう変更したかを簡潔な日本語の文章で報告してください。
 """
@@ -6607,7 +7299,7 @@ def _parse_fix_split_subtasks(text: str) -> list:
     return subtasks if len(subtasks) >= 2 else []
 
 
-_FIX_SUBTASK_REVIEW_PROMPT_TEMPLATE = """あなたはこのプロジェクトの改修レビュー担当です。以下のサブタスクは、組織内の別のメンバーが実装済みです。実際に変更されたファイルの中身をread_file・search_in_file等で確認し、問題があれば自分でwrite_file等のツールを使って直してください。
+_FIX_SUBTASK_REVIEW_PROMPT_TEMPLATE = """あなたはこのプロジェクトの改修レビュー担当です。以下のサブタスクは、組織内の別のメンバーが実装済みです。実際に変更されたファイルの中身をread_file・search_in_file等で確認し、問題があれば自分でedit_file・write_file等のツールを使って直してください。
 
 【このプロジェクトの使用言語】
 {language}
@@ -6621,7 +7313,7 @@ _FIX_SUBTASK_REVIEW_PROMPT_TEMPLATE = """あなたはこのプロジェクトの
 【実際に変更されたファイル】
 {modified_files}
 
-確認した結果、問題が無ければツールを何も呼び出さずに「問題なし」とだけ回答してください。問題があれば、write_file等のツールで実際に修正したうえで、何をどう直したかを簡潔に報告してください。
+確認した結果、問題が無ければツールを何も呼び出さずに「問題なし」とだけ回答してください。問題があれば、edit_file・write_file等のツールで実際に修正したうえで、何をどう直したかを簡潔に報告してください。{edit_over_write_guidance}
 """
 
 
@@ -6629,6 +7321,7 @@ def _build_fix_subtask_review_prompt(subtask: str, full_plan: str, language: str
     return _FIX_SUBTASK_REVIEW_PROMPT_TEMPLATE.format(
         subtask=subtask, full_plan=full_plan, language=language,
         modified_files=", ".join(modified_files) if modified_files else "(不明)",
+        edit_over_write_guidance=f" {_EDIT_OVER_WRITE_GUIDANCE}",
     )
 
 
@@ -6816,6 +7509,7 @@ def _run_fix_task_queue(
             impl_prompt = _FIX_REQUEST_TOOL_PROMPT_TEMPLATE.format(
                 full_plan=full_plan, file_list="\n".join(file_list), request=subtask, language=language,
                 search_then_read_guidance=_SEARCH_THEN_READ_GUIDANCE,
+                edit_over_write_guidance=_EDIT_OVER_WRITE_GUIDANCE,
             )
             summary, error, truncated, modified = _collect_answer_with_project_tools(
                 candidate, org_fingerprint, [{"role": "user", "content": impl_prompt}], project_dir,
@@ -7048,6 +7742,7 @@ def _run_fix_on_project(
     prompt = _FIX_REQUEST_TOOL_PROMPT_TEMPLATE.format(
         full_plan=full_plan, file_list="\n".join(file_list), request=request, language=language,
         search_then_read_guidance=_SEARCH_THEN_READ_GUIDANCE,
+        edit_over_write_guidance=_EDIT_OVER_WRITE_GUIDANCE,
     )
     summary, error, truncated, modified_files = _collect_answer_with_project_tools(
         implementer, org_fingerprint, [{"role": "user", "content": prompt}], project_dir,
@@ -8508,6 +9203,7 @@ def _format_status_member(card: dict, index: int, label: str, last_seen: float =
     installed = card.get("models", {}).get("installed", [])
     loaded = card.get("models", {}).get("loaded", [])
     backends = card.get("models", {}).get("backends", [])
+    context_lengths = card.get("models", {}).get("context_lengths", {})
 
     if free_gb is not None and total_gb is not None:
         memory_line = f"    メモリ: 空き {free_gb}GB / 総 {total_gb}GB"
@@ -8522,6 +9218,12 @@ def _format_status_member(card: dict, index: int, label: str, last_seen: float =
         f"    ロード済みモデル: {', '.join(loaded) if loaded else 'なし'}",
         f"    インストール済みモデル({len(installed)}件): {', '.join(installed) if installed else 'なし'}",
     ]
+    # 仮の判断: context_lengthsはロード済みのOllamaモデルのみ(build_profile_card
+    # 参照)。値が取得できなかった(None)モデルは一覧から省く。
+    known_context_lengths = {m: n for m, n in context_lengths.items() if n}
+    if known_context_lengths:
+        formatted = ", ".join(f"{m}: {n}" for m, n in known_context_lengths.items())
+        lines.append(f"    コンテキスト長: {formatted}")
     if last_seen is not None:
         lines.append(f"    最終確認: {_format_seconds_ago(last_seen)}")
     return "\n".join(lines)
