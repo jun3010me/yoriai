@@ -7400,6 +7400,19 @@ def _run_job_with_conversation_log(chat_log: "_ChatLog", user_label: str, job: c
     `patch_stdout()`(バックグラウンドジョブの出力を安全に差し込む
     既存の仕組み)やテストの`contextlib.redirect_stdout`など、呼び出し
     時点の`sys.stdout`が何であっても壊さずに済む。
+
+    仮の判断(実機で顕在化しうる不具合への対応): `job`はバックグラウンド
+    ジョブ(`_BackgroundJobRunner`の別スレッド)として実行されることが
+    あり、その実行時間は呼び出し元のコンテキスト(`_run_repl_client`の
+    `patch_stdout()`・テストの`contextlib.redirect_stdout`等)より長く
+    続くことがある(`exit`で対話モードを終了した後もジョブは動き続ける
+    設計)。そのため、`job`が終わった時点で無条件に`sys.stdout`を
+    最初に捕まえた値へ戻すと、その間に外側のコンテキストが既に
+    (別の値へ)復元し終えていた場合、その新しい正しい値を誤って
+    自分が最初に見た古い値で上書きしてしまう(`sys.stdout`が壊れた
+    状態のままグローバルに残り続ける)。`sys.stdout`が依然として
+    自分の設置した`tee`のままである場合に限って復元することで、
+    この上書き事故を防ぐ。
     """
     if chat_log is None:
         job()
@@ -7412,7 +7425,8 @@ def _run_job_with_conversation_log(chat_log: "_ChatLog", user_label: str, job: c
     try:
         job()
     finally:
-        sys.stdout = original_stdout
+        if sys.stdout is tee:
+            sys.stdout = original_stdout
 
     captured = "".join(tee.captured).strip()
     chat_log.append({
@@ -7590,7 +7604,7 @@ def _format_startup_banner(out_dir: str, member_count, use_color: bool) -> str:
         "    (送信キーやexit/quitが効かない場合の非常口です)",
         "",
         _ansi("コマンド", _ANSI_BOLD, use_color=use_color),
-        "  (コマンドを付けずに話しかけると、単発/比較/協業のどのモードかを自動判断します)",
+        "  (コマンド無しの発言は常に会話の続きの単発質問として扱われます)",
         f"  {MULTI_QUERY_COMMAND} <質問文>: 空きリソース上位{MULTI_QUERY_TARGET_COUNT}台に同時に質問",
         f"  {AGREE_COMMAND} <制作依頼>: 対話プロトコルによる事前すり合わせを経て協業モードで実装",
         f"  {PLAN_ONLY_COMMAND} <依頼>: 対話プロトコルで計画のみ議論し、実装せず計画書を出力",
@@ -7755,82 +7769,35 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                         break
                 continue
 
-            # 仮の判断(修正セッション中のコマンド無しの発言): セッションが
-            # 有効な間は、明らかに別の新規制作依頼(協業モードのキーワードに
-            # 一致)と判断できない限り、コマンド無しの発言を優先的にそのまま
-            # 対象プロジェクトへの継続的な修正依頼として扱う。「無関係な
-            # 単発質問」の判定は、既存の比較モードのキーワード判定
-            # (`EXECUTION_MODE_COMPARE`)を流用する簡易なものにとどめており、
-            # それ以外の(キーワードに引っかからない)単発の雑談は誤って
-            # 修正依頼として扱われる可能性がある。これは「曖昧な依頼では
-            # ファイルが特定できず、無闇に書き換えは行われない」という
-            # バグ1の修正(`_run_fix_on_project`のmodified_filesチェック)が
-            # 安全網になっているため、実害は限定的と判断した。
+            # 仮の判断(依頼への対応: 平文の自動モード判定を廃止): 以前は
+            # 依頼文のキーワードから実行モードを推測し(「作って」で協業
+            # モードへ、「意見を聞かせて」で比較モードへ、修正セッション中の
+            # 「明らかに新規制作依頼らしい発言」でセッション終了、等)、
+            # コマンド無しの発言を自動的に//agree・//fix・//multi相当の
+            # 処理へ振り分けていた。しかし、対話プロトコルが人間の確認を
+            # 求めて一時停止した直後の感想・追加指示のような、直前の
+            # やり取りへの純粋な「続き」の発言までゼロから判定し直され、
+            # 「[判断: 単発の質問と判断しました]」と表示されて無関係な
+            # 新規のやり取りが始まってしまう(会話が続いているように
+            # 見えない)という指摘を受けた。コマンド無し(`//`を付けない)の
+            # 発言は、修正セッション中かどうかによらず常に「今の会話の
+            # 続き」として単発質問扱いにし、新しい依頼(制作・比較・別
+            # プロジェクトの修正)をしたい場合は`//agree`・`//multi`・`//fix`
+            # のように明示的にコマンドを付けることを求める設計に変更した。
+            # (`_classify_execution_mode`自体は削除せず残してあるが、この
+            # ディスパッチからは呼ばなくなった。)
             if fix_session is not None and not _is_fix_session_end_phrase(text):
-                mode = _classify_execution_mode(text, out_dir)
-                if mode == EXECUTION_MODE_COLLABORATE:
-                    print(
-                        f"[🔧 修正セッションを終了しました({fix_session.project_name}とは"
-                        "別の新規制作依頼と判断したため)]"
-                    )
-                    fix_session = None
-                elif mode == EXECUTION_MODE_COMPARE:
-                    fix_session.unrelated_streak += 1
-                    print(f"[判断: {_execution_mode_reason_label(mode)}]")
-                    messages.append({"role": "user", "content": text})
-                    try:
-                        _ask_organization_multi(port, org_fingerprint, messages)
-                    except KeyboardInterrupt:
-                        if _handle_repl_command_interrupt(interrupt_guard):
-                            break
-                        continue
-                    if fix_session.unrelated_streak >= _FIX_SESSION_UNRELATED_STREAK_LIMIT:
-                        print(
-                            f"[🔧 修正セッションを終了しました({fix_session.project_name}に"
-                            "関係ない話題が続いたため)]"
-                        )
-                        fix_session = None
-                    continue
-                else:
-                    _continue_fix_session(port, org_fingerprint, out_dir, job_runner, fix_session, text, chat_log=messages)
-                    continue
+                _continue_fix_session(port, org_fingerprint, out_dir, job_runner, fix_session, text, chat_log=messages)
+                continue
             elif fix_session is not None:
                 # _is_fix_session_end_phrase(text) が真だった場合。
                 print(f"[🔧 修正セッションを終了しました({fix_session.project_name})]")
                 fix_session = None
                 continue
 
-            # 仮の判断: 明示コマンド(//agree・//fix・//parallel・//multi・
-            # //resume-all)のいずれにも一致しない通常の入力は、依頼文の
-            # 内容から実行モードを自動判定する。判定根拠は既存のメンバー
-            # 選定理由の表示と同じスタイルで「[判断: ...]」として一言添える。
-            mode = _classify_execution_mode(text, out_dir)
-            print(f"[判断: {_execution_mode_reason_label(mode)}]")
-
-            if mode == EXECUTION_MODE_COLLABORATE:
-                job_runner.submit(
-                    lambda text=text: _run_job_with_conversation_log(
-                        messages, text,
-                        lambda: _ask_organization_collaborate(
-                            port, org_fingerprint, text, out_dir, enable_dialogue=True,
-                        ),
-                    ),
-                    queued_notice=_BACKGROUND_QUEUED_NOTICE,
-                )
-                continue
-
-            if mode == EXECUTION_MODE_FIX_PROJECT:
-                fix_session = _begin_fix_session(
-                    port, org_fingerprint, out_dir, job_runner, fix_session, text, chat_log=messages,
-                )
-                continue
-
             messages.append({"role": "user", "content": text})
             try:
-                if mode == EXECUTION_MODE_COMPARE:
-                    _ask_organization_multi(port, org_fingerprint, messages)
-                else:
-                    _ask_organization(port, org_fingerprint, messages)
+                _ask_organization(port, org_fingerprint, messages)
             except KeyboardInterrupt:
                 if _handle_repl_command_interrupt(interrupt_guard):
                     break
