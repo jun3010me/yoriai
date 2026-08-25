@@ -713,6 +713,32 @@ def test_classify_execution_mode_does_not_return_fix_project_without_any_complet
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
+def test_classify_execution_mode_returns_fix_project_for_continuation_phrases():
+    """「では作業してください」「充実させて」のような、修正キーワードには
+    一致しない既存プロジェクトへの作業継続依頼も、完成済みプロジェクトが
+    存在すればFIX_PROJECTと判定される(単発モードに落ちてread_file/
+    write_fileが使えなくなる不具合の再発防止)。
+    """
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        projects_root = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME)
+        _write_completed_project(projects_root, "todo-cli", [("a.py", "説明")])
+        for text in ("では作業してください", "充実させて", "続けてください", "進めてください"):
+            mode = yoriai._classify_execution_mode(text, out_dir)
+            assert mode == yoriai.EXECUTION_MODE_FIX_PROJECT, (text, mode)
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_classify_execution_mode_does_not_return_fix_project_for_continuation_phrases_without_project():
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        mode = yoriai._classify_execution_mode("では作業してください", out_dir)
+        assert mode != yoriai.EXECUTION_MODE_FIX_PROJECT, mode
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # _ask_organization_fix_project(統合テスト)
 # ---------------------------------------------------------------------------
@@ -2028,6 +2054,8 @@ def main():
         test_classify_execution_mode_without_out_dir_never_returns_fix_project,
         test_classify_execution_mode_returns_fix_project_when_project_exists,
         test_classify_execution_mode_does_not_return_fix_project_without_any_completed_project,
+        test_classify_execution_mode_returns_fix_project_for_continuation_phrases,
+        test_classify_execution_mode_does_not_return_fix_project_for_continuation_phrases_without_project,
         test_fix_project_end_to_end_uses_tools_to_rename_edit_and_test,
         test_fix_project_explicit_syntax_bypasses_auto_identification,
         test_fix_project_reports_ambiguous_candidates_without_modifying_anything,
