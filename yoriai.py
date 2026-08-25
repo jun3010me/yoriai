@@ -830,7 +830,10 @@ def _run_turn_with_leak_detection(turn, tools: list):
             yield {"content": buffered_chunk}
 
 
-def stream_chat_completion(model: str, messages: list, extra_tools: list = None, client_tool_names: set = None):
+def stream_chat_completion(
+    model: str, messages: list, extra_tools: list = None, client_tool_names: set = None,
+    disable_default_tools: bool = False,
+):
     """モデル名からOllama/LM Studio/MLX-LMのどれにチャットを振るかを決め、
     正規化されたストリーミングイベント({"content": ...} / {"tool_call": <ツール名>} /
     {"pending_tool_calls": [...]} / {"done": True, "truncated": bool} /
@@ -844,6 +847,15 @@ def stream_chat_completion(model: str, messages: list, extra_tools: list = None,
 
     `extra_tools`(協業モードのレビュー専用read_file等)を渡すと、常時
     有効なCHAT_TOOLSに加えてこのリクエストだけ追加のツールをオファーする。
+
+    仮の判断(不具合修正: 対話プロトコル一時停止後、実装フェーズに繋がらない
+    問題への対応): `disable_default_tools=True`を渡すと、このリクエスト
+    限定でCHAT_TOOLS(既定ではweb_searchのみ)をオファーしない
+    (`extra_tools`が指定されていればそちらは引き続きオファーする)。
+    合意フェーズの一時停止直後の単発質問フォールバック(`_ask_organization`)
+    のように、スコープ確定・補足情報の伝達が主目的で外部情報の裏付けが
+    不要な場面で、モデル(特に思考系モデル)がweb_searchを繰り返し要求して
+    MAX_TOOL_CALL_ROUNDSに達し空の応答で打ち切られる現象を避けるために使う。
 
     `client_tool_names`に名前が含まれるツールは、ここでは実行しない
     (`_execute_tool_call`を呼ばない)。代わりに、そのツールが要求された
@@ -884,7 +896,8 @@ def stream_chat_completion(model: str, messages: list, extra_tools: list = None,
     が含まれるかどうかも確認したうえで再試行の要否を判断する。
     """
     messages = list(messages)  # 呼び出し元のリストをツール実行の追記で汚さない
-    tools = CHAT_TOOLS + list(extra_tools) if extra_tools else CHAT_TOOLS
+    base_tools = [] if disable_default_tools else CHAT_TOOLS
+    tools = base_tools + list(extra_tools) if extra_tools else base_tools
 
     for round_num in range(MAX_TOOL_CALL_ROUNDS + 1):
         if model in get_ollama_loaded_models():
@@ -1231,6 +1244,11 @@ class CardRequestHandler(BaseHTTPRequestHandler):
         # コメントを参照。
         offer_read_file_tool = bool(body.get("offer_read_file_tool"))
         offer_project_tools = bool(body.get("offer_project_tools"))
+        # 仮の判断(不具合修正: 対話プロトコル一時停止後、実装フェーズに
+        # 繋がらない問題への対応、副作用の是正): 依頼元が明示的に
+        # web_search等の既定ツールを不要と申告してきた場合のみ、この
+        # リクエスト限定でCHAT_TOOLSをオファーしない。
+        disable_default_tools = bool(body.get("disable_web_search"))
         if offer_project_tools:
             extra_tools = PROJECT_TOOLS_SCHEMAS
             client_tool_names = PROJECT_TOOLS_CLIENT_NAMES
@@ -1250,7 +1268,10 @@ class CardRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
         try:
-            for event in stream_chat_completion(model, messages, extra_tools=extra_tools, client_tool_names=client_tool_names):
+            for event in stream_chat_completion(
+                model, messages, extra_tools=extra_tools, client_tool_names=client_tool_names,
+                disable_default_tools=disable_default_tools,
+            ):
                 self.wfile.write(json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n")
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
@@ -1727,6 +1748,7 @@ def _select_chat_candidates(self_card: dict, peers: list, local_port: int, task_
 def _stream_chat_from_candidate(
     candidate: dict, org_fingerprint: str, messages: list,
     offer_read_file_tool: bool = False, offer_project_tools: bool = False,
+    disable_web_search: bool = False,
 ):
     """候補(自分自身を含む)のキッチンにHTTP経由(/chat)で問い合わせ、
     正規化されたストリーミングイベントを順にyieldする。
@@ -1738,12 +1760,18 @@ def _stream_chat_from_candidate(
     修正依頼専用、より広い権限のツール束)。どちらも実行結果は相手の
     キッチンではなく呼び出し元がこの応答ストリームを見て自分で作る必要が
     ある(詳細はREAD_FILE_TOOL_NAME定義コメントを参照)。
+
+    `disable_web_search=True`を渡すと、このリクエスト限定で既定の
+    CHAT_TOOLS(web_search)をオファーしない(`stream_chat_completion`の
+    `disable_default_tools`をそのまま伝える)。
     """
     body = {"model": candidate["model"], "messages": messages}
     if offer_project_tools:
         body["offer_project_tools"] = True
     elif offer_read_file_tool:
         body["offer_read_file_tool"] = True
+    if disable_web_search:
+        body["disable_web_search"] = True
     try:
         resp = requests.post(
             f"http://{candidate['address']}:{candidate['port']}/chat",
@@ -1778,12 +1806,18 @@ def _selection_reason_label(task_type: str, top_candidate: dict) -> str:
     return "空きメモリの多さで選択"
 
 
-def _ask_organization(port: int, org_fingerprint: str, messages: list) -> None:
+def _ask_organization(port: int, org_fingerprint: str, messages: list, disable_web_search: bool = False) -> None:
     """自分のキッチン(常駐エージェント)の`/status`で組織内の候補を集め、順番に
     問い合わせて、失敗したら次に空きメモリが多い候補へ自動でフォールバックしながら
     回答をストリーミング表示する。
 
     成功した場合はassistantの回答を`messages`に追記する(会話履歴の継続)。
+
+    仮の判断(不具合修正: 対話プロトコル一時停止後、実装フェーズに繋がらない
+    問題への対応、副作用の是正): `disable_web_search=True`を渡すと、この
+    問い合わせ限定でweb_searchツールをオファーしない。合意フェーズの一時
+    停止直後の続きの発言を、やむを得ず単発質問(このモード)にフォール
+    バックさせる場合に使う(呼び出し元を参照)。
     """
     data = _fetch_org_snapshot(port, org_fingerprint)
     if data is None:
@@ -1805,7 +1839,9 @@ def _ask_organization(port: int, org_fingerprint: str, messages: list) -> None:
 
         answer_parts = []
         failed = False
-        for event in _stream_chat_from_candidate(candidate, org_fingerprint, messages):
+        for event in _stream_chat_from_candidate(
+            candidate, org_fingerprint, messages, disable_web_search=disable_web_search,
+        ):
             if "error" in event:
                 logger.warning("%s への問い合わせに失敗しました: %s", candidate["label"], event["error"])
                 failed = True
@@ -8029,9 +8065,19 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                 )
                 continue
 
+            # 仮の判断(不具合修正: 対話プロトコル一時停止後、実装フェーズに
+            # 繋がらない問題への対応、副作用の是正): 上のpending_design_box
+            # (構造化された再開情報)が既に無く、やむを得ずこの単発質問
+            # フォールバックへ進む場合でも、一時停止直後の発言はスコープの
+            # 確定・補足情報の伝達が主目的でモデルが自発的に外部情報を
+            # 調べる必要性は低い。web_searchツールを繰り返し要求して
+            # MAX_TOOL_CALL_ROUNDSに達し、空の応答で打ち切られる現象を
+            # 避けるため、この問い合わせに限りweb_searchをオファーしない。
+            post_pause_single_fallback = False
             if _last_turn_is_dialogue_pause(messages):
                 print("[💬 対話プロトコルの一時停止直後の発言のため、会話の続きとして扱います]")
                 mode = EXECUTION_MODE_SINGLE
+                post_pause_single_fallback = True
             else:
                 mode = _classify_execution_mode(text, out_dir)
                 print(f"[判断: {_execution_mode_reason_label(mode)}]")
@@ -8060,7 +8106,7 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                 if mode == EXECUTION_MODE_COMPARE:
                     _ask_organization_multi(port, org_fingerprint, messages)
                 else:
-                    _ask_organization(port, org_fingerprint, messages)
+                    _ask_organization(port, org_fingerprint, messages, disable_web_search=post_pause_single_fallback)
             except KeyboardInterrupt:
                 if _handle_repl_command_interrupt(interrupt_guard):
                     break

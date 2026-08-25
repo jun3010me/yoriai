@@ -268,6 +268,88 @@ def test_followup_right_after_a_dialogue_pause_is_not_reclassified():
     assert calls["ask_single"] == 1, calls
 
 
+def test_followup_right_after_a_dialogue_pause_fallback_disables_web_search():
+    """不具合修正の回帰検知(対話プロトコル一時停止後、実装フェーズに
+    繋がらない不具合、副作用の是正): 構造化された再開情報(`pending_box`)が
+    無く、やむを得ず一時停止直後の続きの発言を単発質問(`_ask_organization`)
+    へフォールバックさせる場合、その問い合わせに限りweb_searchツールを
+    オファーしないことを確認する(`disable_web_search=True`が渡ること)。
+    通常の(一時停止直後ではない)単発質問では、これまで通りweb_search
+    ツールをオファーする(`disable_web_search`が渡らない、または`False`)。
+
+    仮の判断: `test_followup_right_after_a_design_dialogue_pause_resumes_
+    instead_of_single_question`と同じ理由(バックグラウンドジョブの完了と
+    次のキー入力の間の競合)により、`_run_repl_client`を別スレッドで動かし、
+    一時停止のジョブが完了したことを確認してから続きの発言を送り込む。
+    """
+    ask_single_kwargs_calls = []
+    paused_ready = threading.Event()
+
+    original_create_session = yoriai._create_repl_prompt_session
+    original_create_runner = yoriai._create_background_job_runner
+    original_ask = yoriai._ask_organization
+    original_ask_collaborate = yoriai._ask_organization_collaborate
+
+    def stub_ask(*args, **kwargs):
+        ask_single_kwargs_calls.append(kwargs)
+
+    def paused_collaborate(*args, **kwargs):
+        print(yoriai._DIALOGUE_PAUSE_HUMAN_JUDGEMENT_MARKER)
+        paused_ready.set()
+
+    yoriai._ask_organization = stub_ask
+    yoriai._ask_organization_collaborate = paused_collaborate
+
+    runner_holder = {}
+
+    def fake_create_runner():
+        runner = original_create_runner()
+        runner_holder["runner"] = runner
+        return runner
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_dialogue_pause_no_web_search_test_")
+    buf = io.StringIO()
+    try:
+        with create_pipe_input() as pipe_input:
+            def fake_create_session():
+                return PromptSession(
+                    input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
+                )
+
+            yoriai._create_repl_prompt_session = fake_create_session
+            yoriai._create_background_job_runner = fake_create_runner
+
+            def run_client():
+                with contextlib.redirect_stdout(buf):
+                    yoriai._run_repl_client(47120, "fingerprint", out_dir)
+
+            thread = threading.Thread(target=run_client)
+            thread.start()
+            try:
+                pipe_input.send_text("富士山の標高は?" + _SUBMIT)
+                pipe_input.send_text(f"{yoriai.AGREE_COMMAND} ToDoリストを作って" + _SUBMIT)
+                assert paused_ready.wait(timeout=5), "合意フェーズの一時停止(バックグラウンドジョブ)がタイムアウトしました"
+                runner_holder["runner"].join()
+                pipe_input.send_text("やっぱり別のアプリを作って" + _SUBMIT + "exit" + _SUBMIT)
+                thread.join(timeout=5)
+                assert not thread.is_alive(), "対話モードがexitで終了しませんでした"
+            finally:
+                yoriai._create_repl_prompt_session = original_create_session
+                yoriai._create_background_job_runner = original_create_runner
+    finally:
+        yoriai._ask_organization = original_ask
+        yoriai._ask_organization_collaborate = original_ask_collaborate
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+    output = buf.getvalue()
+    assert "対話モードを終了します。" in output, output
+    assert len(ask_single_kwargs_calls) == 2, ask_single_kwargs_calls
+    # 1回目(一時停止前の通常の単発質問)はweb_searchを無効化しない。
+    assert ask_single_kwargs_calls[0].get("disable_web_search", False) is False, ask_single_kwargs_calls
+    # 2回目(一時停止直後の単発質問フォールバック)はweb_searchを無効化する。
+    assert ask_single_kwargs_calls[1].get("disable_web_search") is True, ask_single_kwargs_calls
+
+
 def test_followup_right_after_a_design_dialogue_pause_resumes_instead_of_single_question():
     """不具合修正の回帰検知(対話プロトコル一時停止後、実装フェーズに
     繋がらない不具合、パターンA): //agreeの合意フェーズが構造化された
@@ -482,6 +564,7 @@ def main():
         test_agree_command_returns_to_prompt_before_the_job_finishes,
         test_auto_classified_collaborate_mode_is_also_backgrounded,
         test_followup_right_after_a_dialogue_pause_is_not_reclassified,
+        test_followup_right_after_a_dialogue_pause_fallback_disables_web_search,
         test_followup_right_after_a_design_dialogue_pause_resumes_instead_of_single_question,
         test_parallel_command_is_backgrounded,
         test_resume_all_command_is_backgrounded,

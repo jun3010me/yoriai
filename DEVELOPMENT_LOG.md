@@ -3521,3 +3521,47 @@ CHARS`=8000文字を超える場合)、`_truncate_for_history`が単純に先頭
   内の一部のテストは、前節までに記録済みの、今回の変更を含まない
   ブランチ上でも同じ頻度で再現するタイミング起因の低頻度な失敗である
   ことを、変更前のコードでの複数回実行と比較して再確認済み。
+
+### 対話プロトコル一時停止後の単発質問フォールバックでweb_searchを無効化
+
+前節の修正で、`pending_box`(構造化された再開情報)が使える場合は
+一時停止直後の発言が正しく合意フェーズの再開・実装フェーズへ橋渡しされる
+ようになった。しかし`pending_box`が空の場合(`//plan-only`の一時停止・
+プロセス再起動後等)のフォールバック経路は、依然として`mode =
+EXECUTION_MODE_SINGLE`(`_ask_organization`)であり、この単発チャット
+応答は既定でCHAT_TOOLS(web_search)をオファーする。一時停止直後の返信は
+「対話の続き・スコープの確定」が主目的の短いやり取りであることが多いに
+もかかわらず、モデル(特に思考系モデル)が律儀に裏付けを取ろうとして
+web_searchを繰り返し要求し、`MAX_TOOL_CALL_ROUNDS`(3)に達して空の応答の
+まま打ち切られる現象が実機で確認された。対話プロトコル自体のロジックには
+一切手を入れず、「一時停止後の再開ルーティング」と「その際のツール提供の
+有無」だけを直す。
+
+- **`disable_default_tools`引数の追加**: `stream_chat_completion`に
+  `disable_default_tools: bool = False`を追加した。`True`の場合、常時
+  有効なCHAT_TOOLS(web_search)をこのリクエスト限定でオファーしない
+  (`extra_tools`が指定されていればそちらは引き続きオファーする)。
+  `/chat`エンドポイント(`_handle_chat`)は、依頼元が`disable_web_search`
+  フラグを送ってきた場合のみこれを`True`にして中継する。
+  `_stream_chat_from_candidate`・`_ask_organization`にも同名の
+  `disable_web_search`引数を素通しで追加し、既定値は`False`(既存の
+  呼び出し元・挙動には影響しない)。
+- **フォールバック時だけ`True`にする**: `_run_repl_client`のメインループ
+  で、`pending_box`が空で`_last_turn_is_dialogue_pause`によるテキスト
+  ベースの判定でやむを得ず`EXECUTION_MODE_SINGLE`にフォールバックした
+  場合だけ`post_pause_single_fallback = True`を立て、`_ask_organization`
+  呼び出しに`disable_web_search=post_pause_single_fallback`として渡す。
+  通常の(一時停止直後ではない)単発質問では従来通りweb_searchをオファー
+  する。
+- **テストの扱い**: `tests/test_background_collaborate.py`に
+  `test_followup_right_after_a_dialogue_pause_fallback_disables_web_search`
+  を追加した。一時停止前の通常の単発質問では`disable_web_search`が
+  渡らない(またはFalse)こと、`pending_box`を使わない一時停止直後の
+  フォールバックでは`disable_web_search=True`が渡ることの両方を確認する。
+  既存の類似テストと同じ「バックグラウンドジョブの完了」と「次の発言の
+  読み取り」の間の競合を避けるため、`_run_repl_client`を専用スレッドで
+  動かし、一時停止ジョブの完了を`threading.Event`で待ってから続きの
+  発言を送り込むハーネスを用いている(5回連続実行して安定することを
+  確認)。
+- **検証**: 既存の全テストファイル(31ファイル)を実行し、リグレッション
+  が無いことを確認した。
