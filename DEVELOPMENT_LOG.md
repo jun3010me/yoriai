@@ -3565,3 +3565,58 @@ web_searchを繰り返し要求し、`MAX_TOOL_CALL_ROUNDS`(3)に達して空の
   確認)。
 - **検証**: 既存の全テストファイル(31ファイル)を実行し、リグレッション
   が無いことを確認した。
+
+### ツール呼び出しラウンド上限到達時に、空の応答のまま打ち切られる不具合の修正
+
+前節の対応は「一時停止直後の単発質問フォールバック」という特定の場面に
+限ってweb_searchそのものをオファーしない回避策であり、`stream_chat_
+completion`本体の根本問題(最終ラウンドでcontentを1文字も生成せず
+ツール呼び出しだけを返された場合、そのままanswer_partsが空で打ち切られる)
+は残ったままだった。実機では、思考系モデルがweb_searchツールを立て続けに
+要求するケースで、`_ask_organization`などの呼び出し元が空の応答を
+「有効な応答が得られなかった」と誤判定し、次の候補モデルへのフォール
+バックが発生する現象が繰り返し確認された。モデル・マシン自体は正常に
+動作しており、コード側の設計により会話が強制的に打ち切られていた。
+
+- **「tools無し最終問い合わせ」を1回だけ追加**: `stream_chat_completion`の
+  ツール呼び出しループを、通常のMAX_TOOL_CALL_ROUNDS+1ラウンド
+  (0..MAX_TOOL_CALL_ROUNDS)に加えて、`FINAL_NO_TOOL_ROUND`
+  (=MAX_TOOL_CALL_ROUNDS+1)という追加の1ラウンドだけ確保できるよう
+  拡張した。最終ラウンド(round_num == MAX_TOOL_CALL_ROUNDS)でcontentが
+  一度もyieldされないままツール呼び出しのみが返ってきた場合に限り
+  `need_final_no_tool_retry`フラグを立てて`continue`し、
+  `FINAL_NO_TOOL_ROUND`へ進む。このラウンドでは`tools = None`にした
+  うえで「これ以上ツールは使わず、これまでに分かっている情報だけで
+  回答してください」という趣旨のsystemメッセージを会話履歴に1回だけ
+  追加し、同じmessagesで最後にもう1往復問い合わせる。既存の
+  `leaked`/`tools_rejected`時の「`tools = None; continue`」パターンを
+  踏襲した。`need_final_no_tool_retry`がFalseのまま`FINAL_NO_TOOL_ROUND`
+  に達した場合は即座に`break`するため、通常時(最終ラウンドで既に
+  contentが得られている、またはツール呼び出しが無い)は従来通り
+  追加の問い合わせは発生しない。この追加ラウンドでもcontentが空だった
+  場合は、それ以上再試行せず(無限ループにせず)従来通り空のまま終了する。
+- **content判定はチャンク単位**: 「content」を1文字も生成しなかったか
+  どうかは、ラウンド内で`{"content": ...}`イベントが1回でも非空文字列を
+  伴ってyieldされたかを`round_content_yielded`で追跡して判定する
+  (空文字列のcontentチャンクだけが来たケースを「生成した」と誤判定
+  しないため)。
+- **既存の呼び出し元は変更不要**: ストリーミングイベントの形式
+  (`{"content": ...}` / `{"error": ...}` / `{"done": True, ...}`等)は
+  変えていないため、`_ask_organization`・対話プロトコル・修正セッション等、
+  `stream_chat_completion`を呼んでいる全箇所は無改修でそのまま動く。
+- **対象外**: `client_tool_names`(read_file等、呼び出し元での実行が
+  必要なツール)が絡む最終ラウンドのケースは、既存の`pending_tool_calls`
+  経由の設計(呼び出し元に処理を委ねる別ルート)を優先し、今回は特別な
+  分岐を追加していない(最終ラウンド到達時点でこの条件分岐には到達しない
+  ため、従来通りの挙動のまま)。
+- **テスト**: `tests/test_final_no_tool_retry.py`を新設し、(1)最終
+  ラウンドまでcontent無しでweb_searchだけを要求し続けた場合にtools無し
+  最終問い合わせが1回行われ、その結果が最終回答として採用されること、
+  (2)tools無し最終問い合わせでもcontentが空だった場合は、それ以上
+  再試行せず空のまま終了すること(無限ループにならないこと)、
+  (3)通常通り最終ラウンドより前にcontentが得られていれば追加の
+  問い合わせは発生しないこと(非退行確認)、の3ケースを検証した。
+  既存の全テストファイル(`tests/test_tools_fallback_logging.py`・
+  `tests/test_reviewer_read_file_tool.py`・`tests/test_response_
+  truncation.py`を含む全31+1ファイル)を実行し、リグレッションが
+  無いことを確認した。
