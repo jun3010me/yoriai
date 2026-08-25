@@ -3743,6 +3743,17 @@ def _write_dialogue_summary(project_dir: str, dialogue_id: str, topic: str, resu
     return path
 
 
+# 仮の判断(平文からの自動ツール選択の復活への対応): 対話プロトコルが
+# 合意に至らず一時停止した(セーフティリミット・人間の確認が必要)場合に
+# 共通で表示するこの一言を、`_run_repl_client`側でも「直前の会話履歴が
+# 一時停止の報告だったかどうか」を判定するための目印として使う
+# (`_last_turn_is_dialogue_pause`を参照)。文言を変更する場合は両方の
+# 参照箇所を同時に更新すること。
+_DIALOGUE_PAUSE_HUMAN_JUDGEMENT_MARKER = (
+    "[👤 続行するか終了するかは人間の判断です。内容を確認のうえ、必要であれば依頼文を調整して再度お試しください]"
+)
+
+
 def _report_dialogue_result(result: dict, project_dir: str, dialogue_id: str, topic: str) -> None:
     """対話の結果を画面に表示し、議事録・要約を(与えられた場合は)
     ディスクに保存する共通処理。
@@ -3768,7 +3779,7 @@ def _report_dialogue_result(result: dict, project_dir: str, dialogue_id: str, to
         print("[🙋 対話プロトコル: 合意に至らず、人間の確認が必要です]")
     if result.get("human_message"):
         print(result["human_message"])
-    print("[👤 続行するか終了するかは人間の判断です。内容を確認のうえ、必要であれば依頼文を調整して再度お試しください]")
+    print(_DIALOGUE_PAUSE_HUMAN_JUDGEMENT_MARKER)
 
 
 # ---------------------------------------------------------------------------
@@ -6726,6 +6737,31 @@ def _classify_execution_mode(text: str, out_dir: str = None) -> str:
     return EXECUTION_MODE_SINGLE
 
 
+def _last_turn_is_dialogue_pause(messages: list) -> bool:
+    """会話履歴(`messages`/`_ChatLog`)の直前のエントリが、対話プロトコルの
+    一時停止(セーフティリミット・人間の確認が必要)を報告するものだった
+    かどうかを判定する。
+
+    仮の判断(平文からの自動ツール選択の復活、依頼への対応): 以前
+    (637cce6)は、対話プロトコルが人間の確認を求めて一時停止した直後の
+    続きの発言(感想・追加指示等)まで`_classify_execution_mode`でゼロから
+    判定し直され、「[判断: 単発の質問と判断しました]」と表示されて無関係な
+    新規のやり取りとして扱われてしまう不具合があり、平文からの自動判定
+    そのものを廃止していた。その後、会話履歴が一本化され(`_ChatLog`)、
+    バックグラウンドジョブの標準出力も逐次`messages`へ`role: "assistant"`の
+    エントリとして記録されるようになったため、一時停止の報告
+    (`_DIALOGUE_PAUSE_HUMAN_JUDGEMENT_MARKER`)がその直前のエントリに
+    含まれているかどうかを見れば、「一時停止の直後かどうか」を会話状態
+    から判別できる。この場合だけ自動判定をスキップして常に会話の続き
+    (単発質問)として扱い、それ以外の(新規の話しかけらしい)場面では
+    自動判定を有効にする。
+    """
+    if not messages:
+        return False
+    last_content = messages[-1].get("content", "")
+    return _DIALOGUE_PAUSE_HUMAN_JUDGEMENT_MARKER in last_content
+
+
 def _execution_mode_reason_label(mode: str) -> str:
     if mode == EXECUTION_MODE_COLLABORATE:
         return "制作依頼と判断し、事前すり合わせを行います"
@@ -7604,7 +7640,8 @@ def _format_startup_banner(out_dir: str, member_count, use_color: bool) -> str:
         "    (送信キーやexit/quitが効かない場合の非常口です)",
         "",
         _ansi("コマンド", _ANSI_BOLD, use_color=use_color),
-        "  (コマンド無しの発言は常に会話の続きの単発質問として扱われます)",
+        "  (コマンドを付けずに話しかけると、単発/比較/協業のどのモードかを自動判断します)",
+        "  (対話プロトコルの一時停止直後の発言は、自動的に会話の続きとして扱われます)",
         f"  {MULTI_QUERY_COMMAND} <質問文>: 空きリソース上位{MULTI_QUERY_TARGET_COUNT}台に同時に質問",
         f"  {AGREE_COMMAND} <制作依頼>: 対話プロトコルによる事前すり合わせを経て協業モードで実装",
         f"  {PLAN_ONLY_COMMAND} <依頼>: 対話プロトコルで計画のみ議論し、実装せず計画書を出力",
@@ -7769,23 +7806,20 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                         break
                 continue
 
-            # 仮の判断(依頼への対応: 平文の自動モード判定を廃止): 以前は
-            # 依頼文のキーワードから実行モードを推測し(「作って」で協業
-            # モードへ、「意見を聞かせて」で比較モードへ、修正セッション中の
-            # 「明らかに新規制作依頼らしい発言」でセッション終了、等)、
-            # コマンド無しの発言を自動的に//agree・//fix・//multi相当の
-            # 処理へ振り分けていた。しかし、対話プロトコルが人間の確認を
-            # 求めて一時停止した直後の感想・追加指示のような、直前の
-            # やり取りへの純粋な「続き」の発言までゼロから判定し直され、
-            # 「[判断: 単発の質問と判断しました]」と表示されて無関係な
-            # 新規のやり取りが始まってしまう(会話が続いているように
-            # 見えない)という指摘を受けた。コマンド無し(`//`を付けない)の
-            # 発言は、修正セッション中かどうかによらず常に「今の会話の
-            # 続き」として単発質問扱いにし、新しい依頼(制作・比較・別
-            # プロジェクトの修正)をしたい場合は`//agree`・`//multi`・`//fix`
-            # のように明示的にコマンドを付けることを求める設計に変更した。
-            # (`_classify_execution_mode`自体は削除せず残してあるが、この
-            # ディスパッチからは呼ばなくなった。)
+            # 仮の判断(平文からの自動ツール選択の復活、依頼への対応): 一度
+            # (637cce6)は、対話プロトコルの一時停止直後の続きの発言まで
+            # ゼロから判定し直される不具合のため、コマンド無しの発言を
+            # 依頼文のキーワードから実行モードへ自動的に振り分ける仕組み
+            # (`_classify_execution_mode`のディスパッチ呼び出し)を廃止し、
+            # 常に「今の会話の続き」の単発質問として扱うようにしていた。
+            # その後、会話履歴が一本化された(`_ChatLog`)ことで、
+            # 「一時停止の直後かどうか」を直前の会話履歴のエントリから
+            # 判別できるようになったため(`_last_turn_is_dialogue_pause`)、
+            # その場合だけ自動判定をスキップして続きとして扱い、それ以外の
+            # 新規の話しかけらしい場面では自動判定を復活させる。修正
+            # セッション(`fix_session`)中は、それ自体が既に「今は継続中」
+            # という状態を表しているため、これまで通り自動判定を経由せず
+            # 常に対象プロジェクトへの継続的な修正依頼として扱う。
             if fix_session is not None and not _is_fix_session_end_phrase(text):
                 _continue_fix_session(port, org_fingerprint, out_dir, job_runner, fix_session, text, chat_log=messages)
                 continue
@@ -7795,9 +7829,37 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                 fix_session = None
                 continue
 
+            if _last_turn_is_dialogue_pause(messages):
+                print("[💬 対話プロトコルの一時停止直後の発言のため、会話の続きとして扱います]")
+                mode = EXECUTION_MODE_SINGLE
+            else:
+                mode = _classify_execution_mode(text, out_dir)
+                print(f"[判断: {_execution_mode_reason_label(mode)}]")
+
+            if mode == EXECUTION_MODE_COLLABORATE:
+                job_runner.submit(
+                    lambda text=text: _run_job_with_conversation_log(
+                        messages, text,
+                        lambda: _ask_organization_collaborate(
+                            port, org_fingerprint, text, out_dir, enable_dialogue=True,
+                        ),
+                    ),
+                    queued_notice=_BACKGROUND_QUEUED_NOTICE,
+                )
+                continue
+
+            if mode == EXECUTION_MODE_FIX_PROJECT:
+                fix_session = _begin_fix_session(
+                    port, org_fingerprint, out_dir, job_runner, fix_session, text, chat_log=messages,
+                )
+                continue
+
             messages.append({"role": "user", "content": text})
             try:
-                _ask_organization(port, org_fingerprint, messages)
+                if mode == EXECUTION_MODE_COMPARE:
+                    _ask_organization_multi(port, org_fingerprint, messages)
+                else:
+                    _ask_organization(port, org_fingerprint, messages)
             except KeyboardInterrupt:
                 if _handle_repl_command_interrupt(interrupt_guard):
                     break
