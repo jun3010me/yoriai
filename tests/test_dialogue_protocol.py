@@ -113,6 +113,20 @@ def test_parse_integrator_verdict_extracts_marker_and_defaults_to_continue():
     assert yoriai._parse_integrator_verdict("要領を得ない回答") == "継続"
 
 
+def test_critic_template_calibrates_scrutiny_to_request_scale():
+    """批判担当(反論役)が、依頼の規模に見合わない過剰な懸念(小さな
+    個人利用の依頼への大規模なセキュリティ要件・汎用的なAPI仕様の整備
+    など)を持ち出して話を広げてしまわないよう、プロンプトに規模相応の
+    指摘を促す文言が含まれていることを確認する。統合役側にも、そうした
+    過剰な指摘だけを理由に議論を継続させない文言が含まれていることを
+    確認する。
+    """
+    assert "依頼の規模" in yoriai._DIALOGUE_CRITIC_TEMPLATE
+    assert "過剰" in yoriai._DIALOGUE_CRITIC_TEMPLATE
+    assert "セキュリティ" in yoriai._DIALOGUE_CRITIC_TEMPLATE
+    assert "依頼の規模" in yoriai._DIALOGUE_INTEGRATOR_TEMPLATE
+
+
 def test_extract_dialogue_section_falls_back_to_full_text_when_heading_missing():
     assert yoriai._extract_dialogue_section("見出しなしの本文", "最終合意内容:") == "見出しなしの本文"
     assert yoriai._extract_dialogue_section("前置き\n最終合意内容:\nこれが中身", "最終合意内容:") == "これが中身"
@@ -383,21 +397,28 @@ def test_ask_organization_collaborate_without_dialogue_flag_keeps_single_call_be
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
-def test_ask_organization_collaborate_with_dialogue_aborts_without_human_consensus():
-    """対話が合意に至らなかった場合、実装フェーズには一切進まず、
-    議事録・要約だけを残して終了することを確認する(依頼1.4: 対話
-    プロトコルだけで次のフェーズへ自動的に進むことはしない)。
+def test_ask_organization_collaborate_with_dialogue_finalizes_solo_and_implements_without_consensus():
+    """対話プロトコルへの人間の介入を必須にしない、という方針の確認:
+    対話(反論役・統合役)が合意に至らなかった場合でも、そこで立ち止まって
+    人間の判断を待つのではなく、代表1名(提案役)がそれまでの議論を踏まえて
+    単独で計画を確定し、そのまま実装フェーズまで進むことを確認する。
     """
+    plan = "storage.py: add_todo(text: str) -> int を実装する\ncli.py: storage.add_todoを呼び出すCLI"
+
     def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
         text = messages[0]["content"]
-        if _PROPOSER_MARKER in text:
+        if "ファイル分割案を確定してください" in text:
+            yield {"content": plan}
+        elif _PROPOSER_MARKER in text:
             yield {"content": "案"}
         elif _CRITIC_MARKER in text:
             yield {"content": "アイデアが尽きました。\n評価: 情報不足"}
         elif _INTEGRATOR_MARKER in text:
             yield {"content": "判定: 人間に確認\n\n人間への確認事項:\n方向性を決めてください。"}
+        elif "レビュー対象" in text:
+            yield {"content": "問題なし"}
         else:
-            raise AssertionError(f"実装フェーズに進んではいけません: {text[:80]}")
+            yield {"content": "```python\npass\n```"}
         yield {"done": True}
 
     original_snapshot = yoriai._fetch_org_snapshot
@@ -411,15 +432,14 @@ def test_ask_organization_collaborate_with_dialogue_aborts_without_human_consens
                 47120, "fingerprint", "ToDoリストのCLIツールを作って", out_dir, enable_dialogue=True,
             )
         output = buf.getvalue()
-        assert "方向性を決めてください" in output
+        assert "単独で計画を確定" in output, output
+        assert "[✅ 全タスク完了" in output, output
 
         project_dir = os.path.join(
             out_dir, yoriai.PROJECTS_SUBDIR_NAME, yoriai._project_name_with_date_prefix("ToDoリストのCLIツールを作って"),
         )
         saved = set(os.listdir(project_dir))
-        assert saved == {"DIALOGUE_LOG_design.md", "DIALOGUE_SUMMARY_design.md"}, (
-            f"議事録・要約以外の生成物(コード等)は作られないはずです: {saved}"
-        )
+        assert {"storage.py", "cli.py", "PROGRESS.md", "DIALOGUE_LOG_design.md", "DIALOGUE_SUMMARY_design.md"} <= saved, saved
     finally:
         yoriai._fetch_org_snapshot = original_snapshot
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -430,14 +450,18 @@ def test_ask_organization_collaborate_with_dialogue_aborts_without_human_consens
 # 実装フェーズに繋がらない不具合への対応)
 # ---------------------------------------------------------------------------
 
-def test_ask_organization_collaborate_with_dialogue_stores_pending_box_on_pause():
-    """人間の確認が必要で一時停止した場合、`pending_box`に再開情報
-    (`_PendingDesignDialogue`)が格納されることを確認する。合意した場合や
+def test_ask_organization_collaborate_with_dialogue_stores_pending_box_when_solo_finalize_fails():
+    """対話が合意に至らなかった場合、通常は代表1名が単独で計画を確定して
+    そのまま続行する(人間の確認を待たない)。`pending_box`に再開情報
+    (`_PendingDesignDialogue`)が格納されるのは、その単独確定の問い合わせ
+    自体も失敗した(疎通の問題があった)場合のみであることを確認する。
     `pending_box`を渡さない場合(既存の呼び出し元)には影響しないことも
     合わせて確認する。
     """
     def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
         text = messages[0]["content"]
+        if "ファイル分割案を確定してください" in text:
+            return  # 単独確定の問い合わせ自体が失敗した状況(疎通の問題)を模擬する
         if _PROPOSER_MARKER in text:
             yield {"content": "案"}
         elif _CRITIC_MARKER in text:
@@ -488,6 +512,8 @@ def test_resume_organization_collaborate_continues_dialogue_and_implements():
 
     def fake_stream_pause(candidate, org_fingerprint, messages, **_kwargs):
         text = messages[0]["content"]
+        if "ファイル分割案を確定してください" in text:
+            return  # 単独確定の問い合わせ自体が失敗した状況(疎通の問題)を模擬し、pending状態を作る
         if _PROPOSER_MARKER in text:
             yield {"content": "初期案"}
         elif _CRITIC_MARKER in text:
@@ -555,6 +581,8 @@ def test_resume_organization_collaborate_falls_back_to_single_node_plan_when_sti
 
     def fake_stream_pause(candidate, org_fingerprint, messages, **_kwargs):
         text = messages[0]["content"]
+        if "ファイル分割案を確定してください" in text:
+            return  # 単独確定の問い合わせ自体が失敗した状況(疎通の問題)を模擬し、pending状態を作る
         if _PROPOSER_MARKER in text:
             yield {"content": "初期案"}
         elif _CRITIC_MARKER in text:
@@ -672,9 +700,51 @@ def test_run_fix_approach_dialogue_falls_back_silently_when_no_engagement():
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
-def test_run_fix_approach_dialogue_aborts_when_no_consensus_reached():
+def test_run_fix_approach_dialogue_finalizes_solo_without_consensus():
+    """対話プロトコルへの人間の介入を必須にしない、という方針の確認:
+    修正方針についての対話が合意に至らなかった場合でも、そこで立ち止まって
+    人間の判断を待つのではなく、代表1名がそれまでの議論を踏まえて単独で
+    修正方針を確定し、そのまま処理を続行することを確認する。
+    """
+    solo_approach = "utils.pyの削除とhelpers.pyへの完全移行を行う。"
+
     def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
         text = messages[0]["content"]
+        if "あなた一人の判断で修正方針を確定してください" in text:
+            yield {"content": solo_approach}
+        elif _PROPOSER_MARKER in text:
+            yield {"content": "案"}
+        elif _CRITIC_MARKER in text:
+            yield {"content": "アイデアが尽きました。\n評価: 情報不足"}
+        elif _INTEGRATOR_MARKER in text:
+            yield {"content": "判定: 人間に確認\n\n人間への確認事項:\n修正範囲を明確にしてください。"}
+        yield {"done": True}
+
+    candidates = [_candidate("MacStudio", "m1"), _candidate("junnoMac-mini", "m2")]
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_dialogue_test_")
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            augmented_request, aborted = _with_stream(
+                fake_stream, yoriai._run_fix_approach_dialogue,
+                "fingerprint", "何となく直して", candidates, "storage.py: ...", ["storage.py"], "Python", out_dir,
+            )
+        assert aborted is False
+        assert "何となく直して" in augmented_request
+        assert solo_approach in augmented_request
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_run_fix_approach_dialogue_aborts_when_solo_finalize_also_fails():
+    """修正方針についての対話が合意に至らず、かつ代表1名による単独確定の
+    問い合わせ自体も失敗した(疎通の問題)場合にのみ中断することを確認
+    する(通常の意見の対立だけでは中断しないことの裏返しの確認)。
+    """
+    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
+        text = messages[0]["content"]
+        if "あなた一人の判断で修正方針を確定してください" in text:
+            return
         if _PROPOSER_MARKER in text:
             yield {"content": "案"}
         elif _CRITIC_MARKER in text:
@@ -738,6 +808,45 @@ def test_ask_organization_plan_only_never_writes_code_files():
         assert saved == {"DIALOGUE_LOG_plan.md", "DIALOGUE_SUMMARY_plan.md"}, (
             f"計画のみモードは議事録・要約だけを残すはずです: {saved}"
         )
+    finally:
+        yoriai._fetch_org_snapshot = original_snapshot
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_ask_organization_plan_only_finalizes_solo_without_consensus():
+    """計画のみモードでも、対話が合意に至らなかった場合に立ち止まらず、
+    代表1名が単独で計画を確定して表示することを確認する(対話プロトコル
+    への人間の介入を必須にしない、という方針は`//plan-only`にも及ぶ)。
+    """
+    solo_plan = "- 全体方針: まず最小限のCLIを作り、後から永続化を追加する"
+
+    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
+        text = messages[0]["content"]
+        if "あなた一人の判断で計画を確定してください" in text:
+            yield {"content": solo_plan}
+        elif _PROPOSER_MARKER in text:
+            yield {"content": "案"}
+        elif _CRITIC_MARKER in text:
+            yield {"content": "アイデアが尽きました。\n評価: 情報不足"}
+        elif _INTEGRATOR_MARKER in text:
+            yield {"content": "判定: 人間に確認\n\n人間への確認事項:\n方向性を決めてください。"}
+        else:
+            raise AssertionError(f"想定外の問い合わせです: {text[:80]}")
+        yield {"done": True}
+
+    original_snapshot = yoriai._fetch_org_snapshot
+    yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False: _two_member_snapshot()
+    out_dir = tempfile.mkdtemp(prefix="yoriai_plan_only_solo_test_")
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _with_stream(
+                fake_stream, yoriai._ask_organization_plan_only,
+                47120, "fingerprint", "ToDoリストのCLIツールを作って", out_dir,
+            )
+        output = buf.getvalue()
+        assert "計画を単独で確定" in output, output
+        assert solo_plan in output, output
     finally:
         yoriai._fetch_org_snapshot = original_snapshot
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -849,6 +958,7 @@ def main():
         test_assign_discourse_roles_three_or_more_candidates_get_distinct_roles,
         test_parse_critic_verdict_extracts_marker_and_defaults_to_needs_fix,
         test_parse_integrator_verdict_extracts_marker_and_defaults_to_continue,
+        test_critic_template_calibrates_scrutiny_to_request_scale,
         test_extract_dialogue_section_falls_back_to_full_text_when_heading_missing,
         test_run_dialogue_requires_min_rounds_even_when_both_agree_immediately,
         test_run_dialogue_critic_flags_information_shortage_escalates_to_human,
@@ -859,14 +969,16 @@ def main():
         test_report_dialogue_result_skips_files_when_no_engagement,
         test_ask_organization_collaborate_with_dialogue_reaches_consensus_and_implements,
         test_ask_organization_collaborate_without_dialogue_flag_keeps_single_call_behavior,
-        test_ask_organization_collaborate_with_dialogue_aborts_without_human_consensus,
-        test_ask_organization_collaborate_with_dialogue_stores_pending_box_on_pause,
+        test_ask_organization_collaborate_with_dialogue_finalizes_solo_and_implements_without_consensus,
+        test_ask_organization_collaborate_with_dialogue_stores_pending_box_when_solo_finalize_fails,
         test_resume_organization_collaborate_continues_dialogue_and_implements,
         test_resume_organization_collaborate_falls_back_to_single_node_plan_when_still_no_consensus,
         test_run_fix_approach_dialogue_augments_request_on_consensus,
         test_run_fix_approach_dialogue_falls_back_silently_when_no_engagement,
-        test_run_fix_approach_dialogue_aborts_when_no_consensus_reached,
+        test_run_fix_approach_dialogue_finalizes_solo_without_consensus,
+        test_run_fix_approach_dialogue_aborts_when_solo_finalize_also_fails,
         test_ask_organization_plan_only_never_writes_code_files,
+        test_ask_organization_plan_only_finalizes_solo_without_consensus,
         test_plan_only_command_constant_is_independent_from_agree_and_fix,
         test_review_self_explanation_note_reaches_review_prompt_when_enabled,
         test_review_without_self_explanation_flag_sends_unchanged_prompt,
