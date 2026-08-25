@@ -773,19 +773,31 @@ _LEAK_PEEK_CHARS = 30
 _LEAK_TRIGGER_CHARS = "<["
 
 
-def _run_turn_with_leak_detection(turn, tools: list):
-    """1ターン分の応答イベントを中継しつつ、ツール呼び出しをオファーした
-    ときだけ、先頭のcontentが漏れたツール呼び出し記法でないかを確認する。
-    漏れを検出した場合は、それ以降のcontentを画面に出さずに捨て、代わりに
-    {"tool_call_failed": True} を1回だけyieldする(content/tool_callsの
-    どちらも実質的には返さない)。
+def _run_turn_with_leak_detection(turn):
+    """1ターン分の応答イベントを中継しつつ、先頭のcontentが漏れたツール
+    呼び出し記法でないかを確認する。漏れを検出した場合は、それ以降の
+    contentを画面に出さずに捨て、代わりに{"tool_call_failed": True} を
+    1回だけyieldする(content/tool_callsのどちらも実質的には返さない)。
 
     仮の判断: 判定のためにcontentの先頭を少量バッファする間も、元のチャンクの
     区切り(トークン単位)は保ったままリプレイする。1つの大きな塊に結合して
     出すと、バッファ分だけ「一括表示」に戻ってしまい、ストリーミング表示という
     フェーズ5の目的が損なわれるため。
+
+    仮の判断(バグ報告への対応): 当初は`tools`(このラウンドで実際に
+    オファーしたツール一覧)が空の場合は漏れチェック自体を省略していた
+    (ツールをオファーしていないのだから漏れようがない、という前提)。
+    しかし実機で、`stream_chat_completion`のtools無し最終問い合わせ
+    (FINAL_NO_TOOL_ROUND、会話履歴には直前までのツール呼び出しの
+    やり取りが残ったまま`tools=None`で問い合わせる)において、モデルが
+    それでも`<tool_call>`記法をそのまま出力してしまい、このラウンドだけ
+    チェックがスキップされていたために生のツール呼び出し記法が回答本文
+    としてそのままユーザーに表示されてしまう不具合が見つかった。会話
+    履歴にツール呼び出しの前例が残っている限り、そのラウンド自体が
+    ツール無しでもモデルが記法を漏らす可能性は消えないため、`tools`の
+    有無に関わらず常に漏れチェックを行うようにした。
     """
-    state = "peeking" if tools else "streaming"
+    state = "peeking"
     buffered_chunks = []
     buffered_text = ""
     for event in turn:
@@ -939,7 +951,7 @@ def stream_chat_completion(
         round_content_yielded = False
         leaked = False
         tools_rejected = False
-        for event in _run_turn_with_leak_detection(turn, tools):
+        for event in _run_turn_with_leak_detection(turn):
             if "error" in event:
                 status_code = event.get("status_code")
                 # 仮の判断: 「tools無し再試行が発動したかどうか」がログから一目で

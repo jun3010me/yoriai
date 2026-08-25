@@ -106,6 +106,55 @@ def test_final_no_tool_query_still_empty_is_treated_as_no_valid_response():
     assert events[-1] == {"done": True, "truncated": False}, events
 
 
+def test_final_no_tool_query_still_detects_leaked_tool_call_syntax():
+    """バグ報告への対応: tools無しの最終問い合わせ(FINAL_NO_TOOL_ROUND)は
+    `tools=None`でバックエンドに問い合わせるため、モデルにツールを
+    オファーしていない。以前の`_run_turn_with_leak_detection`は
+    「ツールをオファーしたときだけ漏れチェックする」実装だったため、この
+    ラウンドだけ漏れチェックが素通りになっていた。しかし実機では、直前の
+    ラウンドで実際にweb_searchのやり取りが会話履歴に残っているため、
+    tools無しのこのラウンドでもモデルが`<tool_call>`記法をそのまま
+    出力してしまうことがあり、その生の記法がそのままユーザーへの回答
+    本文として表示されてしまう不具合が見つかった。tools無しの最終
+    問い合わせでも漏れチェックが機能し、生の記法がcontentとして
+    そのまま漏れずに{"tool_call_failed": True}が返ることを確認する。
+    """
+    call_count = {"n": 0}
+
+    def fake_turn(base_url, model, messages, tools):
+        call_count["n"] += 1
+        if tools:
+            yield {
+                "tool_calls": [
+                    {"id": f"call_{call_count['n']}", "type": "function",
+                     "function": {"name": "web_search", "arguments": {"query": "しつこく調べる"}}},
+                ],
+            }
+        else:
+            # tools無しでも、モデルがread_fileの呼び出し記法をそのまま
+            # 出力してしまうケースを再現する(実機で報告された不具合)。
+            yield {"content": '<tool_call>\n{"name": "read_file", "arguments": {}}\n</tool_call>'}
+            yield {"tool_calls": []}
+
+    original_turn = yoriai._stream_openai_compatible_turn
+    original_search = yoriai.web_search
+    yoriai._stream_openai_compatible_turn = fake_turn
+    yoriai.web_search = lambda query: [{"title": "dummy", "url": "http://example.com", "snippet": "dummy"}]
+    try:
+        events = list(yoriai.stream_chat_completion(
+            "thinking-model", [{"role": "user", "content": "念入りに調べて回答して"}],
+        ))
+    finally:
+        yoriai._stream_openai_compatible_turn = original_turn
+        yoriai.web_search = original_search
+
+    contents = [e["content"] for e in events if "content" in e]
+    assert contents == [], f"漏れたツール呼び出し記法がcontentとして漏れてはいけません: {events}"
+    assert any(e.get("tool_call_failed") for e in events), (
+        f"漏れを検出してtool_call_failedを返すはずです: {events}"
+    )
+
+
 def test_content_produced_before_round_limit_does_not_trigger_final_no_tool_query():
     """通常通り、最終ラウンドより前にcontent付きの回答が得られていれば
     (=空の応答で打ち切られる問題が発生していなければ)、tools無しの
@@ -136,6 +185,7 @@ def main():
     tests = [
         test_round_limit_with_empty_content_falls_back_to_final_no_tool_query,
         test_final_no_tool_query_still_empty_is_treated_as_no_valid_response,
+        test_final_no_tool_query_still_detects_leaked_tool_call_syntax,
         test_content_produced_before_round_limit_does_not_trigger_final_no_tool_query,
     ]
     failures = 0
