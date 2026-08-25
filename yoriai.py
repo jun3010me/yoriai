@@ -3332,7 +3332,6 @@ def _dispatch_and_save_parallel_tasks(tasks: list, candidates: list, org_fingerp
         t.join()
     print()
 
-    os.makedirs(out_dir, exist_ok=True)
     saved = []
     for filename, candidate, answer, error in results:
         if error or not answer:
@@ -3342,11 +3341,16 @@ def _dispatch_and_save_parallel_tasks(tasks: list, candidates: list, org_fingerp
             )
             continue
         code = _extract_code_from_answer(answer)
-        dest_path = os.path.join(out_dir, filename)
-        with open(dest_path, "w", encoding="utf-8") as f:
-            f.write(code)
-        saved.append({"filename": filename, "candidate": candidate, "code": code})
-        print(f"[💾 {dest_path} に保存しました (担当: {candidate['label']})]")
+        write_result = json.loads(_write_project_file(out_dir, filename, code))
+        if not write_result.get("ok"):
+            logger.warning(
+                "%s の保存に失敗しました(担当: %s): %s",
+                filename, candidate["label"], write_result.get("message", "不明なエラー"),
+            )
+            continue
+        saved_filename = write_result.get("filename", filename)
+        saved.append({"filename": saved_filename, "candidate": candidate, "code": code})
+        print(f"[💾 {os.path.join(out_dir, saved_filename)} に保存しました (担当: {candidate['label']})]")
 
     if not saved:
         print("保存できたファイルがありませんでした。")
@@ -5457,9 +5461,14 @@ def _request_fix(
         return None
 
     fixed_code = _extract_code_from_answer(answer)
-    dest_path = os.path.join(out_dir, filename)
-    with open(dest_path, "w", encoding="utf-8") as f:
-        f.write(fixed_code)
+    write_result = json.loads(_write_project_file(out_dir, filename, fixed_code))
+    if not write_result.get("ok"):
+        _print_tagged(
+            print_lock, filename,
+            f"  → 修正版の保存に失敗しました: {write_result.get('message', '不明なエラー')}。この回の修正は不採用とし、未完了として扱います。",
+        )
+        return None
+    dest_path = os.path.join(out_dir, write_result.get("filename", filename))
     _print_tagged(print_lock, filename, f"[💾 修正版の {dest_path} を保存しました (担当: {owner['label']})]")
     return fixed_code
 
@@ -5699,10 +5708,16 @@ def _run_collaborative_task_queue(
                 continue
 
             code = _extract_code_from_answer(answer)
-            os.makedirs(project_dir, exist_ok=True)
-            dest_path = os.path.join(project_dir, filename)
-            with open(dest_path, "w", encoding="utf-8") as f:
-                f.write(code)
+            write_result = json.loads(_write_project_file(project_dir, filename, code))
+            if not write_result.get("ok"):
+                logger.warning(
+                    "%s の保存に失敗しました(担当: %s): %s",
+                    filename, candidate["label"], write_result.get("message", "不明なエラー"),
+                )
+                # 保存できなかったファイルはタスクリスト上「未完了」のまま残り、
+                # 最終チェックで検出される。このメンバーは次のタスクへ進む。
+                continue
+            dest_path = os.path.join(project_dir, write_result.get("filename", filename))
             _print_tagged(print_lock, filename, f"[💾 {dest_path} に保存しました (担当: {candidate['label']})]")
             _set_task_status(checklist, filename, "impl", _TASK_STATUS_COMPLETED)
             if on_update:
