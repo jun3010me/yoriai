@@ -3183,3 +3183,89 @@ CLIツールを作って」のようなPython前提の依頼も、これまで�
   無効時は既存のプロンプトと一字一句変わらないこと)を計25件で検証した。
   既存の全テストファイル(27ファイル)を実行し直し、リグレッションが
   無いことも確認した。
+
+### プロジェクトフォルダへの日付プレフィックス追加、会話履歴の一本化
+
+利用者から2件のフィードバックを受けた。(1)`//agree`・`//plan-only`が作る
+`projects/<プロジェクト名>/`が増えてきて、いつ作ったものか一覧から
+分かりにくい。(2)対話プロトコルが「人間の確認が必要です」と一時停止した
+直後に感想・追加の指示を送っても、それが無関係な新規の単発質問として
+扱われ、直前のやり取りを組織側が一切踏まえられない。
+
+- **日付プレフィックスを`_generate_project_name`自体には混ぜなかった
+  理由**: `_generate_project_name`は「依頼文からの命名」という既存の
+  役割を持ち、`test_project_output_dir.py`が`_generate_project_name(...)
+  == "todo-cli"`という厳密な等価比較で直接テストしている。日付を混ぜると
+  この関数の責務が「依頼文からの命名」と「いつ作るかという実行時の関心事」
+  の2つに膨らんでしまい、既存のテストの意図(命名ロジック単体の検証)も
+  壊れる。「新規にディレクトリを作る」呼び出し元
+  (`_ask_organization_collaborate`・`_ask_organization_plan_only`)側の
+  関心事として、日付を付ける`_project_name_with_date_prefix`を別関数に
+  分離した。
+- **既存の複数のテストファイルへの影響**: `_generate_project_name`の
+  戻り値をそのまま使って期待するプロジェクトパスを組み立てていた既存
+  テスト(`test_auto_mode_and_agree.py`・`test_auto_resume.py`・
+  `test_progress_persistence.py`・`test_language_agnostic.py`・
+  `test_task_checklist.py`・`test_project_output_dir.py`)は、実際に
+  作られるディレクトリ名が変わるため、期待値の組み立ても
+  `_project_name_with_date_prefix`を使うように合わせて更新した(ロジックの
+  変更ではなく、新しい命名規則への追従)。
+
+- **会話履歴を`messages`という素の`list`から、`list`を継承した
+  `_ChatLog`クラスに置き換えた理由**: 単発質問・`//multi`用の
+  `_ask_organization`/`_ask_organization_multi`は`messages.append(...)`
+  という素朴な`list`操作しか行っておらず、これらの関数(および、同じ
+  `messages`を直接扱う既存のテスト群)を一切変更せずに「`append()`される
+  たびにログファイルへも書き出す」というフックを追加したかった。`list`を
+  継承して`append()`だけをオーバーライドすることで、呼び出し側のコードは
+  無変更のまま`_ChatLog`が今まで通り`list`として振る舞う。
+- **バックグラウンドジョブ(`//agree`等)の出力を、標準出力を丸ごと
+  差し替えるのではなく`_StdoutTee`で転送しつつ捕捉した理由**: 対話モードの
+  セッション本体は`patch_stdout()`(プロンプト入力中でも別スレッドから
+  安全にprintできる仕組み)で包まれており、素朴に`sys.stdout`を
+  `io.StringIO()`のような別物に丸ごと差し替えると、この安全策や、
+  テストの`contextlib.redirect_stdout`によるキャプチャと衝突する
+  (二重に差し替え合って壊れる)おそれがある。`_StdoutTee`は、その時点で
+  実際に有効な`sys.stdout`が何であっても(端末・`patch_stdout()`経由・
+  テストの`redirect_stdout`のいずれでも)そこへの書き込みをそのまま
+  転送しつつ、文字列としても集めるだけなので、どの文脈で使っても既存の
+  出力の仕組みを壊さない。
+- **`_begin_fix_session`/`_continue_fix_session`に`chat_log=None`という
+  既定値付きの新しい引数を追加した理由**: この2関数は
+  `test_fix_session.py`から固定引数で直接呼ばれており、かつ`_run_fix_
+  on_project`自体を固定引数のスタブで丸ごと差し替えるテストヘルパーを
+  持つ。新しい引数を既定値`None`付きで追加し、`chat_log`が`None`の場合は
+  `_run_job_with_conversation_log`が単に`job()`を呼ぶだけ(会話履歴への
+  記録なし)にフォールバックすることで、既存のテストを一切変更せずに
+  済んだ(実際のREPLディスパッチ箇所でのみ`chat_log=messages`を渡す)。
+- **会話履歴に積み上げる内容に8,000文字の上限を設けた理由**: 対話
+  プロトコルの逐語ログを含む出力は長大になりうる。`messages`は次に
+  単発質問を送るたびにLLMへ丸ごと送り直されるため、無制限に積み上げると
+  トークン使用量が際限なく増えてしまう。既存のread_fileツールの
+  `_FILE_CONTENT_TRUNCATE_CHARS`と同じ考え方で、会話履歴(LLMに送る部分)
+  にだけ上限を設け、画面表示・ログファイル自体は切り詰めない(人間が
+  見返す記録を欠落させたくないため)。
+- **テストで`_run_repl_client`の`out_dir`に`"."`(カレントディレクトリ)を
+  渡していた既存の複数のテストファイルへの対応**: `_create_chat_log`が
+  起動直後に(コマンドの種類を問わず)ログファイルを実際に作成するように
+  なったため、`out_dir="."`のままではテスト実行のたびにリポジトリの
+  作業ディレクトリ直下に`chat_logs/`が実際に作られてしまう不具合が
+  判明した(以前はこれらのテストが深いディスク操作関数を一切呼ばない
+  ものばかりだったため`"."`のままでも問題が起きていなかった)。
+  `test_startup_banner.py`・`test_double_ctrl_c_emergency_exit.py`・
+  `test_auto_resume.py`・`test_enter_to_submit.py`・
+  `test_repl_input_handling.py`を、一時ディレクトリを作って渡し、
+  終了時に削除するように修正した。`test_background_collaborate.py`の
+  共有ヘルパーだけは、バックグラウンドジョブの完了(`runner.join()`)を
+  待たずに返る設計のため、その場では削除せず`/tmp`配下に作るだけに
+  とどめた(OSの一時領域なので、リポジトリを汚さない範囲で許容した)。
+  `.gitignore`にも`chat_logs/`を追加した。
+- **検証**: 新規に`tests/test_chat_conversation_log.py`を作成し、
+  `_ChatLog`(list互換・ファイルへの逐次書き出し)、
+  `_run_job_with_conversation_log`(依頼文・捕捉した出力の記録、
+  出力が無い場合のプレースホルダー、長大な出力の会話履歴側だけの切り詰め、
+  `chat_log=None`時の後方互換)、単発質問が直前の`//agree`のやり取りを
+  会話履歴として実際に受け取ること、REPL全体を通した`//agree`実行後に
+  実際のログファイルへ記録されること、`_project_name_with_date_prefix`の
+  日付プレフィックス付与を計12件で検証した。既存の全テストファイル
+  (28ファイル)を実行し直し、リグレッションが無いことも確認した。

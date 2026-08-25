@@ -32,7 +32,9 @@ Enterと同様に送信として扱われる(改行を挿入したい場面で�
 import contextlib
 import io
 import os
+import shutil
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import yoriai  # noqa: E402
@@ -154,13 +156,15 @@ def test_banner_documents_the_new_keys_prominently():
 
         original_create_session = yoriai._create_repl_prompt_session
         yoriai._create_repl_prompt_session = fake_create_session
+        out_dir = tempfile.mkdtemp(prefix="yoriai_enter_to_submit_test_")
         try:
             pipe_input.send_text("\x04")
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
-                yoriai._run_repl_client(47120, "fingerprint", ".")
+                yoriai._run_repl_client(47120, "fingerprint", out_dir)
         finally:
             yoriai._create_repl_prompt_session = original_create_session
+            shutil.rmtree(out_dir, ignore_errors=True)
 
     output = buf.getvalue()
     assert "Enterで送信" in output, output

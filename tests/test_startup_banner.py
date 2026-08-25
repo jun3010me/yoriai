@@ -13,7 +13,9 @@ Claude Code等のツールに近い洗練された印象にしたいという依
 import contextlib
 import io
 import os
+import shutil
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import yoriai  # noqa: E402
@@ -273,11 +275,13 @@ def _run_repl_with_fake_tty_stdout(keystrokes: str) -> str:
         pipe_input.send_text(keystrokes)
 
         sys.stdout = fake_stdout
+        out_dir = tempfile.mkdtemp(prefix="yoriai_startup_banner_test_")
         try:
-            yoriai._run_repl_client(47120, "fingerprint", ".")
+            yoriai._run_repl_client(47120, "fingerprint", out_dir)
         finally:
             sys.stdout = original_stdout
             yoriai._create_repl_prompt_session = original_create_session
+            shutil.rmtree(out_dir, ignore_errors=True)
 
     return fake_stdout.getvalue()
 
@@ -327,12 +331,14 @@ def test_run_repl_client_banner_has_no_escape_codes_on_non_tty_output():
         pipe_input.send_text("exit" + _SUBMIT)
 
         buf = io.StringIO()
+        out_dir = tempfile.mkdtemp(prefix="yoriai_startup_banner_test_")
         try:
             with contextlib.redirect_stdout(buf):
-                yoriai._run_repl_client(47120, "fingerprint", ".")
+                yoriai._run_repl_client(47120, "fingerprint", out_dir)
         finally:
             yoriai._create_repl_prompt_session = original_create_session
             yoriai._create_background_job_runner = original_create_runner
+            shutil.rmtree(out_dir, ignore_errors=True)
 
     assert "\x1b[" not in buf.getvalue()
 

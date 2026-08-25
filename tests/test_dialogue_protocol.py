@@ -341,7 +341,7 @@ def test_ask_organization_collaborate_with_dialogue_reaches_consensus_and_implem
         output = buf.getvalue()
 
         project_dir = os.path.join(
-            out_dir, yoriai.PROJECTS_SUBDIR_NAME, yoriai._generate_project_name("ToDoリストのCLIツールを作って"),
+            out_dir, yoriai.PROJECTS_SUBDIR_NAME, yoriai._project_name_with_date_prefix("ToDoリストのCLIツールを作って"),
         )
         saved = set(os.listdir(project_dir))
         assert {"storage.py", "cli.py", "PROGRESS.md", "DIALOGUE_LOG_design.md", "DIALOGUE_SUMMARY_design.md"} <= saved, saved
@@ -414,7 +414,7 @@ def test_ask_organization_collaborate_with_dialogue_aborts_without_human_consens
         assert "方向性を決めてください" in output
 
         project_dir = os.path.join(
-            out_dir, yoriai.PROJECTS_SUBDIR_NAME, yoriai._generate_project_name("ToDoリストのCLIツールを作って"),
+            out_dir, yoriai.PROJECTS_SUBDIR_NAME, yoriai._project_name_with_date_prefix("ToDoリストのCLIツールを作って"),
         )
         saved = set(os.listdir(project_dir))
         assert saved == {"DIALOGUE_LOG_design.md", "DIALOGUE_SUMMARY_design.md"}, (
@@ -545,7 +545,7 @@ def test_ask_organization_plan_only_never_writes_code_files():
 
         project_dir = os.path.join(
             out_dir, yoriai.PROJECTS_SUBDIR_NAME,
-            yoriai._generate_project_name("ToDoリストのCLIツールを作って") + "-plan",
+            yoriai._project_name_with_date_prefix("ToDoリストのCLIツールを作って", suffix="-plan"),
         )
         saved = set(os.listdir(project_dir))
         assert saved == {"DIALOGUE_LOG_plan.md", "DIALOGUE_SUMMARY_plan.md"}, (

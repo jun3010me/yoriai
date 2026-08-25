@@ -199,7 +199,7 @@ def test_collaborate_writes_progress_md_reflecting_partial_completion():
             yoriai._ask_organization_collaborate(47120, "fingerprint", request, out_dir)
         output = buf.getvalue()
 
-        project_dir = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME, yoriai._generate_project_name(request))
+        project_dir = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME, yoriai._project_name_with_date_prefix(request))
         progress_path = os.path.join(project_dir, yoriai.PROGRESS_FILENAME)
         assert os.path.isfile(progress_path), "PROGRESS.mdが作成されていません"
 

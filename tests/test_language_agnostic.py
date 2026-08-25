@@ -392,7 +392,7 @@ def test_collaborate_records_c_language_from_explicit_request():
 
         project_dir = os.path.join(
             out_dir, yoriai.PROJECTS_SUBDIR_NAME,
-            yoriai._generate_project_name("C言語で、簡単な電卓プログラムを作って"),
+            yoriai._project_name_with_date_prefix("C言語で、簡単な電卓プログラムを作って"),
         )
         parsed = yoriai._parse_progress_markdown(os.path.join(project_dir, yoriai.PROGRESS_FILENAME))
         assert parsed["language"] == "C", parsed
@@ -433,7 +433,7 @@ def test_collaborate_still_defaults_python_regression():
             yoriai._ask_organization_collaborate(47120, "fingerprint", "ToDoリストのCLIツールを作って", out_dir)
 
         project_dir = os.path.join(
-            out_dir, yoriai.PROJECTS_SUBDIR_NAME, yoriai._generate_project_name("ToDoリストのCLIツールを作って"),
+            out_dir, yoriai.PROJECTS_SUBDIR_NAME, yoriai._project_name_with_date_prefix("ToDoリストのCLIツールを作って"),
         )
         parsed = yoriai._parse_progress_markdown(os.path.join(project_dir, yoriai.PROGRESS_FILENAME))
         assert parsed["language"] == "Python", parsed

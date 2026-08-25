@@ -124,7 +124,7 @@ def test_collaborate_saves_generated_files_under_projects_subdir_only():
         with open(os.path.join(out_dir, "config.py"), encoding="utf-8") as f:
             assert "Yoriai本体" in f.read(), "本体のconfig.pyが上書きされています"
 
-        project_dir = os.path.join(out_dir, "projects", "todo-cli")
+        project_dir = os.path.join(out_dir, "projects", yoriai._project_name_with_date_prefix("ToDoリストのCLIツールを作って"))
         assert set(os.listdir(project_dir)) == {"storage.py", "cli.py", "PROGRESS.md"}, os.listdir(project_dir)
     finally:
         yoriai._fetch_org_snapshot = original_snapshot
@@ -147,10 +147,11 @@ def test_collaborate_does_not_overwrite_existing_project_on_rerun():
         yoriai._ask_organization_collaborate(47120, "fingerprint", "ToDoリストのCLIツールを作って", out_dir)
         yoriai._ask_organization_collaborate(47120, "fingerprint", "ToDoリストのCLIツールを作って", out_dir)
 
+        base_name = yoriai._project_name_with_date_prefix("ToDoリストのCLIツールを作って")
         projects_root = os.path.join(out_dir, "projects")
-        assert set(os.listdir(projects_root)) == {"todo-cli", "todo-cli-2"}, os.listdir(projects_root)
-        assert set(os.listdir(os.path.join(projects_root, "todo-cli"))) == {"storage.py", "cli.py", "PROGRESS.md"}
-        assert set(os.listdir(os.path.join(projects_root, "todo-cli-2"))) == {"storage.py", "cli.py", "PROGRESS.md"}
+        assert set(os.listdir(projects_root)) == {base_name, f"{base_name}-2"}, os.listdir(projects_root)
+        assert set(os.listdir(os.path.join(projects_root, base_name))) == {"storage.py", "cli.py", "PROGRESS.md"}
+        assert set(os.listdir(os.path.join(projects_root, f"{base_name}-2"))) == {"storage.py", "cli.py", "PROGRESS.md"}
     finally:
         yoriai._fetch_org_snapshot = original_snapshot
         yoriai._stream_chat_from_candidate = original_stream
@@ -176,7 +177,7 @@ def test_completion_message_shows_actual_save_path():
             yoriai._ask_organization_collaborate(47120, "fingerprint", "ToDoリストのCLIツールを作って", out_dir)
         output = buf.getvalue()
 
-        project_dir = os.path.join(out_dir, "projects", "todo-cli")
+        project_dir = os.path.join(out_dir, "projects", yoriai._project_name_with_date_prefix("ToDoリストのCLIツールを作って"))
         assert project_dir in output, f"保存先パスがログに表示されていません: {output}"
         assert os.path.join(project_dir, "storage.py") in output, output
         assert os.path.join(project_dir, "cli.py") in output, output

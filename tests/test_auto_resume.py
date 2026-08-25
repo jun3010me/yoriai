@@ -242,7 +242,7 @@ def test_collaborate_auto_resumes_and_eventually_completes_when_issue_gets_fixed
 
         project_dir = os.path.join(
             out_dir, yoriai.PROJECTS_SUBDIR_NAME,
-            yoriai._generate_project_name("ToDoリストのCLIツールを作って"),
+            yoriai._project_name_with_date_prefix("ToDoリストのCLIツールを作って"),
         )
         assert yoriai._find_incomplete_projects(out_dir) == [], (
             "最終的に未完了プロジェクトが残っていないはずです"
@@ -284,7 +284,7 @@ def test_collaborate_auto_resume_stops_at_limit_and_reports_clearly():
 
         project_dir = os.path.join(
             out_dir, yoriai.PROJECTS_SUBDIR_NAME,
-            yoriai._generate_project_name("ToDoリストのCLIツールを作って"),
+            yoriai._project_name_with_date_prefix("ToDoリストのCLIツールを作って"),
         )
         parsed = yoriai._parse_progress_markdown(os.path.join(project_dir, yoriai.PROGRESS_FILENAME))
         assert parsed["auto_resume_count"] == 3, parsed
@@ -335,10 +335,14 @@ def test_auto_resume_runs_in_background_without_blocking_next_input():
         pipe_input.send_text(f"{yoriai.AGREE_COMMAND} ToDoリストを作って" + _SUBMIT + "exit" + _SUBMIT)
 
         buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            yoriai._run_repl_client(47120, "fingerprint", ".")
-        yoriai._create_repl_prompt_session = original_create_session
-        yoriai._create_background_job_runner = original_create_runner
+        repl_out_dir = tempfile.mkdtemp(prefix="yoriai_auto_resume_repl_test_")
+        try:
+            with contextlib.redirect_stdout(buf):
+                yoriai._run_repl_client(47120, "fingerprint", repl_out_dir)
+        finally:
+            yoriai._create_repl_prompt_session = original_create_session
+            yoriai._create_background_job_runner = original_create_runner
+            shutil.rmtree(repl_out_dir, ignore_errors=True)
 
     output = buf.getvalue()
     release.set()

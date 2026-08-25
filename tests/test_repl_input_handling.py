@@ -19,7 +19,9 @@ create_pipe_input`で仮想的なキー入力を送り込んだセッション�
 import contextlib
 import io
 import os
+import shutil
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import yoriai  # noqa: E402
@@ -73,15 +75,17 @@ def _run_repl_with_keys(keystrokes: str):
         pipe_input.send_text(keystrokes)
 
         buf = io.StringIO()
+        out_dir = tempfile.mkdtemp(prefix="yoriai_repl_input_test_")
         try:
             with contextlib.redirect_stdout(buf):
-                yoriai._run_repl_client(47120, "fingerprint", ".")
+                yoriai._run_repl_client(47120, "fingerprint", out_dir)
         finally:
             yoriai._create_repl_prompt_session = original_create_session
             yoriai._classify_execution_mode = original_classify
             yoriai._ask_organization = original_ask
             yoriai._ask_organization_multi = original_ask_multi
             yoriai._ask_organization_collaborate = original_ask_collaborate
+            shutil.rmtree(out_dir, ignore_errors=True)
 
     return buf.getvalue(), calls
 
