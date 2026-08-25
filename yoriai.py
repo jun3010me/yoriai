@@ -1038,6 +1038,13 @@ def stream_chat_completion(
             tool_name = tool_call.get("function", {}).get("name", "")
             yield {"tool_call": tool_name, "tool_call_arguments": tool_call.get("function", {}).get("arguments", "")}
             result = _execute_tool_call(tool_call)
+            # 仮の判断(不具合報告への対応: ツール呼び出しの結果が画面に一切
+            # 表示されず、何を検索して何が返ってきたのか分からないという
+            # 指摘): 呼び出し元がツールの実行結果を画面に表示できるよう、
+            # モデルへ返す結果(result)をそのままイベントとしても流す。
+            # モデルへの実際の入力とは別物として扱えるよう、結果の中身
+            # (JSON文字列)は"tool_result_content"というキーに入れて返す。
+            yield {"tool_result": tool_name, "tool_result_content": result}
             messages.append({
                 "role": "tool",
                 "content": result,
@@ -1856,6 +1863,30 @@ def _selection_reason_label(task_type: str, top_candidate: dict) -> str:
     return "空きメモリの多さで選択"
 
 
+# 仮の判断(不具合報告への対応: ウェブ検索が何度も行われても、何を検索し
+# 何が見つかったのかが画面に一切表示されず、成功しているのか失敗している
+# のか分からないという指摘): web_searchの実行結果(タイトル・URL)を
+# 簡潔に画面表示するための整形処理。検索結果の本文(snippet)まで表示すると
+# 1件あたりの行数が膨らみ読みにくくなるため、タイトルとURLのみに絞る。
+_WEB_SEARCH_RESULT_DISPLAY_LIMIT = 5
+
+
+def _format_web_search_result_summary(tool_result_content: str) -> str:
+    try:
+        payload = json.loads(tool_result_content) if tool_result_content else {}
+    except json.JSONDecodeError:
+        payload = {}
+    results = payload.get("results") or []
+    if not results:
+        return "  → 検索結果が見つかりませんでした"
+    lines = [f"  → {len(results)}件ヒット:"]
+    for r in results[:_WEB_SEARCH_RESULT_DISPLAY_LIMIT]:
+        title = r.get("title") or "(タイトルなし)"
+        url = r.get("url") or ""
+        lines.append(f"    - {title} ({url})" if url else f"    - {title}")
+    return "\n".join(lines)
+
+
 def _ask_organization(port: int, org_fingerprint: str, messages: list, disable_web_search: bool = False) -> None:
     """自分のキッチン(常駐エージェント)の`/status`で組織内の候補を集め、順番に
     問い合わせて、失敗したら次に空きメモリが多い候補へ自動でフォールバックしながら
@@ -1901,10 +1932,14 @@ def _ask_organization(port: int, org_fingerprint: str, messages: list, disable_w
                 continue
             tool_call_name = event.get("tool_call")
             if tool_call_name == WEB_SEARCH_TOOL_NAME:
-                print("\n[🔍 ウェブ検索しています...]")
+                query = _parse_tool_call_arguments(event.get("tool_call_arguments")).get("query", "")
+                print(f"\n[🔍 「{query}」を検索しています...]" if query else "\n[🔍 ウェブ検索しています...]")
                 continue
             elif tool_call_name:
                 print(f"\n[🔧 {tool_call_name} を実行しています...]")
+                continue
+            if event.get("tool_result") == WEB_SEARCH_TOOL_NAME:
+                print(_format_web_search_result_summary(event.get("tool_result_content", "")))
                 continue
             content = event.get("content")
             if content:
