@@ -152,6 +152,36 @@ def test_run_job_with_conversation_log_is_noop_when_chat_log_none():
     assert ran["n"] == 1
 
 
+def test_run_job_with_conversation_log_does_not_clobber_stdout_changed_during_job():
+    """デバッグ中に見つかった不具合の再発防止(実機で顕在化しうる):
+    バックグラウンドジョブは、それを起動した側のコンテキスト
+    (`patch_stdout()`・テストの`contextlib.redirect_stdout`等)より長く
+    実行され続けることがある。ジョブの実行中に、その外側のコンテキストが
+    既に`sys.stdout`を別の値へ復元し終えていた場合、ジョブの終了時に
+    それを自分が最初に見た古い値で上書きしてはいけない(グローバルな
+    `sys.stdout`が壊れた状態のまま残り、以降のprintがすべて見えなくなる
+    不具合が実際に発生した)。
+    """
+    tmp_dir = tempfile.mkdtemp(prefix="yoriai_chat_log_test_")
+    original_stdout = sys.stdout
+    try:
+        chat_log = yoriai._ChatLog(os.path.join(tmp_dir, "chat.md"))
+        sentinel = io.StringIO()
+
+        def job():
+            # ジョブの実行中に、外側のコンテキストが既に別の値へ
+            # sys.stdoutを復元し終えたかのようにシミュレートする。
+            sys.stdout = sentinel
+
+        yoriai._run_job_with_conversation_log(chat_log, "//resume-all", job)
+        assert sys.stdout is sentinel, (
+            "外側のコンテキストが既に復元した値を上書きしてはいけません"
+        )
+    finally:
+        sys.stdout = original_stdout
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # 会話履歴の一本化: 単発質問が、直前のバックグラウンドジョブの
 # やり取りを会話コンテキストとして踏まえられること
@@ -315,6 +345,7 @@ def main():
         test_run_job_with_conversation_log_records_placeholder_when_job_prints_nothing,
         test_run_job_with_conversation_log_truncates_long_output_in_history_but_not_on_screen,
         test_run_job_with_conversation_log_is_noop_when_chat_log_none,
+        test_run_job_with_conversation_log_does_not_clobber_stdout_changed_during_job,
         test_single_query_after_agree_job_receives_prior_conversation_as_context,
         test_repl_agree_command_writes_conversation_to_log_file,
         test_project_name_with_date_prefix_starts_with_yymmdd,
