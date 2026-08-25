@@ -23,7 +23,6 @@ import sys
 import threading
 import time
 import unicodedata
-import urllib.parse
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from html.parser import HTMLParser as _HTMLParser
@@ -327,7 +326,7 @@ def _merge_model_lists(*model_lists: list) -> list:
 
 
 # ---------------------------------------------------------------------------
-# ウェブ検索ツール(DuckDuckGo)
+# ウェブ検索ツール(SearXNG)
 # ---------------------------------------------------------------------------
 
 WEB_SEARCH_TOOL_NAME = "web_search"
@@ -492,102 +491,43 @@ def _looks_like_tools_related_error(error_text: str) -> bool:
 
 WEB_SEARCH_MAX_RESULTS = 5
 WEB_SEARCH_TIMEOUT_SEC = 10
-WEB_SEARCH_URL = "https://html.duckduckgo.com/html/"
-# 仮の判断: DuckDuckGo側にブラウザ以外からのアクセスとして弾かれないよう、
-# 一般的なブラウザのUser-Agentを名乗る。
-WEB_SEARCH_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
-
-
-class _DuckDuckGoResultParser(_HTMLParser):
-    """DuckDuckGoのHTML版(JS不要の検索結果ページ)から検索結果を抜き出す
-    最小限のパーサー。`class="result__a"`のリンクをタイトル+URL、
-    `class="result__snippet"`の要素を説明文として拾う。
-
-    仮の判断: DuckDuckGo側のマークアップ変更に弱い非公式な方法だが、外部
-    ライブラリ(ddgs等)が内部で使うRust製の`primp`のようなネイティブ拡張に
-    依存すると、Raspberry Pi(aarch64)ではプリビルドのwheelが無く、
-    ビルドにRustツールチェイン一式が必要になってビルド自体が失敗することが
-    実機で確認された。Yoriaiはこれまでも(Linuxのネットワークインターフェース
-    取得など)外部コマンド・ネイティブ拡張への依存を避けてstdlibで実装してきた
-    方針のため、ここも`requests`とstdlibの`html.parser`だけで実装している。
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.results = []
-        self._section = None  # "title" | "snippet" | None
-        self._current = None  # 収集中の {"title", "url", "snippet"}
-
-    def handle_starttag(self, tag, attrs):
-        if tag != "a":
-            return
-        attrs = dict(attrs)
-        classes = attrs.get("class", "") or ""
-        if "result__a" in classes.split():
-            self._current = {"title": "", "url": self._extract_real_url(attrs.get("href", "")), "snippet": ""}
-            self._section = "title"
-        elif "result__snippet" in classes.split() and self._current is not None:
-            self._section = "snippet"
-
-    def handle_endtag(self, tag):
-        if tag != "a" or self._section is None:
-            return
-        if self._section == "snippet" and self._current is not None:
-            self.results.append(self._current)
-            self._current = None
-        self._section = None
-
-    def handle_data(self, data):
-        if self._section and self._current is not None:
-            self._current[self._section] += data
-
-    @staticmethod
-    def _extract_real_url(href: str) -> str:
-        # DuckDuckGoの検索結果は自前のリダイレクトリンク
-        # (//duckduckgo.com/l/?uddg=<実URLをURLエンコードしたもの>&...)を
-        # 経由するため、そこから元のURLを取り出す。
-        if href.startswith("//"):
-            href = "https:" + href
-        query = urllib.parse.urlparse(href).query
-        real_url = urllib.parse.parse_qs(query).get("uddg", [None])[0]
-        return urllib.parse.unquote(real_url) if real_url else href
+# 仮の判断: 検索バックエンドは自宅のDocker/Proxmox環境に構築中のSearXNGインスタンス
+# (JSON APIとして問い合わせる)を使う。ホスト名・IPを決め打ちにせず、環境変数
+# YORIAI_SEARXNG_URLで指定できるようにしている(Tailscale経由でホスト名から
+# アクセスする可能性もあるため、IPに限らず普通のURL文字列として扱う)。
+# 未設定時は開発時に確認済みのインスタンスのURLを既定値として使う。
+#
+# 注意: SearXNG側でJSON形式のレスポンスを許可しておく必要がある
+# (settings.ymlの `search: formats: - json` を有効にすること)。
+SEARXNG_BASE_URL = os.environ.get("YORIAI_SEARXNG_URL", "http://192.168.11.190:8888")
 
 
 def web_search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS) -> list:
-    """DuckDuckGoのHTML版を直接スクレイピングしてウェブ検索し、結果のリストを返す。
+    """SearXNGインスタンスのJSON APIに問い合わせてウェブ検索し、結果のリストを返す。
 
-    仮の判断: 検索バックエンドはAPIキー登録が不要ですぐ使えるDuckDuckGoを選んだ。
-    非公式スクレイピングのため失敗することもあるが、失敗時は例外を投げずに
-    空リストを返し、モデル側には「検索結果が得られなかった」ことだけ伝える。
+    仮の判断: SearXNGインスタンス側の障害(未起動・タイムアウト・不正な
+    レスポンス等)が起きた場合も例外を投げずに空リストを返し、モデル側には
+    「検索結果が得られなかった」ことだけ伝える(呼び出し元のフォールバック
+    挙動を変えないため)。
     """
     try:
-        resp = requests.post(
-            WEB_SEARCH_URL,
-            data={"q": query},
-            headers={"User-Agent": WEB_SEARCH_USER_AGENT},
+        resp = requests.get(
+            f"{SEARXNG_BASE_URL}/search",
+            params={"q": query, "format": "json"},
             timeout=(CHAT_CONNECT_TIMEOUT_SEC, WEB_SEARCH_TIMEOUT_SEC),
         )
         resp.raise_for_status()
+        data = resp.json()
     except Exception as exc:
         logger.warning("ウェブ検索に失敗しました: %s", exc)
         return []
 
-    parser = _DuckDuckGoResultParser()
-    try:
-        parser.feed(resp.text)
-    except Exception as exc:
-        logger.warning("検索結果の解析に失敗しました: %s", exc)
-        return []
-
     results = []
-    for r in parser.results[:max_results]:
-        title = r["title"].strip()
+    for r in data.get("results", [])[:max_results]:
+        title = (r.get("title") or "").strip()
         if not title:
             continue
-        results.append({"title": title, "url": r["url"], "snippet": r["snippet"].strip()})
+        results.append({"title": title, "url": r.get("url", ""), "snippet": (r.get("content") or "").strip()})
     return results
 
 
