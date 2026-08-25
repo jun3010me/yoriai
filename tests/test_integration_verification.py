@@ -33,6 +33,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import progress  # noqa: E402
 import yoriai  # noqa: E402
 
 
@@ -318,15 +319,15 @@ def test_has_verify_command_treats_none_variants_as_absent():
 
 def test_format_and_parse_verification_result_round_trip_success():
     verification = {"success": True, "attempts": 2, "output": "OK"}
-    text = "\n".join(yoriai._format_verification_result(verification))
-    parsed = yoriai._parse_verification_result(text)
+    text = "\n".join(progress._format_verification_result(verification))
+    parsed = progress._parse_verification_result(text)
     assert parsed == {"success": True, "attempts": 2, "output": ""}, parsed
 
 
 def test_format_and_parse_verification_result_round_trip_failure():
     verification = {"success": False, "attempts": 3, "output": "Traceback (most recent call last):\nNameError"}
-    text = "\n".join(yoriai._format_verification_result(verification))
-    parsed = yoriai._parse_verification_result(text)
+    text = "\n".join(progress._format_verification_result(verification))
+    parsed = progress._parse_verification_result(text)
     assert parsed["success"] is False
     assert parsed["attempts"] == 3
     assert "NameError" in parsed["output"], parsed

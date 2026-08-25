@@ -4205,3 +4205,59 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
     確認済み。`python3 -c "import llm_stream"`が単体でエラー無く成功する
     ことを確認した。`yoriai.py`は7,926行から7,291行に削減され、3分割
     開始前(9,630行)からトータルで2,339行減った。
+- **モジュール分割 第四弾: `progress.py`の切り出し(タスクチェックリスト・
+  PROGRESS.md永続化)**。第三弾のPRがマージされたことを確認して着手した。
+  元の分割方針では第四弾以降(`//agree`・タスクチェックリスト・統合検証・
+  タスクキュー・`//resume-all`/`//fix`)は「依存が複雑なため、第一〜三弾
+  完了後に改めて分割方針を検討する」としてスコープ外にされていたため、
+  ジュンさんへの相談も兼ねて`yoriai.py`(7,291行)の現状を再調査した。
+  結果、`//agree`対話プロトコルや`//resume-all`/`//fix`はオーケストレー
+  ション層同士が密結合で1つの独立モジュールには切り出しにくい一方、
+  タスクチェックリスト・PROGRESS.md永続化層は「他の多くのオーケスト
+  レーション層(タスクキュー・`//resume-all`・`//fix`等)から広く呼ばれる
+  基盤ユーティリティ」という、第一弾のtools.pyと同じ性質を持つ、
+  比較的独立性の高い塊であることが分かったため、これを第四弾として
+  優先した。
+  - `_build_task_checklist`・`_set_task_status`・`_format_checklist_lines`・
+    `_format_task_checklist`・`_incomplete_task_labels`・
+    `_format_verification_result`・`_parse_verification_result`・
+    `_format_progress_markdown`・`_write_progress_md`・
+    `_extract_progress_section`・`_parse_checklist_markdown`・
+    `_parse_auto_resume_count`・`_parse_changelog_markdown`・
+    `_parse_bullet_lines`・`_parse_progress_markdown`・
+    `_progress_checklist_is_incomplete`・`_project_has_pending_work`・
+    `_pending_tasks_from_checklist`・`_find_incomplete_projects`(付随する
+    `_TASK_STATUS_*`・`_PROGRESS_SECTION_*`等の定数を含む)を新設の
+    `progress.py`へ移動した(ロジック変更なし)。`_PendingDesignDialogue`
+    等のセッション状態クラスや`_run_collaborate_implementation_phase`・
+    `_ask_organization_collaborate`(こちらは対話プロトコル・タスク
+    キュー双方に依存するオーケストレーション)はこの直後に定義されていたが、
+    独立性が低いため今回は移動対象に含めなかった。
+  - 循環import解消: `PROJECTS_SUBDIR_NAME`(progress.py側の
+    `_find_incomplete_projects`と、yoriai.py側に残るタスクキュー・
+    `//resume-all`・`//fix`系コードの双方が使う)を`yoriai_types.py`に
+    追加した。逆に`_parse_progress_markdown`が呼ぶ`_parse_module_breakdown`
+    (対話プロトコル・合意フェーズ側のパーサー、yoriai.py側に残る)は、
+    関数内部での遅延importで解消した。
+  - `yoriai.py`側は、タスクキュー・`//resume-all`・`//fix`等から引き続き
+    呼ばれる13関数/定数(`_TASK_STATUS_COMPLETED`・`_TASK_STATUS_IN_PROGRESS`・
+    `_build_task_checklist`・`_find_incomplete_projects`・
+    `_format_task_checklist`・`_incomplete_task_labels`・
+    `_parse_bullet_lines`・`_parse_progress_markdown`・
+    `_pending_tasks_from_checklist`・`_progress_checklist_is_incomplete`・
+    `_project_has_pending_work`・`_set_task_status`・`_write_progress_md`)
+    のみを`from progress import (...)`で明示importした。純粋に
+    progress.py内部でしか使われない残り9関数/定数
+    (`_format_progress_markdown`・`_TASK_STATUS_PENDING`等)は再export
+    していない。`tools.py`側の既存の遅延import
+    (`from yoriai import _parse_progress_markdown, ...`)は、この
+    再exportにより従来通り解決できることを確認した。
+  - 分割でテストの`yoriai.<関数名>`直接参照が壊れた5ファイル
+    (`test_auto_resume.py`・`test_fix_project.py`・
+    `test_integration_verification.py`・`test_progress_persistence.py`・
+    `test_task_checklist.py`)は、`progress.<関数名>`を参照するよう
+    import文・参照箇所のみ修正した(アサーションは無変更)。
+  - 動作確認: `python3 -m pytest tests/`が479件全てパス。`python3 -c
+    "import progress"`が単体でエラー無く成功することを確認した。
+    `yoriai.py`は7,291行から6,857行に削減され、4分割開始前(9,630行)
+    からトータルで2,773行減った。
