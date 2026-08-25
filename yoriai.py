@@ -773,19 +773,31 @@ _LEAK_PEEK_CHARS = 30
 _LEAK_TRIGGER_CHARS = "<["
 
 
-def _run_turn_with_leak_detection(turn, tools: list):
-    """1ターン分の応答イベントを中継しつつ、ツール呼び出しをオファーした
-    ときだけ、先頭のcontentが漏れたツール呼び出し記法でないかを確認する。
-    漏れを検出した場合は、それ以降のcontentを画面に出さずに捨て、代わりに
-    {"tool_call_failed": True} を1回だけyieldする(content/tool_callsの
-    どちらも実質的には返さない)。
+def _run_turn_with_leak_detection(turn):
+    """1ターン分の応答イベントを中継しつつ、先頭のcontentが漏れたツール
+    呼び出し記法でないかを確認する。漏れを検出した場合は、それ以降の
+    contentを画面に出さずに捨て、代わりに{"tool_call_failed": True} を
+    1回だけyieldする(content/tool_callsのどちらも実質的には返さない)。
 
     仮の判断: 判定のためにcontentの先頭を少量バッファする間も、元のチャンクの
     区切り(トークン単位)は保ったままリプレイする。1つの大きな塊に結合して
     出すと、バッファ分だけ「一括表示」に戻ってしまい、ストリーミング表示という
     フェーズ5の目的が損なわれるため。
+
+    仮の判断(バグ報告への対応): 当初は`tools`(このラウンドで実際に
+    オファーしたツール一覧)が空の場合は漏れチェック自体を省略していた
+    (ツールをオファーしていないのだから漏れようがない、という前提)。
+    しかし実機で、`stream_chat_completion`のtools無し最終問い合わせ
+    (FINAL_NO_TOOL_ROUND、会話履歴には直前までのツール呼び出しの
+    やり取りが残ったまま`tools=None`で問い合わせる)において、モデルが
+    それでも`<tool_call>`記法をそのまま出力してしまい、このラウンドだけ
+    チェックがスキップされていたために生のツール呼び出し記法が回答本文
+    としてそのままユーザーに表示されてしまう不具合が見つかった。会話
+    履歴にツール呼び出しの前例が残っている限り、そのラウンド自体が
+    ツール無しでもモデルが記法を漏らす可能性は消えないため、`tools`の
+    有無に関わらず常に漏れチェックを行うようにした。
     """
-    state = "peeking" if tools else "streaming"
+    state = "peeking"
     buffered_chunks = []
     buffered_text = ""
     for event in turn:
@@ -939,7 +951,7 @@ def stream_chat_completion(
         round_content_yielded = False
         leaked = False
         tools_rejected = False
-        for event in _run_turn_with_leak_detection(turn, tools):
+        for event in _run_turn_with_leak_detection(turn):
             if "error" in event:
                 status_code = event.get("status_code")
                 # 仮の判断: 「tools無し再試行が発動したかどうか」がログから一目で
@@ -1026,6 +1038,13 @@ def stream_chat_completion(
             tool_name = tool_call.get("function", {}).get("name", "")
             yield {"tool_call": tool_name, "tool_call_arguments": tool_call.get("function", {}).get("arguments", "")}
             result = _execute_tool_call(tool_call)
+            # 仮の判断(不具合報告への対応: ツール呼び出しの結果が画面に一切
+            # 表示されず、何を検索して何が返ってきたのか分からないという
+            # 指摘): 呼び出し元がツールの実行結果を画面に表示できるよう、
+            # モデルへ返す結果(result)をそのままイベントとしても流す。
+            # モデルへの実際の入力とは別物として扱えるよう、結果の中身
+            # (JSON文字列)は"tool_result_content"というキーに入れて返す。
+            yield {"tool_result": tool_name, "tool_result_content": result}
             messages.append({
                 "role": "tool",
                 "content": result,
@@ -1844,6 +1863,30 @@ def _selection_reason_label(task_type: str, top_candidate: dict) -> str:
     return "空きメモリの多さで選択"
 
 
+# 仮の判断(不具合報告への対応: ウェブ検索が何度も行われても、何を検索し
+# 何が見つかったのかが画面に一切表示されず、成功しているのか失敗している
+# のか分からないという指摘): web_searchの実行結果(タイトル・URL)を
+# 簡潔に画面表示するための整形処理。検索結果の本文(snippet)まで表示すると
+# 1件あたりの行数が膨らみ読みにくくなるため、タイトルとURLのみに絞る。
+_WEB_SEARCH_RESULT_DISPLAY_LIMIT = 5
+
+
+def _format_web_search_result_summary(tool_result_content: str) -> str:
+    try:
+        payload = json.loads(tool_result_content) if tool_result_content else {}
+    except json.JSONDecodeError:
+        payload = {}
+    results = payload.get("results") or []
+    if not results:
+        return "  → 検索結果が見つかりませんでした"
+    lines = [f"  → {len(results)}件ヒット:"]
+    for r in results[:_WEB_SEARCH_RESULT_DISPLAY_LIMIT]:
+        title = r.get("title") or "(タイトルなし)"
+        url = r.get("url") or ""
+        lines.append(f"    - {title} ({url})" if url else f"    - {title}")
+    return "\n".join(lines)
+
+
 def _ask_organization(port: int, org_fingerprint: str, messages: list, disable_web_search: bool = False) -> None:
     """自分のキッチン(常駐エージェント)の`/status`で組織内の候補を集め、順番に
     問い合わせて、失敗したら次に空きメモリが多い候補へ自動でフォールバックしながら
@@ -1889,10 +1932,14 @@ def _ask_organization(port: int, org_fingerprint: str, messages: list, disable_w
                 continue
             tool_call_name = event.get("tool_call")
             if tool_call_name == WEB_SEARCH_TOOL_NAME:
-                print("\n[🔍 ウェブ検索しています...]")
+                query = _parse_tool_call_arguments(event.get("tool_call_arguments")).get("query", "")
+                print(f"\n[🔍 「{query}」を検索しています...]" if query else "\n[🔍 ウェブ検索しています...]")
                 continue
             elif tool_call_name:
                 print(f"\n[🔧 {tool_call_name} を実行しています...]")
+                continue
+            if event.get("tool_result") == WEB_SEARCH_TOOL_NAME:
+                print(_format_web_search_result_summary(event.get("tool_result_content", "")))
                 continue
             content = event.get("content")
             if content:
