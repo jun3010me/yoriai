@@ -386,7 +386,9 @@ def test_followup_right_after_a_design_dialogue_pause_resumes_instead_of_single_
     def stub_ask(*args, **kwargs):
         calls["ask_single"] += 1
 
-    def stub_ask_collaborate(port, org_fingerprint, request, out_dir, enable_dialogue=False, pending_box=None):
+    def stub_ask_collaborate(
+        port, org_fingerprint, request, out_dir, enable_dialogue=False, pending_box=None, completed_box=None,
+    ):
         calls["ask_collaborate"] += 1
         pending = yoriai._PendingDesignDialogue(
             port, org_fingerprint, request, [{"label": "設計担当"}], "/tmp/fake-project-dir",
@@ -459,6 +461,102 @@ def test_followup_right_after_a_design_dialogue_pause_resumes_instead_of_single_
     # されるはずです(不具合修正前は誤ってask_singleへ流れていた)。
     assert calls["ask_single"] == 0, calls
     assert calls["resume_organization_collaborate"] == 1, calls
+
+
+def test_followup_right_after_collaborate_completion_becomes_a_fix_session():
+    """不具合修正の回帰検知: 「〇〇を作って」の協業モードが実装フェーズまで
+    完了した直後、`直して`・`修正して`・`作業して`等のキーワードを一切
+    含まない自然文の追加指示(例:「Webで調べながらコンテンツを書いて」)が、
+    `write_file`等のプロジェクト操作ツールを持たない単発質問
+    (`_ask_organization`)に落ちず、そのプロジェクトへの継続的な修正依頼
+    (`_FixSession`経由の`_run_fix_on_project`)として自動的に扱われることを
+    確認する(`_CompletedBuildBox`参照)。
+
+    `test_followup_right_after_a_design_dialogue_pause_resumes_instead_of_
+    single_question`と同じ理由(バックグラウンドジョブの完了と2件目の
+    発言の読み取りの間の競合を避ける)で、別スレッド+`threading.Event`に
+    よる決定的な同期を使う。
+    """
+    calls = {"ask_single": 0, "run_fix_on_project": 0, "project_dir": None, "request": None}
+    completed_ready = threading.Event()
+
+    original_ask = yoriai._ask_organization
+    original_ask_collaborate = yoriai._ask_organization_collaborate
+    original_run_fix_on_project = yoriai._run_fix_on_project
+    original_create_session = yoriai._create_repl_prompt_session
+    original_create_runner = yoriai._create_background_job_runner
+
+    def stub_ask(*args, **kwargs):
+        calls["ask_single"] += 1
+
+    def stub_ask_collaborate(
+        port, org_fingerprint, request, out_dir, enable_dialogue=False, pending_box=None, completed_box=None,
+    ):
+        if completed_box is not None:
+            completed_box.set("/tmp/fake-completed-project-dir")
+        completed_ready.set()
+
+    def stub_run_fix_on_project(port, org_fingerprint, project_dir, request, out_dir, enable_dialogue=True):
+        calls["run_fix_on_project"] += 1
+        calls["project_dir"] = project_dir
+        calls["request"] = request
+
+    yoriai._ask_organization = stub_ask
+    yoriai._ask_organization_collaborate = stub_ask_collaborate
+    yoriai._run_fix_on_project = stub_run_fix_on_project
+
+    runner_holder = {}
+
+    def fake_create_runner():
+        runner = original_create_runner()
+        runner_holder["runner"] = runner
+        return runner
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_completed_build_followup_test_")
+    buf = io.StringIO()
+    try:
+        with create_pipe_input() as pipe_input:
+            def fake_create_session():
+                return PromptSession(
+                    input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
+                )
+
+            yoriai._create_repl_prompt_session = fake_create_session
+            yoriai._create_background_job_runner = fake_create_runner
+
+            def run_client():
+                with contextlib.redirect_stdout(buf):
+                    yoriai._run_repl_client(47120, "fingerprint", out_dir)
+
+            thread = threading.Thread(target=run_client)
+            thread.start()
+            try:
+                pipe_input.send_text("ObsidianのPKMサイトを作って" + _SUBMIT)
+                assert completed_ready.wait(timeout=5), "協業モードの実装フェーズ完了(バックグラウンドジョブ)がタイムアウトしました"
+                runner_holder["runner"].join()
+                pipe_input.send_text("Webで調べながらコンテンツを書いて" + _SUBMIT + "exit" + _SUBMIT)
+                thread.join(timeout=5)
+                assert not thread.is_alive(), "対話モードがexitで終了しませんでした"
+                runner_holder["runner"].join()
+            finally:
+                yoriai._create_repl_prompt_session = original_create_session
+                yoriai._create_background_job_runner = original_create_runner
+    finally:
+        yoriai._ask_organization = original_ask
+        yoriai._ask_organization_collaborate = original_ask_collaborate
+        yoriai._run_fix_on_project = original_run_fix_on_project
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+    output = buf.getvalue()
+    assert "対話モードを終了します。" in output, output
+    assert "[🏗️" in output, output
+    # write_file等を持たない単発質問(_ask_organization)には落ちないはずです
+    # (不具合修正前は、これらのキーワードを含まない追加指示がここへ流れて
+    # いた)。
+    assert calls["ask_single"] == 0, calls
+    assert calls["run_fix_on_project"] == 1, calls
+    assert calls["project_dir"] == "/tmp/fake-completed-project-dir", calls
+    assert calls["request"] == "Webで調べながらコンテンツを書いて", calls
 
 
 def test_parallel_command_is_backgrounded():

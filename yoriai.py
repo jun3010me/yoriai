@@ -4169,7 +4169,9 @@ def _resume_design_dialogue(pending: "_PendingDesignDialogue", human_reply: str)
     return answer, False
 
 
-def _resume_organization_collaborate(pending: "_PendingDesignDialogue", human_reply: str) -> None:
+def _resume_organization_collaborate(
+    pending: "_PendingDesignDialogue", human_reply: str, completed_box: "_CompletedBuildBox" = None,
+) -> None:
     """一時停止した//agreeの合意フェーズへの人間の回答を受け取り、対話
     プロトコルを続きから再開したうえで、合意(または単独での計画確定)が
     得られ次第そのままタスク分解・実装フェーズへ橋渡しする。
@@ -4177,13 +4179,15 @@ def _resume_organization_collaborate(pending: "_PendingDesignDialogue", human_re
     橋渡し先(`_run_collaborate_implementation_phase`)は、新規の`//agree`が
     一発で合意に達した場合(`_ask_organization_collaborate`)と完全に同じ
     関数であり、一時停止からの再開でも既存の正常系と同じ実装フェーズに
-    合流する。
+    合流する。`completed_box`もそのままそちらへ橋渡しするだけ(詳細は
+    `_CompletedBuildBox`参照)。
     """
     answer, aborted = _resume_design_dialogue(pending, human_reply)
     if aborted:
         return
     _run_collaborate_implementation_phase(
         pending.request, answer, pending.candidates, pending.org_fingerprint, pending.project_dir, pending.port,
+        completed_box=completed_box,
     )
 
 
@@ -4921,8 +4925,42 @@ class _PendingDesignDialogueBox:
             return self._pending
 
 
+class _CompletedBuildBox:
+    """協業モード(`//agree`・自動判定経由の「作って」等)の実装フェーズが
+    完了した直後のプロジェクトディレクトリを保持する箱。`_PendingDesign
+    DialogueBox`と同じ理由(バックグラウンドジョブのスレッドから
+    `_run_repl_client`のメインループへ安全に受け渡すため)でロックで
+    保護する。
+
+    仮の判断(不具合報告への対応: 制作直後に「Webで調べながらコンテンツを
+    書いて」のような自然文の追加指示を送っても、`_classify_execution_mode`
+    のキーワード(直して・修正して・作業して等)に一致せず単発質問モード
+    (`write_file`等のプロジェクト操作ツールを一切持たない)に落ちてしまい、
+    説明文だけが返ってファイルに反映されない不具合への対応): 実装フェーズ
+    完了直後の`project_dir`をここに置いておき、次の人間の発言が来た時点で
+    `fix_session`が(他の理由で)有効になっていなければ、自動的にその
+    プロジェクトへの`_FixSession`を開始する。キーワード判定に頼らず、
+    「直前に自分たちが作ったばかりのプロジェクトがある」という状態そのもの
+    から継続の意図を推測する設計にした。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._project_dir = None
+
+    def set(self, project_dir: str) -> None:
+        with self._lock:
+            self._project_dir = project_dir
+
+    def take(self):
+        with self._lock:
+            project_dir, self._project_dir = self._project_dir, None
+            return project_dir
+
+
 def _run_collaborate_implementation_phase(
     request: str, answer: str, candidates: list, org_fingerprint: str, project_dir: str, port: int,
+    completed_box: "_CompletedBuildBox" = None,
 ) -> None:
     """合意フェーズ(対話プロトコルによる複数ラウンドの議論・設計担当1名への
     1回きりの相談・一時停止後に人間の回答を踏まえて再開した議論、のいずれ
@@ -4932,6 +4970,12 @@ def _run_collaborate_implementation_phase(
     `_ask_organization_collaborate`が一発で合意に達した場合と、一時停止
     からの再開(`_resume_organization_collaborate`)が合意(または単独での
     計画確定)に達した場合の両方から呼ばれ、同じ実装フェーズに合流させる。
+
+    `completed_box`(既定`None`)を渡すと、実装フェーズが最後まで進んで
+    `project_dir`が確定した時点でそこへ格納する。`_run_repl_client`は
+    これを使って、この直後の(コマンド無しの)人間の発言を、キーワード
+    判定に頼らず自動的にこのプロジェクトへの継続的な追加指示(`_FixSession`)
+    として扱う(詳細は`_CompletedBuildBox`を参照)。
     """
     tasks = _parse_module_breakdown(answer)
     if not tasks:
@@ -4985,10 +5029,18 @@ def _run_collaborate_implementation_phase(
     # 何度でもできるようにする、という区別を素直に実装するため)。
     _maybe_auto_resume(project_dir, port, org_fingerprint)
 
+    # 仮の判断: 自動再開でタスクが完遂したかどうかに関わらず、この時点で
+    # `project_dir`にはPROGRESS.mdを含む実在のプロジェクトが出来ている
+    # (`_run_collaborative_project`が既に書き出し済み)。`_FixSession`側の
+    # 継続処理(`_continue_fix_session`)はタスクの完了状態を問わないため、
+    # ここで無条件に格納してよい。
+    if completed_box is not None:
+        completed_box.set(project_dir)
+
 
 def _ask_organization_collaborate(
     port: int, org_fingerprint: str, request: str, out_dir: str, enable_dialogue: bool = False,
-    pending_box: "_PendingDesignDialogueBox" = None,
+    pending_box: "_PendingDesignDialogueBox" = None, completed_box: "_CompletedBuildBox" = None,
 ) -> None:
     """「〇〇を作って」のような制作依頼用: まず優先順位が最も高い1台に
     モジュール分割案とインターフェース設計を相談し(合意フェーズ)、
@@ -5017,6 +5069,11 @@ def _ask_organization_collaborate(
     (`_PendingDesignDialogue`)をそこへ格納する。`_run_repl_client`は
     これを使って、次の人間の発言を「一時停止への回答」として合意フェーズ
     に合流させる(`_resume_organization_collaborate`)。
+
+    `completed_box`(既定`None`)は、そのまま`_run_collaborate_
+    implementation_phase`に橋渡しするだけ(詳細は`_CompletedBuildBox`
+    参照)。対話プロトコルが一時停止して`return`する場合(実装フェーズに
+    到達しない)は、この時点では何も格納しない。
     """
     data = _fetch_org_snapshot(port, org_fingerprint)
     if data is None:
@@ -5072,7 +5129,9 @@ def _ask_organization_collaborate(
         print(f"[🧭 {architect['label']} の回答(合意フェーズの結果、そのまま表示)]")
         print(answer)
 
-    _run_collaborate_implementation_phase(request, answer, candidates, org_fingerprint, project_dir, port)
+    _run_collaborate_implementation_phase(
+        request, answer, candidates, org_fingerprint, project_dir, port, completed_box=completed_box,
+    )
 
 
 def _run_collaborative_project(
@@ -8115,6 +8174,14 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
         # 来た時点でこの箱を確認し、値があれば「一時停止への回答」として
         # 合意フェーズを続きから再開する(`_resume_organization_collaborate`)。
         pending_design_box = _PendingDesignDialogueBox()
+        # 仮の判断(不具合報告への対応: 制作直後の自然文の追加指示が
+        # write_file等を持たない単発質問モードに落ちてファイルに反映
+        # されない問題): 協業モードの実装フェーズが完了するたびに
+        # `_CompletedBuildBox`へそのプロジェクトを置いておき、次の
+        # コマンド無しの発言が来た時点で(他の理由で`fix_session`が
+        # 有効になっていなければ)自動的にそのプロジェクトへの
+        # `_FixSession`として引き継ぐ(詳細は`_CompletedBuildBox`参照)。
+        completed_build_box = _CompletedBuildBox()
         while True:
             text, terminate = _read_multiline_input(session, interrupt_guard)
             if terminate:
@@ -8167,7 +8234,7 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                         messages, text,
                         lambda: _ask_organization_collaborate(
                             port, org_fingerprint, request, out_dir, enable_dialogue=True,
-                            pending_box=pending_design_box,
+                            pending_box=pending_design_box, completed_box=completed_build_box,
                         ),
                     ),
                     queued_notice=_BACKGROUND_QUEUED_NOTICE,
@@ -8225,6 +8292,28 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                         break
                 continue
 
+            # 仮の判断(不具合報告への対応: 「Webサイトを作って」等の制作
+            # 依頼が完了した直後に「Webで調べながらコンテンツを書いて」の
+            # ような自然文の追加指示を送っても、_classify_execution_mode
+            # のキーワード(直して・修正して・作業して等)に一致せず単発
+            # 質問モードに落ちてしまい、write_file等が一切使えないため
+            # モデルが説明文を返すだけでファイルに反映されない不具合への
+            # 対応): 他の理由で`fix_session`が既に有効な場合は、進行中の
+            # 修正対象を横取りしないようそのまま優先する。有効でなければ
+            # ここで`completed_build_box`を確認し、値があれば(=直前に
+            # 協業モードの実装フェーズが完了していれば)、キーワード判定を
+            # 経由せず自動的にそのプロジェクトへの`_FixSession`を開始する。
+            # この直後の`if fix_session is not None`のチェックに、今まさに
+            # 入力されたこの発言自体がそのまま拾われる。
+            if fix_session is None:
+                just_completed_project_dir = completed_build_box.take()
+                if just_completed_project_dir is not None:
+                    fix_session = _FixSession(just_completed_project_dir)
+                    print(
+                        f"[🏗️ 直前の制作依頼(プロジェクト: {fix_session.project_name})が完了したため、"
+                        "続けて同じプロジェクトへの追加指示として扱います]"
+                    )
+
             # 仮の判断(平文からの自動ツール選択の復活、依頼への対応): 一度
             # (637cce6)は、対話プロトコルの一時停止直後の続きの発言まで
             # ゼロから判定し直される不具合のため、コマンド無しの発言を
@@ -8261,7 +8350,7 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                 job_runner.submit(
                     lambda pending=pending_design, text=text: _run_job_with_conversation_log(
                         messages, text,
-                        lambda: _resume_organization_collaborate(pending, text),
+                        lambda: _resume_organization_collaborate(pending, text, completed_box=completed_build_box),
                     ),
                     queued_notice=_BACKGROUND_QUEUED_NOTICE,
                 )
@@ -8290,7 +8379,7 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                         messages, text,
                         lambda: _ask_organization_collaborate(
                             port, org_fingerprint, text, out_dir, enable_dialogue=True,
-                            pending_box=pending_design_box,
+                            pending_box=pending_design_box, completed_box=completed_build_box,
                         ),
                     ),
                     queued_notice=_BACKGROUND_QUEUED_NOTICE,
