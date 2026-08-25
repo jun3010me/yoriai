@@ -4103,3 +4103,39 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
     "import tools"`・`python3 -c "import yoriai_types"`・`python3 -c
     "import yoriai"`がいずれもエラー無く成功することを確認した。
     `yoriai.py`は9,630行から8,430行(約1,200行減)になった。
+- **モジュール分割 第二弾: `network.py`の切り出し(PeerRegistry・mDNS発見・
+  カード配信サーバー)**。第一弾のPRがマージされ動作確認が取れたことを
+  受け、`yoriai.py`から以下のネットワーク層を新設の`network.py`へ移動した
+  (第一弾と同じくロジック変更なし、コピー＆import配線の変更のみ)。
+  - `class PeerRegistry`(発見済みピアの共有レジストリ、`--status`の
+    情報源)・`class CardRequestHandler`(自己紹介カード配信サーバーの
+    リクエストハンドラ)・`start_card_server`・`get_local_ip`・
+    `get_physical_lan_ips`・`_get_physical_lan_ips_macos`・
+    `_get_physical_lan_ips_linux`(付随する`LINUX_VIRTUAL_IFACE_PREFIXES`・
+    `_SIOCGIFADDR`を含む)・`class YoriaiListener`(mDNS発見のリスナー)・
+    `log_peer_card`・`discover_via_tailscale`。
+  - `discover_via_tailscale`は移動前に既存の`tailscale.py`
+    (`find_cli`/`get_peers`)を呼び出しているだけでロジックの重複が
+    無いことを確認した(このPRでは統合は行わず移動のみ)。
+  - `yoriai.py`↔`network.py`間の循環importは第一弾と同じ方針で解消した。
+    `network.py`側の関数(`PeerRegistry`・`start_card_server`・
+    `get_local_ip`・`get_physical_lan_ips`・`YoriaiListener`・
+    `discover_via_tailscale`)を、まだ`yoriai.py`に残っている
+    `run_agent`から呼ぶ必要があるため、`yoriai.py`冒頭で
+    `from network import (...)`と明示import した。逆に
+    `CardRequestHandler`は、まだ`yoriai.py`に残っている
+    `build_profile_card`・`stream_chat_completion`(いずれも第三弾で
+    `llm_stream.py`へ移動予定)を呼ぶ必要があるため、各メソッド内部での
+    遅延import(`from yoriai import ...`)で解消した。双方から参照される
+    `SERVICE_TYPE`・`ORG_FINGERPRINT_HEADER`・`CARD_REQUEST_TIMEOUT_SEC`は
+    新設の`yoriai_types.py`に切り出した。
+  - 分割に伴い`import *`は使わず明示import を維持。テスト側の
+    `yoriai.<関数名>`参照はすべて`yoriai.py`から引き続き参照可能な名前
+    (`PeerRegistry`等、上記の理由で再exportしている6つ)だったため、
+    テストの修正は不要だった(`tests/test_peer_dedup.py`を含め、
+    `yoriai.CardRequestHandler`等の再exportしていない名前を直接参照する
+    テストは存在しなかった)。
+  - 動作確認: `python3 -m pytest tests/`が479件全てパス(特に
+    `tests/test_peer_dedup.py`を確認)。`python3 -c "import network"`が
+    単体でエラー無く成功することを確認した。`yoriai.py`は8,430行から
+    7,926行(約500行減)になった。
