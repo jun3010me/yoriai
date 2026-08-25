@@ -894,12 +894,39 @@ def stream_chat_completion(
     絶対に解決しない別種の原因)でも返ってくることが実機で分かったため、
     ステータスコードに加えてエラー文にツール関連の語(_looks_like_tools_related_error)
     が含まれるかどうかも確認したうえで再試行の要否を判断する。
+
+    仮の判断: 最終ラウンド(round_num == MAX_TOOL_CALL_ROUNDS)でモデルが
+    content(回答本文)を1文字も生成せず、ツール呼び出しのみを要求してきた
+    場合、そのまま空の応答で打ち切ると呼び出し元(_ask_organization等)が
+    「有効な応答が得られなかった」と誤判定し、次の候補モデルへの
+    フォールバックが発生してしまう(実機で、裏付けを取ろうとする思考系
+    モデルがweb_searchを立て続けに要求するケースで確認済み)。これを
+    避けるため、この場合に限り「これ以上ツールは使わない」旨の指示を
+    会話履歴に1回だけ追加したうえで、tools無しでもう1往復だけ問い合わせ、
+    その結果を最終回答として採用する。この最終問い合わせでもcontentが
+    空だった場合は、従来通り空のまま終了する(無限ループにはしない)。
     """
     messages = list(messages)  # 呼び出し元のリストをツール実行の追記で汚さない
     base_tools = [] if disable_default_tools else CHAT_TOOLS
     tools = base_tools + list(extra_tools) if extra_tools else base_tools
 
-    for round_num in range(MAX_TOOL_CALL_ROUNDS + 1):
+    # 通常のツール呼び出しラウンドは0..MAX_TOOL_CALL_ROUNDSのMAX_TOOL_CALL_ROUNDS+1回。
+    # それに加えて、最終ラウンドがcontent無しのツール要求のみで終わった場合だけ
+    # 到達する「tools無し最終問い合わせ」を1ラウンドだけ確保する(必要なければ
+    # 到達せずに従来通り終了する。下の`round_num == FINAL_NO_TOOL_ROUND`の分岐を参照)。
+    FINAL_NO_TOOL_ROUND = MAX_TOOL_CALL_ROUNDS + 1
+    need_final_no_tool_retry = False
+
+    for round_num in range(FINAL_NO_TOOL_ROUND + 1):
+        if round_num == FINAL_NO_TOOL_ROUND:
+            if not need_final_no_tool_retry:
+                break
+            tools = None
+            messages.append({
+                "role": "system",
+                "content": "これ以上ツールは使わず、これまでに分かっている情報だけで回答してください。",
+            })
+
         if model in get_ollama_loaded_models():
             turn = _stream_ollama_turn(model, messages, tools)
         elif model in get_mlx_lm_models():
@@ -909,6 +936,7 @@ def stream_chat_completion(
 
         tool_calls = []
         round_truncated = False
+        round_content_yielded = False
         leaked = False
         tools_rejected = False
         for event in _run_turn_with_leak_detection(turn, tools):
@@ -960,6 +988,8 @@ def stream_chat_completion(
                 yield event
                 continue
             if "content" in event:
+                if event["content"]:
+                    round_content_yielded = True
                 yield event
             elif "tool_calls" in event:
                 tool_calls = event["tool_calls"]
@@ -969,7 +999,15 @@ def stream_chat_completion(
             tools = None  # このモデルにはツールを二度とオファーせず、素の会話として再試行する
             continue
 
-        if not tool_calls or round_num == MAX_TOOL_CALL_ROUNDS:
+        if not tool_calls:
+            break
+
+        if round_num == MAX_TOOL_CALL_ROUNDS:
+            if tools and not round_content_yielded:
+                # 最終ラウンドがcontent無しのツール要求のみだった場合に限り、
+                # 次のFINAL_NO_TOOL_ROUNDへ進んでtools無しの最終問い合わせを行う。
+                need_final_no_tool_retry = True
+                continue
             break
 
         # 仮の判断: このラウンドのtool_callsに1つでもclient_tool_names該当
