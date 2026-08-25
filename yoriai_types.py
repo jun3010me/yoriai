@@ -1,18 +1,33 @@
-"""yoriai.py と tools.py の間で共有される定数・ツールスキーマ。
+"""yoriai.py と tools.py・network.py の間で共有される定数・ツールスキーマ。
 
-仮の判断(モジュール分割第一弾への対応): tools.py への切り出しにあたり、
-以下の定数は「tools.py 側の関数が使うが、yoriai.py 側の関数(まだ移動
-していないコードや、将来 llm_stream.py に移動する予定のコード)からも
-参照される」という双方向の依存関係にある。tools.py に置いたまま
-yoriai.py からimportさせる、あるいはその逆にすると、
-`yoriai.py`⇔`tools.py`の循環importが発生してしまうため、依存の無い
-このモジュールに切り出し、両側から参照する形で解消する。値そのものは
-元のyoriai.py上の定義から変更していない。
+仮の判断(モジュール分割第一弾・第二弾への対応): tools.py・network.py への
+切り出しにあたり、以下の定数は「tools.py/network.py 側の関数が使うが、
+yoriai.py 側の関数(まだ移動していないコードや、将来 llm_stream.py に
+移動する予定のコード)からも参照される」という双方向の依存関係にある。
+tools.py/network.py に置いたまま yoriai.py からimportさせる、あるいは
+その逆にすると、`yoriai.py`⇔`tools.py`/`network.py`の循環importが
+発生してしまうため、依存の無いこのモジュールに切り出し、両側から参照する
+形で解消する。値そのものは元のyoriai.py上の定義から変更していない。
 """
 
 # 仮の判断: チャットの接続確立自体はカード取得と同程度の速さで判定してよい
 # (詳細はyoriai.py側のCHAT_READ_TIMEOUT_SECのコメントを参照)。
 CHAT_CONNECT_TIMEOUT_SEC = 5
+
+# 仮の判断: mDNS/カード取得サーバーが名乗るサービス種別。network.py側の
+# YoriaiListener・CardRequestHandlerと、yoriai.py側にまだ残っているmDNS
+# 起動コード(run_agent)の双方から参照される。
+SERVICE_TYPE = "_yoriai._tcp.local."
+
+# 仮の判断: 自己紹介カード取得・組織フィンガープリント検証で使うHTTP
+# ヘッダー名。network.py側(CardRequestHandler・YoriaiListener・
+# discover_via_tailscale)と、yoriai.py側にまだ残っているチャット問い合わせ
+# コード(_fetch_org_snapshot等)の双方から参照される。
+ORG_FINGERPRINT_HEADER = "X-Yoriai-Org-Fingerprint"
+
+# 仮の判断: カード取得サーバーへの問い合わせのタイムアウト秒数。
+# network.py側と、yoriai.py側にまだ残っているコードの双方から参照される。
+CARD_REQUEST_TIMEOUT_SEC = 5
 
 # 仮の判断: バックエンド(Ollama/LM Studio/MLX-LM)への問い合わせに応答の
 # 最大トークン数を指定していなかったため、生成が延々と続いてしまう不具合が
