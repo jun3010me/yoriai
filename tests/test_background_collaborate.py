@@ -218,20 +218,52 @@ def test_agree_command_returns_to_prompt_before_the_job_finishes():
     assert calls["ask_collaborate"] == 1, calls
 
 
-def test_plain_text_no_longer_auto_classified_into_collaborate_mode():
-    """依頼への対応(平文の自動モード判定の廃止): 以前は「作って」等の
-    キーワードを含む平文が自動的に協業モード(`//agree`相当)へ振り分け
-    られていたが、この自動判定は廃止した。コマンド無しの発言は常に
-    「今の会話の続き」の単発質問として扱われ、協業モードを使いたい場合は
-    `//agree`を明示する必要がある(回帰検知)。
+def test_auto_classified_collaborate_mode_is_also_backgrounded():
+    """平文からの自動ツール選択の復活: 「作って」等の制作系キーワードを
+    含む平文は、`//agree`を明示しなくても自動的に協業モードへ振り分け
+    られ、`//agree`と同様にバックグラウンドジョブとして扱われる
+    (完了を待たずに次の入力・`exit`を受け付けられる)ことを確認する。
     """
+    release = threading.Event()
+
+    def slow_collaborate():
+        release.wait(timeout=5)
+
     output, calls, runner, restore = _run_repl_with_keys(
         "ToDoリストのCLIツールを作って" + _SUBMIT + "exit" + _SUBMIT,
+        ask_collaborate_side_effect=slow_collaborate,
     )
     assert "対話モードを終了します。" in output, output
+    release.set()
     runner.join()
     restore()
-    assert calls["ask_collaborate"] == 0, calls
+    assert calls["ask_collaborate"] == 1, calls
+
+
+def test_followup_right_after_a_dialogue_pause_is_not_reclassified():
+    """平文からの自動ツール選択の復活に伴う回帰検知(637cce6で報告された
+    不具合の再発防止): 対話プロトコルが人間の確認を求めて一時停止した
+    直後に、たとえ協業モードのキーワード(「作って」)を含む発言を送っても、
+    新規の自動判定にはかけず「今の会話の続き」の単発質問として扱う
+    ことを確認する。
+    """
+    def paused_collaborate():
+        print(yoriai._DIALOGUE_PAUSE_HUMAN_JUDGEMENT_MARKER)
+
+    output, calls, runner, restore = _run_repl_with_keys(
+        f"{yoriai.AGREE_COMMAND} ToDoリストを作って" + _SUBMIT
+        + "やっぱり別のアプリを作って" + _SUBMIT
+        + "exit" + _SUBMIT,
+        ask_collaborate_side_effect=paused_collaborate,
+    )
+    runner.join()
+    restore()
+    assert "対話モードを終了します。" in output, output
+    assert "[💬 対話プロトコルの一時停止直後の発言のため、会話の続きとして扱います]" in output, output
+    # 1回目(明示//agree)はモード判定を経由しない。2回目の「作って」を
+    # 含む続きの発言も、一時停止直後のためモード判定をスキップするはず。
+    assert calls["classify"] == 0, calls
+    assert calls["ask_collaborate"] == 1, calls
     assert calls["ask_single"] == 1, calls
 
 
@@ -336,7 +368,8 @@ def main():
         test_background_job_runner_prints_queued_notice_only_when_busy,
         test_background_job_runner_continues_after_a_job_raises,
         test_agree_command_returns_to_prompt_before_the_job_finishes,
-        test_plain_text_no_longer_auto_classified_into_collaborate_mode,
+        test_auto_classified_collaborate_mode_is_also_backgrounded,
+        test_followup_right_after_a_dialogue_pause_is_not_reclassified,
         test_parallel_command_is_backgrounded,
         test_resume_all_command_is_backgrounded,
         test_second_agree_while_first_still_running_shows_queued_notice,
