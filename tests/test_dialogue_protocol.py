@@ -426,6 +426,193 @@ def test_ask_organization_collaborate_with_dialogue_aborts_without_human_consens
 
 
 # ---------------------------------------------------------------------------
+# 一時停止後の再開ルーティング(不具合修正: 対話プロトコル一時停止後、
+# 実装フェーズに繋がらない不具合への対応)
+# ---------------------------------------------------------------------------
+
+def test_ask_organization_collaborate_with_dialogue_stores_pending_box_on_pause():
+    """人間の確認が必要で一時停止した場合、`pending_box`に再開情報
+    (`_PendingDesignDialogue`)が格納されることを確認する。合意した場合や
+    `pending_box`を渡さない場合(既存の呼び出し元)には影響しないことも
+    合わせて確認する。
+    """
+    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
+        text = messages[0]["content"]
+        if _PROPOSER_MARKER in text:
+            yield {"content": "案"}
+        elif _CRITIC_MARKER in text:
+            yield {"content": "アイデアが尽きました。\n評価: 情報不足"}
+        elif _INTEGRATOR_MARKER in text:
+            yield {"content": "判定: 人間に確認\n\n人間への確認事項:\n方向性を決めてください。"}
+        else:
+            raise AssertionError(f"実装フェーズに進んではいけません: {text[:80]}")
+        yield {"done": True}
+
+    original_snapshot = yoriai._fetch_org_snapshot
+    yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False: _two_member_snapshot()
+    out_dir = tempfile.mkdtemp(prefix="yoriai_agree_pending_test_")
+    try:
+        pending_box = yoriai._PendingDesignDialogueBox()
+        with contextlib.redirect_stdout(io.StringIO()):
+            _with_stream(
+                fake_stream, yoriai._ask_organization_collaborate,
+                47120, "fingerprint", "ToDoリストのCLIツールを作って", out_dir, enable_dialogue=True,
+                pending_box=pending_box,
+            )
+        pending = pending_box.peek()
+        assert pending is not None, "一時停止時にはpending_boxへ再開情報が格納されるはずです"
+        assert pending.request == "ToDoリストのCLIツールを作って"
+        assert pending.result["status"] == yoriai.DIALOGUE_STATUS_NEEDS_HUMAN
+        assert os.path.isdir(pending.project_dir)
+
+        # pending_boxを渡さない既存の呼び出し(後方互換性)では、一時停止しても
+        # 例外にならず、単に何も格納されないだけであることを確認する。
+        with contextlib.redirect_stdout(io.StringIO()):
+            _with_stream(
+                fake_stream, yoriai._ask_organization_collaborate,
+                47120, "fingerprint", "別のToDoリストを作って", out_dir, enable_dialogue=True,
+            )
+    finally:
+        yoriai._fetch_org_snapshot = original_snapshot
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_resume_organization_collaborate_continues_dialogue_and_implements():
+    """一時停止後に人間の回答を受け取ったら、対話プロトコルを続きから
+    再開し、合意に達し次第そのまま実装フェーズ(タスク分解・write_file等)
+    まで進むことを確認する(不具合修正のパターンA・Bへの回帰検知)。
+    生成物は一時停止時と同じプロジェクトディレクトリに保存され、議事録には
+    一時停止前のラウンドの発言も引き継がれていることを確認する。
+    """
+    plan = "storage.py: add_todo(text: str) -> int を実装する\ncli.py: storage.add_todoを呼び出すCLI"
+
+    def fake_stream_pause(candidate, org_fingerprint, messages, **_kwargs):
+        text = messages[0]["content"]
+        if _PROPOSER_MARKER in text:
+            yield {"content": "初期案"}
+        elif _CRITIC_MARKER in text:
+            yield {"content": "アイデアが尽きました。\n評価: 情報不足"}
+        elif _INTEGRATOR_MARKER in text:
+            yield {"content": "判定: 人間に確認\n\n人間への確認事項:\n方向性を決めてください。"}
+        else:
+            raise AssertionError(f"実装フェーズに進んではいけません: {text[:80]}")
+        yield {"done": True}
+
+    def fake_stream_resume(candidate, org_fingerprint, messages, **_kwargs):
+        text = messages[0]["content"]
+        if _PROPOSER_MARKER in text:
+            yield {"content": plan}
+        elif _CRITIC_MARKER in text:
+            yield {"content": "問題なし\n評価: 合意"}
+        elif _INTEGRATOR_MARKER in text:
+            yield {"content": f"判定: 合意\n\n最終合意内容:\n{plan}"}
+        elif "レビュー対象" in text:
+            yield {"content": "問題なし"}
+        else:
+            yield {"content": "```python\npass\n```"}
+        yield {"done": True}
+
+    original_snapshot = yoriai._fetch_org_snapshot
+    yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False: _two_member_snapshot()
+    out_dir = tempfile.mkdtemp(prefix="yoriai_agree_resume_test_")
+    try:
+        pending_box = yoriai._PendingDesignDialogueBox()
+        with contextlib.redirect_stdout(io.StringIO()):
+            _with_stream(
+                fake_stream_pause, yoriai._ask_organization_collaborate,
+                47120, "fingerprint", "ToDoリストのCLIツールを作って", out_dir, enable_dialogue=True,
+                pending_box=pending_box,
+            )
+        pending = pending_box.peek()
+        assert pending is not None
+        project_dir = pending.project_dir
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _with_stream(
+                fake_stream_resume, yoriai._resume_organization_collaborate, pending, "自由に決めてください",
+            )
+        output = buf.getvalue()
+
+        assert "[✅ 全タスク完了" in output, output
+        saved = set(os.listdir(project_dir))
+        assert {"storage.py", "cli.py", "PROGRESS.md"} <= saved, saved
+
+        with open(os.path.join(project_dir, "DIALOGUE_LOG_design.md"), encoding="utf-8") as f:
+            log_content = f.read()
+        assert "初期案" in log_content, "一時停止前(ラウンド1)の議事録が再開後も引き継がれているはずです"
+    finally:
+        yoriai._fetch_org_snapshot = original_snapshot
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_resume_organization_collaborate_falls_back_to_single_node_plan_when_still_no_consensus():
+    """再開後もなお合意に至らなかった場合、一時停止を重ねて人間との往復を
+    繰り返すのではなく、設計担当1名が人間の回答を踏まえて単独で計画を
+    確定し、そのまま実装フェーズへ進むことを確認する。
+    """
+    plan = "storage.py: add_todo(text: str) -> int を実装する\ncli.py: storage.add_todoを呼び出すCLI"
+
+    def fake_stream_pause(candidate, org_fingerprint, messages, **_kwargs):
+        text = messages[0]["content"]
+        if _PROPOSER_MARKER in text:
+            yield {"content": "初期案"}
+        elif _CRITIC_MARKER in text:
+            yield {"content": "アイデアが尽きました。\n評価: 情報不足"}
+        elif _INTEGRATOR_MARKER in text:
+            yield {"content": "判定: 人間に確認\n\n人間への確認事項:\n方向性を決めてください。"}
+        else:
+            raise AssertionError(f"実装フェーズに進んではいけません: {text[:80]}")
+        yield {"done": True}
+
+    def fake_stream_resume_stuck(candidate, org_fingerprint, messages, **_kwargs):
+        text = messages[0]["content"]
+        if _PROPOSER_MARKER in text:
+            yield {"content": "改訂案"}
+        elif _CRITIC_MARKER in text:
+            yield {"content": "まだ懸念があります。\n評価: 情報不足"}
+        elif _INTEGRATOR_MARKER in text:
+            yield {"content": "判定: 人間に確認\n\n人間への確認事項:\nまだ決まりません。"}
+        elif "ファイル分割案を確定してください" in text:
+            yield {"content": plan}
+        elif "レビュー対象" in text:
+            yield {"content": "問題なし"}
+        else:
+            yield {"content": "```python\npass\n```"}
+        yield {"done": True}
+
+    original_snapshot = yoriai._fetch_org_snapshot
+    yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False: _two_member_snapshot()
+    out_dir = tempfile.mkdtemp(prefix="yoriai_agree_resume_fallback_test_")
+    try:
+        pending_box = yoriai._PendingDesignDialogueBox()
+        with contextlib.redirect_stdout(io.StringIO()):
+            _with_stream(
+                fake_stream_pause, yoriai._ask_organization_collaborate,
+                47120, "fingerprint", "ToDoリストのCLIツールを作って", out_dir, enable_dialogue=True,
+                pending_box=pending_box,
+            )
+        pending = pending_box.peek()
+        assert pending is not None
+        project_dir = pending.project_dir
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _with_stream(
+                fake_stream_resume_stuck, yoriai._resume_organization_collaborate, pending, "自由に決めてください",
+            )
+        output = buf.getvalue()
+
+        assert "計画を単独で確定" in output, output
+        assert "[✅ 全タスク完了" in output, output
+        saved = set(os.listdir(project_dir))
+        assert {"storage.py", "cli.py", "PROGRESS.md"} <= saved, saved
+    finally:
+        yoriai._fetch_org_snapshot = original_snapshot
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 # //fix の修正方針への組み込み
 # ---------------------------------------------------------------------------
 
@@ -673,6 +860,9 @@ def main():
         test_ask_organization_collaborate_with_dialogue_reaches_consensus_and_implements,
         test_ask_organization_collaborate_without_dialogue_flag_keeps_single_call_behavior,
         test_ask_organization_collaborate_with_dialogue_aborts_without_human_consensus,
+        test_ask_organization_collaborate_with_dialogue_stores_pending_box_on_pause,
+        test_resume_organization_collaborate_continues_dialogue_and_implements,
+        test_resume_organization_collaborate_falls_back_to_single_node_plan_when_still_no_consensus,
         test_run_fix_approach_dialogue_augments_request_on_consensus,
         test_run_fix_approach_dialogue_falls_back_silently_when_no_engagement,
         test_run_fix_approach_dialogue_aborts_when_no_consensus_reached,

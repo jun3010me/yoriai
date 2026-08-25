@@ -3423,3 +3423,101 @@ CLIツールを作って」のようなPython前提の依頼も、これまで�
   起因の低頻度な失敗があることを、変更前のコードで15回連続実行して
   再確認したうえで、今回の変更によって持ち込まれたものではないことを
   確認済み)。
+
+### 対話プロトコル一時停止後、実装フェーズに繋がらない不具合の修正
+
+前節までの変更で、`//agree`の合意フェーズ(対話プロトコル)が「人間に
+確認」で一時停止した直後の発言は、`_last_turn_is_dialogue_pause`により
+新規判定をスキップして「会話の続き」として扱われるようになっていた。
+しかし実際にその「続き」として渡した先が`mode = EXECUTION_MODE_SINGLE`
+(単発チャット応答、`_ask_organization`)に固定されており、人間が回答を
+返してもタスク分解・`write_file`等の実装フェーズには一切繋がらない不具合
+が利用者から報告された。加えて、`_last_turn_is_dialogue_pause`は会話履歴
+の直前のエントリに一時停止マーカーが含まれるかを文字列として調べている
+だけだったため、対話の議事録が長く(`_BACKGROUND_JOB_HISTORY_TRUNCATE_
+CHARS`=8000文字を超える場合)、`_truncate_for_history`が単純に先頭
+`limit`文字だけを残す実装になっていたことで、末尾付近に印字される
+マーカーごと切り捨てられ、一時停止直後の判定自体に失敗するケースも
+あった(この場合は新規の`_classify_execution_mode`にかけられ、合意
+ラウンドを失って最初からやり直しになる)。
+
+- **`_truncate_for_history`のマーカー保護**: マーカー
+  (`_DIALOGUE_PAUSE_HUMAN_JUDGEMENT_MARKER`)が含まれる出力を切り詰める
+  際は、先頭部分を短縮してでもマーカー以降(マーカー自体とその後ろ)を
+  必ず残すようにした。マーカーが無い既存の出力の切り詰め方(先頭
+  `limit`文字を残し「以下省略」を付ける)はそのまま維持している。
+- **一時停止からの「続きから」再開**: `_run_dialogue`に`resume_
+  transcript`/`resume_round`という2つの引数を追加しただけで、以前の
+  議事録を引き継いで指定ラウンドから再開できるようにした。提案役・
+  反論役・統合役のやり取りや合意判定そのもののロジック(依頼の制約
+  「対話プロトコル自体のロジックには手を入れない」)は一切変更していない。
+  新設した`_resume_design_dialogue`が、一時停止時点までの要約・人間への
+  確認事項・今回人間から得た回答を`background`に追記したうえで
+  `_run_dialogue`を呼び直す。
+  - 再開後も合意に至らなかった場合(セーフティリミット再到達・再度
+    「人間に確認」)は、これ以上一時停止を人間との往復で重ねることはせず、
+    それまでの議論と人間の回答を踏まえて設計担当1名が単独で計画を確定し、
+    そのまま実装フェーズへ進む(依頼の「既に議論が尽くされている場合は
+    そのまま実装へ進む」に相当する扱い)。応答が一切得られなかった場合
+    (`DIALOGUE_STATUS_NO_ENGAGEMENT`)のみ中断する。
+- **実装フェーズへの橋渡しの共通化**: `_ask_organization_collaborate`が
+  合意フェーズ後にタスク分解・`_run_collaborative_project`・
+  `_maybe_auto_resume`を呼んでいた一連の処理を`_run_collaborate_
+  implementation_phase`として切り出した。一発で合意した場合(既存の
+  正常系)と、一時停止から再開して合意(または単独での計画確定)した
+  場合(`_resume_organization_collaborate`)の両方が、この同じ橋渡し
+  関数に合流する。
+- **一時停止状態のスレッド間受け渡し**: `_ask_organization_collaborate`は
+  `_BackgroundJobRunner`の別スレッドで実行されるため、一時停止した場合に
+  再開へ必要な情報(組織・依頼文・候補メンバー・プロジェクトディレクトリ・
+  対話の生の結果)を`_PendingDesignDialogue`にまとめ、ロックで保護した
+  `_PendingDesignDialogueBox`(`_ChatLog`と同様の考え方)を介して
+  `_run_repl_client`のメインループへ受け渡す。`_ask_organization_
+  collaborate`に`pending_box`引数(既定`None`)を追加しただけなので、
+  既存の呼び出し元・テストへの影響は無い。
+  - `_run_repl_client`側では、次の発言を読む前にこの箱を確認し、値が
+    あれば`_last_turn_is_dialogue_pause`によるテキストベースの判定より
+    優先して「一時停止への回答」として扱い、`_resume_organization_
+    collaborate`をバックグラウンドジョブとして投入する。マーカーベースの
+    判定(`_last_turn_is_dialogue_pause`)は、`pending_box`が空の場合
+    (`//plan-only`の一時停止・スタブ化されたテスト等、構造化された
+    再開情報を持たない場合)のフォールバックとして残した。
+  - 一時停止中に人間が新しい明示コマンド(`//agree`・`//fix`等)を
+    入力した場合は、「今の一時停止への回答」ではなく別の新しい指示だと
+    判断し、再開待ち状態を破棄する(新規の`//agree`が進行中の修正
+    セッションを終了させるのと同じ考え方)。
+  - プロジェクトディレクトリは一時停止時点で確定していたものをそのまま
+    再利用する(新規に解決し直すと連番がずれて生成物と対話ログが別の
+    ディレクトリに散らばってしまうため)。`DIALOGUE_LOG_design.md`/
+    `DIALOGUE_SUMMARY_design.md`も同じファイルへ再開後の内容で上書き
+    されるが、`_run_dialogue`に渡した`resume_transcript`により一時停止
+    前のラウンドの発言も上書き後の議事録に引き継がれる。
+- **テストの扱い**: `tests/test_dialogue_protocol.py`に、一時停止時に
+  `pending_box`へ再開情報が格納されること、再開後に合意すればそのまま
+  タスク分解・実装まで進むこと(生成物が一時停止時と同じプロジェクト
+  ディレクトリに保存され、議事録に一時停止前のラウンドの発言が引き継がれて
+  いることも確認)、再開後も合意に至らない場合は単独での計画確定へ
+  フォールバックして実装まで進むこと、の3件を追加した。
+  `tests/test_chat_conversation_log.py`には、`_BACKGROUND_JOB_HISTORY_
+  TRUNCATE_CHARS`を超える長い議事録でも一時停止マーカーが切り詰め後の
+  会話履歴から検出できることを確認するテストを追加した。
+  `tests/test_background_collaborate.py`には、`pending_box`を使った
+  一時停止後、直後の発言が単発質問(`_ask_organization`)ではなく合意
+  フェーズの再開(`_resume_organization_collaborate`)へルーティング
+  されることを確認するテストを追加した。ただし、既存の類似テスト
+  (`test_followup_right_after_a_dialogue_pause_is_not_reclassified`)が
+  「バックグラウンドジョブの完了」と「次の発言の読み取り」の間に本質的な
+  競合を抱えており(全キーストロークを起動前に一括でパイプへ送り込む
+  既存の共通ハーネス`_run_repl_with_keys`に起因し、変更前のコードでも
+  再現する既知の問題)、この新規テストを同じ競合の上に積み増すと不安定に
+  なってしまうため、`_run_repl_client`を専用スレッドで動かし、一時停止
+  ジョブの完了を`threading.Event`で待ってから次の発言を送り込む専用の
+  ハーネスを別途用意し、決定的に検証できるようにした(8回連続実行して
+  安定することを確認)。
+- **検証**: 既存の全テストファイル(31ファイル)を複数回実行し、今回の
+  変更によるリグレッションが無いことを確認した。`test_followup_right_
+  after_a_dialogue_pause_is_not_reclassified`・`test_second_agree_
+  while_first_still_running_shows_queued_notice`・`test_fix_session.py`
+  内の一部のテストは、前節までに記録済みの、今回の変更を含まない
+  ブランチ上でも同じ頻度で再現するタイミング起因の低頻度な失敗である
+  ことを、変更前のコードでの複数回実行と比較して再確認済み。

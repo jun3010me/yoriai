@@ -142,6 +142,40 @@ def test_run_job_with_conversation_log_truncates_long_output_in_history_but_not_
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def test_run_job_with_conversation_log_keeps_dialogue_pause_marker_detectable_after_truncation():
+    """不具合修正の回帰検知: 対話プロトコルの議事録が長く(会話履歴への
+    記録上限を超えて)一時停止した場合でも、一時停止マーカー
+    (`_DIALOGUE_PAUSE_HUMAN_JUDGEMENT_MARKER`)は末尾に印字されるため
+    切り詰められて消えてしまい、`_last_turn_is_dialogue_pause`が
+    「一時停止直後の発言かどうか」を誤判定していた(依頼のパターンB)。
+    マーカーを含む長い出力でも、会話履歴に記録された内容からマーカーが
+    検出できることを確認する。
+    """
+    tmp_dir = tempfile.mkdtemp(prefix="yoriai_chat_log_test_")
+    try:
+        chat_log = yoriai._ChatLog(os.path.join(tmp_dir, "chat.md"))
+        long_transcript = "議事録の発言\n" * 2000  # _BACKGROUND_JOB_HISTORY_TRUNCATE_CHARSを優に超える長さ
+        assert len(long_transcript) > yoriai._BACKGROUND_JOB_HISTORY_TRUNCATE_CHARS
+
+        def job():
+            print(long_transcript)
+            print(yoriai._DIALOGUE_PAUSE_HUMAN_JUDGEMENT_MARKER)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            yoriai._run_job_with_conversation_log(chat_log, "//agree ToDoリストを作って", job)
+
+        recorded = chat_log[1]["content"]
+        assert len(recorded) < len(long_transcript), "会話履歴への記録は切り詰められるはずです"
+        assert yoriai._DIALOGUE_PAUSE_HUMAN_JUDGEMENT_MARKER in recorded, (
+            "一時停止マーカーは切り詰め後も会話履歴に残っているはずです"
+        )
+        assert yoriai._last_turn_is_dialogue_pause(chat_log), (
+            "切り詰め後もこの発言が一時停止直後だと判定できるはずです"
+        )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def test_run_job_with_conversation_log_is_noop_when_chat_log_none():
     ran = {"n": 0}
 
@@ -344,6 +378,7 @@ def main():
         test_run_job_with_conversation_log_records_user_and_captured_output,
         test_run_job_with_conversation_log_records_placeholder_when_job_prints_nothing,
         test_run_job_with_conversation_log_truncates_long_output_in_history_but_not_on_screen,
+        test_run_job_with_conversation_log_keeps_dialogue_pause_marker_detectable_after_truncation,
         test_run_job_with_conversation_log_is_noop_when_chat_log_none,
         test_run_job_with_conversation_log_does_not_clobber_stdout_changed_during_job,
         test_single_query_after_agree_job_receives_prior_conversation_as_context,
