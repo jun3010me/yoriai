@@ -194,23 +194,36 @@ def test_run_dialogue_critic_flags_information_shortage_escalates_to_human():
     assert result["total_utterances"] == 3, "1ラウンド目で人間に確認へ切り替わるはずです"
 
 
-def test_run_dialogue_pauses_at_safety_limit_of_fifty_utterances():
-    """暴走防止: 合意に至らない議論が続いても、全ノードの発言回数の
-    合計が50回を超えた時点で強制的に一時停止することを確認する。
+def _make_never_converging_stream():
+    """`_run_dialogue`が「同じ内容の繰り返し」検出(`DIALOGUE_STATUS_
+    STAGNANT`)で早期に打ち切られることなく、ラウンドを重ねるごとに
+    (内容は変わり続けるが)合意には至らない議論を模擬する`fake_stream`を
+    作る。ラウンドごとに提案・反論の文面へ通し番号を混ぜて変化させる
+    (`_utterances_are_near_duplicate`のしきい値0.92を超えないようにする)。
     """
+    round_counter = {"n": 0}
+
     def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
         text = messages[0]["content"]
         if _PROPOSER_MARKER in text:
-            yield {"content": "改善案"}
+            round_counter["n"] += 1
+            yield {"content": f"改善案(検討{round_counter['n']}周目、観点{round_counter['n']}を追加で考慮)"}
         elif _CRITIC_MARKER in text:
-            yield {"content": "まだ懸念があります。\n評価: 要修正"}
+            yield {"content": f"まだ懸念があります(指摘{round_counter['n']}件目)。\n評価: 要修正"}
         elif _INTEGRATOR_MARKER in text:
             yield {"content": "判定: 継続\n\n議論継続中です。"}
         yield {"done": True}
 
+    return fake_stream
+
+
+def test_run_dialogue_pauses_at_safety_limit_of_fifty_utterances():
+    """暴走防止: 合意に至らない議論が続いても、全ノードの発言回数の
+    合計が50回を超えた時点で強制的に一時停止することを確認する。
+    """
     candidates = [_candidate("MacStudio", "m1"), _candidate("junnoMac-mini", "m2")]
     result = _with_stream(
-        fake_stream, yoriai._run_dialogue,
+        _make_never_converging_stream(), yoriai._run_dialogue,
         org_fingerprint="fp", topic="議題", background="背景", candidates=candidates,
         output_instruction="出力形式の指示", max_rounds=100,
     )
@@ -221,19 +234,9 @@ def test_run_dialogue_pauses_at_safety_limit_of_fifty_utterances():
 
 
 def test_run_dialogue_gives_up_after_max_rounds_without_consensus():
-    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
-        text = messages[0]["content"]
-        if _PROPOSER_MARKER in text:
-            yield {"content": "改善案"}
-        elif _CRITIC_MARKER in text:
-            yield {"content": "まだ懸念があります。\n評価: 要修正"}
-        elif _INTEGRATOR_MARKER in text:
-            yield {"content": "判定: 継続\n\n議論継続中です。"}
-        yield {"done": True}
-
     candidates = [_candidate("MacStudio", "m1"), _candidate("junnoMac-mini", "m2")]
     result = _with_stream(
-        fake_stream, yoriai._run_dialogue,
+        _make_never_converging_stream(), yoriai._run_dialogue,
         org_fingerprint="fp", topic="議題", background="背景", candidates=candidates,
         output_instruction="出力形式の指示", max_rounds=3,
     )
@@ -257,6 +260,109 @@ def test_run_dialogue_no_engagement_when_proposer_never_answers():
 
     assert result["status"] == yoriai.DIALOGUE_STATUS_NO_ENGAGEMENT
     assert result["total_utterances"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 文字化け検出(_looks_garbled)・重大なバグ報告への対応
+# ---------------------------------------------------------------------------
+
+def test_looks_garbled_false_for_normal_japanese_text():
+    normal = "この提案は、シンプルな辞書のリストでデータを保持する設計です。並行アクセスへの配慮も含めて検討しました。"
+    assert yoriai._looks_garbled(normal) is False
+
+
+def test_looks_garbled_false_for_short_text_even_if_repetitive():
+    # 短い応答は誤検知しやすいため、_GARBLED_MIN_LENGTH未満は対象外。
+    assert yoriai._looks_garbled("ああああ") is False
+
+
+def test_looks_garbled_true_for_dominant_single_character_repetition():
+    garbled = "呵" * 60
+    assert yoriai._looks_garbled(garbled) is True
+
+
+def test_looks_garbled_true_for_dominant_short_pattern_repetition():
+    garbled = "ㅋㅋ" * 40  # ハングルの記号が連続する典型的な崩壊パターンを模擬
+    assert yoriai._looks_garbled(garbled) is True
+
+
+def test_looks_garbled_false_for_long_but_diverse_text():
+    diverse = "".join(f"観点{i}についての検討事項を具体的に述べます。" for i in range(20))
+    assert yoriai._looks_garbled(diverse) is False
+
+
+def test_utterances_are_near_duplicate_detects_identical_and_distinct_text():
+    a = "storage.pyでadd_todoを実装し、cli.pyから呼び出す設計にします。"
+    assert yoriai._utterances_are_near_duplicate(a, a) is True
+    assert yoriai._utterances_are_near_duplicate(a, "まったく別の内容の提案文です。") is False
+    assert yoriai._utterances_are_near_duplicate(a, "") is False
+    assert yoriai._utterances_are_near_duplicate(None, a) is False
+
+
+def test_run_dialogue_stops_and_reports_garbled_when_a_speaker_collapses():
+    """重大なバグ報告への対応: 長時間の対話プロトコルで応答が文字化けに
+    崩壊した場合、その発言を無効として扱いラウンドを打ち切ることを確認
+    する。
+    """
+    garbled_answer = "ㅋ" * 60
+
+    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
+        text = messages[0]["content"]
+        if _PROPOSER_MARKER in text:
+            yield {"content": "改善案"}
+        elif _CRITIC_MARKER in text:
+            yield {"content": garbled_answer}
+        elif _INTEGRATOR_MARKER in text:
+            raise AssertionError("文字化けを検知した時点で統合役へは問い合わせないはずです")
+        yield {"done": True}
+
+    candidates = [_candidate("MacStudio", "m1"), _candidate("junnoMac-mini", "m2")]
+    result = _with_stream(
+        fake_stream, yoriai._run_dialogue,
+        org_fingerprint="fp", topic="議題", background="背景", candidates=candidates,
+        output_instruction="出力形式の指示",
+    )
+
+    assert result["status"] == yoriai.DIALOGUE_STATUS_GARBLED
+    assert "junnoMac-mini" in result["human_message"]
+    assert result["total_utterances"] == 2
+
+
+def test_run_dialogue_stops_as_stagnant_when_rounds_repeat_and_adopts_latest_proposal():
+    """重大なバグ報告への対応: ラウンドを重ねても提案役・反論役の発言が
+    実質的に同じ内容の繰り返しになった場合、統合役への問い合わせを待たず
+    その場で打ち切り、直近の(最も具体的な)提案をそのまま採用することを
+    確認する。
+    """
+    proposal = "storage.py: add_todo(text: str) -> int を実装し、cli.pyから呼び出す。"
+    critique = "並行アクセス時の扱いだけ確認したいですが、大きな問題はありません。"
+
+    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
+        text = messages[0]["content"]
+        if _PROPOSER_MARKER in text:
+            yield {"content": proposal}
+        elif _CRITIC_MARKER in text:
+            yield {"content": f"{critique}\n評価: 要修正"}
+        elif _INTEGRATOR_MARKER in text:
+            # 統合役自身は(今回は)まだ合意とは判断していない("判定: 継続")
+            # ケースを想定する。合意が正当に成立したケースまで巻き込んで
+            # 打ち切らないことの裏返しとして、統合役への問い合わせ自体は
+            # 毎ラウンド行われる。
+            yield {"content": "判定: 継続\n\n議論継続中です。"}
+        yield {"done": True}
+
+    candidates = [_candidate("MacStudio", "m1"), _candidate("junnoMac-mini", "m2")]
+    result = _with_stream(
+        fake_stream, yoriai._run_dialogue,
+        org_fingerprint="fp", topic="議題", background="背景", candidates=candidates,
+        output_instruction="出力形式の指示",
+    )
+
+    assert result["status"] == yoriai.DIALOGUE_STATUS_STAGNANT
+    assert result["final_content"].strip() == proposal
+    # ラウンド1(3発言)+ラウンド2(3発言、統合役の判定後に内容の繰り返しを
+    # 検知して打ち切り)=6発言。
+    assert result["total_utterances"] == 6, result
 
 
 # ---------------------------------------------------------------------------
@@ -965,6 +1071,14 @@ def main():
         test_run_dialogue_pauses_at_safety_limit_of_fifty_utterances,
         test_run_dialogue_gives_up_after_max_rounds_without_consensus,
         test_run_dialogue_no_engagement_when_proposer_never_answers,
+        test_looks_garbled_false_for_normal_japanese_text,
+        test_looks_garbled_false_for_short_text_even_if_repetitive,
+        test_looks_garbled_true_for_dominant_single_character_repetition,
+        test_looks_garbled_true_for_dominant_short_pattern_repetition,
+        test_looks_garbled_false_for_long_but_diverse_text,
+        test_utterances_are_near_duplicate_detects_identical_and_distinct_text,
+        test_run_dialogue_stops_and_reports_garbled_when_a_speaker_collapses,
+        test_run_dialogue_stops_as_stagnant_when_rounds_repeat_and_adopts_latest_proposal,
         test_dialogue_log_and_summary_files_are_both_written,
         test_report_dialogue_result_skips_files_when_no_engagement,
         test_ask_organization_collaborate_with_dialogue_reaches_consensus_and_implements,
