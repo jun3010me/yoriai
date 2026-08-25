@@ -440,15 +440,18 @@ def test_new_agree_ends_the_active_fix_session():
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
-def test_natural_production_request_ends_the_active_fix_session():
-    """セッション中に、コマンド無しでも明らかに新規制作依頼と読み取れる
-    発言(協業モードのキーワードを含む)があった場合、セッションを終了し
-    通常の新規制作依頼として扱うことを確認する。
+def test_production_sounding_followup_still_continues_the_fix_session():
+    """依頼への対応(平文の自動モード判定の廃止): 以前は、セッション中に
+    コマンド無しで「協業モードのキーワードを含む」発言があると、それを
+    新規制作依頼と自動判定してセッションを終了していた。この推測に
+    基づく自動判定は廃止し、コマンド無しの発言は常にセッションの続き
+    (対象プロジェクトへの継続的な修正依頼)として扱う。新しい制作を
+    始めたい場合は`//agree`を明示する必要がある(回帰検知)。
     """
     out_dir = tempfile.mkdtemp(prefix="yoriai_fix_session_test_")
     try:
         projects_root = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME)
-        _write_completed_project(projects_root, "todo-cli", [("utils.py", "説明")])
+        project_dir = _write_completed_project(projects_root, "todo-cli", [("utils.py", "説明")])
 
         keys = (
             f"{yoriai.FIX_PROJECT_COMMAND} todo-cli: バグを直して" + _SUBMIT
@@ -457,9 +460,10 @@ def test_natural_production_request_ends_the_active_fix_session():
         )
         output, calls, fix_calls = _run_repl_with_keys(keys, out_dir)
 
-        assert calls["run_fix"] == 1, calls
-        assert calls["ask_collaborate"] == 1, calls
-        assert "別の新規制作依頼" in output, output
+        assert calls["run_fix"] == 2, calls
+        assert calls["ask_collaborate"] == 0, calls
+        assert fix_calls[1] == (project_dir, "全然別の天気予報アプリを作って"), fix_calls
+        assert "別の新規制作依頼" not in output, output
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
 
@@ -488,17 +492,22 @@ def test_switching_to_another_project_via_fix_ends_the_previous_session():
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
-def test_unrelated_topics_streak_ends_the_session_after_the_limit():
-    """比較モード相当の「関係ない話題」がしきい値回数連続すると、
-    自動的にセッションが終了することを確認する。
+def test_repeated_unrelated_sounding_chatter_never_ends_the_session():
+    """依頼への対応(平文の自動モード判定の廃止): 以前は「関係ない話題」
+    (比較モード相当のキーワード)が何度か連続すると自動的にセッションを
+    終了していたが、この自動判定は廃止した。何度雑談っぽい発言が続いても、
+    明示的な終了フレーズ・別コマンドが無い限りセッションは終了しない
+    (常に対象プロジェクトへの継続的な修正依頼として扱われる)ことを
+    確認する。
     """
     out_dir = tempfile.mkdtemp(prefix="yoriai_fix_session_test_")
     try:
         projects_root = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME)
         _write_completed_project(projects_root, "todo-cli", [("utils.py", "説明")])
 
+        # 以前の閾値を超える回数、雑談っぽい発言を連続で送る。
         unrelated_turns = "".join(
-            "みんなの意見を聞かせて" + _SUBMIT for _ in range(yoriai._FIX_SESSION_UNRELATED_STREAK_LIMIT)
+            "みんなの意見を聞かせて" + _SUBMIT for _ in range(5)
         )
         keys = (
             f"{yoriai.FIX_PROJECT_COMMAND} todo-cli: バグを直して" + _SUBMIT
@@ -507,33 +516,8 @@ def test_unrelated_topics_streak_ends_the_session_after_the_limit():
         )
         output, calls, fix_calls = _run_repl_with_keys(keys, out_dir)
 
-        assert calls["run_fix"] == 1, calls
-        assert calls["ask_multi"] == yoriai._FIX_SESSION_UNRELATED_STREAK_LIMIT, calls
-        assert "関係ない話題が続いた" in output, output
-    finally:
-        shutil.rmtree(out_dir, ignore_errors=True)
-
-
-def test_a_single_unrelated_topic_does_not_end_the_session():
-    """1回だけの脱線ではセッションを終了せず、その後の発言はまだ継続的な
-    修正依頼として扱われることを確認する。
-    """
-    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_session_test_")
-    try:
-        projects_root = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME)
-        project_dir = _write_completed_project(projects_root, "todo-cli", [("utils.py", "説明")])
-
-        keys = (
-            f"{yoriai.FIX_PROJECT_COMMAND} todo-cli: バグを直して" + _SUBMIT
-            + "みんなの意見を聞かせて" + _SUBMIT
-            + "今度は逆にして" + _SUBMIT
-            + "exit" + _SUBMIT
-        )
-        output, calls, fix_calls = _run_repl_with_keys(keys, out_dir)
-
-        assert calls["run_fix"] == 2, calls
-        assert calls["ask_multi"] == 1, calls
-        assert fix_calls[1] == (project_dir, "今度は逆にして"), fix_calls
+        assert calls["run_fix"] == 6, calls
+        assert calls["ask_multi"] == 0, calls
         assert "関係ない話題が続いた" not in output, output
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -582,10 +566,9 @@ def main():
         test_fix_command_without_project_name_continues_the_session_like_a_plain_followup,
         test_explicit_end_phrase_ends_the_session_without_triggering_a_fix,
         test_new_agree_ends_the_active_fix_session,
-        test_natural_production_request_ends_the_active_fix_session,
+        test_production_sounding_followup_still_continues_the_fix_session,
         test_switching_to_another_project_via_fix_ends_the_previous_session,
-        test_unrelated_topics_streak_ends_the_session_after_the_limit,
-        test_a_single_unrelated_topic_does_not_end_the_session,
+        test_repeated_unrelated_sounding_chatter_never_ends_the_session,
         test_idle_timeout_ends_the_session_before_processing_the_next_turn,
     ]
     failures = 0

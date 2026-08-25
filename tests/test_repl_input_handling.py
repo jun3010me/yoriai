@@ -134,14 +134,16 @@ def test_exit_and_quit_are_case_insensitive():
         assert "対話モードを終了します。" in output, f"{word!r}: {output}"
 
 
-def test_normal_input_still_reaches_mode_classification():
-    """空入力・終了コマンド以外の通常の入力は、これまで通りモード判定に
-    進むことを確認する(回帰検知: 判定ロジックそのものを壊していないか)。
+def test_normal_input_goes_straight_to_single_query_without_classification():
+    """空入力・終了コマンド以外の通常の入力(コマンド無しの平文)は、
+    自動モード判定を経由せず、常に「今の会話の続き」の単発質問として
+    そのまま`_ask_organization`に渡ることを確認する(依頼への対応:
+    平文の自動モード判定の廃止)。
     """
     output, calls = _run_repl_with_keys("富士山の標高は?" + _SUBMIT + "exit" + _SUBMIT)
-    assert calls["classify"] == 1, calls
+    assert calls["classify"] == 0, calls
     assert calls["ask_single"] == 1, calls
-    assert "[判断:" in output, output
+    assert "[判断:" not in output, output
 
 
 def test_eof_terminates_the_repl():
@@ -159,7 +161,7 @@ def main():
         test_exit_with_surrounding_whitespace_terminates,
         test_quit_terminates_immediately,
         test_exit_and_quit_are_case_insensitive,
-        test_normal_input_still_reaches_mode_classification,
+        test_normal_input_goes_straight_to_single_query_without_classification,
         test_eof_terminates_the_repl,
     ]
     failures = 0

@@ -218,21 +218,21 @@ def test_agree_command_returns_to_prompt_before_the_job_finishes():
     assert calls["ask_collaborate"] == 1, calls
 
 
-def test_auto_classified_collaborate_mode_is_also_backgrounded():
-    release = threading.Event()
-
-    def slow_collaborate():
-        release.wait(timeout=5)
-
+def test_plain_text_no_longer_auto_classified_into_collaborate_mode():
+    """依頼への対応(平文の自動モード判定の廃止): 以前は「作って」等の
+    キーワードを含む平文が自動的に協業モード(`//agree`相当)へ振り分け
+    られていたが、この自動判定は廃止した。コマンド無しの発言は常に
+    「今の会話の続き」の単発質問として扱われ、協業モードを使いたい場合は
+    `//agree`を明示する必要がある(回帰検知)。
+    """
     output, calls, runner, restore = _run_repl_with_keys(
         "ToDoリストのCLIツールを作って" + _SUBMIT + "exit" + _SUBMIT,
-        ask_collaborate_side_effect=slow_collaborate,
     )
     assert "対話モードを終了します。" in output, output
-    release.set()
     runner.join()
     restore()
-    assert calls["ask_collaborate"] == 1, calls
+    assert calls["ask_collaborate"] == 0, calls
+    assert calls["ask_single"] == 1, calls
 
 
 def test_parallel_command_is_backgrounded():
@@ -336,7 +336,7 @@ def main():
         test_background_job_runner_prints_queued_notice_only_when_busy,
         test_background_job_runner_continues_after_a_job_raises,
         test_agree_command_returns_to_prompt_before_the_job_finishes,
-        test_auto_classified_collaborate_mode_is_also_backgrounded,
+        test_plain_text_no_longer_auto_classified_into_collaborate_mode,
         test_parallel_command_is_backgrounded,
         test_resume_all_command_is_backgrounded,
         test_second_agree_while_first_still_running_shows_queued_notice,

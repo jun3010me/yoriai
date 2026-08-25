@@ -3269,3 +3269,74 @@ CLIツールを作って」のようなPython前提の依頼も、これまで�
   実際のログファイルへ記録されること、`_project_name_with_date_prefix`の
   日付プレフィックス付与を計12件で検証した。既存の全テストファイル
   (28ファイル)を実行し直し、リグレッションが無いことも確認した。
+
+### 平文の実行モード自動判定(コマンド不要化)の廃止
+
+前節の会話履歴の一本化だけでは、利用者から「対話プロトコルが人間の確認を
+求めて一時停止した直後に感想を送っても、`[判断: 単発の質問と判断しました]`
+と表示されて無関係な新規のやり取りとして扱われる」という指摘が続いた。
+原因は、会話履歴自体は共有されるようになっていても、コマンド無しの発言は
+依然として`_classify_execution_mode`によるキーワード判定(「作って」で
+協業モードへ、「意見を聞かせて」で比較モードへ、等)を毎回経由しており、
+これが「続きの発言なのに新規判定される」という体感につながっていたこと
+だった。利用者に選択肢を示したところ、「自動判定を廃止し、常に会話の
+続きとして扱う。新しいことをしたいときは`//agree`等で明示する」という
+方針が明示的に選ばれた。
+
+- **`_classify_execution_mode`関数自体は削除せず、`_run_repl_client`の
+  ディスパッチから呼ぶのをやめるだけにとどめた理由**: この関数を直接
+  ユニットテストしている既存テスト(`test_auto_mode_and_agree.py`・
+  `test_fix_project.py`)や、`_run_repl_client`全体を通したテストで
+  `yoriai._classify_execution_mode`を退避・差し替える`spy_classify`
+  パターンを使っているテストファイル(`test_background_collaborate.py`・
+  `test_repl_input_handling.py`・`test_double_ctrl_c_emergency_exit.py`)が
+  複数あり、関数自体を削除すると`AttributeError`でこれらが軒並み壊れる。
+  関数はまだ正しく動作する独立したロジックであり、呼び出さなくなった
+  だけなので、削除によるテスト資産の破壊とのトレードオフに見合わないと
+  判断し、呼び出し側だけを変更した。
+- **修正セッション(`_FixSession`)中の「無関係な話題と自動判定されたら
+  セッションを終了する」仕組み(`unrelated_streak`)も同時に廃止した
+  理由**: この仕組み自体が`_classify_execution_mode`のCOMPARE/
+  COLLABORATE判定に依存しており、「常に続きとして扱う」という新方針とは
+  相容れない。コマンド無しの発言は、修正セッション中かどうかによらず
+  一律に「今の会話の続き」として扱うのが一貫性のある設計だと判断した。
+  `_FixSession.unrelated_streak`フィールド自体(値を書き換えるコードが
+  無くなっただけ)は、`touch()`の単体テストがまだ検証しているため残した。
+- **既存テストの扱い**: 平文の自動判定に依存していた既存テスト
+  (`test_repl_input_handling.py`の`test_normal_input_still_reaches_
+  mode_classification`、`test_background_collaborate.py`の
+  `test_auto_classified_collaborate_mode_is_also_backgrounded`、
+  `test_fix_session.py`の`test_unrelated_topics_streak_ends_the_
+  session_after_the_limit`・`test_a_single_unrelated_topic_does_not_
+  end_the_session`・`test_natural_production_request_ends_the_active_
+  fix_session`)は、廃止された挙動をそのまま検証していたため、削除
+  または新方針(常に続きとして扱われる)を検証する内容に書き換えた。
+- **デバッグの過程で見つかった別件の重大なバグ**: 前節の
+  `_run_job_with_conversation_log`(バックグラウンドジョブの出力を
+  `_StdoutTee`で捕捉する仕組み)に、`sys.stdout`を無条件に元の値へ戻す
+  実装のままだと、ジョブの実行時間が呼び出し元のコンテキスト
+  (`patch_stdout()`やテストの`contextlib.redirect_stdout`)より長引いた
+  場合に、既に別の値へ復元済みの`sys.stdout`を古い値で上書きしてしまい、
+  以降のprintがすべて見えなくなる(テストで言えば、あるテストの
+  `io.StringIO`がグローバルな`sys.stdout`に居座り続け、後続の全テストの
+  出力が消える)不具合が実際に発生することが分かった。テストスイート全体を
+  繰り返し実行して初めて再現した。`sys.stdout is tee`(自分が設置した
+  ものがまだ現役かどうか)を確認してから復元するようガードし、他の
+  コンテキストが既に復元し終えていた場合は何もしない(上書きしない)
+  ように修正した。
+- **既知の別件(今回のバグではない)**: `test_fix_session.py`の一部の
+  REPL統合テストが、`prompt_toolkit`の仮想入力(`create_pipe_input`)と
+  バックグラウンドジョブキューのタイミングに起因すると見られる、
+  ごく低頻度(15回中2〜5回程度)の失敗を示すことを確認した。この
+  フリーキーさは、今回の変更を一切含まない`main`ブランチの元のコミット
+  (`89b04d8`)でも同じ頻度で再現することを確認済みであり、今回の変更に
+  よって持ち込まれたものではない(範囲外の既存の課題として記録するに
+  とどめる)。
+- **検証**: 平文がもはや`_classify_execution_mode`を経由しないこと、
+  常に`_ask_organization`(単発質問扱い)に渡ること、修正セッション中の
+  コマンド無しの発言が常にセッションの続きとして扱われること(以前の
+  閾値回数を超えて雑談を送っても終了しないこと)を、更新した既存テスト
+  および起動時案内文の文言修正で確認した。既存の全テストファイル
+  (28ファイル)を複数回実行し直し、今回の変更によるリグレッションが
+  無いことを確認した(前述の`test_fix_session.py`のタイミング起因の
+  低頻度な失敗を除く)。
