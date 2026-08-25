@@ -383,10 +383,10 @@ def test_execute_project_tool_call_dispatches_run_command():
 
 
 def test_project_tools_schemas_use_run_command_not_run_test():
-    tool_names = {schema["function"]["name"] for schema in yoriai.PROJECT_TOOLS_SCHEMAS}
+    tool_names = {schema["function"]["name"] for schema in tools.PROJECT_TOOLS_SCHEMAS}
     assert "run_command" in tool_names, tool_names
     assert "run_test" not in tool_names, tool_names
-    assert tools.RUN_COMMAND_TOOL_NAME in yoriai.PROJECT_TOOLS_CLIENT_NAMES
+    assert tools.RUN_COMMAND_TOOL_NAME in tools.PROJECT_TOOLS_CLIENT_NAMES
 
 
 def main():

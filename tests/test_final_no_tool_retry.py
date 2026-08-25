@@ -17,6 +17,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import llm_stream  # noqa: E402
+import tools  # noqa: E402
 import yoriai  # noqa: E402
 
 
@@ -40,22 +42,22 @@ def test_round_limit_with_empty_content_falls_back_to_final_no_tool_query():
             yield {"content": "ツール無しで分かる範囲の回答です"}
             yield {"tool_calls": []}
 
-    original_turn = yoriai._stream_openai_compatible_turn
-    original_search = yoriai.web_search
-    yoriai._stream_openai_compatible_turn = fake_turn
-    yoriai.web_search = lambda query: [{"title": "dummy", "url": "http://example.com", "snippet": "dummy"}]
+    original_turn = llm_stream._stream_openai_compatible_turn
+    original_search = tools.web_search
+    llm_stream._stream_openai_compatible_turn = fake_turn
+    tools.web_search = lambda query: [{"title": "dummy", "url": "http://example.com", "snippet": "dummy"}]
     try:
-        events = list(yoriai.stream_chat_completion(
+        events = list(llm_stream.stream_chat_completion(
             "thinking-model", [{"role": "user", "content": "念入りに調べて回答して"}],
         ))
     finally:
-        yoriai._stream_openai_compatible_turn = original_turn
-        yoriai.web_search = original_search
+        llm_stream._stream_openai_compatible_turn = original_turn
+        tools.web_search = original_search
 
     # ラウンド0,1,2,3(MAX_TOOL_CALL_ROUNDS+1回)まではツール付きで
     # web_searchだけを要求し続け、最後にtools無しの1往復が追加で
     # 呼ばれるはずなので、合計で MAX_TOOL_CALL_ROUNDS + 2 回問い合わせる。
-    assert call_count["n"] == yoriai.MAX_TOOL_CALL_ROUNDS + 2, (
+    assert call_count["n"] == llm_stream.MAX_TOOL_CALL_ROUNDS + 2, (
         f"tools無し最終問い合わせを含めた呼び出し回数が想定と異なります: {call_count['n']}"
     )
     contents = [e["content"] for e in events if "content" in e]
@@ -84,21 +86,21 @@ def test_final_no_tool_query_still_empty_is_treated_as_no_valid_response():
             # tools無しでもなお空(content無し・tool_calls無し)を返すケース。
             yield {"tool_calls": []}
 
-    original_turn = yoriai._stream_openai_compatible_turn
-    original_search = yoriai.web_search
-    yoriai._stream_openai_compatible_turn = fake_turn
-    yoriai.web_search = lambda query: [{"title": "dummy", "url": "http://example.com", "snippet": "dummy"}]
+    original_turn = llm_stream._stream_openai_compatible_turn
+    original_search = tools.web_search
+    llm_stream._stream_openai_compatible_turn = fake_turn
+    tools.web_search = lambda query: [{"title": "dummy", "url": "http://example.com", "snippet": "dummy"}]
     try:
-        events = list(yoriai.stream_chat_completion(
+        events = list(llm_stream.stream_chat_completion(
             "thinking-model", [{"role": "user", "content": "念入りに調べて回答して"}],
         ))
     finally:
-        yoriai._stream_openai_compatible_turn = original_turn
-        yoriai.web_search = original_search
+        llm_stream._stream_openai_compatible_turn = original_turn
+        tools.web_search = original_search
 
     # tools無し最終問い合わせは1回限りで、そこでも空ならそれ以上は
     # 再試行せずに終了する(無限ループにならない)。
-    assert call_count["n"] == yoriai.MAX_TOOL_CALL_ROUNDS + 2, (
+    assert call_count["n"] == llm_stream.MAX_TOOL_CALL_ROUNDS + 2, (
         f"tools無し最終問い合わせが1回だけ行われるはずです: {call_count['n']}"
     )
     contents = [e["content"] for e in events if "content" in e]
@@ -136,17 +138,17 @@ def test_final_no_tool_query_still_detects_leaked_tool_call_syntax():
             yield {"content": '<tool_call>\n{"name": "read_file", "arguments": {}}\n</tool_call>'}
             yield {"tool_calls": []}
 
-    original_turn = yoriai._stream_openai_compatible_turn
-    original_search = yoriai.web_search
-    yoriai._stream_openai_compatible_turn = fake_turn
-    yoriai.web_search = lambda query: [{"title": "dummy", "url": "http://example.com", "snippet": "dummy"}]
+    original_turn = llm_stream._stream_openai_compatible_turn
+    original_search = tools.web_search
+    llm_stream._stream_openai_compatible_turn = fake_turn
+    tools.web_search = lambda query: [{"title": "dummy", "url": "http://example.com", "snippet": "dummy"}]
     try:
-        events = list(yoriai.stream_chat_completion(
+        events = list(llm_stream.stream_chat_completion(
             "thinking-model", [{"role": "user", "content": "念入りに調べて回答して"}],
         ))
     finally:
-        yoriai._stream_openai_compatible_turn = original_turn
-        yoriai.web_search = original_search
+        llm_stream._stream_openai_compatible_turn = original_turn
+        tools.web_search = original_search
 
     contents = [e["content"] for e in events if "content" in e]
     assert contents == [], f"漏れたツール呼び出し記法がcontentとして漏れてはいけません: {events}"
@@ -167,14 +169,14 @@ def test_content_produced_before_round_limit_does_not_trigger_final_no_tool_quer
         yield {"content": "1回で答えられます"}
         yield {"tool_calls": []}
 
-    original_turn = yoriai._stream_openai_compatible_turn
-    yoriai._stream_openai_compatible_turn = fake_turn
+    original_turn = llm_stream._stream_openai_compatible_turn
+    llm_stream._stream_openai_compatible_turn = fake_turn
     try:
-        events = list(yoriai.stream_chat_completion(
+        events = list(llm_stream.stream_chat_completion(
             "simple-model", [{"role": "user", "content": "こんにちは"}],
         ))
     finally:
-        yoriai._stream_openai_compatible_turn = original_turn
+        llm_stream._stream_openai_compatible_turn = original_turn
 
     assert call_count["n"] == 1, f"1回で完了するはずです: {call_count['n']}"
     contents = [e["content"] for e in events if "content" in e]

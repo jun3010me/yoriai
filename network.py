@@ -11,13 +11,11 @@ Tailscale経由の発見。
 `start_card_server`・`get_local_ip`・`get_physical_lan_ips`・
 `YoriaiListener`・`discover_via_tailscale`)は、まだ`yoriai.py`側に残って
 いるコード(mDNS起動処理を含む`run_agent`)からも呼ばれるため、`yoriai.py`
-側で`from network import ...`して使う。逆に`CardRequestHandler`は、まだ
-`yoriai.py`側に残っている関数(`build_profile_card`・
-`stream_chat_completion`。将来`llm_stream.py`へ移動予定)を呼ぶ必要が
-あるが、`yoriai.py`が本モジュールをimportしているため、モジュール
-読み込み時点でのトップレベルimportは循環importになってしまう。そのため、
-これらは実際に呼ばれるメソッドの内部で遅延import(呼び出し時には両
-モジュールとも読み込みが完了しているため問題なく解決できる)している。
+側で`from network import ...`して使う。逆に`CardRequestHandler`が呼ぶ
+`build_profile_card`・`stream_chat_completion`は、モジュール分割第三弾で
+`yoriai.py`から`llm_stream.py`へ移動した。`network.py`と`llm_stream.py`の
+間に循環依存は無いため(`llm_stream.py`は`network.py`を一切importしない)、
+これら2つは`llm_stream`からトップレベルで直接importしている。
 
 `discover_via_tailscale`は既存の`tailscale.py`(Tailscale CLIのラッパー、
 `find_cli`/`get_peers`)を呼び出すだけで、ロジックの重複は無い(統合は
@@ -39,6 +37,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import requests
 
 import tailscale
+from llm_stream import build_profile_card, stream_chat_completion
 from tools import PROJECT_TOOLS_CLIENT_NAMES, PROJECT_TOOLS_SCHEMAS
 from yoriai_types import (
     CARD_REQUEST_TIMEOUT_SEC,
@@ -200,13 +199,11 @@ class CardRequestHandler(BaseHTTPRequestHandler):
         return True
 
     def _handle_card(self):
-        from yoriai import build_profile_card
         if not self._check_org_fingerprint():
             return
         self._send_json(build_profile_card(self.agent_id))
 
     def _handle_status(self):
-        from yoriai import build_profile_card
         # 仮の判断: --status はこのエンドポイントに問い合わせるだけの軽量な
         # コマンドにしたいので、自分自身のカードと、mDNS/Tailscaleでこれまでに
         # 発見済みのピア一覧(PeerRegistryのスナップショット)をまとめて返す。
@@ -220,7 +217,6 @@ class CardRequestHandler(BaseHTTPRequestHandler):
         })
 
     def _handle_chat(self):
-        from yoriai import stream_chat_completion
         # 仮の判断: /chat も /card と同じくトークンのフィンガープリントで認証する。
         if not self._check_org_fingerprint():
             return

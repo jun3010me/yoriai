@@ -19,6 +19,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import llm_stream  # noqa: E402
 import yoriai  # noqa: E402
 
 
@@ -51,7 +52,7 @@ def test_mlx_lm_prioritized_over_lmstudio_when_no_ollama():
         ollama_loaded=[],
         lmstudio_models=["qwen3-235b-a22b"],
         mlx_lm_models=["mlx-community/Qwen2.5-7B-Instruct-4bit"],
-        fn=lambda: yoriai.build_profile_card("test-agent"),
+        fn=lambda: llm_stream.build_profile_card("test-agent"),
     )
 
     assert card["models"]["loaded"][0] == "mlx-community/Qwen2.5-7B-Instruct-4bit", (
@@ -76,7 +77,7 @@ def test_ollama_still_wins_over_mlx_lm_and_lmstudio():
         ollama_loaded=["llama3"],
         lmstudio_models=["qwen3-235b-a22b"],
         mlx_lm_models=["mlx-community/Qwen2.5-7B-Instruct-4bit"],
-        fn=lambda: yoriai.build_profile_card("test-agent"),
+        fn=lambda: llm_stream.build_profile_card("test-agent"),
     )
 
     assert card["models"]["loaded"][0] == "llama3", (
@@ -96,7 +97,7 @@ def test_lmstudio_used_when_mlx_lm_not_running():
         ollama_loaded=[],
         lmstudio_models=["qwen3-235b-a22b"],
         mlx_lm_models=[],
-        fn=lambda: yoriai.build_profile_card("test-agent"),
+        fn=lambda: llm_stream.build_profile_card("test-agent"),
     )
 
     assert card["models"]["loaded"][0] == "qwen3-235b-a22b", (

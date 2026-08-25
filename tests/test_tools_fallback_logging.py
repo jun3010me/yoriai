@@ -20,6 +20,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import llm_stream  # noqa: E402
 import yoriai  # noqa: E402
 
 
@@ -64,14 +65,14 @@ def test_tools_rejected_triggers_retry_and_logs_it():
             yield {"content": "OK without tools"}
             yield {"tool_calls": []}
 
-    original = yoriai._stream_openai_compatible_turn
-    yoriai._stream_openai_compatible_turn = fake_turn
+    original = llm_stream._stream_openai_compatible_turn
+    llm_stream._stream_openai_compatible_turn = fake_turn
     try:
         events, logs = _run_with_capture(
-            lambda: list(yoriai.stream_chat_completion("qwen3-coder-30b", [{"role": "user", "content": "fix bug"}]))
+            lambda: list(llm_stream.stream_chat_completion("qwen3-coder-30b", [{"role": "user", "content": "fix bug"}]))
         )
     finally:
-        yoriai._stream_openai_compatible_turn = original
+        llm_stream._stream_openai_compatible_turn = original
 
     assert any("[tools無し再試行]" in line and "qwen3-coder-30b" in line for line in logs), (
         f"発動ログ([tools無し再試行])が見つかりません: {logs}"
@@ -97,14 +98,14 @@ def test_resource_error_does_not_trigger_retry_despite_matching_status_code():
             "status_code": 400,
         }
 
-    original = yoriai._stream_openai_compatible_turn
-    yoriai._stream_openai_compatible_turn = fake_turn
+    original = llm_stream._stream_openai_compatible_turn
+    llm_stream._stream_openai_compatible_turn = fake_turn
     try:
         events, logs = _run_with_capture(
-            lambda: list(yoriai.stream_chat_completion("qwen/qwen3-coder-30b", [{"role": "user", "content": "fix bug"}]))
+            lambda: list(llm_stream.stream_chat_completion("qwen/qwen3-coder-30b", [{"role": "user", "content": "fix bug"}]))
         )
     finally:
-        yoriai._stream_openai_compatible_turn = original
+        llm_stream._stream_openai_compatible_turn = original
 
     assert not any("[tools無し再試行]" in line for line in logs), (
         f"ツールと無関係なエラーなのに再試行が発動しています: {logs}"
@@ -124,14 +125,14 @@ def test_non_tools_status_code_does_not_trigger_retry_and_logs_it():
     def fake_turn(base_url, model, messages, tools):
         yield {"error": "401: unauthorized", "status_code": 401}
 
-    original = yoriai._stream_openai_compatible_turn
-    yoriai._stream_openai_compatible_turn = fake_turn
+    original = llm_stream._stream_openai_compatible_turn
+    llm_stream._stream_openai_compatible_turn = fake_turn
     try:
         events, logs = _run_with_capture(
-            lambda: list(yoriai.stream_chat_completion("some-model", [{"role": "user", "content": "hi"}]))
+            lambda: list(llm_stream.stream_chat_completion("some-model", [{"role": "user", "content": "hi"}]))
         )
     finally:
-        yoriai._stream_openai_compatible_turn = original
+        llm_stream._stream_openai_compatible_turn = original
 
     assert any("[tools無し再試行なし]" in line for line in logs), (
         f"非発動ログ([tools無し再試行なし])が見つかりません: {logs}"
@@ -158,7 +159,7 @@ def test_http_error_response_body_is_logged():
             import json
             return json.loads(self.text)
 
-    event, logs = _run_with_capture(lambda: yoriai._log_and_build_http_error("http://localhost:1234", _FakeResponse()))
+    event, logs = _run_with_capture(lambda: llm_stream._log_and_build_http_error("http://localhost:1234", _FakeResponse()))
 
     assert event["status_code"] == 400
     assert "context length exceeded for tools" in event["error"], event

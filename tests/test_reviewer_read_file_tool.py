@@ -49,7 +49,9 @@ import io
 import contextlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import llm_stream  # noqa: E402
 import yoriai  # noqa: E402
+import yoriai_types  # noqa: E402
 
 
 def _member(label, model):
@@ -180,17 +182,17 @@ def test_stream_chat_completion_yields_pending_tool_calls_for_client_tool_withou
             ],
         }
 
-    original = yoriai._stream_openai_compatible_turn
-    yoriai._stream_openai_compatible_turn = fake_turn
+    original = llm_stream._stream_openai_compatible_turn
+    llm_stream._stream_openai_compatible_turn = fake_turn
     try:
-        events = list(yoriai.stream_chat_completion(
+        events = list(llm_stream.stream_chat_completion(
             "some-review-model",
             [{"role": "user", "content": "cli.pyをレビューしてください"}],
-            extra_tools=[yoriai.READ_FILE_TOOL_SCHEMA],
+            extra_tools=[yoriai_types.READ_FILE_TOOL_SCHEMA],
             client_tool_names={yoriai.READ_FILE_TOOL_NAME},
         ))
     finally:
-        yoriai._stream_openai_compatible_turn = original
+        llm_stream._stream_openai_compatible_turn = original
 
     assert len(events) == 1 and "pending_tool_calls" in events[0], (
         f"read_file要求時はpending_tool_callsを1件だけyieldして終了するはずです: {events}"
@@ -495,17 +497,17 @@ def test_review_offers_search_in_file_tool_alongside_read_file():
         yield {"content": "問題なし"}
         yield {"done": True}
 
-    original = yoriai._stream_openai_compatible_turn
-    yoriai._stream_openai_compatible_turn = fake_turn
+    original = llm_stream._stream_openai_compatible_turn
+    llm_stream._stream_openai_compatible_turn = fake_turn
     try:
-        list(yoriai.stream_chat_completion(
+        list(llm_stream.stream_chat_completion(
             "some-review-model",
             [{"role": "user", "content": "cli.pyをレビューしてください"}],
-            extra_tools=[yoriai.READ_FILE_TOOL_SCHEMA, yoriai.SEARCH_IN_FILE_TOOL_SCHEMA],
+            extra_tools=[yoriai_types.READ_FILE_TOOL_SCHEMA, yoriai_types.SEARCH_IN_FILE_TOOL_SCHEMA],
             client_tool_names={yoriai.READ_FILE_TOOL_NAME, yoriai.SEARCH_IN_FILE_TOOL_NAME},
         ))
     finally:
-        yoriai._stream_openai_compatible_turn = original
+        llm_stream._stream_openai_compatible_turn = original
 
 
 def test_collect_review_answer_with_read_file_dispatches_search_in_file():
