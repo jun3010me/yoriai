@@ -3548,6 +3548,14 @@ _DIALOGUE_CRITIC_TEMPLATE = """あなたは{speaker_label}さんとして、複�
 
 提案の問題点・リスク・抜け漏れを具体的に指摘してください。問題が無ければその旨を書いてください。
 
+指摘は、依頼の規模・目的に見合った範囲にとどめてください。個人利用・学習用・
+実験的な小さな依頼に対して、大規模なサービス運用を前提にしたセキュリティ
+要件、本来の依頼にない汎用的なAPI仕様の整備、過剰な抽象化・拡張性など、
+依頼された範囲を超える論点を持ち出して話を大きくしないでください。依頼の
+規模に対して明らかに不釣り合いな懸念しか無い場合は、それを理由に「評価:
+要修正」にはせず、「参考: 〜」として触れるにとどめたうえで「評価: 合意」
+としてください。
+
 出力の最後に、次のいずれか1つを必ず独立した行として書いてください:
 評価: 合意
 評価: 要修正
@@ -3567,7 +3575,7 @@ _DIALOGUE_INTEGRATOR_TEMPLATE = """あなたは{speaker_label}さんとして、
 【これまでの議論】
 {transcript}
 
-これまでの議論を踏まえ、次のいずれか1つを独立した行として必ず書いてください:
+これまでの議論を踏まえ、次のいずれか1つを独立した行として必ず書いてください。反論役の指摘が、依頼の規模・目的に見合わない過剰な要求(小さな依頼への大規模なセキュリティ要件・汎用的なAPI仕様の整備など)に留まる場合は、それを理由に「判定: 継続」にせず「判定: 合意」としてください:
 判定: 合意
 判定: 継続
 判定: 人間に確認
@@ -3831,10 +3839,14 @@ def _report_dialogue_result(result: dict, project_dir: str, dialogue_id: str, to
     """対話の結果を画面に表示し、議事録・要約を(与えられた場合は)
     ディスクに保存する共通処理。
 
-    合意に達した場合(DIALOGUE_STATUS_CONSENSUS)以外は、それまでの
-    議事録全文と要約を人間に提示し、続行するか終了するかの判断を
-    人間に委ねる(対話プロトコルだけで次のフェーズへ自動的に進む
-    ことはしない)。
+    仮の判断(依頼: 対話プロトコルへの人間の介入を必須にしない): 以前は
+    合意(DIALOGUE_STATUS_CONSENSUS)以外の結果が出た時点でこの関数自身が
+    「続行するか終了するかは人間の判断です」という一時停止メッセージを
+    表示していたが、これをやめた。対話プロトコルは実装前の複数視点による
+    すり合わせであり、合意形成そのものが人間の判断を待つゲートではない
+    ため。この関数は議事録・要約の保存と結果の客観的な報告のみを行い、
+    合意に至らなかった場合にどう決着させるか(代表1名による単独確定、
+    `_finalize_dialogue_solo`)は各呼び出し元がこれに続けて行う。
     """
     if result["status"] == DIALOGUE_STATUS_NO_ENGAGEMENT:
         return
@@ -3849,10 +3861,36 @@ def _report_dialogue_result(result: dict, project_dir: str, dialogue_id: str, to
     if result["status"] == DIALOGUE_STATUS_SAFETY_LIMIT:
         print(f"[⏸️ 対話プロトコル: {_DIALOGUE_STATUS_LABEL_JA[DIALOGUE_STATUS_SAFETY_LIMIT]}]")
     else:
-        print("[🙋 対話プロトコル: 合意に至らず、人間の確認が必要です]")
+        print(f"[🙋 対話プロトコル: {_DIALOGUE_STATUS_LABEL_JA[DIALOGUE_STATUS_NEEDS_HUMAN]}]")
     if result.get("human_message"):
         print(result["human_message"])
-    print(_DIALOGUE_PAUSE_HUMAN_JUDGEMENT_MARKER)
+
+
+# 仮の判断(依頼: 対話プロトコルへの人間の介入を必須にしない): 反論役・
+# 統合役が合意に至らなかった場合(セーフティリミット到達・情報不足の
+# 表明等)でも、そこで立ち止まって人間の回答を待つのではなく、代表1名
+# (`architect`、各対話の提案役)がそれまでの議論を踏まえて単独で結論を
+# 確定し、そのまま後続のフェーズ(実装等)へ進む。人間が関わるのは対話の
+# 途中ではなく、議事録・要約という記録と最終的な成果物を見た後になる
+# (中断するのは、この単独確定の問い合わせ自体が失敗した=疎通の問題が
+# あった場合のみ。これは議論が難航した結果ではないため、人間に確認するに
+# 値する)。
+def _finalize_dialogue_solo(architect: dict, org_fingerprint: str, prompt: str) -> tuple:
+    """合意に至らなかった対話を、代表1名(`architect`)の単独判断で確定
+    させる。戻り値は`(確定した内容, 中断すべきかどうか)`。
+    """
+    answer, error, truncated = _collect_answer_from_candidate(
+        architect, org_fingerprint, [{"role": "user", "content": prompt}],
+    )
+    if error or not answer:
+        print(f"{architect['label']} への単独確定の問い合わせに失敗しました: {error or '応答がありませんでした'}")
+        print(_DIALOGUE_PAUSE_HUMAN_JUDGEMENT_MARKER)
+        return "", True
+    if truncated:
+        print(f"[⚠️ {architect['label']} の応答が長すぎたため、{CHAT_MAX_OUTPUT_TOKENS}トークンで打ち切られました。以下は不完全な内容の可能性があります]")
+    print(f"[🧭 {architect['label']} の回答(対話プロトコルは合意に至りませんでしたが、単独で結論を確定してそのまま続行します)]")
+    print(answer)
+    return answer, False
 
 
 # ---------------------------------------------------------------------------
@@ -3995,10 +4033,12 @@ def _run_design_dialogue(org_fingerprint: str, request: str, candidates: list, p
     場合に人間の回答を受けて対話を再開する`_resume_design_dialogue`が、
     それまでの議事録・要約を引き継ぐために使う。
 
-    合意に至らなかった場合(セーフティリミット・人間の確認が必要)は、
-    議事録・要約をディスクに保存したうえで中断を指示する(呼び出し元は
-    実装フェーズに進まない)。対話プロトコルだけで次のフェーズへ自動的に
-    進むことはしないという要件のため、最終的な続行判断は人間に委ねる。
+    合意に至らなかった場合(セーフティリミット・情報不足の表明等)は、
+    議事録・要約をディスクに保存したうえで、立ち止まって人間の回答を
+    待つのではなく、代表1名(`architect`)がそれまでの議論を踏まえて
+    単独で計画を確定し、そのまま実装フェーズへ進む(`_finalize_dialogue_
+    solo`。対話プロトコルへの人間の介入を必須にしないという方針のため)。
+    中断するのは、その単独確定の問い合わせ自体が失敗した場合のみ。
     """
     architect = candidates[0]
     print(
@@ -4018,13 +4058,23 @@ def _run_design_dialogue(org_fingerprint: str, request: str, candidates: list, p
     if result["status"] == DIALOGUE_STATUS_NO_ENGAGEMENT:
         print("設計担当から応答が得られませんでした。")
         return "", True, result
-    if result["status"] != DIALOGUE_STATUS_CONSENSUS:
-        return "", True, result
+    if result["status"] == DIALOGUE_STATUS_CONSENSUS:
+        final_content = result["final_content"] or ""
+        print("[🧭 対話プロトコルで合意した計画(そのまま表示)]")
+        print(final_content)
+        return final_content, False, result
 
-    final_content = result["final_content"] or ""
-    print("[🧭 対話プロトコルで合意した計画(そのまま表示)]")
-    print(final_content)
-    return final_content, False, result
+    print(
+        f"[🧭 合意には至りませんでしたが、対話プロトコルは人間の確認を待たずに進めるため、"
+        f"{architect['label']}さんがこれまでの議論を踏まえて単独で計画を確定します...]"
+    )
+    finalize_prompt = (
+        f"{_build_module_breakdown_prompt(request)}\n\n"
+        f"【これまでの議論の経緯】\n{_format_dialogue_transcript_for_prompt(result['transcript'])}\n\n"
+        "上記を踏まえて、あなた一人の判断でファイル分割案を確定してください。"
+    )
+    final_content, aborted = _finalize_dialogue_solo(architect, org_fingerprint, finalize_prompt)
+    return final_content, aborted, result
 
 
 # 仮の判断(不具合修正: 対話プロトコル一時停止後、実装フェーズに繋がらない
@@ -4193,6 +4243,23 @@ def _ask_organization_plan_only(port: int, org_fingerprint: str, request: str, o
     if result["status"] == DIALOGUE_STATUS_CONSENSUS:
         print("[🧭 対話プロトコルでまとまった計画(そのまま表示)]")
         print(result["final_content"] or "")
+        return
+
+    print(
+        f"[🧭 合意には至りませんでしたが、対話プロトコルは人間の確認を待たずに進めるため、"
+        f"{architect['label']}さんがこれまでの議論を踏まえて計画を単独で確定します...]"
+    )
+    finalize_prompt = (
+        "あなたはソフトウェア設計の計画立案を担当します。\n\n"
+        f"以下の依頼について、実装には進まず計画のみを検討しています。\n\n依頼内容: {request}\n\n"
+        f"{_build_plan_only_output_instruction()}\n\n"
+        f"【これまでの議論の経緯】\n{_format_dialogue_transcript_for_prompt(result['transcript'])}\n\n"
+        "上記を踏まえて、あなた一人の判断で計画を確定してください。"
+    )
+    final_content, aborted = _finalize_dialogue_solo(architect, org_fingerprint, finalize_prompt)
+    if not aborted:
+        print("[🧭 対話プロトコルでまとまった計画(そのまま表示)]")
+        print(final_content)
 
 
 # 仮の判断: PROGRESS.mdに記録する「使用言語」は、依頼文から推測した言語
@@ -6324,9 +6391,13 @@ def _run_fix_approach_dialogue(
     (問い合わせに失敗した場合は安全側にフォールバックする)と一貫しない
     体験になる。そのため、提案役から一度も実のある応答が得られなかった
     場合(`DIALOGUE_STATUS_NO_ENGAGEMENT`)は、対話を行わなかったことに
-    して元の依頼文のまま処理を続行する。実際に議論が行われたが合意に
-    至らなかった場合(セーフティリミット・人間の確認が必要)は、依頼の
-    要件通り議事録・要約を保存したうえで中断する。
+    して元の依頼文のまま処理を続行する。実際に議論は行われたが合意に
+    至らなかった場合(セーフティリミット・情報不足の表明等)は、対話
+    プロトコルへの人間の介入を必須にしないという方針に従い、立ち止まって
+    人間の回答を待つのではなく、代表1名(`architect`)がそれまでの議論を
+    踏まえて単独で修正方針を確定し、そのまま処理を続行する
+    (`_finalize_dialogue_solo`。中断するのは、その単独確定の問い合わせ
+    自体が失敗した場合のみ)。
     """
     architect = candidates[0]
     print(f"[🧭 対話プロトコルによる修正方針の事前合意: {architect['label']}さんを中心に議論します...]")
@@ -6347,14 +6418,29 @@ def _run_fix_approach_dialogue(
 
     _report_dialogue_result(result, project_dir, "fix", f"修正依頼「{request}」の方針")
 
-    if result["status"] != DIALOGUE_STATUS_CONSENSUS:
-        return request, True
+    if result["status"] == DIALOGUE_STATUS_CONSENSUS:
+        agreed_approach = (result["final_content"] or "").strip()
+        if not agreed_approach:
+            return request, False
+        print("[🧭 対話プロトコルで合意した修正方針]")
+        print(agreed_approach)
+        return f"{request}\n\n[対話プロトコルで事前合意した修正方針]\n{agreed_approach}", False
 
-    agreed_approach = (result["final_content"] or "").strip()
+    print(
+        f"[🧭 合意には至りませんでしたが、対話プロトコルは人間の確認を待たずに進めるため、"
+        f"{architect['label']}さんがこれまでの議論を踏まえて修正方針を単独で確定します...]"
+    )
+    finalize_prompt = (
+        f"あなたはソフトウェア修正の方針を決定します。\n\n{background}\n\n"
+        f"【これまでの議論の経緯】\n{_format_dialogue_transcript_for_prompt(result['transcript'])}\n\n"
+        f"上記を踏まえて、あなた一人の判断で修正方針を確定してください。{_build_fix_dialogue_output_instruction()}"
+    )
+    agreed_approach, aborted = _finalize_dialogue_solo(architect, org_fingerprint, finalize_prompt)
+    if aborted:
+        return request, True
+    agreed_approach = agreed_approach.strip()
     if not agreed_approach:
         return request, False
-    print("[🧭 対話プロトコルで合意した修正方針]")
-    print(agreed_approach)
     return f"{request}\n\n[対話プロトコルで事前合意した修正方針]\n{agreed_approach}", False
 
 
