@@ -3091,13 +3091,25 @@ _RUN_COMMAND_BLOCKED_COMMAND_NAMES = {
 # -fsyntax-onlyのみ許可」のような決め打ちをやめ、モデルが自分でコマンドを
 # 選べるようにしたことの裏返しとして必要になった防御)。
 _RUN_COMMAND_BLOCKED_FLAGS_BY_INTERPRETER = {
-    "python3": {"-c", "-m", "-i"},
-    "python": {"-c", "-m", "-i"},
+    "python3": {"-c", "-i"},
+    "python": {"-c", "-i"},
     "node": {"-e", "--eval", "-p", "--print", "-r", "--require", "-i", "--interactive"},
     "ruby": {"-e"},
     "perl": {"-e", "-E"},
     "php": {"-r"},
 }
+
+# 仮の判断(統合検証ループへの対応): 以前は`-m`もインタプリタ全体への
+# ブロック対象フラグとして一律禁止していたが、これでは`python3 -m pytest`
+# `python3 -m py_compile`のような正当な検証手段まで塞いでしまい、
+# 統合検証ループ(実行して落ちたら直す)の実現の妨げになる。そこで`-m`は
+# 全面禁止をやめ、直後に来るモジュール名がこの許可リストにある場合のみ
+# 通す方式に緩和する(検証コマンド・run_commandの両方に効く)。
+# `http.server`はサーバーが起動しっぱなしになるが、RUN_COMMAND_TIMEOUT_SEC
+# (10秒)で必ず強制終了されるため問題ない。判断に迷うモジュール
+# (`webbrowser`・`pdb`・`venv`等、任意のコード実行や外部プロセス起動に
+# つながりうるもの)は含めず、必要になった時点で個別に追加する方針とする。
+_PYTHON_ALLOWED_MODULES = {"pytest", "unittest", "py_compile", "compileall", "json.tool", "http.server"}
 
 
 def _validate_run_command(command: str) -> tuple:
@@ -3138,6 +3150,15 @@ def _validate_run_command(command: str) -> tuple:
                 f"'{parts[0]}'の{'/'.join(sorted(used))}は任意のコード実行やネットワークアクセスに"
                 f"つながるため使用できません。検証したいファイルを直接指定してください"
                 f"(例: '{parts[0]} app.py')。"
+            )
+
+    if parts[0] in ("python3", "python") and "-m" in parts[1:]:
+        m_index = parts.index("-m")
+        module = parts[m_index + 1] if m_index + 1 < len(parts) else None
+        if module not in _PYTHON_ALLOWED_MODULES:
+            return None, (
+                f"'{parts[0]} -m {module or ''}'は使用できません。"
+                f"-mで実行できるのは次のモジュールのみです: {', '.join(sorted(_PYTHON_ALLOWED_MODULES))}"
             )
 
     return parts, None
@@ -4295,6 +4316,8 @@ _MODULE_BREAKDOWN_PROMPT_TEMPLATE = """あなたはソフトウェア設計を�
 <ファイル名1>: <実装すべき内容をここに>
 <ファイル名2>: <実装すべき内容をここに(<ファイル名1>の行と完全に同じ関数名を使うこと)>
 
+最後にもう1行、「検証コマンド: <コマンド>」という形式で、このプロジェクトが正しく動くことを確認できる、1つのコマンドを書いてください(例: 検証コマンド: python3 main.py)。実行に人間の入力(標準入力)が必要な対話型ツールの場合や、適切なコマンドが無い場合は「検証コマンド: なし」と書いてください。
+
 依頼内容: {request}
 """
 
@@ -4384,7 +4407,11 @@ def _build_design_dialogue_output_instruction(request: str) -> str:
         "「ファイル名: 実装すべき内容(インターフェースの詳細を含む)」という形式で出力してください"
         "(2〜4ファイル程度を想定します):\n"
         "<ファイル名1>: <実装すべき内容をここに>\n"
-        "<ファイル名2>: <実装すべき内容をここに(<ファイル名1>の行と完全に同じ関数名を使うこと)>"
+        "<ファイル名2>: <実装すべき内容をここに(<ファイル名1>の行と完全に同じ関数名を使うこと)>\n\n"
+        "最後にもう1行、「検証コマンド: <コマンド>」という形式で、このプロジェクトが正しく動くことを"
+        "確認できる、1つのコマンドを書いてください(例: 検証コマンド: python3 main.py)。実行に人間の"
+        "入力(標準入力)が必要な対話型ツールの場合や、適切なコマンドが無い場合は"
+        "「検証コマンド: なし」と書いてください。"
     )
 
 
@@ -4708,6 +4735,52 @@ def _build_collaborative_implementation_request(filename: str, own_content: str,
 # まとめられる。
 _FILE_HEADER_PATTERN = re.compile(r"^([\w./\-]+\.[A-Za-z0-9]+):\s*(.*)$")
 
+# 仮の判断(統合検証ループへの対応): 設計担当への出力形式の指示
+# (`_MODULE_BREAKDOWN_PROMPT_TEMPLATE`・`_build_design_dialogue_output_
+# instruction`)に「検証コマンド: <コマンド>」という行を1行追加した。
+# この行は`_FILE_HEADER_PATTERN`(拡張子付きのファイル名がコロンの直前に
+# ある行)には一致しない(「検証コマンド」は拡張子を持たないため)ため、
+# `_parse_module_breakdown`にそのまま渡すと直前のファイルの詳細行として
+# 誤って取り込まれてしまう。そのため、`_parse_module_breakdown`を呼ぶ前に
+# この行だけを別途抜き出しておく、という2段階の解析にする。
+_VERIFY_COMMAND_LINE_PATTERN = re.compile(r"^検証コマンド\s*[:：]\s*(.*)$")
+
+
+def _extract_verify_command(text: str) -> tuple:
+    """設計担当の回答(モジュール分割案の生テキスト)から「検証コマンド: …」
+    行を抜き出し、`(検証コマンド, その行を取り除いた残りのテキスト)`を返す。
+
+    見つからない場合は`("", text)`を返す(この機能追加より前の出力形式との
+    後方互換。検証コマンドの行を書かないモデルに対しても、従来通り
+    `_parse_module_breakdown`でファイル一覧だけを解析できる)。複数回
+    登場した場合は最初の1件だけを採用し、以降の行はそのまま残す
+    (説明文中に偶然同じ文言が登場しても暴走しないようにするため)。
+    """
+    verify_command = ""
+    found = False
+    remaining_lines = []
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip().lstrip("-*・# ").strip().replace("`", "")
+        match = _VERIFY_COMMAND_LINE_PATTERN.match(stripped)
+        if match and not found:
+            verify_command = match.group(1).strip()
+            found = True
+            continue
+        remaining_lines.append(raw_line)
+    return verify_command, "\n".join(remaining_lines)
+
+
+# 仮の判断: 「検証コマンド: なし」(適切なコマンドが無い・対話型ツールで
+# 標準入力が必要、の2ケース)と、行自体が無かった場合(旧形式の出力・
+# 抜き出しに失敗した場合)を、どちらも「検証コマンド無し」として同じ
+# 扱いにする。呼び出し元でいちいち両方を意識せずに済むよう、判定は
+# ここに集約する。
+_NO_VERIFY_COMMAND_VALUES = ("", "なし", "無し", "特になし")
+
+
+def _has_verify_command(verify_command: str) -> bool:
+    return (verify_command or "").strip() not in _NO_VERIFY_COMMAND_VALUES
+
 
 def _parse_module_breakdown(text: str) -> list:
     """設計担当メンバーの回答を [(ファイル名, 内容), ...] のリストに変換する。
@@ -4943,8 +5016,21 @@ PROGRESS_FILENAME = "PROGRESS.md"
 _PROGRESS_SECTION_REQUEST = "## 元の依頼"
 _PROGRESS_SECTION_LANGUAGE = "## 使用言語"
 _PROGRESS_SECTION_PLAN = "## モジュール分割案"
+# 仮の判断(統合検証ループへの対応): 合意フェーズが決めた検証コマンドを
+# 「モジュール分割案」と同じ節にまとめず独立の節にする。検証コマンドは
+# ファイル単位の情報ではなくプロジェクト全体に対する1つの値のため、
+# `_parse_module_breakdown`(ファイル単位のリストを組み立てるパーサー)に
+# 混ぜて解析させるより、`_extract_progress_section`で単純に1行読み出す
+# 方が素直だと判断した。
+_PROGRESS_SECTION_VERIFY_COMMAND = "## 検証コマンド"
 _PROGRESS_SECTION_CHECKLIST = "## タスク状況"
 _PROGRESS_SECTION_AUTO_RESUME_COUNT = "## 自動再開の試行回数"
+# 仮の判断: 統合検証の結果(成功/失敗・試行回数・失敗時の出力冒頭)も、
+# 「自動再開の試行回数」と同じくPROGRESS.md自身に直接記録する(別ファイルは
+# 持たせない)。`//resume-all`が「実装は完了しているが統合検証だけ失敗した
+# ままのプロジェクト」を検出する(`_project_has_pending_work`)ために、
+# ディスク上の状態を正として扱う既存方針をそのまま踏襲する。
+_PROGRESS_SECTION_VERIFICATION = "## 統合検証"
 _PROGRESS_SECTION_REVIEW = "## 直近のレビュー指摘"
 _PROGRESS_SECTION_CHANGELOG = "## 更新履歴"
 # 仮の判断(バグ報告への対応): //fixのタスク分割(_run_fix_task_queue)が
@@ -4959,10 +5045,53 @@ _PROGRESS_SECTION_PENDING_FIX_REQUEST = "## 未完了の修正依頼"
 _PROGRESS_SECTION_PENDING_FIX_SUBTASKS = "## 未完了の修正サブタスク"
 
 
+_VERIFICATION_OUTPUT_RECORD_CHARS = 500
+
+
+def _format_verification_result(verification: dict) -> list:
+    """統合検証の結果(`{"success": bool, "attempts": int, "output": str}`)を、
+    PROGRESS.mdの「統合検証」節の本文行のリストにする。失敗時のみ、
+    最後の出力の冒頭(`_VERIFICATION_OUTPUT_RECORD_CHARS`文字まで)を
+    続けて記録する(成功時は出力を残す実益が薄いため省く)。
+    """
+    if verification["success"]:
+        return [f"✅ 成功 ({verification['attempts']}回目の試行で成功)"]
+    lines = [f"❌ 失敗 ({verification['attempts']}回試行)"]
+    output = (verification.get("output") or "").strip()
+    if output:
+        lines.append("")
+        lines.append(output[:_VERIFICATION_OUTPUT_RECORD_CHARS])
+    return lines
+
+
+_VERIFICATION_SUCCESS_PATTERN = re.compile(r"^✅ 成功 \((\d+)回目の試行で成功\)$")
+_VERIFICATION_FAILURE_PATTERN = re.compile(r"^❌ 失敗 \((\d+)回試行\)$")
+
+
+def _parse_verification_result(text: str):
+    """`_format_verification_result`の逆変換。節が無い・想定した形式で
+    解析できない場合は`None`を返す(「まだ統合検証を実行していない」
+    ことを表す。旧バージョンのPROGRESS.mdとの後方互換にもなる)。
+    """
+    lines = text.splitlines()
+    if not lines:
+        return None
+    first = lines[0].strip()
+    success_match = _VERIFICATION_SUCCESS_PATTERN.match(first)
+    if success_match:
+        return {"success": True, "attempts": int(success_match.group(1)), "output": ""}
+    failure_match = _VERIFICATION_FAILURE_PATTERN.match(first)
+    if failure_match:
+        output = "\n".join(lines[1:]).strip("\n")
+        return {"success": False, "attempts": int(failure_match.group(1)), "output": output}
+    return None
+
+
 def _format_progress_markdown(
     request: str, tasks: list, checklist: list, review_feedback: dict, auto_resume_count: int = 0,
     changelog: list = None, language: str = "",
     pending_fix_request: str = "", pending_fix_subtasks: list = None,
+    verify_command: str = "", verification: dict = None,
 ) -> str:
     """PROGRESS.mdの内容を組み立てる。
 
@@ -4992,6 +5121,10 @@ def _format_progress_markdown(
     (旧バージョンのPROGRESS.mdや、この節を省きたい呼び出し元)の場合は
     この節自体を出力しない(既存の「直近のレビュー指摘」等と同じ、
     値が無ければ節ごと省略する方針)。
+
+    仮の判断: 「検証コマンド」「統合検証」も同じく、値が無ければ節ごと
+    省略する(`verify_command`が空文字列、または`verification`が`None`
+    (まだ統合検証を実行していない)の場合)。
     """
     lines = ["# プロジェクト進行状況", "", _PROGRESS_SECTION_REQUEST, "", request, ""]
     if language:
@@ -5004,6 +5137,11 @@ def _format_progress_markdown(
     for filename, content in tasks:
         lines.append(f"{filename}: {content}")
     lines.append("")
+    if verify_command:
+        lines.append(_PROGRESS_SECTION_VERIFY_COMMAND)
+        lines.append("")
+        lines.append(verify_command)
+        lines.append("")
     lines.append(_PROGRESS_SECTION_CHECKLIST)
     lines.append("")
     lines.extend(_format_checklist_lines(checklist))
@@ -5012,6 +5150,11 @@ def _format_progress_markdown(
     lines.append("")
     lines.append(str(auto_resume_count))
     lines.append("")
+    if verification is not None:
+        lines.append(_PROGRESS_SECTION_VERIFICATION)
+        lines.append("")
+        lines.extend(_format_verification_result(verification))
+        lines.append("")
     if review_feedback:
         lines.append(_PROGRESS_SECTION_REVIEW)
         lines.append("")
@@ -5041,11 +5184,12 @@ def _write_progress_md(
     project_dir: str, request: str, tasks: list, checklist: list, review_feedback: dict, auto_resume_count: int = 0,
     changelog: list = None, language: str = "",
     pending_fix_request: str = "", pending_fix_subtasks: list = None,
+    verify_command: str = "", verification: dict = None,
 ) -> None:
     os.makedirs(project_dir, exist_ok=True)
     content = _format_progress_markdown(
         request, tasks, checklist, review_feedback, auto_resume_count, changelog, language,
-        pending_fix_request, pending_fix_subtasks,
+        pending_fix_request, pending_fix_subtasks, verify_command, verification,
     )
     with open(os.path.join(project_dir, PROGRESS_FILENAME), "w", encoding="utf-8") as f:
         f.write(content)
@@ -5144,9 +5288,10 @@ def _parse_bullet_lines(text: str) -> list:
 def _parse_progress_markdown(path: str):
     """PROGRESS.mdを読み込み、`{"request":, "language":, "tasks":,
     "checklist":, "auto_resume_count":, "changelog":, "pending_fix_request":,
-    "pending_fix_subtasks":}`の辞書として返す。ファイルが存在しない・
-    想定した形式で解析できない場合は`None`を返す(呼び出し元は、その
-    プロジェクトの再開をスキップすべきというシグナルとして扱う)。
+    "pending_fix_subtasks":, "verify_command":, "verification":}`の辞書として
+    返す。ファイルが存在しない・想定した形式で解析できない場合は`None`を
+    返す(呼び出し元は、そのプロジェクトの再開をスキップすべきという
+    シグナルとして扱う)。
 
     仮の判断: `language`は、この節が無い旧バージョンのPROGRESS.mdでは
     空文字列になる(この機能追加より前に作られた既存プロジェクトを
@@ -5158,6 +5303,12 @@ def _parse_progress_markdown(path: str):
     では空リストになる(//fixのタスク分割機能より前に作られたプロジェクト・
     分割が発生したことのないプロジェクトのどちらも、単に「未完了の
     修正サブタスクは無い」として扱われる)。
+
+    仮の判断: `verify_command`(この節が無ければ空文字列)・`verification`
+    (この節が無い、または統合検証がまだ実行されていなければ`None`)も
+    同じ後方互換の方針。統合検証機能より前に作られたプロジェクトは、
+    `//resume-all`で再開しても単に統合検証がスキップされるだけで、
+    エラー扱いにはならない。
     """
     try:
         with open(path, encoding="utf-8") as f:
@@ -5177,6 +5328,8 @@ def _parse_progress_markdown(path: str):
         "changelog": _parse_changelog_markdown(_extract_progress_section(text, _PROGRESS_SECTION_CHANGELOG)),
         "pending_fix_request": _extract_progress_section(text, _PROGRESS_SECTION_PENDING_FIX_REQUEST).strip(),
         "pending_fix_subtasks": _parse_bullet_lines(_extract_progress_section(text, _PROGRESS_SECTION_PENDING_FIX_SUBTASKS)),
+        "verify_command": _extract_progress_section(text, _PROGRESS_SECTION_VERIFY_COMMAND).strip(),
+        "verification": _parse_verification_result(_extract_progress_section(text, _PROGRESS_SECTION_VERIFICATION)),
     }
 
 
@@ -5198,8 +5351,23 @@ def _project_has_pending_work(parsed: dict) -> bool:
     使わず`_progress_checklist_is_incomplete`だけで判定していた箇所
     (`_find_incomplete_projects`等)では、この未完了状態が一切見えず、
     `//resume-all`から再開する手段が無くなってしまっていた。
+
+    仮の判断(統合検証ループへの対応): 全タスクのチェックリストが完了
+    していても、統合検証(`verification`)が記録されていて、その結果が
+    失敗のままの場合も「再開すべき作業が残っている」とみなす。統合検証は
+    ファイル単位のチェックリストとは独立した結果のため、これが無いと
+    「実装は完了しているが統合検証に失敗したまま放置されたプロジェクト」
+    が`//resume-all`から永久に拾えなくなってしまう。統合検証が一度も
+    実行されていない(`verification`が`None`。検証コマンドが「なし」
+    だった場合を含む)場合は、それ自体は「失敗」ではないため対象外とする。
     """
-    return _progress_checklist_is_incomplete(parsed["checklist"]) or bool(parsed.get("pending_fix_subtasks"))
+    verification = parsed.get("verification")
+    verification_failed = bool(verification) and not verification.get("success", True)
+    return (
+        _progress_checklist_is_incomplete(parsed["checklist"])
+        or bool(parsed.get("pending_fix_subtasks"))
+        or verification_failed
+    )
 
 
 def _pending_tasks_from_checklist(tasks: list, checklist: list) -> list:
@@ -5340,6 +5508,7 @@ def _run_collaborate_implementation_phase(
     判定に頼らず自動的にこのプロジェクトへの継続的な追加指示(`_FixSession`)
     として扱う(詳細は`_CompletedBuildBox`を参照)。
     """
+    verify_command, answer = _extract_verify_command(answer)
     tasks = _parse_module_breakdown(answer)
     if not tasks:
         print("設計担当の回答からファイル分割案を読み取れませんでした。上記の回答内容を確認してください。")
@@ -5348,6 +5517,10 @@ def _run_collaborate_implementation_phase(
     print(f"[📐 モジュール分割案がまとまりました({len(tasks)}ファイル): {', '.join(f for f, _ in tasks)}]")
     for filename, content in tasks:
         print(f"  - {filename}: {content}")
+    if _has_verify_command(verify_command):
+        print(f"[🔍 検証コマンド: {verify_command}]")
+    else:
+        print("[🔍 検証コマンドは指定されませんでした(統合検証はスキップされます)]")
 
     # 仮の判断(バグ報告への対応): 設計担当の説明文が、計画に無い架空の
     # ファイル名に言及していないかをここで機械的にチェックする。実装・
@@ -5384,6 +5557,7 @@ def _run_collaborate_implementation_phase(
 
     _run_collaborative_project(
         request, tasks, checklist, candidates, org_fingerprint, project_dir, tasks, language=language,
+        verify_command=verify_command,
     )
 
     # 仮の判断: 自動再開(有限の上限付き)は、この「新規の協業モード実行」
@@ -5497,36 +5671,143 @@ def _ask_organization_collaborate(
     )
 
 
+# ---------------------------------------------------------------------------
+# 統合検証ループ(全タスク完了後、プロジェクト全体を実際に動かして確認する)
+# ---------------------------------------------------------------------------
+#
+# 構文チェック(_check_file_syntax、ファイル単位)とレビュー担当による
+# 内容レビュー(読むだけで実行はしない)だけでは、構文としては正しいが
+# 実行すると落ちるコード(import漏れ・未定義の関数呼び出し・モジュール間の
+# シグネチャ不一致など)を誰も検出できない。ローカルLLMは一発で正しく
+# 書けないことが前提のため、実行結果を見て直す輪(検証コマンドの実行→
+# 失敗したら担当メンバーに修正を依頼→再実行、を上限回数まで繰り返す)を
+# 全タスク完了後に1回だけ挟む。ファイル単位ではなくプロジェクト全体に
+# 対して行う。ファイル単位の構文チェックは既に存在しており、実行しないと
+# 分からない不具合の大半は「複数ファイルを統合したとき」に現れるため。
+
+# 仮の判断: 依頼の指定通り3回。ファイル単位のレビュー往復(最大2回)とは
+# 独立した、プロジェクト全体に対する外側の歯止め。
+MAX_VERIFY_ATTEMPTS = 3
+
+_INTEGRATION_VERIFICATION_FIX_PROMPT_TEMPLATE = """あなたはこのプロジェクトの改修担当です。全タスクの実装が完了した後の統合検証で、以下の検証コマンドの実行に失敗しました。
+
+【このプロジェクトの実装計画全体】
+{full_plan}
+
+【実行した検証コマンド】
+{verify_command}
+
+【終了コード】
+{returncode}
+
+【出力】
+{output}
+
+原因を推測で決めつけず、read_file・search_in_fileで実際のコードを確認してから直してください。{edit_over_write_guidance}
+
+修正が完了したら、最後にツールを呼び出さずに、何が原因で何を直したかを簡潔な日本語の文章で報告してください。
+"""
+
+
+def _build_integration_verification_fix_prompt(full_plan: str, verify_command: str, run_result: dict) -> str:
+    output = run_result.get("output")
+    if output is None:
+        output = run_result.get("message", "(出力はありません)")
+    return _INTEGRATION_VERIFICATION_FIX_PROMPT_TEMPLATE.format(
+        full_plan=full_plan, verify_command=verify_command,
+        returncode=run_result.get("returncode", "不明"), output=output,
+        edit_over_write_guidance=f" {_EDIT_OVER_WRITE_GUIDANCE}",
+    )
+
+
+def _run_integration_verification(
+    verify_command: str, candidates: list, org_fingerprint: str, project_dir: str,
+    tasks: list, max_attempts: int = MAX_VERIFY_ATTEMPTS,
+) -> tuple:
+    """検証コマンドを実行し、失敗したら担当メンバー1名に修正を依頼して
+    再実行する、を最大`max_attempts`回まで繰り返す。
+    `(成功したか, 最後の出力, 試行回数)`を返す。
+
+    仮の判断: 修正を依頼する担当は`candidates`の先頭(=最も空きメモリの
+    多いメンバー、`_select_chat_candidates`の並び順)を固定で使う。
+    タスクキュー方式のように複数メンバーに分担させる必要は無く
+    (検証の失敗原因は通常1箇所ではなくプロジェクト全体の整合性の
+    問題であり、1人が一貫して見た方が良いと判断)、単純さを優先した。
+
+    仮の判断: 未完了タスクが残っている場合・検証コマンドが指定されて
+    いない場合のスキップ判定は、呼び出し元(`_run_collaborative_project`)
+    が行う。この関数自身は「検証コマンドを実行して、失敗したら直す」
+    という実行ループの責務だけに絞り、スキップ判定に必要な`checklist`を
+    引数に含めない(依頼で示された関数シグネチャの形をそのまま踏襲した)。
+    """
+    fixer = candidates[0]
+    full_plan = "\n".join(f"{fn}: {content}" for fn, content in tasks)
+    last_output = ""
+    for attempt in range(1, max_attempts + 1):
+        run_result = json.loads(_run_project_command(project_dir, verify_command))
+        if run_result.get("ok"):
+            return True, run_result.get("output", ""), attempt
+
+        last_output = run_result.get("output")
+        if last_output is None:
+            last_output = run_result.get("message", "")
+        if attempt >= max_attempts:
+            break
+
+        print(
+            f"[❌ 終了コード {run_result.get('returncode', '?')} で失敗しました。"
+            f"修正を依頼します ({attempt}回目/{max_attempts}回)]"
+        )
+        print(f"[🔧 {fixer['label']} (モデル: {fixer['model']}) が修正しています...]")
+        fix_prompt = _build_integration_verification_fix_prompt(full_plan, verify_command, run_result)
+        _collect_answer_with_project_tools(
+            fixer, org_fingerprint, [{"role": "user", "content": fix_prompt}], project_dir,
+        )
+        print(f"[🔍 統合検証: {verify_command} を再実行します]")
+
+    return False, last_output, max_attempts
+
+
 def _run_collaborative_project(
     request: str, tasks: list, checklist: list, candidates: list, org_fingerprint: str,
     project_dir: str, tasks_to_queue: list, auto_resume_count: int = 0, changelog: list = None,
-    language: str = "",
+    language: str = "", verify_command: str = "",
 ) -> None:
     """タスクキュー方式による実装・レビューを実行し、その間PROGRESS.mdを
     更新し続ける。新規プロジェクト(`_ask_organization_collaborate`)・
-    再開(`_resume_project`)の両方から共通で呼ばれる。
+    再開(`_resume_project`)の両方から共通で呼ばれる。全タスク完了後・
+    最終チェックリスト表示の前に、統合検証(`_run_integration_verification`)
+    を挟む。
 
     `tasks`は計画全体(PROGRESS.mdの「モジュール分割案」に書き出す対象)、
     `tasks_to_queue`は実際にタスクキューへ投入する対象(新規作成時は
     `tasks`と同じ、再開時は未完了だったファイルだけの部分集合)。
 
     `auto_resume_count`(自動再開の試行回数)・`changelog`(既存プロジェクト
-    への修正依頼の更新履歴)・`language`(使用言語)は、この関数自身は
-    変更せず、呼び出し元から渡された値をそのままPROGRESS.mdに書き戻すだけの、
-    素通しの値として扱う。新規プロジェクトでは既定値(`0`・空・空文字列)の
-    まま、手動`//resume-all`(`_resume_project`)経由ではディスク上の既存の
-    値がそのまま渡ってくる。これが無いと、修正依頼で追記した更新履歴や、
-    合意フェーズで決まった使用言語が、その後の(無関係な)`//resume-all`に
-    よるPROGRESS.mdの書き換えで消えてしまう。
+    への修正依頼の更新履歴)・`language`(使用言語)・`verify_command`
+    (統合検証コマンド)は、この関数自身は変更せず、呼び出し元から渡された
+    値をそのままPROGRESS.mdに書き戻すだけの、素通しの値として扱う。
+    新規プロジェクトでは既定値(`0`・空・空文字列)のまま、手動
+    `//resume-all`(`_resume_project`)経由ではディスク上の既存の値が
+    そのまま渡ってくる。これが無いと、修正依頼で追記した更新履歴や、
+    合意フェーズで決まった使用言語・検証コマンドが、その後の(無関係な)
+    `//resume-all`によるPROGRESS.mdの書き換えで消えてしまう。
     """
     changelog = list(changelog) if changelog else []
     review_feedback = {}
+    # 仮の判断: 統合検証の結果はクロージャ内(write_progress)から参照する
+    # 必要があるが、Pythonの関数はネストしたスコープの単純な代入
+    # (verification = ...)ができない(nonlocal宣言が要る)ため、書き換え
+    # 可能な入れ物として1要素の辞書に包む。既存のreview_feedback(dict、
+    # ミュータブルなオブジェクトをそのまま更新する)と同じ発想。
+    verification_holder = {"result": None}
     progress_lock = threading.Lock()
 
     def write_progress():
         with progress_lock:
             _write_progress_md(
                 project_dir, request, tasks, checklist, review_feedback, auto_resume_count, changelog, language,
+                verify_command=verify_command, verification=verification_holder["result"],
             )
 
     write_progress()
@@ -5540,6 +5821,28 @@ def _run_collaborative_project(
             on_update=write_progress, review_feedback=review_feedback,
         )
 
+    # 仮の判断: 統合検証は、未完了タスクが1件でも残っている場合はスキップ
+    # する(実装が揃っていない状態で実行しても失敗するに決まっており、
+    # 無駄な問い合わせと誤解を招く報告になるため)。検証コマンドが
+    # 「なし」または未設定の場合もスキップする。どちらもスキップした旨を
+    # 表示するにとどめ、エラーやタスクの未完了扱いにはしない。
+    incomplete_labels = _incomplete_task_labels(checklist)
+    if incomplete_labels:
+        print(f"[⏭️ 統合検証: 未完了のタスクが残っているためスキップします]")
+    elif not _has_verify_command(verify_command):
+        print("[⏭️ 統合検証: 検証コマンドが指定されていないためスキップします]")
+    else:
+        print(f"[🔍 統合検証: {verify_command} を実行します]")
+        success, last_output, attempts = _run_integration_verification(
+            verify_command, candidates, org_fingerprint, project_dir, tasks,
+        )
+        verification_holder["result"] = {"success": success, "attempts": attempts, "output": last_output}
+        if success:
+            print(f"[✅ 統合検証に成功しました ({attempts}回目の試行)]")
+        else:
+            print(f"[❌ 統合検証に失敗しました({attempts}回試行)]")
+        write_progress()
+
     # 【最重要】組織自身が立てた計画のうち、1つでも未完了のタスクが残って
     # いる場合は「✅ レビュー完了」を名乗らず、何が終わっていないかを
     # 明示して報告する。実装フェーズ・レビューフェーズがそれぞれ「自分の
@@ -5548,9 +5851,21 @@ def _run_collaborative_project(
     # を、このタスクリストによる最終チェックが最後の砦として検出する。
     print()
     print(_format_task_checklist(checklist))
-    incomplete_labels = _incomplete_task_labels(checklist)
+    verification_result = verification_holder["result"]
+    if verification_result is not None:
+        if verification_result["success"]:
+            print(f"[🔍 統合検証: 成功 ({verification_result['attempts']}回目の試行)]")
+        else:
+            print(f"[🔍 統合検証: 失敗 ({verification_result['attempts']}回試行)]")
     if incomplete_labels:
         print(f"[⚠️ 未完了のタスクが残っています: {', '.join(incomplete_labels)}]")
+    elif verification_result is not None and not verification_result["success"]:
+        # 仮の判断: 実装(ファイル単位のタスク)自体はすべて完了している
+        # ため「未完了のタスクが残っています」とは表示しない一方、
+        # 「✅ 全タスク完了」も名乗らない(統合検証で実際に動かないことが
+        # 判明しているものを完了扱いにすると、依頼の「品質保証の実効性」
+        # という趣旨に反するため)。両者を区別できる専用の表示にする。
+        print(f"[⚠️ 実装は完了しましたが、統合検証に失敗しています (保存先: {project_dir})]")
     else:
         print(f"[✅ 全タスク完了 (保存先: {project_dir})]")
     write_progress()
@@ -6412,7 +6727,16 @@ def _resume_project(project_dir: str, port: int, org_fingerprint: str, auto_resu
     # 後から自然に付与される)。
     language = parsed["language"] or _infer_language_from_tasks(tasks)
     tasks_to_queue = _pending_tasks_from_checklist(tasks, checklist)
-    if not tasks_to_queue:
+    verify_command = parsed.get("verify_command", "")
+    prior_verification = parsed.get("verification")
+    # 仮の判断(統合検証ループへの対応): ファイル単位のタスクはすべて
+    # 完了しているが、統合検証だけが失敗のまま残っているプロジェクトも
+    # ここで拾う(`_project_has_pending_work`が「未完了」と判定する条件と
+    # 揃える)。この場合`tasks_to_queue`は空になるが、そのまま
+    # `_run_collaborative_project`に処理を渡せば、タスクキュー
+    # (空なのでスキップされる)の後段の統合検証だけが再実行される。
+    verification_needs_retry = bool(prior_verification) and not prior_verification.get("success", True)
+    if not tasks_to_queue and not verification_needs_retry:
         print(f"[{project_dir}] 未完了のタスクは見つかりませんでした。")
         return True
 
@@ -6425,13 +6749,16 @@ def _resume_project(project_dir: str, port: int, org_fingerprint: str, auto_resu
         print(f"[⚠️ {project_dir}] 組織内にロード済みモデルを持つメンバーがいないため、再開をスキップします。")
         return False
 
-    print(
-        f"[🔁 {project_dir} を再開します: 未完了{len(tasks_to_queue)}件"
-        f" ({', '.join(fn for fn, _ in tasks_to_queue)})]"
-    )
+    if tasks_to_queue:
+        print(
+            f"[🔁 {project_dir} を再開します: 未完了{len(tasks_to_queue)}件"
+            f" ({', '.join(fn for fn, _ in tasks_to_queue)})]"
+        )
+    else:
+        print(f"[🔁 {project_dir} を再開します: 統合検証のみ再実行します]")
     _run_collaborative_project(
         request, tasks, checklist, candidates, org_fingerprint, project_dir, tasks_to_queue,
-        auto_resume_count, changelog, language,
+        auto_resume_count, changelog, language, verify_command=verify_command,
     )
     return True
 

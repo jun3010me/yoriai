@@ -3824,3 +3824,91 @@ completion`本体の根本問題(最終ラウンドでcontentを1文字も生成
   `tests/test_background_collaborate.py`・`tests/test_fix_session.py`の
   タイミング依存の間欠的な失敗を除き、リグレッションが無いことを
   確認した。
+
+### 統合検証ループ(動かして、落ちたら直す)の実装
+
+これまでの品質保証は、`_check_file_syntax`によるファイル単位の機械的な
+構文チェックと、レビュー担当LLMによる内容レビュー(最大2回、読むだけで
+実行はしない)に限られていた。構文としては正しいが実行すると落ちる
+コード(import漏れ・未定義の関数呼び出し・モジュール間のシグネチャ
+不一致など)は誰も検出できないまま「✅ 全タスク完了」になってしまう
+不具合が、両方向(誤検知・見逃し)で報告されていた。`run_command`
+ツール自体は存在するが、`//fix`のセッション中にモデルが任意に呼べる
+だけで、「実行して落ちたら直す、通るまで繰り返す」という自動の輪には
+なっていなかった。ローカルLLMは一発で正しく書けないことが前提のため、
+実行結果を見て直す輪を、全タスク完了後にプロジェクト全体に対して
+1回だけ挟むことにした(ファイル単位の構文チェックは既にあり、実行しないと
+分からない不具合の大半は「複数ファイルを統合したとき」に現れるため)。
+
+対応:
+
+- **合意フェーズで検証コマンドを決めさせる**: `_MODULE_BREAKDOWN_PROMPT_
+  TEMPLATE`・`_build_design_dialogue_output_instruction`の出力形式に、
+  ファイル一覧の最後に「検証コマンド: <コマンド>」という行を1行追加する
+  よう指示を足した。対話型ツール(標準入力が必要)や適切なコマンドが
+  無い場合は「検証コマンド: なし」と書かせる。この行は拡張子付きの
+  ファイル名の形(`_FILE_HEADER_PATTERN`)に一致しないため、
+  `_parse_module_breakdown`に渡す前に`_extract_verify_command()`で
+  個別に抜き出す2段階の解析にした(`_run_collaborate_implementation_
+  phase`で、対話プロトコル経由・単一設計担当への相談経由のどちらの
+  `answer`に対しても同じ処理を通すため、両方の経路をまとめて対応できる)。
+  「なし」「無し」「特になし」やこの行自体が無い(旧形式)場合は
+  `_has_verify_command()`でまとめて「検証コマンド無し」として扱う。
+- **PROGRESS.mdへの永続化**: 新設の`## 検証コマンド`(1行、コマンド文字列)
+  ・`## 統合検証`(`✅ 成功 (N回目の試行で成功)` / `❌ 失敗 (N回試行)`+
+  失敗時は最後の出力の冒頭`_VERIFICATION_OUTPUT_RECORD_CHARS`(500)文字を
+  記録)の2節を`_format_progress_markdown`/`_write_progress_md`に追加し、
+  `_parse_progress_markdown`で`verify_command`/`verification`として
+  読み戻せるようにした。どちらも値が無ければ(旧バージョンのPROGRESS.md・
+  まだ統合検証を実行していない場合)節ごと省略する、既存の「直近の
+  レビュー指摘」等と同じ方針。
+- **`run_command`の`-m`フラグを限定的に緩和**: `_RUN_COMMAND_BLOCKED_
+  FLAGS_BY_INTERPRETER`がpython3/pythonの`-m`を全面禁止していたため、
+  `python3 -m pytest`のような検証ループに必要な正当な手段まで塞がれて
+  いた。`-m`は全面禁止をやめ、直後に来るモジュール名が新設の許可リスト
+  `_PYTHON_ALLOWED_MODULES`(`pytest`・`unittest`・`py_compile`・
+  `compileall`・`json.tool`・`http.server`)にある場合のみ通す方式に
+  変更した。`http.server`はサーバーが起動しっぱなしになるが、
+  `RUN_COMMAND_TIMEOUT_SEC`(10秒)で必ず強制終了されるため問題ない。
+  判断に迷うモジュール(`webbrowser`・`pdb`等)は含めず、必要になった
+  時点で追加する方針とした。
+- **`_run_integration_verification()`を新設**し、検証コマンドを実行して
+  失敗したら担当メンバー1名(`candidates`の先頭、最も空きメモリの多い
+  メンバー)に`_collect_answer_with_project_tools`(課題2で追加した
+  `edit_file`・`_EDIT_OVER_WRITE_GUIDANCE`を含むプロジェクトツール一式)で
+  修正を依頼し、再実行する、を最大`MAX_VERIFY_ATTEMPTS`(新設、3)回まで
+  繰り返すようにした。修正依頼プロンプトには実装計画全体・実行コマンド・
+  終了コード・出力を含め、「原因を推測で決めつけず、read_file・
+  search_in_fileで実際のコードを確認してから直すこと」を明記した。
+  スキップ判定(未完了タスクが残っている・検証コマンドが無い)は、
+  `checklist`という別の関心事を持ち込まないよう呼び出し元
+  (`_run_collaborative_project`)側で行う設計にした。
+- **`_run_collaborative_project`への統合**: `_run_collaborative_task_
+  queue`の完了後・最終チェックリスト表示の前に統合検証を挟んだ。
+  未完了タスクが残っている場合、検証コマンドが「なし」の場合はそれぞれ
+  その旨を表示してスキップする。結果は`## 統合検証`としてPROGRESS.mdに
+  記録し、`[✅ 全タスク完了]`の判定条件にも含めた。全タスク完了かつ
+  統合検証成功のときだけ「✅ 全タスク完了」を名乗り、実装は完了して
+  いても統合検証が失敗している場合は`[⚠️ 実装は完了しましたが、統合検証に
+  失敗しています]`と区別して報告する(未完了タスクが残っている場合の
+  既存の`[⚠️ 未完了のタスクが残っています]`と同じ、正直な報告という思想)。
+- **`//resume-all`での再開対応**: `_project_has_pending_work`の判定に
+  「全タスクは完了しているが、統合検証が失敗のまま記録されている」
+  ケースを追加した。`_resume_project`は、ファイル単位の未完了タスクが
+  無くても統合検証の再試行が必要な場合は早期リターンせず、`_run_
+  collaborative_project`に処理を渡す(タスクキューは空のため実質
+  スキップされ、統合検証だけが再実行される)ようにした。
+- **テスト**: `tests/test_integration_verification.py`を新設し、
+  (1)1回目/2回目の試行で成功する場合の修正依頼の発生回数、(2)3回とも
+  失敗した場合に無限に繰り返さず「成功」と報告されないこと、(3)未完了
+  タスク・検証コマンド未設定によるスキップ、(4)PROGRESS.mdへの記録・
+  再読み込み、(5)`_project_has_pending_work`が失敗した統合検証を
+  拾うこと、(6)`_extract_verify_command`の抜き出し、を確認した。
+  `tests/test_run_command.py`には`python3 -m pytest`が通り
+  `python3 -m os`のような許可外モジュールが拒否されるケースを追加し、
+  既存の`python3 -m http.server`を拒否する期待値(今回`http.server`を
+  許可リストに加えたため矛盾する)を`python3 -m os`に差し替えた。
+  既存の全テストファイル(35ファイル)を実行し、事前から存在していた
+  `tests/test_background_collaborate.py`・`tests/test_fix_session.py`の
+  タイミング依存の間欠的な失敗を除き、リグレッションが無いことを
+  確認した。
