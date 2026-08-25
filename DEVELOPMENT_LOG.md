@@ -3752,3 +3752,75 @@ completion`本体の根本問題(最終ラウンドでcontentを1文字も生成
   タイミング依存の間欠的な失敗(今回の変更前・変更後で発生確率が変わらず、
   背景スレッドが実際のTCP接続を試みる既存の設計に起因することを確認済み)
   を除き、リグレッションが無いことを確認した。
+
+### edit_fileツール(部分置換)の追加
+
+これまでプロジェクトファイルへの書き込み手段はwrite_file(全文上書き)
+のみで、スキーマにも「差分ではなくファイル全体を渡すこと」と明記して
+いた。これには2つの実害があった。(1)ファイル破壊: 300行のファイルの
+3行を直すために毎回300行を出力させるため、`CHAT_MAX_OUTPUT_TOKENS`に
+達して途中で切れると、切れたままのコードが書き込まれる。(2)意図しない
+改変: ローカルLLMは全文を通すたびに、触る必要のないコメントや実装を
+書き換えてしまいやすい。Claude Codeが`Write`とは別に`Edit`(一意な文字列の
+置換)を持っているのと同じ理由(便利さより事故防止)で、`edit_file`を
+新設した。
+
+対応:
+
+- **`EDIT_FILE_TOOL_SCHEMA`を新設**し、`filename`・`old_string`・
+  `new_string`(いずれも必須)を受け取るツールとして定義した。
+  `replace_all`のようなオプションは意図的に付けていない。一意マッチの
+  強制がこのツールの安全性の根拠であり、ローカルLLMに一括置換の権限を
+  渡すと、たまたま複数箇所に出現する短い文字列を指定してしまった場合に
+  意図しない箇所まで一斉に書き換えてしまう恐れがあるため。
+- **`_edit_project_file()`を新設**し、パス解決は既存の
+  `_resolve_safe_project_path()`を必ず経由するようにした(PROGRESS.mdの
+  保護もこれで効く)。ファイルが存在しない場合は`_read_project_file_fresh`
+  と同様に`_planned_filenames_from_progress()`で計画上のファイルかどうかを
+  確認して案内を出し分ける。`old_string`の出現回数を数え、0件は
+  「見つかりませんでした」、2件以上は「N箇所に一致しました」+一致箇所の
+  行番号一覧(モデルが次の試行で範囲を広げる判断材料にするため)を返し、
+  どちらの場合もファイルには一切触れない。1件のときだけ置換して書き込む。
+  書き込み後の即時構文チェック(`syntax_ok`/`syntax_error`/
+  `syntax_check_skipped`)は`_write_project_file`と処理内容が重複するため、
+  `_syntax_check_result_fields()`という共通ヘルパーに切り出して両方から
+  呼ぶようにした。
+- **各所への登録**: `PROJECT_TOOLS_SCHEMAS`・`PROJECT_TOOLS_CLIENT_NAMES`・
+  `_execute_project_tool_call()`・`_MUTATING_PROJECT_TOOL_NAMES`
+  (`_mutated_filename_from_tool_result()`がedit_fileの成功も「変更された
+  ファイル」として拾えるようにするため。`//fix`の`modified_files`への
+  反映に必要)に追加した。
+- **write_fileの説明文を反転**: 「既存ファイルの一部だけを直したい場合も
+  ファイル全体をここに渡すこと」という記述を、「新規ファイルの作成、
+  またはファイル全体を作り直す場合に使う。部分修正にはedit_fileを
+  使うこと」という逆向きの指示に書き換えた。`_SEARCH_THEN_READ_GUIDANCE`
+  と同様の共通の案内文`_EDIT_OVER_WRITE_GUIDANCE`を新設し、
+  プロジェクトツールを提供する全プロンプト(`_FIX_REQUEST_TOOL_PROMPT_
+  TEMPLATE`・`_FIX_SUBTASK_REVIEW_PROMPT_TEMPLATE`、3箇所の呼び出し)で
+  使い回すようにした。
+- **応答切れによるファイル破壊のガード**: `stream_chat_completion()`が
+  `pending_tool_calls`をyieldする際、そのラウンドが`CHAT_MAX_OUTPUT_TOKENS`
+  上限で打ち切られたかどうか(`truncated`)を今回新たに合わせて渡すように
+  した(これまでは`pending_tool_calls`イベントにこの情報が含まれておらず、
+  呼び出し元が判断できなかった)。`_collect_answer_with_project_tools()`は
+  この`truncated`が立ったラウンドに`write_file`呼び出しが含まれていた
+  場合、その`write_file`だけを実行せず(read_file等の読み取り系ツールは
+  通常どおり実行する)、「応答が長さ制限で途中までしか届いていないため、
+  この write_file は実行しませんでした」という理由をツール結果として
+  返すようにした。write_fileの`content`引数(ファイル全体)が生成の
+  途中で切れている可能性が高く、そのまま書き込むとファイルが壊れた状態で
+  保存されてしまうため。
+- **テスト**: `tests/test_edit_file.py`を新設し、(1)一意にマッチした
+  ときに置換されること、(2)0件・複数件のときはファイルが一切変更
+  されないこと(複数件のときは行番号がエラーに含まれること)、
+  (3)`new_string=""`で削除になること、(4)`../`・絶対パス・PROGRESS.mdが
+  既存ツールと同じく拒否されること、(5)計画上は存在するが未実装/計画に
+  無いファイルへの区別、(6)置換後に構文エラーになる場合は`syntax_ok:
+  false`と詳細が返ること、(7)ツール登録・`_execute_project_tool_call`
+  でのディスパッチ・`_mutated_filename_from_tool_result`での認識、
+  (8)`truncated`なラウンドの`write_file`が実行されず(read_fileは実行
+  され)、ファイルが変更されないこと、を確認した。既存の全テスト
+  ファイル(34ファイル)を実行し、事前から存在していた
+  `tests/test_background_collaborate.py`・`tests/test_fix_session.py`の
+  タイミング依存の間欠的な失敗を除き、リグレッションが無いことを
+  確認した。

@@ -566,6 +566,20 @@ _SEARCH_THEN_READ_GUIDANCE = (
     "必要な範囲だけをread_fileで読むことを検討してください。"
 )
 
+# 仮の判断(edit_fileの追加に伴う対応): _SEARCH_THEN_READ_GUIDANCEと同様、
+# write_file・edit_fileの両方を提供するすべてのプロンプト(修正依頼専用・
+# タスクキュー・サブタスクレビューの3箇所)で同じ文言を使い回す共通の
+# 案内文。write_fileのツール説明文自体にもedit_fileへの誘導を書いたが、
+# プロンプト本文でも重ねて促すことで、モデルが「部分修正でも全文を
+# 書き直すもの」という思い込みに引っ張られにくくする(全文書き直しに
+# よるファイル破壊・意図しない改変を防ぐのが目的)。
+_EDIT_OVER_WRITE_GUIDANCE = (
+    "既存ファイルの一部だけを直す場合は、write_fileでファイル全体を書き直すのではなく、"
+    "edit_fileで変更したい箇所だけを置き換えてください。"
+    "write_fileで全体を書き直すと、直す必要のない箇所まで変わってしまったり、"
+    "応答の長さ制限で途中で切れてファイルが壊れたりする恐れがあります。"
+)
+
 # 仮の判断: 依頼の「1回のレビューにつき、ファイル読み取りツールの呼び出しは
 # 最大3回程度までに制限してほしい」という要件に対応する上限。MAX_TOOL_CALL_ROUNDS
 # (ツール呼び出しラウンド全体の上限、web_searchも含む)とは別に、read_file単体の
@@ -1009,8 +1023,8 @@ def stream_chat_completion(
 ):
     """モデル名からOllama/LM Studio/MLX-LMのどれにチャットを振るかを決め、
     正規化されたストリーミングイベント({"content": ...} / {"tool_call": <ツール名>} /
-    {"pending_tool_calls": [...]} / {"done": True, "truncated": bool} /
-    {"error": ...})を順にyieldする。`truncated`は、最後のラウンドの応答が
+    {"pending_tool_calls": [...], "truncated": bool} / {"done": True, "truncated": bool} /
+    {"error": ...})を順にyieldする。`truncated`は、それぞれそのラウンドの応答が
     CHAT_MAX_OUTPUT_TOKENS上限に達して途中で打ち切られたかどうかを表す。
 
     モデルがツール(既定ではweb_searchのみ)の呼び出しを要求した場合は、
@@ -1188,10 +1202,18 @@ def stream_chat_completion(
         # 呼び出し元に渡して終了する。1ラウンドでweb_searchとread_fileが
         # 混在するようなケースの部分実行は複雑さの割に実利が薄いため扱わず、
         # 呼び出し元側にラウンド全体の実行を委ねる単純な設計にした。
+        #
+        # 仮の判断(応答切れによるファイル破壊のガードへの対応): `round_truncated`
+        # (このラウンドの応答がCHAT_MAX_OUTPUT_TOKENS上限に達して途中で
+        # 打ち切られたかどうか)もあわせて渡す。tool_callsのJSON自体は
+        # (ツール呼び出しの構造化出力なので)途中で切れていても不完全な
+        # まま解析されうるが、その中身(特にwrite_fileのcontent引数)が
+        # 途中で切れている可能性があるかどうかは、呼び出し元
+        # (`_collect_answer_with_project_tools`)がここで初めて判断できる。
         if client_tool_names and any(
             tool_call.get("function", {}).get("name", "") in client_tool_names for tool_call in tool_calls
         ):
-            yield {"pending_tool_calls": tool_calls}
+            yield {"pending_tool_calls": tool_calls, "truncated": round_truncated}
             return
 
         messages.append({"role": "assistant", "content": "", "tool_calls": tool_calls})
@@ -2609,18 +2631,27 @@ LIST_DIR_TOOL_SCHEMA = {
     },
 }
 
+# 仮の判断(edit_fileの追加に伴う変更): 以前は「既存ファイルの一部だけを
+# 直したい場合も、ファイル全体をここに渡すこと」と明示的に指示していたが、
+# これには2つの実害があった。(1)ファイル破壊: 数百行のファイルの数行を
+# 直すためだけに毎回全体を出力させるため、CHAT_MAX_OUTPUT_TOKENSに達して
+# 途中で切れると、切れたままのコードが書き込まれてしまう。(2)意図しない
+# 改変: ローカルLLMは全文を通すたびに、触る必要のないコメントや実装まで
+# 書き換えてしまいやすい。edit_file(一意な文字列の置換)を新設したことで、
+# 指示を逆転させ、部分修正にはedit_fileを使うよう促す。
 WRITE_FILE_TOOL_NAME = "write_file"
 WRITE_FILE_TOOL_SCHEMA = {
     "type": "function",
     "function": {
         "name": WRITE_FILE_TOOL_NAME,
         "description": (
-            "このプロジェクトディレクトリ内に、指定した内容でファイルを新規作成・上書きする。"
+            "新規ファイルの作成、またはファイル全体を作り直す場合に使う。"
             "'サブディレクトリ名/ファイル名'のようにサブディレクトリ内のパスを指定することもでき、"
             "そのサブディレクトリがまだ存在しなければ自動的に作成される"
             "(make_directoryを先に呼ぶ必要はない)。"
-            "既存ファイルの一部だけを直したい場合も、read_fileで現在の中身を確認したうえで"
-            "ファイル全体の新しい内容をここに渡すこと(差分ではなく全体を渡す)。"
+            "既存ファイルの一部だけを直したい場合はedit_fileを使うこと"
+            "(write_fileで全体を書き直すと、直す必要のない箇所まで変わってしまったり、"
+            "応答の長さ制限で途中で切れてファイルが壊れたりする恐れがある)。"
         ),
         "parameters": {
             "type": "object",
@@ -2632,6 +2663,47 @@ WRITE_FILE_TOOL_SCHEMA = {
                 "content": {"type": "string", "description": "ファイルの新しい中身(ファイル全体)"},
             },
             "required": ["filename", "content"],
+        },
+    },
+}
+
+# 仮の判断: replace_allのようなオプションは付けない。一意マッチを強制する
+# ことがこのツールの安全性の根拠であり、ローカルLLMに一括置換の権限を
+# 渡すと、たまたま複数箇所に出現する短い文字列(例: 変数名や共通の記法)を
+# old_stringに指定してしまった場合に、意図しない箇所まで一斉に書き換えて
+# しまう恐れがある。一意に定まらない場合は、呼び出し元に前後の文脈を
+# 広げて再試行させる(Claude CodeのEditツールと同じ設計方針)。
+EDIT_FILE_TOOL_NAME = "edit_file"
+EDIT_FILE_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": EDIT_FILE_TOOL_NAME,
+        "description": (
+            "既存ファイルの一部だけを置き換える(部分修正)。write_fileと違い、"
+            "ファイル全体ではなく変更したい箇所だけを渡せばよいため、ファイルが壊れたり"
+            "無関係な箇所まで書き換わったりする心配が無い。"
+            "old_stringはファイル内で一意に定まる必要があるので、変更したい行だけでなく、"
+            "その前後の行も含めて(インデント・空白も含めて実際のファイルと完全に一致する形で)"
+            "十分な文脈を含めること。new_stringに空文字列を渡すと、old_stringの箇所を"
+            "削除したことになる。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "filename": {
+                    "type": "string",
+                    "description": "編集するファイル名(例: utils.py、またはtemplates/base.htmlのようなサブディレクトリ内のパス)",
+                },
+                "old_string": {
+                    "type": "string",
+                    "description": "置換前の文字列。ファイル内で一意に定まるだけの前後の文脈を含めること(インデント・空白も含めて実際のファイルの中身と完全に一致させる)",
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "置換後の文字列。空文字列を渡すとold_stringの箇所を削除したことになる",
+                },
+            },
+            "required": ["filename", "old_string", "new_string"],
         },
     },
 }
@@ -2734,18 +2806,33 @@ RUN_COMMAND_TOOL_SCHEMA = {
 # として明確に分離する。
 PROJECT_TOOLS_SCHEMAS = [
     READ_FILE_TOOL_SCHEMA, SEARCH_IN_FILE_TOOL_SCHEMA, LIST_DIR_TOOL_SCHEMA, WRITE_FILE_TOOL_SCHEMA,
-    MOVE_FILE_TOOL_SCHEMA, DELETE_FILE_TOOL_SCHEMA, MAKE_DIRECTORY_TOOL_SCHEMA,
+    EDIT_FILE_TOOL_SCHEMA, MOVE_FILE_TOOL_SCHEMA, DELETE_FILE_TOOL_SCHEMA, MAKE_DIRECTORY_TOOL_SCHEMA,
     RUN_COMMAND_TOOL_SCHEMA,
 ]
 PROJECT_TOOLS_CLIENT_NAMES = {
     READ_FILE_TOOL_NAME, SEARCH_IN_FILE_TOOL_NAME, LIST_DIR_TOOL_NAME, WRITE_FILE_TOOL_NAME,
-    MOVE_FILE_TOOL_NAME, DELETE_FILE_TOOL_NAME, MAKE_DIRECTORY_TOOL_NAME,
+    EDIT_FILE_TOOL_NAME, MOVE_FILE_TOOL_NAME, DELETE_FILE_TOOL_NAME, MAKE_DIRECTORY_TOOL_NAME,
     RUN_COMMAND_TOOL_NAME,
 }
 
 
 def _list_project_directory(project_dir: str) -> str:
     return json.dumps({"files": _list_project_files(project_dir)}, ensure_ascii=False)
+
+
+def _syntax_check_result_fields(filename_for_syntax: str, text: str, file_path: str) -> dict:
+    """`_check_file_syntax`の結果を、ツールの返り値にそのまま混ぜ込める
+    フィールドの辞書にする共通ヘルパー。write_file・edit_fileの両方が
+    「書き込み直後にその場でフィードバックし、モデル自身が次のラウンドで
+    直せるようにする」という同じ設計を必要とするため、ここに切り出して
+    共有する。
+    """
+    status, detail = _check_file_syntax(filename_for_syntax, text, file_path=file_path)
+    if status == "ok":
+        return {"syntax_ok": True}
+    if status == "error":
+        return {"syntax_ok": False, "syntax_error": detail}
+    return {"syntax_check_skipped": detail}  # skipped
 
 
 def _write_project_file(project_dir: str, filename: str, content) -> str:
@@ -2774,14 +2861,88 @@ def _write_project_file(project_dir: str, filename: str, content) -> str:
     except Exception as exc:
         return json.dumps({"ok": False, "message": f"書き込みに失敗しました: {exc}"}, ensure_ascii=False)
     result = {"ok": True, "filename": _project_relpath(project_dir, safe_path)}
-    status, detail = _check_file_syntax(os.path.basename(safe_path), text, file_path=safe_path)
-    if status == "ok":
-        result["syntax_ok"] = True
-    elif status == "error":
-        result["syntax_ok"] = False
-        result["syntax_error"] = detail
-    else:  # skipped
-        result["syntax_check_skipped"] = detail
+    result.update(_syntax_check_result_fields(os.path.basename(safe_path), text, safe_path))
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _edit_project_file(project_dir: str, filename: str, old_string: str, new_string: str) -> str:
+    """edit_fileツールの応答本体。`old_string`がファイル内でちょうど1箇所に
+    一致する場合のみ`new_string`に置き換える(一意マッチの強制がこのツールの
+    安全性の根拠なので、0件・複数件はどちらもエラーとし、ファイルには
+    一切触れない)。
+
+    仮の判断: パス解決は他の全ツールと同じく`_resolve_safe_project_path`を
+    経由する(PROGRESS.mdの保護もこれで効く)。ファイルが存在しない場合は、
+    `_read_project_file_fresh`と同様にPROGRESS.mdの計画に含まれる名前かどうかを
+    確認し、「計画上は存在するがまだ未実装」なのか「そもそも計画に無い名前」
+    なのかを区別して伝える(read_fileと同じ理由。詳細は
+    `_planned_filenames_from_progress`定義部のコメントを参照)。
+    """
+    safe_path, error = _resolve_safe_project_path(project_dir, filename)
+    if error:
+        return json.dumps({"ok": False, "message": error}, ensure_ascii=False)
+    if not os.path.isfile(safe_path):
+        planned = _planned_filenames_from_progress(project_dir)
+        if planned and os.path.basename(filename or "") not in planned:
+            return json.dumps({
+                "ok": False,
+                "message": (
+                    f"'{filename}' は実装計画(PROGRESS.mdのモジュール分割案)に"
+                    "含まれていないファイル名です。新規に作成するつもりであれば"
+                    "write_fileを使ってください。そうでなければ、計画の記述ミスの"
+                    "可能性があります。計画に実在するファイル: "
+                    f"{', '.join(sorted(planned))}"
+                ),
+            }, ensure_ascii=False)
+        return json.dumps(
+            {"ok": False, "message": "そのファイルはまだ存在しません(未実装です)。新規作成の場合はwrite_fileを使ってください。"},
+            ensure_ascii=False,
+        )
+
+    try:
+        with open(safe_path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except Exception as exc:
+        return json.dumps({"ok": False, "message": f"読み取りに失敗しました: {exc}"}, ensure_ascii=False)
+
+    match_count = text.count(old_string) if old_string else 0
+    if match_count == 0:
+        return json.dumps({
+            "ok": False,
+            "message": (
+                "指定された文字列が見つかりませんでした。read_fileで現在の内容を確認してから、"
+                "実際のファイルの中身と完全に一致する文字列を指定してください"
+                "(インデントや空白も含めて一致する必要があります)。"
+            ),
+        }, ensure_ascii=False)
+    if match_count > 1:
+        # 仮の判断: モデルが次の試行で範囲を広げる判断材料になるよう、
+        # 一致した箇所の行番号一覧も返す(1-indexed。read_file/search_in_fileの
+        # 行番号表記と揃える)。
+        matched_lines = []
+        offset = 0
+        for _ in range(match_count):
+            idx = text.index(old_string, offset)
+            matched_lines.append(text.count("\n", 0, idx) + 1)
+            offset = idx + 1
+        return json.dumps({
+            "ok": False,
+            "message": (
+                f"指定された文字列が{match_count}箇所に一致しました。どの箇所を編集するか"
+                "一意に定まるよう、前後の行を含めて範囲を広げてください。"
+            ),
+            "matched_lines": matched_lines,
+        }, ensure_ascii=False)
+
+    new_text = text.replace(old_string, new_string, 1)
+    try:
+        with open(safe_path, "w", encoding="utf-8") as f:
+            f.write(new_text)
+    except Exception as exc:
+        return json.dumps({"ok": False, "message": f"書き込みに失敗しました: {exc}"}, ensure_ascii=False)
+
+    result = {"ok": True, "filename": _project_relpath(project_dir, safe_path)}
+    result.update(_syntax_check_result_fields(os.path.basename(safe_path), new_text, safe_path))
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -3184,6 +3345,12 @@ def _execute_project_tool_call(
         filename = arguments.get("filename", "")
         _print_tagged(print_lock, tag, f"[✏️ {filename or '(不明なファイル)'} を書き込んでいます...]")
         return _write_project_file(project_dir, filename, arguments.get("content", ""))
+    if name == EDIT_FILE_TOOL_NAME:
+        filename = arguments.get("filename", "")
+        _print_tagged(print_lock, tag, f"[✂️ {filename or '(不明なファイル)'} の一部を編集しています...]")
+        return _edit_project_file(
+            project_dir, filename, arguments.get("old_string", ""), arguments.get("new_string", ""),
+        )
     if name == MOVE_FILE_TOOL_NAME:
         old_filename = arguments.get("old_filename", "")
         new_filename = arguments.get("new_filename", "")
@@ -3221,12 +3388,15 @@ MAX_PROJECT_TOOL_ROUNDS = 50
 # (JSON結果の"ok"フィールド)を追跡することで、「本当に何か変更されたか」
 # を機械的に判定できるようにする。make_directoryは空のディレクトリを
 # 作るだけで「修正の実体」とは言えないため含めない。read_file・list_dir・
-# run_commandはファイルを変更しないため対象外。
-_MUTATING_PROJECT_TOOL_NAMES = {WRITE_FILE_TOOL_NAME, MOVE_FILE_TOOL_NAME, DELETE_FILE_TOOL_NAME}
+# run_commandはファイルを変更しないため対象外。edit_fileはwrite_fileと
+# 同じくファイルの中身を実際に書き換えるツールのため、同様に含める。
+_MUTATING_PROJECT_TOOL_NAMES = {
+    WRITE_FILE_TOOL_NAME, EDIT_FILE_TOOL_NAME, MOVE_FILE_TOOL_NAME, DELETE_FILE_TOOL_NAME,
+}
 
 
 def _mutated_filename_from_tool_result(tool_call: dict, result: str) -> str:
-    """`tool_call`が実際にファイルを変更した(write_file/move_file/
+    """`tool_call`が実際にファイルを変更した(write_file/edit_file/move_file/
     delete_fileが成功した)場合、そのファイル名を返す。それ以外
     (対象外のツール・失敗した呼び出し・結果が解析できない場合)は
     空文字列を返す。
@@ -3285,6 +3455,15 @@ def _collect_answer_with_project_tools(
 
     モデルが説明文だけを返してツールを一度も呼ばなかった場合は、
     `_NO_TOOL_CALL_NUDGE_MESSAGE`参照。
+
+    仮の判断(応答切れによるファイル破壊のガード): あるラウンドの応答が
+    CHAT_MAX_OUTPUT_TOKENS上限に達して途中で打ち切られていた
+    (`pending_tool_calls`イベントの`truncated`)場合、そのラウンドに
+    write_file呼び出しが含まれていても実行しない。write_fileのcontent
+    引数(ファイル全体)が生成の途中で切れている可能性が高く、そのまま
+    書き込むとファイルが壊れた状態で保存されてしまうため。read_file等の
+    読み取り系ツールは(内容の生成ではなく既存ファイルの参照なので)
+    通常どおり実行する。
     """
     messages = list(messages)
     modified_files = []
@@ -3292,6 +3471,7 @@ def _collect_answer_with_project_tools(
     for _round_num in range(MAX_PROJECT_TOOL_ROUNDS):
         answer_parts = []
         pending_tool_calls = None
+        pending_truncated = False
         error = None
         truncated = False
         for event in _stream_chat_from_candidate(candidate, org_fingerprint, messages, offer_project_tools=True):
@@ -3300,6 +3480,7 @@ def _collect_answer_with_project_tools(
                 break
             if "pending_tool_calls" in event:
                 pending_tool_calls = event["pending_tool_calls"]
+                pending_truncated = bool(event.get("truncated"))
                 break
             content = event.get("content")
             if content:
@@ -3325,7 +3506,18 @@ def _collect_answer_with_project_tools(
 
         messages.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
         for tool_call in pending_tool_calls:
-            result = _execute_project_tool_call(project_dir, tool_call, print_lock, tag or candidate["label"])
+            function_name = tool_call.get("function", {}).get("name", "")
+            if pending_truncated and function_name == WRITE_FILE_TOOL_NAME:
+                result = json.dumps({
+                    "ok": False,
+                    "message": (
+                        "応答が長さ制限で途中までしか届いていないため、この write_file は実行しませんでした。"
+                        "ファイルが壊れるのを防ぐためです。edit_file で必要な箇所だけを直すか、"
+                        "複数回に分けて書き込んでください。"
+                    ),
+                }, ensure_ascii=False)
+            else:
+                result = _execute_project_tool_call(project_dir, tool_call, print_lock, tag or candidate["label"])
             messages.append({"role": "tool", "content": result, "tool_call_id": tool_call.get("id")})
             mutated_filename = _mutated_filename_from_tool_result(tool_call, result)
             if mutated_filename:
@@ -6531,13 +6723,15 @@ _FIX_REQUEST_TOOL_PROMPT_TEMPLATE = """あなたはこのプロジェクトの�
 - search_in_file: 既存ファイル内でキーワードや関数名を検索し、該当行番号とその前後の抜粋だけを確認する。ファイルが大きい場合、read_fileでいきなり全体を読む前にまずこれで見当をつけると効率的。
 - read_file: 既存ファイルの中身を確認する(filenameのみ指定するとファイル全体、start_line/end_line(またはline+context_lines)を指定するとその範囲だけを読める)
 - list_dir: ファイル一覧を確認する
-- write_file: ファイルを新規作成・上書きする(部分修正の場合も、まずread_fileで現在の中身を確認したうえでファイル全体を書き直すこと)
+- write_file: ファイルを新規作成する、またはファイル全体を作り直す(部分修正にはedit_fileを使うこと)
+- edit_file: 既存ファイルの一部だけを置き換える(old_stringがファイル内で一意に定まるよう、前後の文脈を含めて指定すること。new_stringを空文字列にすると削除になる)
 - move_file: ファイル名を変更(移動)する
 - make_directory: サブディレクトリを作成する
 - delete_file: 不要になったファイルを削除する(取り消せないため、本当に不要な場合のみ使うこと)
 - run_command: ファイルの検証(動作確認)に使う。そのファイルの種類に適したコマンドを自分で判断して実行すること(例: .pyファイルなら'python3 <ファイル名>'、.jsファイルなら'node --check <ファイル名>'、.cファイルなら'gcc -fsyntax-only <ファイル名>'、.html/.cssファイルなら'check_html <HTMLファイル名>')。ただし、ネットワークアクセス(curl・wget・ssh等)・ファイルの削除や移動(rm・mv・cp等)・権限昇格(sudo等)を行うコマンドは実行できない(拒否される)。ファイルの削除・移動・作成・上書きは、run_commandではなく必ずdelete_file・move_file・write_fileを使うこと。
 
 {search_then_read_guidance}
+{edit_over_write_guidance}
 
 関連するファイル(import元・import先など)がある場合は、read_fileで確認したうえで、必要なファイルすべてに修正を反映してください。修正が完了したら、最後にツールを呼び出さずに、何をどう変更したかを簡潔な日本語の文章で報告してください。
 """
@@ -6778,7 +6972,7 @@ def _parse_fix_split_subtasks(text: str) -> list:
     return subtasks if len(subtasks) >= 2 else []
 
 
-_FIX_SUBTASK_REVIEW_PROMPT_TEMPLATE = """あなたはこのプロジェクトの改修レビュー担当です。以下のサブタスクは、組織内の別のメンバーが実装済みです。実際に変更されたファイルの中身をread_file・search_in_file等で確認し、問題があれば自分でwrite_file等のツールを使って直してください。
+_FIX_SUBTASK_REVIEW_PROMPT_TEMPLATE = """あなたはこのプロジェクトの改修レビュー担当です。以下のサブタスクは、組織内の別のメンバーが実装済みです。実際に変更されたファイルの中身をread_file・search_in_file等で確認し、問題があれば自分でedit_file・write_file等のツールを使って直してください。
 
 【このプロジェクトの使用言語】
 {language}
@@ -6792,7 +6986,7 @@ _FIX_SUBTASK_REVIEW_PROMPT_TEMPLATE = """あなたはこのプロジェクトの
 【実際に変更されたファイル】
 {modified_files}
 
-確認した結果、問題が無ければツールを何も呼び出さずに「問題なし」とだけ回答してください。問題があれば、write_file等のツールで実際に修正したうえで、何をどう直したかを簡潔に報告してください。
+確認した結果、問題が無ければツールを何も呼び出さずに「問題なし」とだけ回答してください。問題があれば、edit_file・write_file等のツールで実際に修正したうえで、何をどう直したかを簡潔に報告してください。{edit_over_write_guidance}
 """
 
 
@@ -6800,6 +6994,7 @@ def _build_fix_subtask_review_prompt(subtask: str, full_plan: str, language: str
     return _FIX_SUBTASK_REVIEW_PROMPT_TEMPLATE.format(
         subtask=subtask, full_plan=full_plan, language=language,
         modified_files=", ".join(modified_files) if modified_files else "(不明)",
+        edit_over_write_guidance=f" {_EDIT_OVER_WRITE_GUIDANCE}",
     )
 
 
@@ -6987,6 +7182,7 @@ def _run_fix_task_queue(
             impl_prompt = _FIX_REQUEST_TOOL_PROMPT_TEMPLATE.format(
                 full_plan=full_plan, file_list="\n".join(file_list), request=subtask, language=language,
                 search_then_read_guidance=_SEARCH_THEN_READ_GUIDANCE,
+                edit_over_write_guidance=_EDIT_OVER_WRITE_GUIDANCE,
             )
             summary, error, truncated, modified = _collect_answer_with_project_tools(
                 candidate, org_fingerprint, [{"role": "user", "content": impl_prompt}], project_dir,
@@ -7219,6 +7415,7 @@ def _run_fix_on_project(
     prompt = _FIX_REQUEST_TOOL_PROMPT_TEMPLATE.format(
         full_plan=full_plan, file_list="\n".join(file_list), request=request, language=language,
         search_then_read_guidance=_SEARCH_THEN_READ_GUIDANCE,
+        edit_over_write_guidance=_EDIT_OVER_WRITE_GUIDANCE,
     )
     summary, error, truncated, modified_files = _collect_answer_with_project_tools(
         implementer, org_fingerprint, [{"role": "user", "content": prompt}], project_dir,
