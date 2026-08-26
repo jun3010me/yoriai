@@ -3866,8 +3866,14 @@ def _build_review_prompt(
     # (`_run_review_self_explanation`)の申し送り事項があれば、参考情報
     # として追記する。無い場合(既定)は既存のプロンプトと一字一句同じ
     # になるよう、空文字列のまま何も追記しない。
+    #
+    # 仮の判断(申し送り事項消失バグへの対応): この文言は「合意した申し
+    # 送り事項」のように合意済みであることを前提とした書き方をしない。
+    # `_run_review_self_explanation`は合意に至らなかった場合、反論役の
+    # 生の指摘発言をそのまま`self_explanation`として返すことがあるため、
+    # 合意の有無によらず自然に読める書き方(「挙がった懸念点」)にする。
     self_explanation_section = (
-        f"\n【実装担当の設計判断についての申し送り事項(事前の自己説明・質疑より)】\n{self_explanation}\n"
+        f"\n【実装担当の設計判断について、事前の自己説明対話で挙がった懸念点(必ずしも合意には至っていません)】\n{self_explanation}\n"
         if self_explanation else ""
     )
     return _REVIEW_PROMPT_TEMPLATE.format(
@@ -4257,6 +4263,23 @@ def _request_fix(
     return fixed_code
 
 
+def _latest_critic_utterance(transcript: list) -> str:
+    """`transcript`(`_run_dialogue`の議事録)の中から、反論役
+    (`DIALOGUE_ROLE_CRITIC`)による最新ラウンドの発言内容を返す。反論役の
+    発言が1件も無ければ空文字列を返す。
+
+    仮の判断: `_run_review_self_explanation`専用のヘルパー。合意に至らな
+    かった対話でも、反論役が実際に指摘した懸念点そのものを申し送り事項
+    として拾い上げるために使う(詳細は`_run_review_self_explanation`の
+    docstring参照)。
+    """
+    critic_utterances = [u for u in transcript if u.get("role") == DIALOGUE_ROLE_CRITIC]
+    if not critic_utterances:
+        return ""
+    latest = max(critic_utterances, key=lambda u: u["round"])
+    return (latest.get("content") or "").strip()
+
+
 def _run_review_self_explanation(
     filename: str, owner: dict, reviewer: dict, code: str, full_plan: str, org_fingerprint: str,
     print_lock: threading.Lock = None,
@@ -4274,6 +4297,23 @@ def _run_review_self_explanation(
     保存も行わない(ファイルごとに議事録ファイルが量産されるのを避ける
     ため。永続化が必須なのは計画フェーズ・修正フェーズのような、
     プロジェクト全体に関わる議題に対してのみ)。
+
+    仮の判断(申し送り事項消失バグへの対応): 合意(`DIALOGUE_STATUS_
+    CONSENSUS`)または打ち切り採用(`DIALOGUE_STATUS_STAGNANT`)に至った
+    場合は、従来通り`final_content`(統合役がまとめた内容)をそのまま
+    申し送り事項として使う。それ以外(`DIALOGUE_STATUS_NEEDS_HUMAN`・
+    `DIALOGUE_STATUS_SAFETY_LIMIT`・`DIALOGUE_STATUS_GARBLED`等、合意に
+    至らなかった・打ち切られた場合)は`final_content`が`None`になり、
+    `summary`(`_summarize_dialogue`)も反論役の実際の発言内容とは無関係な
+    定型文になる。反論役が具体的な懸念点を挙げるほど合意には至りにくく
+    なるため、この定型文をそのまま使うと反論役が仕事をしているほど
+    申し送り事項が失われるという逆転が起きる。そこで、この場合は反論役が
+    直近に述べた発言(`_latest_critic_utterance`)を優先して使う。反論役の
+    発言が1件も無かった場合(候補が1台のみで反論役が実質存在しない等)は、
+    フォールバックとして従来通り`summary`を使う。`DIALOGUE_STATUS_
+    NO_ENGAGEMENT`(提案役からすら実のある応答が一度も得られなかった
+    場合)は、実装担当自身が何も説明できていない状態で反論役の発言も
+    存在しないため、これまで通り空文字列のままとする。
     """
     background = f"【実装計画全体】\n{full_plan}\n\n【{filename}のコード】\n{_truncate_file_content(code)[0]}"
     result = _run_dialogue(
@@ -4287,7 +4327,11 @@ def _run_review_self_explanation(
         ),
         print_lock=print_lock, tag=filename, min_rounds=1, max_rounds=2,
     )
-    return (result.get("final_content") or result.get("summary") or "").strip()
+    if result["status"] in (DIALOGUE_STATUS_CONSENSUS, DIALOGUE_STATUS_STAGNANT):
+        return (result.get("final_content") or "").strip()
+    if result["status"] == DIALOGUE_STATUS_NO_ENGAGEMENT:
+        return ""
+    return _latest_critic_utterance(result["transcript"]) or (result.get("summary") or "").strip()
 
 
 def _review_and_fix_one_file(
