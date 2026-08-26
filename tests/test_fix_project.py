@@ -2023,14 +2023,32 @@ _SPLIT_FAILING_SUBTASK_INDEX = 1  # _SPLIT_SUBTASKS[1] == lesson2.html担当
 
 def _fake_stream_fix_split_one_subtask_never_finishes(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
     """`_fake_stream_fix_split`と同じシナリオだが、lesson2.html担当の
-    サブタスクだけは、実機の往復回数上限到達を再現するため、
-    list_dirの呼び出しを無限に繰り返して終わらない(_collect_answer_
-    with_project_toolsがMAX_PROJECT_TOOL_ROUNDSで打ち切るまで続く)。
+    サブタスクだけは、実機の堂々巡り検知(同じlist_dirの呼び出しを
+    繰り返し続ける)による打ち切りを再現する(`_collect_answer_
+    with_project_tools`が`PROJECT_TOOL_LOOP_REPEAT_LIMIT`到達で打ち切る
+    まで続く)。
+
+    仮の判断: 堂々巡りで失敗したサブタスクは`_resplit_looping_fix_
+    subtasks`によって単体で再度`_decide_fix_task_split`にかけられる
+    (依頼の「index.html等3ファイルにまたがるnav追加のような、タスク
+    設計自体が大きすぎるケースを見直す」機能への対応)。この規模判定の
+    プロンプトは元の依頼(3ファイル分)・失敗したサブタスク単体(1ファイル
+    分)のどちらでも「1人のメンバーが一度に実行できる規模か」という
+    同じ文言を含むため、埋め込まれた依頼文そのもの(元の依頼文字列か、
+    失敗したサブタスク単体の説明文か)で区別する。失敗したサブタスク
+    単体は既に1ファイルに絞られており、これ以上分割する余地が無い
+    という現実的な判定を模擬し、「分割不要」と答える(このテストの
+    目的はあくまで堂々巡り検知後のpending化・resume-all検出の確認で
+    あり、再分割そのものの検証は別テストで行う)。
     """
     prompt = messages[0]["content"] if messages else ""
     tool_round = _tool_round(messages)
 
     if "1人のメンバーが一度に実行できる規模か" in prompt:
+        if _SPLIT_SUBTASKS[_SPLIT_FAILING_SUBTASK_INDEX] in prompt:
+            yield {"content": "分割不要"}
+            yield {"done": True}
+            return
         yield {"content": "\n".join(f"- {s}" for s in _SPLIT_SUBTASKS)}
         yield {"done": True}
         return
@@ -2062,6 +2080,101 @@ def _fake_stream_fix_split_one_subtask_never_finishes(candidate, org_fingerprint
 
     yield {"content": "問題なし"}
     yield {"done": True}
+
+
+_RESPLIT_FINER_SUBTASKS = [
+    "lesson2.htmlのヘッダー部分にレッスン2の見出しを追加する",
+    "lesson2.htmlの本文部分にレッスン2の内容を追加する",
+]
+
+
+def _fake_stream_fix_split_loop_failure_gets_resplit(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
+    """`_fake_stream_fix_split_one_subtask_never_finishes`と同じく
+    lesson2.html担当のサブタスクが堂々巡りで打ち切られるが、こちらは
+    その後の再分割の問い合わせ(`_decide_fix_task_split`)に対して
+    「さらに2件に分割すべき」と答えるバリエーション。実機報告の
+    「タスクの設計自体が大きすぎた」ケースで、再分割によってより細かい
+    サブタスクに置き換わることをエンドツーエンドで確認するために使う。
+    """
+    prompt = messages[0]["content"] if messages else ""
+    tool_round = _tool_round(messages)
+
+    if "1人のメンバーが一度に実行できる規模か" in prompt:
+        if _SPLIT_SUBTASKS[_SPLIT_FAILING_SUBTASK_INDEX] in prompt:
+            yield {"content": "\n".join(f"- {s}" for s in _RESPLIT_FINER_SUBTASKS)}
+            yield {"done": True}
+            return
+        yield {"content": "\n".join(f"- {s}" for s in _SPLIT_SUBTASKS)}
+        yield {"done": True}
+        return
+
+    if "改修レビュー担当です" in prompt:
+        yield {"content": "問題なし"}
+        yield {"done": True}
+        return
+
+    if _SPLIT_SUBTASKS[_SPLIT_FAILING_SUBTASK_INDEX] in prompt:
+        yield {"pending_tool_calls": [
+            {"id": f"call_{tool_round}", "type": "function", "function": {"name": "list_dir", "arguments": {}}},
+        ]}
+        return
+
+    for filename, subtask_text in zip(_SPLIT_TARGET_FILES, _SPLIT_SUBTASKS):
+        if subtask_text in prompt:
+            if tool_round == 0:
+                yield {"pending_tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {
+                        "name": "write_file",
+                        "arguments": {"filename": filename, "content": f"<!-- {filename} updated -->\n"},
+                    }},
+                ]}
+                return
+            yield {"content": f"{filename}を更新しました。"}
+            yield {"done": True}
+            return
+
+    yield {"content": "問題なし"}
+    yield {"done": True}
+
+
+def test_fix_project_loop_failed_subtask_gets_resplit_into_finer_subtasks_end_to_end():
+    """実機報告への対応の確認: 堂々巡り検知で打ち切られたサブタスクは、
+    そのまま同じ説明文でPROGRESS.mdに残るのではなく、再分割の判定担当が
+    分割できると判断した場合はより細かいサブタスク群に置き換わって
+    永続化され、次の`//resume-all`で細かい単位から再挑戦できることを
+    確認する(タスクの設計自体を見直す機能そのもののエンドツーエンド
+    確認)。
+    """
+    original_snapshot = yoriai._fetch_org_snapshot
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False: _two_member_snapshot()
+    yoriai._stream_chat_from_candidate = _fake_stream_fix_split_loop_failure_gets_resplit
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        projects_root = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME)
+        project_dir = _write_completed_project(
+            projects_root, "html-course",
+            [("lesson1.html", "レッスン1"), ("lesson2.html", "レッスン2"), ("progress.js", "進捗保存")],
+            files={fn: f"<!-- {fn} placeholder -->\n" for fn in _SPLIT_TARGET_FILES},
+        )
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            yoriai._ask_organization_fix_project(
+                47120, "fingerprint", "レッスンを2つ追加して進捗保存機能もつけて", out_dir,
+            )
+        output = buf.getvalue()
+
+        assert "タスクの設計自体が大きすぎた可能性があると判断し" in output, output
+        assert "2件のより細かいサブタスクに分割し直しました" in output, output
+
+        parsed = yoriai._parse_progress_markdown(os.path.join(project_dir, yoriai.PROGRESS_FILENAME))
+        assert parsed["pending_fix_subtasks"] == _RESPLIT_FINER_SUBTASKS, parsed
+    finally:
+        yoriai._fetch_org_snapshot = original_snapshot
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
 
 
 def test_fix_project_split_persists_pending_subtasks_so_resume_all_finds_it():
@@ -2165,6 +2278,97 @@ def test_resume_all_completes_previously_pending_fix_subtask_and_clears_it():
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# 堂々巡り検知で失敗したサブタスクの再分割(_resplit_looping_fix_subtasks)
+# ---------------------------------------------------------------------------
+
+def test_resplit_looping_fix_subtasks_replaces_only_the_loop_failed_subtask():
+    """堂々巡り検知(`loop_failed_task_keys`)で失敗したサブタスクだけを
+    対象に`_decide_fix_task_split`で再分割を試み、分割できた場合は
+    より細かいサブタスク群に置き換えることを確認する。完了済みの
+    サブタスクは結果に含まれない(=再分割の対象にもならない)。
+    """
+    checklist = yoriai._build_task_checklist([
+        ("サブタスク1", "サブタスク1の説明"),
+        ("サブタスク2", "index.html・plugins-guide.html・workflow.htmlにnavを追加する"),
+    ])
+    yoriai._set_task_status(checklist, "サブタスク1", "impl", yoriai._TASK_STATUS_COMPLETED)
+    yoriai._set_task_status(checklist, "サブタスク1", "review", yoriai._TASK_STATUS_COMPLETED)
+    numbered_subtasks = [
+        (1, "サブタスク1の説明"),
+        (2, "index.html・plugins-guide.html・workflow.htmlにnavを追加する"),
+    ]
+
+    original_decide = yoriai._decide_fix_task_split
+
+    def fake_decide(candidate, org_fingerprint, request, full_plan, file_list, language):
+        assert request == "index.html・plugins-guide.html・workflow.htmlにnavを追加する", request
+        return [
+            "index.htmlにnavを追加する", "plugins-guide.htmlにnavを追加する", "workflow.htmlにnavを追加する",
+        ]
+
+    yoriai._decide_fix_task_split = fake_decide
+    try:
+        pending = yoriai._resplit_looping_fix_subtasks(
+            checklist, numbered_subtasks, {"サブタスク2"},
+            {"label": "MacStudio", "model": "m"}, "fingerprint", "full plan", ["index.html"], "HTML",
+        )
+    finally:
+        yoriai._decide_fix_task_split = original_decide
+
+    assert pending == [
+        "index.htmlにnavを追加する", "plugins-guide.htmlにnavを追加する", "workflow.htmlにnavを追加する",
+    ], pending
+
+
+def test_resplit_looping_fix_subtasks_keeps_original_text_when_split_not_needed():
+    """再分割の判定担当が「分割不要」(または判定の問い合わせ自体に失敗)と
+    判断した場合、元のサブタスクの説明文をそのまま残すことを確認する
+    (無限に分割を試み続けない、既存の`_decide_fix_task_split`の安全側
+    フォールバックと同じ考え方の非破壊確認)。
+    """
+    checklist = yoriai._build_task_checklist([("サブタスク1", "index.htmlにnavを追加する")])
+    numbered_subtasks = [(1, "index.htmlにnavを追加する")]
+
+    original_decide = yoriai._decide_fix_task_split
+    yoriai._decide_fix_task_split = lambda *a, **kw: []
+    try:
+        pending = yoriai._resplit_looping_fix_subtasks(
+            checklist, numbered_subtasks, {"サブタスク1"},
+            {"label": "MacStudio", "model": "m"}, "fingerprint", "full plan", ["index.html"], "HTML",
+        )
+    finally:
+        yoriai._decide_fix_task_split = original_decide
+
+    assert pending == ["index.htmlにnavを追加する"], pending
+
+
+def test_resplit_looping_fix_subtasks_does_not_resplit_subtasks_outside_the_loop_failed_set():
+    """`loop_failed_task_keys`に含まれない(=堂々巡り以外の理由で未完了の)
+    サブタスクは再分割の対象にならず、元の説明文のまま残ることを確認する
+    (レビュー段階だけが堂々巡りで失敗したケース等、スコープ外として
+    明示している挙動の確認)。
+    """
+    checklist = yoriai._build_task_checklist([("サブタスク1", "index.htmlにnavを追加する")])
+    numbered_subtasks = [(1, "index.htmlにnavを追加する")]
+
+    original_decide = yoriai._decide_fix_task_split
+
+    def fake_decide(*args, **kwargs):
+        raise AssertionError("loop_failed_task_keysに含まれないサブタスクは再分割を試みないはずです")
+
+    yoriai._decide_fix_task_split = fake_decide
+    try:
+        pending = yoriai._resplit_looping_fix_subtasks(
+            checklist, numbered_subtasks, set(),
+            {"label": "MacStudio", "model": "m"}, "fingerprint", "full plan", ["index.html"], "HTML",
+        )
+    finally:
+        yoriai._decide_fix_task_split = original_decide
+
+    assert pending == ["index.htmlにnavを追加する"], pending
+
+
 def main():
     tests = [
         test_text_similarity_score_rewards_shared_substrings,
@@ -2247,7 +2451,11 @@ def main():
         test_progress_markdown_defaults_pending_fix_fields_to_empty,
         test_project_has_pending_work_detects_pending_fix_subtasks_even_when_module_checklist_is_complete,
         test_fix_project_split_persists_pending_subtasks_so_resume_all_finds_it,
+        test_fix_project_loop_failed_subtask_gets_resplit_into_finer_subtasks_end_to_end,
         test_resume_all_completes_previously_pending_fix_subtask_and_clears_it,
+        test_resplit_looping_fix_subtasks_replaces_only_the_loop_failed_subtask,
+        test_resplit_looping_fix_subtasks_keeps_original_text_when_split_not_needed,
+        test_resplit_looping_fix_subtasks_does_not_resplit_subtasks_outside_the_loop_failed_set,
     ]
     failures = 0
     for test in tests:

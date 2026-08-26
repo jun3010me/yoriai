@@ -1037,6 +1037,22 @@ _MUTATING_PROJECT_TOOL_NAMES = {
 # 繰り返し」を許し、それでも変わらなければ停滞と判断する)とした。
 PROJECT_TOOL_LOOP_REPEAT_LIMIT = 3
 
+# 仮の判断(実機報告への対応): 促しても堂々巡りが解消しない場合、それは
+# 「このモデルの能力不足」ではなく「1つのサブタスクとして複数ファイルに
+# またがる調査+修正を丸ごと詰め込んだ、タスクの設計自体が大きすぎる」
+# 可能性が高いという実機報告があった(index.html・plugins-guide.html・
+# workflow.htmlの3ファイルへのnav属性追加を1サブタスクにまとめていた)。
+# `_collect_answer_with_project_tools`が返す`error`にこの文字列が含まれて
+# いるかどうかで、呼び出し元(`yoriai.py`の`_run_fix_task_queue`)が
+# 「堂々巡りによる打ち切りだったか」を、他の種類の失敗(接続エラー・
+# タイムアウト・ラウンド上限到達)と区別できるようにする。エラー文言の
+# 一部をマーカーとして使う簡便な方法だが、この文字列は本ファイル内の
+# この打ち切り処理でしか使っていないため十分に一意(戻り値のタプルに
+# 新しいフィールドを追加すると、既存の全呼び出し元・テストの戻り値の
+# 分解を変更する必要が生じてしまうため、既存の型を変えずに済むこちらを
+# 選んだ)。
+PROJECT_TOOL_LOOP_ERROR_MARKER = "堂々巡り"
+
 
 def _normalize_project_tool_call(tool_call: dict) -> tuple:
     """`tool_call`から`(name, arguments)`を取り出す。`arguments`がJSON
@@ -1278,7 +1294,7 @@ def _collect_answer_with_project_tools(
             return "", (
                 f"同じツール呼び出し({call_description})が、ファイルの変更を1件も挟まずに"
                 f"{PROJECT_TOOL_LOOP_REPEAT_LIMIT}回繰り返され、探索をやめて修正するよう1度促しても"
-                "改善しなかったため、堂々巡りと判断してこの時点で打ち切りました"
+                f"改善しなかったため、{PROJECT_TOOL_LOOP_ERROR_MARKER}と判断してこの時点で打ち切りました"
             ), False, modified_files
 
     return "", f"ツール呼び出しの往復回数が上限({MAX_PROJECT_TOOL_ROUNDS}回)に達しました", False, modified_files

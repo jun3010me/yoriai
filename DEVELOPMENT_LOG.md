@@ -4766,3 +4766,82 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   おり、これは今回の変更に起因するものではなく、並列ディスパッチ関連の
   既存のスレッドタイミング依存によるものと見られる(今回のスコープ外)。
   今回の変更に固有の失敗は無い。
+
+### 堂々巡り検知後、同じサブタスクを繰り返す代わりにタスクの設計自体を見直す
+
+- **背景**: 上記の「1度だけ促す」対応を実機(`./projects/260826-obsidian-
+  pkm-web-web`)で試したところ、促した直後も同じ`search_in_file`/`list_dir`
+  を繰り返し続け、最終的に同じ堂々巡りエラーで打ち切られる状況が再現した。
+  当初はLM Studio側のContext Length設定(実際に8192だったことが判明)が
+  原因ではないかと調べたが、設定を上げてもらってもなお同じ症状が
+  再現したため、ジュンさんから「ただループから抜けるだけでは未完了
+  タスクが残り続けてどうしようもない。そもそもタスクの設計が間違って
+  いるという判断にして、タスクの設計からやり直すようにしてほしい」と
+  いう、より根本的な方向性の指摘があった。
+- **診断**: 実際に堂々巡りが起きていたサブタスクは「index.html、
+  plugins-guide.html、workflow.htmlに`role="navigation"`および適切な
+  `aria-label`を追加する」という、1サブタスクに3ファイル分の調査+修正を
+  詰め込んだものだった。`//fix`は依頼の規模判定(`_decide_fix_task_
+  split`、`_FIX_SPLIT_DECISION_PROMPT_TEMPLATE`)を依頼の受付時に1回
+  だけ行い、以後`//resume-all`で再開する際は`_resume_fix_project`が
+  `_run_fix_task_queue`にPROGRESS.mdの`pending_fix_subtasks`(未完了
+  サブタスクの説明文、堂々巡りで打ち切られても変更されずそのまま
+  記録されていた)を素通しで渡すだけで、規模判定をやり直す経路が
+  存在しなかった。つまり一度大きすぎるサブタスクとして生成されると、
+  `//resume-all`を何度実行しても同じ規模のまま同じ担当に再挑戦させる
+  だけの構造になっていた。
+- **修正**: `tools.py`に`PROJECT_TOOL_LOOP_ERROR_MARKER = "堂々巡り"`を
+  新設し、堂々巡り検知による打ち切りの`error`文言にこのマーカーを含める
+  ようにした(戻り値のタプル形状を変えず、既存の全呼び出し元・テストへの
+  影響を避けるため、エラー文言の一部をマーカーとして使う設計。この
+  文字列は本ファイル内のこの打ち切り処理でしか使っていないため十分に
+  一意)。`yoriai.py`の`_run_fix_task_queue`のworkerが、実装フェーズの
+  `error`にこのマーカーが含まれる場合、そのサブタスクの`task_key`を
+  `loop_failed_task_keys`に記録する。新設した`_resplit_looping_fix_
+  subtasks`(`_pending_subtask_descriptions`を置き換え)は、未完了の
+  各サブタスクについて、`loop_failed_task_keys`に含まれるものだけを
+  対象に、そのサブタスクの説明文自体を新たな「修正依頼」とみなして
+  `_decide_fix_task_split`に再度かけ直す。より細かいサブタスクに分割
+  できた場合はそちらに置き換え、「分割不要」または判定自体が失敗した
+  場合は元の説明文をそのまま残す(無限に分割を試み続けない安全側
+  フォールバック)。レビュー段階だけが堂々巡りで失敗したケースは
+  スコープ外とし(`loop_failed_task_keys`に含めない)、実装のやり直し
+  ではなくレビュー観点の絞り込みが必要な別種の問題として今回は扱わない
+  ことをdocstringに明記した。
+- **既存動作への影響確認**: 既存の`test_fix_project_split_persists_
+  pending_subtasks_so_resume_all_finds_it`が使う`fake_stream`
+  (`_fake_stream_fix_split_one_subtask_never_finishes`)は、規模判定の
+  プロンプト(「1人のメンバーが一度に実行できる規模か」という文言で
+  判定)を、埋め込まれた依頼文の中身を見ずに常に3分割で返していたため、
+  今回追加した再分割の問い合わせにも(元の依頼だと誤認して)同じ3分割を
+  返してしまい、テストの前提(堂々巡りで失敗したサブタスクがそのまま
+  1件だけ残る)が崩れて失敗するようになった。実際には、失敗した
+  サブタスク単体(1ファイル分、既に十分小さい)への規模判定なら
+  「分割不要」と答えるのが現実的なモデルの振る舞いのため、fake_stream
+  側を「埋め込まれた依頼文が、失敗したサブタスク単体の説明文であれば
+  分割不要と答える」ように修正した(このテスト自体が検証したい「堂々
+  巡りで失敗したサブタスクがpending化され`//resume-all`から検出できる」
+  という内容は変えていない)。
+- **テスト**: `tests/test_fix_project.py`に4ケース追加した。
+  `_resplit_looping_fix_subtasks`の単体テスト3件
+  (`_decide_fix_task_split`を直接差し替えて検証):
+  堂々巡りで失敗したサブタスクだけが再分割の対象になり分割結果に
+  置き換わること、「分割不要」判定時に元の説明文が残ること、
+  `loop_failed_task_keys`に含まれないサブタスクは(`_decide_fix_task_
+  split`が呼ばれてしまうと`AssertionError`になるfakeを使って)そもそも
+  再分割を試みないこと。加えて、新設した`_fake_stream_fix_split_loop_
+  failure_gets_resplit`(堂々巡りで失敗した後の規模判定で「2件に分割
+  すべき」と答えるバリエーション)を使ったエンドツーエンドのテスト
+  `test_fix_project_loop_failed_subtask_gets_resplit_into_finer_
+  subtasks_end_to_end`を追加し、実際に`_ask_organization_fix_project`を
+  通しで実行した結果、画面出力に再分割のログが出ること・
+  PROGRESS.mdの`pending_fix_subtasks`が元の1件ではなく再分割後の
+  2件に置き換わって永続化されることを確認した。
+- **動作確認**: `python3 -m pytest tests/test_fix_project.py`を実行し、
+  新規4件を含め85件全てパス。`python3 -m pytest tests/`をフルスイートで
+  3回連続実行し、いずれも今回の変更に起因する新規の失敗は無いことを
+  確認した(既存の`test_auto_resume.py`・`test_reviewer_read_file_
+  tool.py`の2件は前回までのログに報告済み。`test_fix_session.py`の
+  一部が実行ごとに異なるテストで失敗する現象も観測したが、これは
+  `git stash`で今回までの変更を全て退避したベースラインでも同様に
+  再現する既存のスレッドタイミング依存の不安定性であり、スコープ外)。
