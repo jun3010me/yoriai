@@ -531,7 +531,7 @@ _EDIT_OVER_WRITE_GUIDANCE = (
 # 最大3回程度までに制限してほしい」という要件に対応する上限。MAX_TOOL_CALL_ROUNDS
 # (ツール呼び出しラウンド全体の上限、web_searchも含む)とは別に、read_file単体の
 # 呼び出し回数をレビュー1回(=stream_chat_completionの1回の実行)ごとにカウントする。
-MAX_READ_FILE_CALLS_PER_REVIEW = 3
+MAX_READ_FILE_CALLS_PER_REVIEW = 6
 
 # 仮の判断(モジュール分割第一弾・第三弾への対応): MAX_TOOL_CALL_ROUNDS
 # (モデルが延々とツール呼び出しを繰り返すループに陥らないよう、1つの質問
