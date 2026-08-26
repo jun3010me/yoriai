@@ -2200,6 +2200,57 @@ def _finalize_dialogue_solo(candidates: list, org_fingerprint: str, prompt: str)
 
 AGREE_COMMAND = "//agree"
 
+# 仮の判断: `//agree`への依頼を「コンテンツ生成」(Webページ・記事等の
+# 制作依頼)と「ソフトウェア実装」(アプリ・ツール等の制作依頼)に大まかに
+# 分類するための定数。ピア選択で使う`TASK_TYPE_CODING`/`TASK_TYPE_GENERAL`
+# (コーディング系タスクかどうかという別軸の分類)とは目的が異なるため、
+# 名前が混同しないよう別の定数名にする。
+AGREE_REQUEST_TYPE_CONTENT = "content"
+AGREE_REQUEST_TYPE_SOFTWARE = "software"
+
+# コンテンツ生成を示すキーワード(簡易なキーワードベース判定でよく、
+# 厳密な自然言語理解までは求めない)。
+_CONTENT_REQUEST_KEYWORDS = (
+    "Webページ", "ウェブページ", "まとめ", "記事", "ブログ", "解説", "レポート",
+)
+
+# ソフトウェア実装を示すキーワード。
+_SOFTWARE_REQUEST_KEYWORDS = (
+    "アプリ", "ツール", "CLI", "スクリプト", "API", "プログラム",
+)
+
+# 依頼文中にこれらの語が明示的に含まれる場合、キーワード分類の結果に
+# 関わらずコンテンツ生成として扱う(ユーザーの明示的な指示を最優先する)。
+_EXPLICIT_RESEARCH_INSTRUCTION_KEYWORDS = (
+    "Web検索して", "ウェブ検索して", "調査して",
+)
+
+
+def _classify_agree_request_type(request: str) -> str:
+    """`//agree`への依頼が「コンテンツ生成」か「ソフトウェア実装」かを
+    簡易なキーワードベースで分類する。依頼文に「Web検索して」「調査して」
+    という明示的な指示があれば、キーワード分類の結果に関わらず
+    `AGREE_REQUEST_TYPE_CONTENT`を優先する(ユーザーの明示的な意図を
+    最優先する)。
+
+    それ以外は、コンテンツ生成キーワードのみに該当する場合だけ
+    `AGREE_REQUEST_TYPE_CONTENT`とし、両方に該当する・どちらにも
+    該当しない曖昧な場合は`AGREE_REQUEST_TYPE_SOFTWARE`(既存の挙動)を
+    デフォルトとする。誤判定でコンテンツ生成に倒れて既存ユーザーの
+    ソフトウェア開発フローを壊すことを避けるため、後方互換性を優先する。
+    """
+    text = request or ""
+    for keyword in _EXPLICIT_RESEARCH_INSTRUCTION_KEYWORDS:
+        if keyword in text:
+            return AGREE_REQUEST_TYPE_CONTENT
+
+    has_content_keyword = any(keyword in text for keyword in _CONTENT_REQUEST_KEYWORDS)
+    has_software_keyword = any(keyword in text for keyword in _SOFTWARE_REQUEST_KEYWORDS)
+    if has_content_keyword and not has_software_keyword:
+        return AGREE_REQUEST_TYPE_CONTENT
+    return AGREE_REQUEST_TYPE_SOFTWARE
+
+
 # 対話プロトコルを使い、成果物(コード等)は作らず計画だけを出力する単体
 # モード(依頼の「計画のみを出す単体モード」)。既存の新規作成モード
 # (//agree)・修正モード(//fix)とは独立したコマンドとして実装する。
@@ -3102,6 +3153,14 @@ def _ask_organization_collaborate(
     projects_root = os.path.join(out_dir, PROJECTS_SUBDIR_NAME)
     project_name = _project_name_with_date_prefix(request)
     project_dir = _resolve_project_dir(projects_root, project_name)
+
+    # 仮の判断: 依頼の種類(コンテンツ生成/ソフトウェア実装)を分類する。
+    # 現時点ではこの分類結果を使ってタスク分解の分岐を実際に切り替える
+    # 仕組み(コンテンツ生成用のリサーチフェーズ・タスク分解テンプレート)は
+    # まだ実装しておらず、既存のソフトウェア実装用の分岐
+    # (`_build_module_breakdown_prompt`・`_run_design_dialogue`)をそのまま
+    # 使う。段階的な導入の第一歩として、まず分類だけを追加する。
+    request_type = _classify_agree_request_type(request)
 
     if enable_dialogue:
         answer, aborted, dialogue_result = _run_design_dialogue(org_fingerprint, request, candidates, project_dir)
