@@ -4590,3 +4590,74 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
     (「上限(3回)」)を更新し忘れていたことが原因の既存の不具合であり、
     `git stash`で本修正を退避したベースラインでも同一のテストが同様に
     失敗することを確認済みのため、今回もスコープ外として修正していない。
+
+### 対話プロトコルでの応答なし(タイムアウト等)が原因不明になる問題の修正
+
+- **背景**: MacStudio(リソースに余裕がある状態)で対話プロトコル
+  (`_run_dialogue`)を実行した際、`[💬 MacStudioさん(提案役・ラウンド2)]
+  (応答がありませんでした)`という表示のみが出て、タイムアウトなのか・
+  接続エラーなのか・本当に空応答だったのかが一切わからない、という報告
+  があった。原因は2箇所あり、1箇所は既にコード内のコメントに関連する
+  過去の実害報告が残っている既知の弱点(タイムアウト値)、もう1箇所は
+  今回はじめて見つかったバグ(エラー情報の握りつぶし)だった。
+- **原因1(バグ)・修正**: `yoriai.py`の`_run_dialogue`内のローカル関数
+  `speak()`は、`_collect_answer_from_candidate`が返す`(content, error,
+  truncated)`のうち`error`をアンダースコア始まりの`_error`として受け取った
+  まま二度と参照しておらず、ログにも画面にも一切出力していなかった。
+  単発質問モード(`_ask_organization`)では同種の失敗が
+  `logger.warning`で記録されるのに対し、対話プロトコル経由の場合だけ
+  完全に無音になっていた。`_error`を`error`に変更した上で、
+  `_print_tagged`で表示する文言を分岐させた: `error`がtruthyなら
+  `f"(問い合わせに失敗しました: {error})"`、`error`がfalsyかつ`answer`が
+  空なら従来通り`"(応答がありませんでした)"`、`answer`があれば従来通り
+  そのまま表示する。`transcript`に積む`content`は`answer`のまま変更して
+  いない(エラー文言を後続ラウンドのプロンプトに埋め込まれる議事録
+  `_format_dialogue_transcript_for_prompt`に混入させると、発言内容の
+  ように後続の役割に読ませてしまい新たな混乱を生むため、画面表示専用に
+  とどめた)。`state["any_real_content"]`の判定ロジックは変更していない。
+  `_run_dialogue`本体の合意判定ロジック(`DIALOGUE_STATUS_*`の分岐)には
+  一切手を入れていない。
+- **原因2(既知の弱点)・対応**: `yoriai_types.py`の
+  `CHAT_READ_TIMEOUT_SEC`(既定120秒)は、トークンが実際に流れ続けている
+  間は働かないため生成が長時間続くこと自体には対応できているが、大型
+  モデル(コード内コメントに実例として登場する「MacStudio上の
+  qwen3-235b」)が最初の1トークンを出すまでの時間(プロンプト処理+
+  thinking)がこれを超えると`ReadTimeout`が発生する。対話プロトコルは
+  ラウンドを重ねるほど議事録全文をプロンプトに累積するため、ラウンドが
+  進むほど起きやすい構造になっている。既定値そのものを闇雲に変更する
+  のではなく、`KEEP_ALIVE`(`llm_stream.py`・
+  `YORIAI_OLLAMA_KEEP_ALIVE`環境変数)と同じ流儀で、環境変数
+  `YORIAI_CHAT_READ_TIMEOUT_SEC`があればそれを使い、無ければ既定値
+  120秒のままとする上書き機構を追加した。値の取得元(`os.environ.get`)を
+  変えるだけで、`yoriai.py`・`llm_stream.py`・`network.py`の参照側の
+  コード(`timeout=(CHAT_CONNECT_TIMEOUT_SEC, CHAT_READ_TIMEOUT_SEC)`)は
+  変更していない。既定値(120秒)・`CHAT_CONNECT_TIMEOUT_SEC`は変更して
+  いない。
+- **テスト**: `tests/test_dialogue_protocol.py`に3ケース追加した:
+  接続失敗を模擬した`fake_stream`から画面出力に「問い合わせに失敗
+  しました」と「Connection refused」の両方が含まれることを確認する
+  テスト、エラーが無く単に空応答だった場合に従来通り「(応答が
+  ありませんでした)」が出て「問い合わせに失敗しました」は出ないことを
+  確認するテスト(既存の
+  `test_run_dialogue_no_engagement_when_proposer_never_answers`の
+  非破壊確認を兼ねる)、エラー時も`transcript`の各発言`content`に
+  画面表示専用の「問い合わせに失敗しました」という文言が混入しないことを
+  確認するテスト。新規`tests/test_chat_read_timeout_env_override.py`を
+  新設し、環境変数未設定時に`CHAT_READ_TIMEOUT_SEC == 120`であること、
+  `YORIAI_CHAT_READ_TIMEOUT_SEC=300`設定時に`importlib.reload`後
+  `CHAT_READ_TIMEOUT_SEC == 300`であることを確認する2ケースを追加した
+  (テスト後は環境変数を確実にunsetし、モジュールを既定値の状態に戻す)。
+  計5ケース追加。
+- **動作確認**: `python3 -m pytest tests/`を実行し、新規5件を含め512件中
+  510件パス。既存の`test_auto_resume.py::
+  test_collaborate_auto_resume_stops_at_limit_and_reports_clearly`
+  (前回までのログに既に報告済みの、上限値変更時にアサーション文言
+  「上限(3回)」の更新を忘れた既存の不具合)と、
+  `test_reviewer_read_file_tool.py::
+  test_collect_review_answer_with_read_file_caps_at_max_calls`
+  (直前のコミット「Increase MAX_READ_FILE_CALLS_PER_REVIEW to 6」で
+  上限値を3から6に変更した際に、このテスト自身のアサーション文言
+  「実際のディスク読み取りは最大3回までのはず」を更新し忘れたと見られる
+  既存の不具合)の2件が失敗したが、`git stash`で今回の変更を退避した
+  ベースラインでも同一の2件が同様に失敗することを確認済みのため、
+  いずれも今回のスコープ外として修正していない。
