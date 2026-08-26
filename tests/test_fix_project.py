@@ -1582,6 +1582,66 @@ def test_collect_answer_with_project_tools_loop_nudge_lets_model_recover_and_suc
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
+def test_collect_answer_with_project_tools_loop_nudge_after_edit_tells_model_to_stop_and_report():
+    """実機報告への対応の確認: 既にedit_fileで変更に成功した後、同じ
+    search_in_fileで自分の変更を延々確認し続けて終われないパターン
+    (「今すぐ修正しろ」という言い直し要求は実態と矛盾する)では、
+    「既に変更済みなのでこれ以上確認せず完了報告せよ」という別の
+    言い直し要求が使われ、モデルがそれを受けてツール呼び出し無しの
+    テキストだけで完了すれば、エラーにならず正常に完了することを
+    確認する。
+    """
+    calls = {"n": 0}
+
+    def fake_stream(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield {"pending_tool_calls": [
+                {
+                    "id": "edit_1", "type": "function",
+                    "function": {"name": "edit_file", "arguments": {
+                        "filename": "index.html", "old_string": "<nav>", "new_string": "<nav role=\"navigation\">",
+                    }},
+                },
+            ]}
+            return
+        if 2 <= calls["n"] <= 4:
+            # 変更は既に完了しているのに、同じ検索を3回繰り返して
+            # 確認し続ける(実機ログと同じパターン)。
+            yield {"pending_tool_calls": [
+                {
+                    "id": f"search_{calls['n']}", "type": "function",
+                    "function": {"name": "search_in_file", "arguments": {"filename": "index.html", "query": "nav"}},
+                },
+            ]}
+            return
+        # 促された直後、ツールを呼ばずに完了報告だけを返す(期待する
+        # 立ち直り方)。
+        yield {"content": "index.htmlのnavにrole=\"navigation\"を追加しました。"}
+        yield {"done": True}
+
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._stream_chat_from_candidate = fake_stream
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        with open(os.path.join(out_dir, "index.html"), "w") as f:
+            f.write("<nav></nav>")
+        candidate = {"label": "MacStudio", "model": "m", "address": "127.0.0.1", "port": 47120}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            content, error, truncated, modified_files = yoriai._collect_answer_with_project_tools(
+                candidate, "fingerprint", [{"role": "user", "content": "navを直して"}], out_dir,
+            )
+        assert error is None, error
+        assert modified_files == ["index.html"], modified_files
+        assert content == "index.htmlのnavにrole=\"navigation\"を追加しました。"
+        assert "既に変更済みのため、これ以上確認せず完了報告するよう促して再試行しています" in buf.getvalue(), buf.getvalue()
+    finally:
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
 def test_collect_answer_with_project_tools_loop_detection_resets_after_a_real_edit():
     """同じ読み取り系ツール呼び出しの間に、実際にファイルを変更する
     write_file/edit_fileの成功が挟まっていれば「前進があった」とみなし、
@@ -2436,6 +2496,7 @@ def main():
         test_collect_answer_with_project_tools_stops_at_round_cap,
         test_collect_answer_with_project_tools_detects_identical_repeated_calls_as_loop,
         test_collect_answer_with_project_tools_loop_nudge_lets_model_recover_and_succeed,
+        test_collect_answer_with_project_tools_loop_nudge_after_edit_tells_model_to_stop_and_report,
         test_collect_answer_with_project_tools_loop_detection_resets_after_a_real_edit,
         test_resume_project_preserves_changelog_from_a_prior_fix,
         test_parse_fix_split_subtasks_extracts_bullet_lines,
