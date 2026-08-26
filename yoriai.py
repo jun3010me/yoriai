@@ -3589,9 +3589,8 @@ def _run_integration_verification(
 # ことが多く、この場合`_run_collaborative_project`は統合検証ループ自体を
 # スキップするため、骨組みだけの成果物がそのまま素通りしてしまう。
 # 既存の統合検証(検証コマンドの実行・失敗時の自動修正)とは責務を分離した、
-# 独立の警告専用チェックとして追加する。誤検知でユーザーの成果物を
-# 握りつぶすことを避けるため、今回のスコープでは「警告表示のみ」に
-# とどめ、自動修正ループへの統合は将来の改善項目とする。
+# 独立の警告専用チェックとして追加する(自動修正ループへの統合は
+# `_run_content_volume_verification`で行う。後述)。
 _CONTENT_VOLUME_MIN_CHARS = 500
 
 _CONTENT_PLACEHOLDER_MARKERS = ("TODO", "準備中", "後で追加", "[プレースホルダー]")
@@ -3689,6 +3688,101 @@ def _check_content_volume(project_dir: str, tasks: list) -> dict:
     return {"ok": not warnings, "warnings": warnings}
 
 
+# 仮の判断(コンテンツ内容量チェックの再修正ループ): `_check_content_
+# volume`は警告を検出するだけで、`_run_integration_verification`と違い
+# 自動修正には繋がっていなかった(前段のコメントで将来の改善項目として
+# 明記していた)。「検出→再実行対象として担当者に差し戻す」という依頼の
+# 要件に対応するため、`_run_integration_verification`と同じ「実行して
+# 失敗したら担当メンバー1名に`_collect_answer_with_project_tools`
+# (`//fix`・統合検証の両方が使っている、既存プロジェクトへのファイル
+# 操作ツール群を提供する既存の問い合わせ関数)で修正させ、再実行する」
+# というループの構造を、検証コマンドではなく`_check_content_volume`に
+# 対して適用する。
+MAX_CONTENT_VOLUME_FIX_ATTEMPTS = 2
+
+_CONTENT_VOLUME_FIX_PROMPT_TEMPLATE = """あなたはこのプロジェクトの改修担当です。全タスクの実装完了後の内容量チェックで、以下の問題が見つかりました。
+
+【このプロジェクトの構成案全体】
+{full_plan}
+
+【検出された問題】
+{warnings}
+
+【調査結果(参考にできる具体的な情報)】
+{research_notes}
+
+上記の調査結果にある具体例・数値・固有名詞を使って、指摘されたファイルの本文を書き足してください。「ここに説明が入ります」のような未完成のプレースホルダーや、具体例を伴わない抽象的な一般論だけの文章は禁止します。各セクションは最低でも{min_chars}文字程度の、具体例を含む説明にしてください。
+
+read_file・search_in_fileで現在の内容を確認してから、edit_file・write_fileで直してください。{edit_over_write_guidance}
+
+修正が完了したら、最後にツールを呼び出さずに、何を書き足したかを簡潔な日本語の文章で報告してください。
+"""
+
+
+def _build_content_volume_fix_prompt(full_plan: str, warnings: list, research_notes: str) -> str:
+    return _CONTENT_VOLUME_FIX_PROMPT_TEMPLATE.format(
+        full_plan=full_plan,
+        warnings="\n".join(f"- {warning}" for warning in warnings),
+        research_notes=research_notes or _RESEARCH_NO_RESULTS_MESSAGE,
+        min_chars=_CONTENT_VOLUME_MIN_CHARS,
+        edit_over_write_guidance=f" {_EDIT_OVER_WRITE_GUIDANCE}",
+    )
+
+
+def _run_content_volume_verification(
+    candidates: list, org_fingerprint: str, project_dir: str, tasks: list,
+    max_attempts: int = MAX_CONTENT_VOLUME_FIX_ATTEMPTS,
+) -> dict:
+    """コンテンツ生成系の`//agree`が生成したファイルの内容量・完成度を
+    `_check_content_volume`でチェックし、警告があれば担当メンバー1名に
+    修正を依頼して再チェックする、を最大`max_attempts`回まで繰り返す。
+    `_run_integration_verification`と同じ「実行して失敗したら直す」
+    ループの構造を、検証コマンドではなく`_check_content_volume`に対して
+    適用したもの。
+
+    仮の判断: 修正を依頼する担当は`_run_integration_verification`と
+    同様に`candidates`の先頭で固定する(内容量不足はプロジェクト全体に
+    またがる問題であり、1人が一貫して見た方が良いと判断)。
+
+    戻り値は`_check_content_volume`と同じ形式(`{"ok": bool, "warnings":
+    list}`)に、実際に試行した回数`attempts`を加えたもの。`max_attempts`回
+    試みても解消しない場合は、最後のチェック結果(`ok: False`)をそのまま
+    返す(誤検知でユーザーの成果物を握りつぶすことを避けるため、それ以上
+    リトライせず生成物はそのまま維持する)。
+    """
+    fixer = candidates[0]
+    full_plan = "\n".join(f"{fn}: {content}" for fn, content in tasks)
+    research_notes_path = os.path.join(project_dir, "research_notes.md")
+    research_notes = ""
+    if os.path.exists(research_notes_path):
+        try:
+            with open(research_notes_path, encoding="utf-8") as f:
+                research_notes = f.read()
+        except OSError:
+            research_notes = ""
+
+    result = _check_content_volume(project_dir, tasks)
+    for attempt in range(1, max_attempts + 1):
+        if result["ok"]:
+            result["attempts"] = attempt
+            return result
+        if attempt >= max_attempts:
+            break
+        print(f"[⚠️ 内容量チェックで警告があります。修正を依頼します ({attempt}回目/{max_attempts}回)]")
+        for warning in result["warnings"]:
+            print(f"  - {warning}")
+        print(f"[🔧 {fixer['label']} (モデル: {fixer['model']}) が本文を書き足しています...]")
+        fix_prompt = _build_content_volume_fix_prompt(full_plan, result["warnings"], research_notes)
+        _collect_answer_with_project_tools(
+            fixer, org_fingerprint, [{"role": "user", "content": fix_prompt}], project_dir,
+        )
+        print("[🔍 内容量チェックを再実行します]")
+        result = _check_content_volume(project_dir, tasks)
+
+    result["attempts"] = max_attempts
+    return result
+
+
 def _run_collaborative_project(
     request: str, tasks: list, checklist: list, candidates: list, org_fingerprint: str,
     project_dir: str, tasks_to_queue: list, auto_resume_count: int = 0, changelog: list = None,
@@ -3717,10 +3811,11 @@ def _run_collaborative_project(
     仮の判断(リサーチ機能組み込み ステップ4): `request_type`(既定
     `AGREE_REQUEST_TYPE_SOFTWARE`、既存の呼び出し元`_resume_project`との
     後方互換性のため)が`AGREE_REQUEST_TYPE_CONTENT`の場合のみ、統合検証の
-    後に`_check_content_volume`を呼び、警告があれば標準出力に表示する
-    (処理は中断しない)。`//fix`・`//resume-all`(`_resume_project`)は
-    今回のスコープ外のため、この引数を渡さず既定値のまま(チェックは
-    実行されない)。
+    後に`_run_content_volume_verification`を呼ぶ。内容量・完成度の警告が
+    検出された場合は担当メンバーへ差し戻して修正させ、それでも解消しない
+    警告だけを標準出力に表示する(処理は中断しない)。`//fix`・
+    `//resume-all`(`_resume_project`)は今回のスコープ外のため、この
+    引数を渡さず既定値のまま(チェックは実行されない)。
     """
     changelog = list(changelog) if changelog else []
     review_feedback = {}
@@ -3772,19 +3867,23 @@ def _run_collaborative_project(
             print(f"[❌ 統合検証に失敗しました({attempts}回試行)]")
         write_progress()
 
-    # 仮の判断(リサーチ機能組み込み ステップ4): コンテンツ生成系の依頼は
-    # 検証コマンドを持たないことが多く、上記の統合検証がまるごとスキップ
-    # されるため、内容量・完成度の警告チェックをここに独立して挟む。
-    # 未完了タスクが残っている場合はファイルが揃っていない可能性が高い
-    # ため、統合検証のスキップ判定と同じ理由でスキップする。警告があっても
-    # 処理は中断せず、標準出力への表示にとどめる(誤検知で成果物を握り
-    # つぶすことを避けるため)。
+    # 仮の判断(リサーチ機能組み込み ステップ4、修正: 自動修正ループ化):
+    # コンテンツ生成系の依頼は検証コマンドを持たないことが多く、上記の
+    # 統合検証がまるごとスキップされるため、内容量・完成度のチェックを
+    # ここに独立して挟む。未完了タスクが残っている場合はファイルが
+    # 揃っていない可能性が高いため、統合検証のスキップ判定と同じ理由で
+    # スキップする。`_run_content_volume_verification`が検出→担当者への
+    # 差し戻し→再チェックを最大`MAX_CONTENT_VOLUME_FIX_ATTEMPTS`回まで
+    # 行い、それでも解消しない警告だけをここで表示する(誤検知で成果物を
+    # 握りつぶすことを避けるため、それ以上は処理を中断しない)。
     if request_type == AGREE_REQUEST_TYPE_CONTENT and not incomplete_labels:
-        content_volume_result = _check_content_volume(project_dir, tasks)
+        content_volume_result = _run_content_volume_verification(candidates, org_fingerprint, project_dir, tasks)
         if not content_volume_result["ok"]:
-            print("[⚠️ 内容量チェックで警告があります(生成物はそのまま維持されます)]")
+            print("[⚠️ 内容量チェックで警告が残っています(生成物はそのまま維持されます)]")
             for warning in content_volume_result["warnings"]:
                 print(f"  - {warning}")
+        else:
+            print(f"[✅ 内容量チェックに成功しました ({content_volume_result['attempts']}回目の試行)]")
 
     # 【最重要】組織自身が立てた計画のうち、1つでも未完了のタスクが残って
     # いる場合は「✅ レビュー完了」を名乗らず、何が終わっていないかを
