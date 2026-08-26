@@ -4348,3 +4348,52 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
     発生することを確認済みであり、モジュール分割第三弾で既に記録した
     環境依存のflakinessと同種のもの(今回の変更とは無関係)と判断した。
     単体・複数回の実行では新規テストを含め安定してパスすることを確認した。
+- **`//agree`へのリサーチ機能組み込み ステップ3: コンテンツ生成用タスク
+  分解テンプレートの新設**。ステップ2のPR(#96)がマージされたことを
+  確認して着手した。ステップ2で保存された調査結果(`research_notes.md`)を、
+  コンテンツ生成系の依頼のタスク分解プロンプトに実際に埋め込む仕組みを
+  追加した(ステップ1・2はそれぞれ分類とリサーチの実行だけで、下流の
+  タスク分解には結線されていなかった)。
+  - `_CONTENT_BREAKDOWN_PROMPT_TEMPLATE`を新設した。「あなたはコンテンツ
+    制作の構成案を担当します(ソフトウェアの実装ではありません)」と役割を
+    明示し、`research_notes`を埋め込んで「調査結果を無視して一般論だけで
+    構成案を作ることは禁止します」と明示的に指示する。ファイル分割の要求は
+    既存の`_MODULE_BREAKDOWN_PROMPT_TEMPLATE`の「関数シグネチャの厳密な
+    一致」ではなく「同じ用語・見出しレベルをすべてのファイルで揃える」
+    というセクション構成の一貫性にした。出力形式(「ファイル名: 内容」+
+    「検証コマンド: <コマンド>」、「検証コマンド: なし」の許容を含む)は
+    既存の`_parse_module_breakdown`がそのまま解析できるよう据え置いた。
+  - `_build_module_breakdown_prompt`のシグネチャを
+    `_build_module_breakdown_prompt(request, request_type, research_notes="")`
+    に変更し、`AGREE_REQUEST_TYPE_CONTENT`の場合は`_CONTENT_BREAKDOWN_
+    PROMPT_TEMPLATE`を、それ以外(既定`AGREE_REQUEST_TYPE_SOFTWARE`)は
+    従来通り`_MODULE_BREAKDOWN_PROMPT_TEMPLATE`を使うよう分岐させた。
+    `_build_design_dialogue_output_instruction`にも同様の分岐(`request_type`
+    ・`research_notes`を追加引数として受け取り、コンテンツ系の場合は
+    同じ方針の指示を返す)を追加した。
+  - `grep -rn "_build_module_breakdown_prompt("`で洗い出した呼び出し元
+    (`_run_design_dialogue`・`_resume_design_dialogue`・
+    `_ask_organization_collaborate`、および`tests/test_language_agnostic.py`・
+    `tests/test_planned_filename_consistency.py`の直接呼び出し4箇所)を
+    全て更新した。`_run_design_dialogue`・`_PendingDesignDialogue`
+    (対話プロトコルが一時停止した状態を保持するクラス)には`request_type`・
+    `research_notes`を保持・引き継ぐフィールドを追加し、一時停止からの
+    再開(`_resume_design_dialogue`)でもコンテンツ用の指示・調査結果が
+    失われないようにした。いずれも新しい引数には既存の呼び出し元向けの
+    デフォルト値(`AGREE_REQUEST_TYPE_SOFTWARE`・空文字列)を設定したため、
+    既存のソフトウェア実装系`//agree`の挙動は変更していない。
+  - `_ask_organization_collaborate`内、対話プロトコル有効・無効いずれの
+    分岐にも、ステップ1・2で計算済みの`request_type`・`research_notes`を
+    渡すよう結線した。
+  - `tests/test_agree_request_classification.py`に4ケースを追加: コンテンツ
+    系分類時に`_CONTENT_BREAKDOWN_PROMPT_TEMPLATE`が使われ`research_notes`
+    が実際に埋め込まれること、ソフトウェア系では引き続き既存テンプレートが
+    使われること、対話プロトコル側の出力指示も同様に分岐すること、
+    `request_type`省略時は既定でソフトウェア実装用の挙動になることを検証。
+  - 動作確認: `python3 -m pytest tests/`が490件(既存486件+新規4件)
+    全てパス。フルスイート実行時、`test_background_collaborate.py`・
+    `test_fix_session.py`のスレッド・タイミング依存のテストがたまに1件
+    だけ失敗することがあったが、変更を一切加えていないこのブランチの
+    ベースライン(ステップ2マージ直後の状態)でも同一のテストが同様に
+    複数回に1回失敗することを確認済みであり、今回の変更とは無関係な
+    既知の環境依存flakinessと判断した。
