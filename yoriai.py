@@ -98,6 +98,7 @@ from yoriai_types import (
     SERVICE_TYPE,
 )
 from tools import (
+    PROJECT_TOOL_LOOP_ERROR_MARKER,
     WEB_SEARCH_TOOL_NAME,
     _ask_organization_multi,
     _collect_answer_with_project_tools,
@@ -5405,18 +5406,61 @@ def _persist_pending_fix_subtasks(
         )
 
 
-def _pending_subtask_descriptions(checklist: list, numbered_subtasks: list) -> list:
+def _resplit_looping_fix_subtasks(
+    checklist: list, numbered_subtasks: list, loop_failed_task_keys: set,
+    candidate: dict, org_fingerprint: str, full_plan: str, file_list: list, language: str,
+    print_lock: threading.Lock = None,
+) -> list:
     """タスクキュー実行後のチェックリストから、まだ完了していない
-    (実装・レビューのいずれかが未完了の)サブタスクの説明文を返す。
-    チェックリスト上の仮の識別子(「サブタスクN」)を、`numbered_subtasks`
-    (`[(N, サブタスクの説明文), ...]`)を使って元の説明文に逆引きする。
+    (実装・レビューのいずれかが未完了の)サブタスクの説明文のリストを
+    返す。チェックリスト上の仮の識別子(「サブタスクN」)を、
+    `numbered_subtasks`(`[(N, サブタスクの説明文), ...]`)を使って元の
+    説明文に逆引きする。ただし堂々巡り検知
+    (`PROJECT_TOOL_LOOP_ERROR_MARKER`、`tools.py`の`_collect_answer_
+    with_project_tools`が「探索をやめて修正するよう促しても改善しな
+    かった」と判断して打ち切ったケース)によって実装が失敗した
+    サブタスク(`loop_failed_task_keys`)は扱いを変える。
+
+    仮の判断(実機報告への対応): ただ同じ説明文のまま`//resume-all`に
+    引き継いでも、次に担当するメンバーも同じ堂々巡りを繰り返すだけ
+    だった(実機で複数回再現)。これは「モデルの能力不足」というより
+    「index.html・plugins-guide.html・workflow.htmlの3ファイルへの
+    nav属性追加」のように、1サブタスクに複数ファイルへの調査+修正を
+    詰め込みすぎた、タスクの設計自体の問題である可能性が高い。そこで、
+    堂々巡りで失敗したサブタスクは、その説明文自体を新たな「修正依頼」と
+    みなして`_decide_fix_task_split`(既存の//fix規模判定)に再度かけ、
+    より細かいサブタスクに分割できた場合はそちらに置き換える。「分割
+    不要」と判定された場合・判定の問い合わせ自体が失敗した場合は、
+    無限に分割を試み続けることはせず、安全側として元の説明文をそのまま
+    残す(次の`//resume-all`ではまた同じ担当に丸ごと再挑戦してもらう、
+    これまで通りの挙動にフォールバックする)。
+
+    レビュー段階だけが堂々巡りで失敗したサブタスク(実装は完了済み)は
+    このスコープ外とし、`loop_failed_task_keys`に含めないことを前提と
+    する(呼び出し元`_run_fix_task_queue`を参照。実装のやり直しでは
+    なくレビュー観点の絞り込みが必要なケースであり、単純な再分割では
+    解決しないため)。
     """
     pending = []
     for index, subtask in numbered_subtasks:
         task_key = f"サブタスク{index}"
         statuses = [task["status"] for task in checklist if task["filename"] == task_key]
-        if any(status != _TASK_STATUS_COMPLETED for status in statuses):
-            pending.append(subtask)
+        if not any(status != _TASK_STATUS_COMPLETED for status in statuses):
+            continue
+        if task_key in loop_failed_task_keys:
+            finer_subtasks = _decide_fix_task_split(
+                candidate, org_fingerprint, subtask, full_plan, file_list, language,
+            )
+            if len(finer_subtasks) >= 2:
+                _print_tagged(
+                    print_lock, task_key,
+                    f"[🔀 {task_key}は同じツール呼び出しの堂々巡りで完了できなかったため、"
+                    f"タスクの設計自体が大きすぎた可能性があると判断し、"
+                    f"{len(finer_subtasks)}件のより細かいサブタスクに分割し直しました]",
+                )
+                pending.extend(finer_subtasks)
+                continue
+        pending.append(subtask)
     return pending
 
 
@@ -5450,6 +5494,11 @@ def _run_fix_task_queue(
       「サブタスクN」という仮の識別子を「ファイル名」として扱う。
     - メンバーが1台しかない場合、担当外のレビュー担当を選べないため、
       そのサブタスクのレビューはスキップする(実装だけは行う)。
+    - 実装が堂々巡り検知(`PROJECT_TOOL_LOOP_ERROR_MARKER`)で失敗した
+      サブタスクは、`_resplit_looping_fix_subtasks`によりタスクの設計
+      自体を見直す(詳細はそちらのdocstringを参照。ただ同じ説明文の
+      まま`//resume-all`へ引き継いでも、次に担当するメンバーも同じ
+      堂々巡りを繰り返すだけだった実機報告への対応)。
     """
     numbered_subtasks = list(enumerate(subtasks, start=1))
     numbered_subtasks.sort(key=lambda t: _estimate_task_weight(t[1]), reverse=True)
@@ -5461,6 +5510,7 @@ def _run_fix_task_queue(
     remaining = list(numbered_subtasks)
     all_modified_files = []
     session_errors = []
+    loop_failed_task_keys = set()
 
     def pop_next():
         with queue_lock:
@@ -5477,6 +5527,10 @@ def _run_fix_task_queue(
     def record_error(note):
         with queue_lock:
             session_errors.append(note)
+
+    def record_loop_failure(task_key):
+        with queue_lock:
+            loop_failed_task_keys.add(task_key)
 
     def worker(candidate):
         while True:
@@ -5513,6 +5567,8 @@ def _run_fix_task_queue(
 
             if error:
                 record_error(f"{task_key}: {error}")
+                if PROJECT_TOOL_LOOP_ERROR_MARKER in error:
+                    record_loop_failure(task_key)
                 # 実装が完了しなかったサブタスクはチェックリスト上「未完了」の
                 # まま残り、最終チェックで検出される。このメンバーは次の
                 # サブタスクへ進む。
@@ -5574,8 +5630,15 @@ def _run_fix_task_queue(
     # (「サブタスクN」)から逆引きしておく。このリストをPROGRESS.mdに
     # 記録しない場合、往復回数の上限等で一部だけ未完了のまま終わっても
     # `//resume-all`からはその状態が一切見えず、再開する手段が無くなって
-    # しまう(実機で報告された不具合)。
-    still_pending_subtasks = _pending_subtask_descriptions(checklist, numbered_subtasks)
+    # しまう(実機で報告された不具合)。堂々巡り検知で失敗したサブタスク
+    # (`loop_failed_task_keys`)は、`_resplit_looping_fix_subtasks`が
+    # タスクの設計自体を見直す(単純な逆引きではなく、可能であればより
+    # 細かいサブタスクに分割し直した説明文を返す)。
+    still_pending_subtasks = _resplit_looping_fix_subtasks(
+        checklist, numbered_subtasks, loop_failed_task_keys,
+        candidates[0], org_fingerprint, full_plan, file_list, language,
+        print_lock=print_lock,
+    )
 
     combined_error = "; ".join(session_errors) if session_errors else None
     if not all_modified_files:
