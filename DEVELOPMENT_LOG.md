@@ -4661,3 +4661,57 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   既存の不具合)の2件が失敗したが、`git stash`で今回の変更を退避した
   ベースラインでも同一の2件が同様に失敗することを確認済みのため、
   いずれも今回のスコープ外として修正していない。
+
+### プロジェクト用ツール往復の「堂々巡り」検知(MAX_PROJECT_TOOL_ROUNDS引き上げでは解決しない停滞)
+
+- **背景**: 上記の対話プロトコルのエラー可視化に続けて、`//fix`等の実装
+  フェーズで使われる`tools.py`の`MAX_PROJECT_TOOL_ROUNDS`(修正ツール一式の
+  往復上限、既定50)をジュンさんが試しに500へ引き上げたところ、
+  `read_file`/`search_in_file`/`list_dir`のような読み取り専用ツールだけを
+  延々繰り返し、`write_file`/`edit_file`(実際の修正)に一度も到達しない
+  まま「止まらなくなった」という報告があった。診断の結果、これは
+  無限ループそのものではなく「500回転ぶんを律儀にやろうとしている」
+  状態で、上限を引き上げれば引き上げるほど同じ停滞に費やす時間が
+  伸びるだけだった。ジュンさんからのフィードバックは「回数の問題では
+  なく、同じことを繰り返していること自体をループ中に気づける仕組みが
+  欲しい」というもので、`_run_dialogue`側に既にある文字化け検知
+  (`_looks_garbled`)と同じ発想の、往復回数の上限とは独立した停滞検知を
+  `_collect_answer_with_project_tools`(`tools.py`)に追加することにした。
+- **設計**: `_MUTATING_PROJECT_TOOL_NAMES`(write_file/edit_file/
+  move_file/delete_fileの、実際にファイルを変更する4種)を1件も挟まずに、
+  同じツール名+同じ引数の呼び出しが`PROJECT_TOOL_LOOP_REPEAT_LIMIT`
+  (=3)回連続したら、ラウンド上限を待たずにその時点で打ち切り、
+  `MAX_PROJECT_TOOL_ROUNDS`到達時と同じ`error`の戻り値経路でその旨を
+  返すようにした。「連続」の判定は、mutating呼び出しが1件でも成功する
+  たびに(前進があったとみなして)カウントを白紙に戻すことで表現している
+  (`repeat_counts = {}`)。引数の比較は、モデルによってはargumentsが
+  JSON文字列で来ることがあるため、辞書に正規化してからキー順序を揃えて
+  比較する(`_normalize_project_tool_call`・`_project_tool_call_repeat_key`、
+  `_execute_project_tool_call`の既存の引数正規化と同じ考え方)。
+  閾値3回は、`MAX_READ_FILE_CALLS_PER_REVIEW`等の既存の「3」という
+  値の並びに合わせつつ、「最低でも1往復程度の様子見は許すが、それでも
+  変わらなければ停滞と判断する」という考え方で選んだ。
+- **既存動作への影響確認**: 停滞検知はラウンド上限(`MAX_PROJECT_TOOL_
+  ROUNDS`)の判定より先に効くため、既存の`test_collect_answer_with_
+  project_tools_stops_at_round_cap`(モデルが同じ`list_dir`呼び出しを
+  繰り返し続けてもラウンド上限で打ち切られることを確認するテスト)が、
+  新しい停滞検知に先に引っかかって失敗するようになった。このテストの
+  目的はあくまで「ラウンド上限側の打ち切り」の検証であるため、
+  ラウンドごとに(`search_in_file`の`query`引数へ通し番号を混ぜて)
+  引数を変化させる形に修正し、停滞検知には引っかからずに純粋な
+  ラウンド上限到達を再現できるようにした(このテスト自体が検証したい
+  内容は変えていない)。
+- **テスト**: `tests/test_fix_project.py`に2ケース追加した。
+  `test_collect_answer_with_project_tools_detects_identical_repeated_
+  calls_as_loop`は、実機報告と同じ「同じファイル・同じクエリの
+  `search_in_file`を延々繰り返す」`fake_stream`に対し、
+  `MAX_PROJECT_TOOL_ROUNDS`(50)に達する遥か手前(3回)で打ち切られ、
+  `error`に「堂々巡り」および実際に繰り返されたツール名(`search_in_file`)
+  が含まれることを確認する。`test_collect_answer_with_project_tools_
+  loop_detection_resets_after_a_real_edit`は、同じ`search_in_file`呼び出しの
+  間に`write_file`の成功を1回挟んだ場合、停滞カウントがリセットされ、
+  誤って打ち切られないことを確認する(誤検知防止の非破壊確認)。
+- **動作確認**: `python3 -m pytest tests/`を実行し、新規2件を含め514件中
+  512件パス。失敗した2件は前回までのログに報告済みの既存の不具合
+  (`test_auto_resume.py`・`test_reviewer_read_file_tool.py`、いずれも
+  アサーション文言の更新漏れ)のみで、今回の変更による新規の失敗は無い。

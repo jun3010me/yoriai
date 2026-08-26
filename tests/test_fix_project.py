@@ -1449,11 +1449,20 @@ def test_fix_project_end_to_end_delete_records_two_changelog_entries():
 def test_collect_answer_with_project_tools_stops_at_round_cap():
     """モデルが延々とツール呼び出しを繰り返すループに陥っても、
     MAX_PROJECT_TOOL_ROUNDSで確実に打ち切られることを確認する
-    (暴走防止)。
+    (暴走防止)。ここでは堂々巡り検知(同じ呼び出しの繰り返し)とは
+    別の経路を検証したいため、ラウンドごとに引数を変える(=堂々巡り
+    検知には引っかからないが、一向にwrite_file等に辿り着かない)ことで
+    純粋にラウンド上限側の打ち切りを再現する。
     """
+    counter = {"n": 0}
+
     def fake_stream_never_stops(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
+        counter["n"] += 1
         yield {"pending_tool_calls": [
-            {"id": "call_x", "type": "function", "function": {"name": "list_dir", "arguments": {}}},
+            {
+                "id": f"call_{counter['n']}", "type": "function",
+                "function": {"name": "search_in_file", "arguments": {"filename": "x.py", "query": f"pattern{counter['n']}"}},
+            },
         ]}
 
     original_stream = yoriai._stream_chat_from_candidate
@@ -1469,6 +1478,92 @@ def test_collect_answer_with_project_tools_stops_at_round_cap():
         assert error is not None and "上限" in error, error
         assert truncated is False
         assert modified_files == [], modified_files
+    finally:
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_collect_answer_with_project_tools_detects_identical_repeated_calls_as_loop():
+    """回数の上限(MAX_PROJECT_TOOL_ROUNDS)をいくら緩めても解消しない
+    「同じ検索・一覧確認だけを繰り返して一向に前進しない」停滞を、
+    ラウンド上限を待たずに検知して打ち切ることを確認する(実機報告:
+    上限を50→500に緩和しても、read_file/search_in_file/list_dirだけを
+    延々繰り返しwrite_file/edit_fileに一度も到達しないまま止まらなく
+    なった)。
+    """
+    def fake_stream_same_search_forever(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
+        yield {"pending_tool_calls": [
+            {
+                "id": "call_x", "type": "function",
+                "function": {"name": "search_in_file", "arguments": {"filename": "index.html", "query": "nav"}},
+            },
+        ]}
+
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._stream_chat_from_candidate = fake_stream_same_search_forever
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        with open(os.path.join(out_dir, "index.html"), "w") as f:
+            f.write("<nav></nav>")
+        candidate = {"label": "MacStudio", "model": "m", "address": "127.0.0.1", "port": 47120}
+        content, error, truncated, modified_files = yoriai._collect_answer_with_project_tools(
+            candidate, "fingerprint", [{"role": "user", "content": "navを直して"}], out_dir,
+        )
+        assert content == ""
+        assert error is not None and "堂々巡り" in error, error
+        assert "search_in_file" in error, error
+        assert truncated is False
+        assert modified_files == [], modified_files
+    finally:
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_collect_answer_with_project_tools_loop_detection_resets_after_a_real_edit():
+    """同じ読み取り系ツール呼び出しの間に、実際にファイルを変更する
+    write_file/edit_fileの成功が挟まっていれば「前進があった」とみなし、
+    堂々巡り検知のカウントをリセットすることを確認する(誤検知防止)。
+    """
+    calls = {"n": 0}
+
+    def fake_stream(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
+        calls["n"] += 1
+        search_call = {
+            "id": f"search_{calls['n']}", "type": "function",
+            "function": {"name": "search_in_file", "arguments": {"filename": "index.html", "query": "nav"}},
+        }
+        if calls["n"] == 3:
+            # 2回検索した後に実際の変更を1回挟む。
+            yield {"pending_tool_calls": [
+                {
+                    "id": "write_1", "type": "function",
+                    "function": {"name": "write_file", "arguments": {"filename": "index.html", "content": "<nav>fixed</nav>"}},
+                },
+            ]}
+            return
+        if calls["n"] >= 6:
+            # リセット後さらに2回検索した程度では、まだ閾値(3回)に
+            # 達しないはずなので、そのまま最終回答を返させて完了させる。
+            yield {"content": "確認しました"}
+            yield {"done": True}
+            return
+        yield {"pending_tool_calls": [search_call]}
+
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._stream_chat_from_candidate = fake_stream
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        with open(os.path.join(out_dir, "index.html"), "w") as f:
+            f.write("<nav></nav>")
+        candidate = {"label": "MacStudio", "model": "m", "address": "127.0.0.1", "port": 47120}
+        content, error, truncated, modified_files = yoriai._collect_answer_with_project_tools(
+            candidate, "fingerprint", [{"role": "user", "content": "navを直して"}], out_dir,
+        )
+        assert error is None, error
+        assert modified_files == ["index.html"], modified_files
+        assert content == "確認しました"
     finally:
         yoriai._stream_chat_from_candidate = original_stream
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -2073,6 +2168,8 @@ def main():
         test_fix_project_works_with_single_member_present,
         test_fix_project_end_to_end_delete_records_two_changelog_entries,
         test_collect_answer_with_project_tools_stops_at_round_cap,
+        test_collect_answer_with_project_tools_detects_identical_repeated_calls_as_loop,
+        test_collect_answer_with_project_tools_loop_detection_resets_after_a_real_edit,
         test_resume_project_preserves_changelog_from_a_prior_fix,
         test_parse_fix_split_subtasks_extracts_bullet_lines,
         test_parse_fix_split_subtasks_returns_empty_for_no_split_answer,

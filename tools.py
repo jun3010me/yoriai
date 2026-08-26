@@ -1021,6 +1021,45 @@ _MUTATING_PROJECT_TOOL_NAMES = {
     WRITE_FILE_TOOL_NAME, EDIT_FILE_TOOL_NAME, MOVE_FILE_TOOL_NAME, DELETE_FILE_TOOL_NAME,
 }
 
+# 仮の判断(実機報告への対応): MAX_PROJECT_TOOL_ROUNDSは「暴走してもいずれ
+# 止まる」ための歯止めであって、「同じ検索・一覧確認を延々繰り返して
+# 一向に前進しない」こと自体の検知にはならない(上限を50→500に緩和した
+# ところ、read_file/search_in_file/list_dirだけを回り続けて
+# write_file/edit_fileに一度も到達しないまま500ラウンドかけて堂々巡りする
+# 実例が報告された)。回数をいくら許容してもこの種の停滞は解消しないため、
+# 「同じツール名+同じ引数の(ファイルを変更しない)呼び出しが、直近の
+# 変更成功から何回連続したか」を別途数え、これがこの閾値に達した時点で
+# ラウンド上限を待たずに打ち切る。3回(=最低でも一往復は「様子見の
+# 繰り返し」を許し、それでも変わらなければ停滞と判断する)とした。
+PROJECT_TOOL_LOOP_REPEAT_LIMIT = 3
+
+
+def _normalize_project_tool_call(tool_call: dict) -> tuple:
+    """`tool_call`から`(name, arguments)`を取り出す。`arguments`がJSON
+    文字列で渡ってきた場合も辞書に戻す(`_execute_project_tool_call`の
+    引数正規化処理と同じ考え方)。停滞検知(`_project_tool_call_repeat_
+    key`)・実際のツール実行の双方から使われる共通の正規化処理。
+    """
+    function = tool_call.get("function", {})
+    name = function.get("name", "")
+    arguments = function.get("arguments", {})
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments) if arguments else {}
+        except json.JSONDecodeError:
+            arguments = {}
+    if not isinstance(arguments, dict):
+        arguments = {}
+    return name, arguments
+
+
+def _project_tool_call_repeat_key(name: str, arguments: dict) -> str:
+    """`(name, arguments)`を、停滞検知用に「同じ呼び出しかどうか」を
+    比較できる文字列キーに正規化する。キー順序を揃えることで、見た目の
+    違い(キー順序等)だけで別の呼び出しと誤判定しないようにする。
+    """
+    return name + ":" + json.dumps(arguments, sort_keys=True, ensure_ascii=False)
+
 
 def _mutated_filename_from_tool_result(tool_call: dict, result: str) -> str:
     """`tool_call`が実際にファイルを変更した(write_file/edit_file/move_file/
@@ -1100,11 +1139,21 @@ def _collect_answer_with_project_tools(
     書き込むとファイルが壊れた状態で保存されてしまうため。read_file等の
     読み取り系ツールは(内容の生成ではなく既存ファイルの参照なので)
     通常どおり実行する。
+
+    仮の判断(堂々巡り検知): MAX_PROJECT_TOOL_ROUNDSは回数さえ許せば
+    いずれ抜けられる暴走への歯止めだが、「同じ検索・一覧確認だけを
+    繰り返して一向に前進しない」停滞はラウンド数をいくら増やしても
+    解消しない。そのため、ファイルの変更(`_MUTATING_PROJECT_TOOL_NAMES`)を
+    1件も挟まずに同じツール名+同じ引数の呼び出しが
+    `PROJECT_TOOL_LOOP_REPEAT_LIMIT`回連続したら、ラウンド上限を待たずに
+    その時点で打ち切り、`error`にその旨を返す(呼び出し元は`error`を
+    `MAX_PROJECT_TOOL_ROUNDS`到達時と同じ経路でそのまま表示・記録できる)。
     """
     from yoriai import _print_tagged, _stream_chat_from_candidate
     messages = list(messages)
     modified_files = []
     nudged = False
+    repeat_counts = {}
     for _round_num in range(MAX_PROJECT_TOOL_ROUNDS):
         answer_parts = []
         pending_tool_calls = None
@@ -1161,6 +1210,21 @@ def _collect_answer_with_project_tools(
             mutated_filename = _mutated_filename_from_tool_result(tool_call, result)
             if mutated_filename:
                 modified_files.append(mutated_filename)
+                # 仮の判断: 実際にファイルの変更に成功した=前進があったので、
+                # ここまでの「様子見の繰り返し」カウントは白紙に戻す。
+                repeat_counts = {}
+                continue
+            _, call_arguments = _normalize_project_tool_call(tool_call)
+            repeat_key = _project_tool_call_repeat_key(function_name, call_arguments)
+            repeat_counts[repeat_key] = repeat_counts.get(repeat_key, 0) + 1
+            if repeat_counts[repeat_key] >= PROJECT_TOOL_LOOP_REPEAT_LIMIT:
+                loop_error = (
+                    f"同じツール呼び出し({function_name}: "
+                    f"{json.dumps(call_arguments, ensure_ascii=False)})が、"
+                    f"ファイルの変更を1件も挟まずに{PROJECT_TOOL_LOOP_REPEAT_LIMIT}回繰り返されたため、"
+                    "堂々巡りと判断してこの時点で打ち切りました"
+                )
+                return "", loop_error, False, modified_files
 
     return "", f"ツール呼び出しの往復回数が上限({MAX_PROJECT_TOOL_ROUNDS}回)に達しました", False, modified_files
 
