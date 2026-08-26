@@ -2611,7 +2611,7 @@ def _resume_organization_collaborate(
         return
     _run_collaborate_implementation_phase(
         pending.request, answer, pending.candidates, pending.org_fingerprint, pending.project_dir, pending.port,
-        completed_box=completed_box,
+        completed_box=completed_box, request_type=pending.request_type,
     )
 
 
@@ -3105,7 +3105,7 @@ class _CompletedBuildBox:
 
 def _run_collaborate_implementation_phase(
     request: str, answer: str, candidates: list, org_fingerprint: str, project_dir: str, port: int,
-    completed_box: "_CompletedBuildBox" = None,
+    completed_box: "_CompletedBuildBox" = None, request_type: str = AGREE_REQUEST_TYPE_SOFTWARE,
 ) -> None:
     """合意フェーズ(対話プロトコルによる複数ラウンドの議論・設計担当1名への
     1回きりの相談・一時停止後に人間の回答を踏まえて再開した議論、のいずれ
@@ -3171,7 +3171,7 @@ def _run_collaborate_implementation_phase(
 
     _run_collaborative_project(
         request, tasks, checklist, candidates, org_fingerprint, project_dir, tasks, language=language,
-        verify_command=verify_command,
+        verify_command=verify_command, request_type=request_type,
     )
 
     # 仮の判断: 自動再開(有限の上限付き)は、この「新規の協業モード実行」
@@ -3384,6 +3384,7 @@ def _ask_organization_collaborate(
 
     _run_collaborate_implementation_phase(
         request, answer, candidates, org_fingerprint, project_dir, port, completed_box=completed_box,
+        request_type=request_type,
     )
 
 
@@ -3484,10 +3485,117 @@ def _run_integration_verification(
     return False, last_output, max_attempts
 
 
+# 仮の判断(リサーチ機能組み込み ステップ4): `_run_integration_
+# verification`は検証コマンドの実行結果(成功/失敗)のみを見ており、
+# 生成物の内容量やプレースホルダーの有無は一切チェックしていない。
+# コンテンツ生成系の依頼は検証コマンドを持たない(「検証コマンド: なし」)
+# ことが多く、この場合`_run_collaborative_project`は統合検証ループ自体を
+# スキップするため、骨組みだけの成果物がそのまま素通りしてしまう。
+# 既存の統合検証(検証コマンドの実行・失敗時の自動修正)とは責務を分離した、
+# 独立の警告専用チェックとして追加する。誤検知でユーザーの成果物を
+# 握りつぶすことを避けるため、今回のスコープでは「警告表示のみ」に
+# とどめ、自動修正ループへの統合は将来の改善項目とする。
+_CONTENT_VOLUME_MIN_CHARS = 500
+
+_CONTENT_PLACEHOLDER_MARKERS = ("TODO", "準備中", "後で追加", "[プレースホルダー]")
+
+# 仮の判断: 簡易的なキーワード抽出用のトークンパターン。日本語には英語の
+# ような単語区切り(スペース)が無く、厳密な形態素解析は依頼の「厳密な
+# 意味理解までは求めない」というスコープを超えるため、固有名詞・技術用語に
+# 多く現れる「英数字の連続」と「カタカナの連続」だけを拾う単純な正規表現に
+# とどめる。
+_CONTENT_KEYWORD_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9]{3,}|[ァ-ヴー]{2,}")
+
+# 調査結果から抽出したキーワードのうち、生成コンテンツに反映されている
+# べき最低割合。誤検知を避けるため緩めの閾値にする(警告止まりの目安に
+# すぎず、これを下回っても処理は中断しない)。
+_CONTENT_KEYWORD_REFLECTION_MIN_RATIO = 0.2
+
+# 抽出できたキーワードがこれ未満の場合は判定材料として不十分なため
+# チェック自体をスキップする(リサーチフェーズが「検索結果なし」で
+# 終わった場合の定型文などからの誤検知を防ぐ)。
+_CONTENT_KEYWORD_MIN_COUNT_TO_CHECK = 3
+
+
+def _extract_research_keywords(research_notes_text: str) -> list:
+    """`research_notes.md`の内容から、簡易的なキーワード候補(英数字の
+    連続・カタカナの連続)を登場順・重複無しで抽出する。
+    """
+    seen = set()
+    keywords = []
+    for token in _CONTENT_KEYWORD_TOKEN_PATTERN.findall(research_notes_text or ""):
+        if token not in seen:
+            seen.add(token)
+            keywords.append(token)
+    return keywords
+
+
+def _check_content_volume(project_dir: str, tasks: list) -> dict:
+    """コンテンツ生成系の`//agree`が生成したファイルの内容量・完成度を
+    簡易的にチェックする。戻り値は`{"ok": bool, "warnings": list}`。
+
+    チェック内容:
+    - 各生成ファイルの文字数が`_CONTENT_VOLUME_MIN_CHARS`を下回っていないか
+    - 「TODO」「準備中」「後で追加」「[プレースホルダー]」等、未完成を
+      示す文字列が含まれていないか
+    - `research_notes.md`から抽出したキーワードが、生成されたコンテンツ
+      ファイル側に一定数以上(`_CONTENT_KEYWORD_REFLECTION_MIN_RATIO`)
+      反映されているか(簡易的な文字列一致であり、厳密な意味理解までは
+      求めない)
+
+    `research_notes.md`が存在しない・「検索結果なし」のままだった場合、
+    またはキーワードが`_CONTENT_KEYWORD_MIN_COUNT_TO_CHECK`未満しか
+    抽出できなかった場合は、キーワード反映チェックはスキップする
+    (判定材料が乏しい状態での誤検知を避けるため)。
+    """
+    warnings = []
+    file_texts = {}
+    for filename, _content_desc in tasks:
+        safe_path, error = _resolve_safe_project_path(project_dir, filename)
+        if error:
+            continue
+        try:
+            with open(safe_path, encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            continue
+        file_texts[filename] = text
+
+        if len(text) < _CONTENT_VOLUME_MIN_CHARS:
+            warnings.append(
+                f"{filename}: 文字数が{len(text)}文字と少なく、内容が薄い可能性があります"
+                f"(目安: {_CONTENT_VOLUME_MIN_CHARS}文字以上)"
+            )
+        for marker in _CONTENT_PLACEHOLDER_MARKERS:
+            if marker in text:
+                warnings.append(f"{filename}: 未完成を示す「{marker}」という記述が含まれています")
+
+    research_notes_path = os.path.join(project_dir, "research_notes.md")
+    if os.path.exists(research_notes_path):
+        try:
+            with open(research_notes_path, encoding="utf-8") as f:
+                research_text = f.read()
+        except OSError:
+            research_text = ""
+        if research_text and research_text != _RESEARCH_NO_RESULTS_MESSAGE:
+            keywords = _extract_research_keywords(research_text)
+            if len(keywords) >= _CONTENT_KEYWORD_MIN_COUNT_TO_CHECK:
+                combined_content = "\n".join(file_texts.values())
+                matched = [kw for kw in keywords if kw in combined_content]
+                ratio = len(matched) / len(keywords)
+                if ratio < _CONTENT_KEYWORD_REFLECTION_MIN_RATIO:
+                    warnings.append(
+                        "調査結果のキーワードが生成コンテンツにほとんど反映されていません"
+                        f"(反映: {len(matched)}/{len(keywords)}件)"
+                    )
+
+    return {"ok": not warnings, "warnings": warnings}
+
+
 def _run_collaborative_project(
     request: str, tasks: list, checklist: list, candidates: list, org_fingerprint: str,
     project_dir: str, tasks_to_queue: list, auto_resume_count: int = 0, changelog: list = None,
-    language: str = "", verify_command: str = "",
+    language: str = "", verify_command: str = "", request_type: str = AGREE_REQUEST_TYPE_SOFTWARE,
 ) -> None:
     """タスクキュー方式による実装・レビューを実行し、その間PROGRESS.mdを
     更新し続ける。新規プロジェクト(`_ask_organization_collaborate`)・
@@ -3508,6 +3616,14 @@ def _run_collaborative_project(
     そのまま渡ってくる。これが無いと、修正依頼で追記した更新履歴や、
     合意フェーズで決まった使用言語・検証コマンドが、その後の(無関係な)
     `//resume-all`によるPROGRESS.mdの書き換えで消えてしまう。
+
+    仮の判断(リサーチ機能組み込み ステップ4): `request_type`(既定
+    `AGREE_REQUEST_TYPE_SOFTWARE`、既存の呼び出し元`_resume_project`との
+    後方互換性のため)が`AGREE_REQUEST_TYPE_CONTENT`の場合のみ、統合検証の
+    後に`_check_content_volume`を呼び、警告があれば標準出力に表示する
+    (処理は中断しない)。`//fix`・`//resume-all`(`_resume_project`)は
+    今回のスコープ外のため、この引数を渡さず既定値のまま(チェックは
+    実行されない)。
     """
     changelog = list(changelog) if changelog else []
     review_feedback = {}
@@ -3558,6 +3674,20 @@ def _run_collaborative_project(
         else:
             print(f"[❌ 統合検証に失敗しました({attempts}回試行)]")
         write_progress()
+
+    # 仮の判断(リサーチ機能組み込み ステップ4): コンテンツ生成系の依頼は
+    # 検証コマンドを持たないことが多く、上記の統合検証がまるごとスキップ
+    # されるため、内容量・完成度の警告チェックをここに独立して挟む。
+    # 未完了タスクが残っている場合はファイルが揃っていない可能性が高い
+    # ため、統合検証のスキップ判定と同じ理由でスキップする。警告があっても
+    # 処理は中断せず、標準出力への表示にとどめる(誤検知で成果物を握り
+    # つぶすことを避けるため)。
+    if request_type == AGREE_REQUEST_TYPE_CONTENT and not incomplete_labels:
+        content_volume_result = _check_content_volume(project_dir, tasks)
+        if not content_volume_result["ok"]:
+            print("[⚠️ 内容量チェックで警告があります(生成物はそのまま維持されます)]")
+            for warning in content_volume_result["warnings"]:
+                print(f"  - {warning}")
 
     # 【最重要】組織自身が立てた計画のうち、1つでも未完了のタスクが残って
     # いる場合は「✅ レビュー完了」を名乗らず、何が終わっていないかを

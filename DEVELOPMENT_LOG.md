@@ -4397,3 +4397,56 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
     ベースライン(ステップ2マージ直後の状態)でも同一のテストが同様に
     複数回に1回失敗することを確認済みであり、今回の変更とは無関係な
     既知の環境依存flakinessと判断した。
+- **`//agree`へのリサーチ機能組み込み ステップ4(最終段): 統合検証への
+  内容量チェックの追加**。ステップ3のPR(#97)がマージされたことを確認して
+  着手した。既存の統合検証(`_run_integration_verification`)は検証コマンド
+  の実行結果(成功/失敗)のみを見ており、生成物の内容量やプレースホルダー
+  の有無は一切チェックしていない。コンテンツ生成系の依頼は検証コマンドを
+  持たない(「検証コマンド: なし」)ことが多く、この場合統合検証ループ
+  自体がまるごとスキップされ、骨組みだけの成果物がそのまま素通りして
+  しまう問題への対応。
+  - `_check_content_volume(project_dir, tasks) -> dict`を新設した。既存の
+    検証コマンド実行ロジック(`_run_integration_verification`)には手を
+    加えず、責務を分離した独立関数にした。戻り値は
+    `{"ok": bool, "warnings": list}`。
+    - 各生成ファイルの文字数が閾値(`_CONTENT_VOLUME_MIN_CHARS`、500文字)
+      を下回っていないか。
+    - 「TODO」「準備中」「後で追加」「[プレースホルダー]」等、未完成を
+      示す文字列(`_CONTENT_PLACEHOLDER_MARKERS`)が含まれていないか。
+    - `research_notes.md`から簡易的に抽出したキーワード
+      (`_extract_research_keywords`: 英数字3文字以上の連続・カタカナ2文字
+      以上の連続を拾うだけの単純な正規表現。依頼の「厳密な意味理解までは
+      求めない」に対応し、形態素解析はしない)が、生成コンテンツ側に
+      一定割合(`_CONTENT_KEYWORD_REFLECTION_MIN_RATIO`、20%)以上反映
+      されているか。`research_notes.md`が存在しない・「検索結果なし」の
+      まま・抽出できたキーワードが3件未満の場合は、判定材料が乏しく誤
+      検知を招くため、このキーワードチェック自体をスキップする。
+  - `_run_collaborative_project`(`_run_collaborate_implementation_phase`
+    経由で`_ask_organization_collaborate`・`_resume_organization_
+    collaborate`双方から呼ばれる)に`request_type`引数(既定
+    `AGREE_REQUEST_TYPE_SOFTWARE`)を追加し、`AGREE_REQUEST_TYPE_CONTENT`
+    かつ未完了タスクが残っていない場合のみ、統合検証の後に
+    `_check_content_volume`を呼んで警告を標準出力に表示するようにした。
+    `ok: False`でも処理は中断せず警告表示のみにとどめる(誤検知で成果物を
+    握りつぶすことを避けるため、依頼の指定通り今回のスコープでは
+    「警告止まり」とし、自動修正ループへの統合は将来の改善項目とする)。
+  - `request_type`は`_run_collaborate_implementation_phase`・
+    `_ask_organization_collaborate`・`_resume_organization_collaborate`
+    (`_PendingDesignDialogue`が保持する値)を経由してそのまま渡すだけで、
+    `//fix`・`//resume-all`(`_resume_project`からの呼び出し)には一切
+    渡さない(既定値のまま)ため、既存のソフトウェア実装系`//agree`・
+    `//fix`・`//resume-all`の挙動は変更していない。
+  - `tests/test_content_volume_check.py`(新規)に、文字数不足・
+    プレースホルダー検出・キーワード未反映のそれぞれで警告が出ること、
+    条件を満たす正常系では警告が出ないこと、`research_notes.md`が
+    存在しない場合はキーワードチェックだけがスキップされることを検証する
+    テストを追加した。
+  - 動作確認: `python3 -m pytest tests/`が495件(既存490件+新規5件)
+    全てパス。フルスイート実行時、`test_background_collaborate.py`の
+    スレッド・タイミング依存のテストがたまに1件だけ失敗することが
+    あったが、これまでのステップと同じく変更前のベースラインでも同様に
+    再現する既知の環境依存flakinessであり、今回の変更とは無関係と判断した。
+  - これで、依頼書のステップ1〜4(依頼の種類判定・独立したリサーチ
+    フェーズ・コンテンツ用タスク分解テンプレート・統合検証への内容量
+    チェック)が全て完了した。`//fix`への同様の適用は、依頼書に明記の
+    通り今回のスコープ外(将来、別途スコープを切って検討する)。
