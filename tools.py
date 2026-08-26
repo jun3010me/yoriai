@@ -1030,7 +1030,8 @@ _MUTATING_PROJECT_TOOL_NAMES = {
 # 「同じツール名+同じ引数の(ファイルを変更しない)呼び出しが、直近の
 # 変更成功から何回連続したか」を別途数え、これがこの閾値に達した時点で
 # ラウンド上限を待たずに、まず1度だけモデルに繰り返しを自覚させて
-# 修正へ着手するよう促し(_PROJECT_TOOL_LOOP_NUDGE_MESSAGE)、それでも
+# 修正へ着手するか完了報告を促し(_PROJECT_TOOL_LOOP_NUDGE_MESSAGE_
+# BEFORE_EDIT/_AFTER_EDIT)、それでも
 # 同じ繰り返しが解消しなければ打ち切る。ただ打ち切って人間に投げ返す
 # だけでは、//resume-allで再開しても同じ堂々巡りを繰り返すだけだった
 # (実機で2回連続再現)ための対応。3回(=最低でも一往復は「様子見の
@@ -1129,13 +1130,33 @@ _NO_TOOL_CALL_NUDGE_MESSAGE = (
 # 終えるよう促す。_NO_TOOL_CALL_NUDGE_MESSAGE(ツールを一度も呼ばなかった
 # ケース)と対になる、逆方向(ツールを呼びすぎて前進しないケース)の言い直し
 # 要求。
-_PROJECT_TOOL_LOOP_NUDGE_MESSAGE = (
+#
+# 仮の判断(実機報告への対応): 当初は「まだ何も修正していない(探索段階の
+# まま停滞している)」ケースだけを想定した1種類のメッセージだったが、
+# 実機ログで「実際にedit_fileを2回呼んで変更は済んでいるのに、その後も
+# 同じsearch_in_fileで自分の変更を延々確認し続けて終われない」という
+# 別パターンが見つかった。この場合に「今すぐwrite_file/edit_fileで修正
+# してください」と促すのは、既に修正済みという実際の状態と矛盾しており、
+# モデルを余計混乱させかねない。`modified_files`(このセッションで既に
+# 成功した変更の有無)を見て、どちらのパターンかで促す内容を分ける:
+# まだ何も変更していなければ「今すぐ修正しろ」(_BEFORE_EDIT)、既に
+# 何か変更済みなら「その変更で完了しているので、これ以上確認せず
+# ツールを一切呼ばずに完了報告だけ返せ」(_AFTER_EDIT)と促す。
+_PROJECT_TOOL_LOOP_NUDGE_MESSAGE_BEFORE_EDIT = (
     "同じツール呼び出し({call_description})を、ファイルの変更を1件も挟まずに"
     "繰り返しています。これ以上同じ検索・確認を繰り返しても新しい情報は得られません。"
     "探すのをやめて、ここまでに得られた情報だけを根拠に、今すぐwrite_fileまたは"
     "edit_fileで実際の修正を行ってください。対象のファイル・箇所がまだ特定できて"
     "いない場合は、探索を続けるのではなく、何が分からないのか・なぜ対応できないのかを"
     "具体的に説明した上で作業を終えてください。"
+)
+
+_PROJECT_TOOL_LOOP_NUDGE_MESSAGE_AFTER_EDIT = (
+    "同じツール呼び出し({call_description})を、それ以上のファイルの変更を伴わずに"
+    "繰り返しています。あなたは既に次のファイルを変更済みです: {modified_files}。"
+    "この修正作業はもう完了しています。これ以上read_file・search_in_file・list_dir等で"
+    "確認や検索を続ける必要はありません。ツールを一切呼び出さず、これまでに何を"
+    "変更したかを日本語のテキストで簡潔に報告して、この作業を終えてください。"
 )
 
 
@@ -1279,17 +1300,31 @@ def _collect_answer_with_project_tools(
                 # だけだった(実機で2回連続再現)。打ち切る前に一度だけ、
                 # モデル自身に繰り返しを自覚させ、探索をやめて今ある情報で
                 # 修正するか、できない理由を説明して終えるよう促す。
+                #
+                # 仮の判断(実機報告への対応): `modified_files`が既に
+                # 空でない場合(=このセッション中に既に何らかの変更に
+                # 成功している)、実際には「まだ修正していない」のでは
+                # なく「修正は済んでいるのに、その後も同じ検索で自分の
+                # 変更を延々確認し続けて終われない」パターンである。
+                # この場合に「今すぐ修正しろ」(_BEFORE_EDIT)と促すのは
+                # 実態と矛盾するため、「その変更で完了しているので、
+                # ツールを呼ばず完了報告だけ返せ」(_AFTER_EDIT)と促す。
                 loop_nudged = True
                 repeat_counts = {}
+                if modified_files:
+                    nudge_message = _PROJECT_TOOL_LOOP_NUDGE_MESSAGE_AFTER_EDIT.format(
+                        call_description=call_description,
+                        modified_files=", ".join(dict.fromkeys(modified_files)),
+                    )
+                    nudge_log_suffix = "既に変更済みのため、これ以上確認せず完了報告するよう促して再試行しています...]"
+                else:
+                    nudge_message = _PROJECT_TOOL_LOOP_NUDGE_MESSAGE_BEFORE_EDIT.format(call_description=call_description)
+                    nudge_log_suffix = "探索をやめて実際の修正に着手するよう促して再試行しています...]"
                 _print_tagged(
                     print_lock, tag or candidate["label"],
-                    f"[⚠️ 同じツール呼び出し({call_description})の繰り返しを検知したため、"
-                    "探索をやめて実際の修正に着手するよう促して再試行しています...]",
+                    f"[⚠️ 同じツール呼び出し({call_description})の繰り返しを検知したため、{nudge_log_suffix}",
                 )
-                messages.append({
-                    "role": "user",
-                    "content": _PROJECT_TOOL_LOOP_NUDGE_MESSAGE.format(call_description=call_description),
-                })
+                messages.append({"role": "user", "content": nudge_message})
                 continue
             return "", (
                 f"同じツール呼び出し({call_description})が、ファイルの変更を1件も挟まずに"
