@@ -58,7 +58,9 @@ def _two_member_snapshot():
 # ---------------------------------------------------------------------------
 
 def test_module_breakdown_prompt_forbids_undeclared_file_references():
-    prompt = yoriai._build_module_breakdown_prompt("高校生向けのHTML/CSS学習サイトを作って")
+    prompt = yoriai._build_module_breakdown_prompt(
+        "高校生向けのHTML/CSS学習サイトを作って", yoriai.AGREE_REQUEST_TYPE_SOFTWARE,
+    )
     assert "一字一句完全に一致" in prompt, prompt
 
 

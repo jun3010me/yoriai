@@ -80,7 +80,9 @@ def test_detect_requested_language_returns_empty_when_unspecified():
 
 
 def test_build_module_breakdown_prompt_embeds_explicit_language_instruction():
-    prompt = yoriai._build_module_breakdown_prompt("C言語で、簡単な電卓プログラムを作って")
+    prompt = yoriai._build_module_breakdown_prompt(
+        "C言語で、簡単な電卓プログラムを作って", yoriai.AGREE_REQUEST_TYPE_SOFTWARE,
+    )
     assert "必ずC" in prompt, prompt
 
 
@@ -89,7 +91,9 @@ def test_build_module_breakdown_prompt_lets_architect_decide_when_unspecified():
     判断するよう指示するだけで、Yoriai側で言語を決め打ちしないことを
     確認する。
     """
-    prompt = yoriai._build_module_breakdown_prompt("ToDoリストのCLIツールを作って")
+    prompt = yoriai._build_module_breakdown_prompt(
+        "ToDoリストのCLIツールを作って", yoriai.AGREE_REQUEST_TYPE_SOFTWARE,
+    )
     assert "Pythonとは限りません" in prompt, prompt
 
 
@@ -99,7 +103,9 @@ def test_build_module_breakdown_prompt_no_longer_hardcodes_python_example():
     しやすく、これが設計担当をPython風のファイル分割へ引きずる一因に
     なっていたため、言語非依存のプレースホルダーに置き換えたことを確認する。
     """
-    prompt = yoriai._build_module_breakdown_prompt("高校生向けのHTML/CSS学習サイトを作って")
+    prompt = yoriai._build_module_breakdown_prompt(
+        "高校生向けのHTML/CSS学習サイトを作って", yoriai.AGREE_REQUEST_TYPE_SOFTWARE,
+    )
     assert "storage.py" not in prompt, prompt
     assert "cli.py" not in prompt, prompt
 

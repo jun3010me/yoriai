@@ -2281,6 +2281,36 @@ _MODULE_BREAKDOWN_PROMPT_TEMPLATE = """あなたはソフトウェア設計を�
 依頼内容: {request}
 """
 
+# 仮の判断(リサーチ機能組み込み ステップ3): コンテンツ生成系の依頼
+# (`AGREE_REQUEST_TYPE_CONTENT`)向けのタスク分解テンプレート。ソフトウェア
+# 設計用の`_MODULE_BREAKDOWN_PROMPT_TEMPLATE`が要求する「関数シグネチャの
+# 厳密な一致」はコンテンツ制作には無意味なため要求せず、代わりに「同じ
+# 用語・見出しレベルを複数ファイルで揃える」というセクション構成の一貫性を
+# 要求する。ステップ2のリサーチフェーズの結果(`research_notes`)を埋め込み、
+# それを踏まえて構成するよう明示することで、調査結果を無視した一般論
+# だけの骨組みが生成される問題を防ぐ。出力形式(「ファイル名: 内容」+
+# 「検証コマンド: <コマンド>」)は既存の`_parse_module_breakdown`が
+# そのまま解析できるよう、`_MODULE_BREAKDOWN_PROMPT_TEMPLATE`と揃えてある
+# (パーサー・後段のタスクキュー方式はそのまま流用する)。
+_CONTENT_BREAKDOWN_PROMPT_TEMPLATE = """あなたはコンテンツ制作の構成案を担当します(ソフトウェアの実装ではありません)。以下の依頼を、複数人で分担して執筆・作成できるよう、複数のファイルに分割する構成案を考えてください。
+
+以下の調査結果を踏まえて構成してください。調査結果を無視して一般論だけで構成案を作ることは禁止します:
+
+【調査結果】
+{research_notes}
+
+各ファイルが担当する内容には、調査結果のどの情報を反映するかを具体的に明記してください。複数のファイルに分かれる場合でも、同じ用語・見出しレベル(例: 主要な章立てのレベル分け)をすべてのファイルで揃え、一貫した構成にしてください(ソフトウェアの関数シグネチャのような厳密なインターフェース一致は不要ですが、用語・見出し構成の一貫性は必須です)。
+
+出力は次の形式のみとし、他の説明文や前置き・後書きは一切含めないでください。ファイルごとに1行、「ファイル名: 作成すべき内容(調査結果のどの情報を反映するかを含む)」という形式で出力してください(2〜4ファイル程度を想定します。ファイル名の拡張子は依頼内容に適したもの(例: .html/.md)を選んでください):
+
+<ファイル名1>: <作成すべき内容をここに>
+<ファイル名2>: <作成すべき内容をここに(<ファイル名1>の行と同じ用語・見出しレベルを使うこと)>
+
+最後にもう1行、「検証コマンド: <コマンド>」という形式で書いてください。コンテンツ制作では動作確認用のコマンドが無いことが多いため、適切なコマンドが無い場合は「検証コマンド: なし」と書いてください。
+
+依頼内容: {request}
+"""
+
 # 仮の判断: 依頼の項目1(合意フェーズでの言語判定)への対応。ユーザーが
 # 依頼文中で言語・技術を明示した場合はそれを最優先で設計担当への指示に
 # 埋め込む。明示が無い場合、「どんな依頼にどの言語が最適か」という判断は
@@ -2321,7 +2351,21 @@ def _detect_requested_language(request_text: str) -> str:
     return ""
 
 
-def _build_module_breakdown_prompt(request: str) -> str:
+def _build_module_breakdown_prompt(request: str, request_type: str, research_notes: str = "") -> str:
+    """設計担当への、タスク分解の元になるプロンプトを組み立てる。
+
+    仮の判断(リサーチ機能組み込み ステップ3): `request_type`
+    (`_classify_agree_request_type`の分類結果)が`AGREE_REQUEST_TYPE_CONTENT`
+    の場合は、コンテンツ制作用の`_CONTENT_BREAKDOWN_PROMPT_TEMPLATE`に
+    `research_notes`(ステップ2のリサーチフェーズの結果)を埋め込んで返す。
+    それ以外(既定の`AGREE_REQUEST_TYPE_SOFTWARE`)は、従来通り
+    `_MODULE_BREAKDOWN_PROMPT_TEMPLATE`をそのまま使う(既存のソフトウェア
+    実装系`//agree`の挙動は変更しない)。
+    """
+    if request_type == AGREE_REQUEST_TYPE_CONTENT:
+        return _CONTENT_BREAKDOWN_PROMPT_TEMPLATE.format(
+            request=request, research_notes=research_notes or _RESEARCH_NO_RESULTS_MESSAGE,
+        )
     requested_language = _detect_requested_language(request)
     if requested_language:
         language_instruction = (
@@ -2343,12 +2387,36 @@ def _build_design_dialogue_background(request: str) -> str:
     )
 
 
-def _build_design_dialogue_output_instruction(request: str) -> str:
+def _build_design_dialogue_output_instruction(
+    request: str, request_type: str = AGREE_REQUEST_TYPE_SOFTWARE, research_notes: str = "",
+) -> str:
     """対話プロトコルの提案役・統合役に渡す、計画の出力形式についての
     指示。既存の`_MODULE_BREAKDOWN_PROMPT_TEMPLATE`の言語判定・出力形式の
     指示をそのまま踏襲し、統合役が出す「最終合意内容」が既存の
     `_parse_module_breakdown`でそのまま解析できる形式になるようにする。
+
+    仮の判断(リサーチ機能組み込み ステップ3): `request_type`が
+    `AGREE_REQUEST_TYPE_CONTENT`の場合は、`_build_module_breakdown_prompt`の
+    `_CONTENT_BREAKDOWN_PROMPT_TEMPLATE`分岐と同じ方針(セクション構成の
+    一貫性・調査結果の埋め込み)の指示を返す。既定値
+    `AGREE_REQUEST_TYPE_SOFTWARE`は既存の呼び出し元との後方互換性のため。
     """
+    if request_type == AGREE_REQUEST_TYPE_CONTENT:
+        return (
+            "あなたたちはコンテンツ制作の構成案を担当します(ソフトウェアの実装ではありません)。"
+            "以下の調査結果を踏まえて構成してください。調査結果を無視して一般論だけで構成案を作ることは"
+            f"禁止します。\n\n【調査結果】\n{research_notes or _RESEARCH_NO_RESULTS_MESSAGE}\n\n"
+            "各ファイルが担当する内容には、調査結果のどの情報を反映するかを具体的に明記してください。"
+            "複数のファイルに分かれる場合でも、同じ用語・見出しレベルをすべてのファイルで揃え、"
+            "一貫した構成にしてください。\n\n"
+            "出力は次の形式のみとし、他の説明文や前置き・後書きは一切含めないでください。ファイルごとに1行、"
+            "「ファイル名: 作成すべき内容(調査結果のどの情報を反映するかを含む)」という形式で出力してください"
+            "(2〜4ファイル程度を想定します):\n"
+            "<ファイル名1>: <作成すべき内容をここに>\n"
+            "<ファイル名2>: <作成すべき内容をここに(<ファイル名1>の行と同じ用語・見出しレベルを使うこと)>\n\n"
+            "最後にもう1行、「検証コマンド: <コマンド>」という形式で書いてください。適切なコマンドが無い場合は"
+            "「検証コマンド: なし」と書いてください。"
+        )
     requested_language = _detect_requested_language(request)
     if requested_language:
         language_instruction = f"必ず{requested_language}を使って実装してください。ファイルの拡張子もこの言語に合わせてください。"
@@ -2375,7 +2443,10 @@ def _build_design_dialogue_output_instruction(request: str) -> str:
     )
 
 
-def _run_design_dialogue(org_fingerprint: str, request: str, candidates: list, project_dir: str) -> tuple:
+def _run_design_dialogue(
+    org_fingerprint: str, request: str, candidates: list, project_dir: str,
+    request_type: str = AGREE_REQUEST_TYPE_SOFTWARE, research_notes: str = "",
+) -> tuple:
     """//agreeの合意フェーズを、対話プロトコル(`_run_dialogue`)による
     複数ノード・複数ラウンドの合意形成に置き換える(依頼の「計画フェーズ
     での利用」)。戻り値は`(合意した計画テキスト, 中断すべきかどうか, 対話の
@@ -2389,6 +2460,12 @@ def _run_design_dialogue(org_fingerprint: str, request: str, candidates: list, p
     単独で計画を確定し、そのまま実装フェーズへ進む(`_finalize_dialogue_
     solo`。対話プロトコルへの人間の介入を必須にしないという方針のため)。
     中断するのは、その単独確定の問い合わせ自体が失敗した場合のみ。
+
+    仮の判断(リサーチ機能組み込み ステップ3): `request_type`・
+    `research_notes`(既定はソフトウェア実装用の値・空文字列で、既存の
+    呼び出し元との後方互換性を保つ)は、そのまま`_build_design_dialogue_
+    output_instruction`・単独確定時の`_build_module_breakdown_prompt`に
+    引き継ぐだけで、対話プロトコル自体の進行ロジックには手を入れない。
     """
     architect = candidates[0]
     print(
@@ -2400,7 +2477,7 @@ def _run_design_dialogue(org_fingerprint: str, request: str, candidates: list, p
         topic=f"制作依頼「{request}」のモジュール分割・インターフェース設計",
         background=_build_design_dialogue_background(request),
         candidates=candidates,
-        output_instruction=_build_design_dialogue_output_instruction(request),
+        output_instruction=_build_design_dialogue_output_instruction(request, request_type, research_notes),
         tag="設計",
     )
     _report_dialogue_result(result, project_dir, "design", "モジュール分割・インターフェース設計")
@@ -2419,7 +2496,7 @@ def _run_design_dialogue(org_fingerprint: str, request: str, candidates: list, p
         f"{architect['label']}さんがこれまでの議論を踏まえて単独で計画を確定します...]"
     )
     finalize_prompt = (
-        f"{_build_module_breakdown_prompt(request)}\n\n"
+        f"{_build_module_breakdown_prompt(request, request_type, research_notes)}\n\n"
         f"【これまでの議論の経緯】\n{_format_dialogue_transcript_for_prompt(result['transcript'])}\n\n"
         "上記を踏まえて、あなた一人の判断でファイル分割案を確定してください。"
     )
@@ -2462,11 +2539,18 @@ def _resume_design_dialogue(pending: "_PendingDesignDialogue", human_reply: str)
     ている場合は対話フェーズを再開せずそのままEXECUTION_MODE_COLLABORATE
     相当の実装フェーズへ直接進む、に相当する扱い)。応答が一切得られな
     かった場合(`DIALOGUE_STATUS_NO_ENGAGEMENT`)のみ、中断を指示する。
+
+    仮の判断(リサーチ機能組み込み ステップ3): `pending.request_type`・
+    `pending.research_notes`(ステップ1・2で`_ask_organization_collaborate`が
+    計算・保存したもの)をそのまま`_build_design_dialogue_output_
+    instruction`・単独確定時の`_build_module_breakdown_prompt`に引き継ぐ。
     """
     request = pending.request
     candidates = pending.candidates
     project_dir = pending.project_dir
     prior_result = pending.result
+    request_type = pending.request_type
+    research_notes = pending.research_notes
     architect = candidates[0]
 
     prior_transcript = prior_result.get("transcript") or []
@@ -2477,7 +2561,7 @@ def _resume_design_dialogue(pending: "_PendingDesignDialogue", human_reply: str)
         topic=f"制作依頼「{request}」のモジュール分割・インターフェース設計",
         background=_build_design_dialogue_resume_background(request, prior_result, human_reply),
         candidates=candidates,
-        output_instruction=_build_design_dialogue_output_instruction(request),
+        output_instruction=_build_design_dialogue_output_instruction(request, request_type, research_notes),
         tag="設計",
         min_rounds=1,
         max_rounds=resume_round + _DIALOGUE_RESUME_EXTRA_ROUNDS,
@@ -2501,7 +2585,7 @@ def _resume_design_dialogue(pending: "_PendingDesignDialogue", human_reply: str)
         "計画を単独で確定し、実装フェーズへ進みます...]"
     )
     fallback_prompt = (
-        f"{_build_module_breakdown_prompt(request)}\n\n"
+        f"{_build_module_breakdown_prompt(request, request_type, research_notes)}\n\n"
         f"【これまでの議論の経緯】\n{_format_dialogue_transcript_for_prompt(result['transcript'])}\n\n"
         f"【人間からの回答】\n{human_reply}\n\n"
         "上記を踏まえて、あなた一人の判断でファイル分割案を確定してください。"
@@ -2916,6 +3000,7 @@ class _PendingDesignDialogue:
 
     def __init__(
         self, port: int, org_fingerprint: str, request: str, candidates: list, project_dir: str, result: dict,
+        request_type: str = AGREE_REQUEST_TYPE_SOFTWARE, research_notes: str = "",
     ):
         self.port = port
         self.org_fingerprint = org_fingerprint
@@ -2923,6 +3008,13 @@ class _PendingDesignDialogue:
         self.candidates = candidates
         self.project_dir = project_dir
         self.result = result
+        # 仮の判断(リサーチ機能組み込み ステップ3): 対話プロトコルが一時
+        # 停止する前に`_ask_organization_collaborate`が計算・保存した依頼の
+        # 種類・リサーチ結果を、再開時(`_resume_design_dialogue`)にも
+        # 引き継げるようここに保持する。既定値は既存の呼び出し元との
+        # 後方互換性のため。
+        self.request_type = request_type
+        self.research_notes = research_notes
 
 
 class _PendingDesignDialogueBox:
@@ -3242,23 +3334,28 @@ def _ask_organization_collaborate(
     # リサーチフェーズを実行し、Web検索の結果を`research_notes.md`として
     # 保存する。リサーチ担当は設計担当(`architect`)と同じ候補選定ロジック
     # (`_select_chat_candidates`の先頭)で選ばれた候補をそのまま流用する。
-    # ここで得た`research_notes`をコンテンツ用タスク分解プロンプトへ
-    # 埋め込む処理はステップ3で追加するため、現時点ではまだ下流の
-    # `_build_module_breakdown_prompt`・`_run_design_dialogue`(ソフトウェア
-    # 実装用の分岐)には渡さず、保存するだけにとどめる。既存のソフトウェア
-    # 実装系`//agree`の挙動は変更しない。
     research_notes = ""
     if request_type == AGREE_REQUEST_TYPE_CONTENT:
         research_notes = _run_research_phase(architect, org_fingerprint, request, project_dir)
 
+    # 仮の判断(リサーチ機能組み込み ステップ3): `request_type`・
+    # `research_notes`を、対話プロトコル有効・無効いずれの分岐にもそのまま
+    # 引き継ぐ。`AGREE_REQUEST_TYPE_SOFTWARE`の場合は`research_notes`が
+    # 空文字列のままであり、`_build_module_breakdown_prompt`・
+    # `_build_design_dialogue_output_instruction`はどちらもこの場合
+    # 従来通り`_MODULE_BREAKDOWN_PROMPT_TEMPLATE`側の分岐を使うため、
+    # 既存のソフトウェア実装系`//agree`の挙動は変更しない。
     if enable_dialogue:
-        answer, aborted, dialogue_result = _run_design_dialogue(org_fingerprint, request, candidates, project_dir)
+        answer, aborted, dialogue_result = _run_design_dialogue(
+            org_fingerprint, request, candidates, project_dir, request_type, research_notes,
+        )
         if aborted:
             if pending_box is not None and dialogue_result["status"] in (
                 DIALOGUE_STATUS_NEEDS_HUMAN, DIALOGUE_STATUS_SAFETY_LIMIT,
             ):
                 pending_box.set(_PendingDesignDialogue(
                     port, org_fingerprint, request, candidates, project_dir, dialogue_result,
+                    request_type, research_notes,
                 ))
             return
     else:
@@ -3266,7 +3363,7 @@ def _ask_organization_collaborate(
             f"[🧭 合意フェーズ開始: まず {architect['label']} (モデル: {architect['model']}) に"
             f"モジュール分割案とインターフェース設計を相談しています...]"
         )
-        breakdown_prompt = _build_module_breakdown_prompt(request)
+        breakdown_prompt = _build_module_breakdown_prompt(request, request_type, research_notes)
         answer, error, truncated = _collect_answer_from_candidate(
             architect, org_fingerprint, [{"role": "user", "content": breakdown_prompt}],
         )

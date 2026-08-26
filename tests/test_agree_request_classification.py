@@ -76,12 +76,78 @@ def test_explicit_research_instruction_overrides_keyword_classification():
     assert yoriai._classify_agree_request_type(request_with_no_keyword) == yoriai.AGREE_REQUEST_TYPE_CONTENT
 
 
+# ---------------------------------------------------------------------------
+# ステップ3: コンテンツ生成用タスク分解テンプレートの新設
+# ---------------------------------------------------------------------------
+#
+# `_build_module_breakdown_prompt`・`_build_design_dialogue_output_
+# instruction`が、ステップ1の分類結果(`request_type`)に応じて
+# `_CONTENT_BREAKDOWN_PROMPT_TEMPLATE`(コンテンツ制作用)/
+# `_MODULE_BREAKDOWN_PROMPT_TEMPLATE`(ソフトウェア実装用、既存)を
+# 正しく使い分け、コンテンツ系の場合はステップ2のリサーチフェーズの結果
+# (`research_notes`)がプロンプトに実際に埋め込まれることを検証する。
+
+def test_build_module_breakdown_prompt_uses_content_template_and_embeds_research_notes():
+    """`request_type`が`AGREE_REQUEST_TYPE_CONTENT`の場合、コンテンツ制作用の
+    役割説明(ソフトウェア設計ではないことの明示)と、渡した`research_notes`
+    の内容がそのままプロンプトに埋め込まれることを確認する。
+    """
+    research_notes = "Obsidianはバックリンクでノート同士を関連付けられる(調査結果の具体例)"
+    prompt = yoriai._build_module_breakdown_prompt(
+        "ObsidianでPKMを構築するための知識をまとめたWebページを作って",
+        yoriai.AGREE_REQUEST_TYPE_CONTENT,
+        research_notes,
+    )
+    assert "コンテンツ制作の構成案を担当します" in prompt, prompt
+    assert research_notes in prompt, prompt
+    # ソフトウェア設計用テンプレートの「関数シグネチャ」要求は出てこない。
+    assert "関数のシグネチャ" not in prompt, prompt
+
+
+def test_build_module_breakdown_prompt_still_uses_software_template_for_software_requests():
+    """`request_type`が`AGREE_REQUEST_TYPE_SOFTWARE`の場合は、既存の
+    ソフトウェア実装用テンプレートがそのまま使われ、コンテンツ用の文言は
+    出てこないことを確認する(既存のソフトウェア実装系`//agree`の挙動が
+    変わっていないことの回帰確認)。
+    """
+    prompt = yoriai._build_module_breakdown_prompt(
+        "ToDoリストのCLIツールを作って", yoriai.AGREE_REQUEST_TYPE_SOFTWARE,
+    )
+    assert "関数のシグネチャ" in prompt, prompt
+    assert "コンテンツ制作の構成案を担当します" not in prompt, prompt
+
+
+def test_build_design_dialogue_output_instruction_embeds_research_notes_for_content():
+    """対話プロトコル(計画フェーズ)側の出力指示も、コンテンツ系の場合は
+    `research_notes`を埋め込み、ソフトウェア用の「関数シグネチャ」要求を
+    出さないことを確認する。
+    """
+    research_notes = "生成AIの最新動向: 具体的な調査結果のダミーテキスト"
+    instruction = yoriai._build_design_dialogue_output_instruction(
+        "生成AIの最新動向について調査してまとめて", yoriai.AGREE_REQUEST_TYPE_CONTENT, research_notes,
+    )
+    assert research_notes in instruction, instruction
+    assert "関数のシグネチャ" not in instruction, instruction
+
+
+def test_build_design_dialogue_output_instruction_defaults_to_software_behavior():
+    """`request_type`を省略した場合は既定でソフトウェア実装用の指示になる
+    (既存呼び出し元との後方互換性)ことを確認する。
+    """
+    instruction = yoriai._build_design_dialogue_output_instruction("ToDoリストのCLIツールを作って")
+    assert "関数のシグネチャ" in instruction, instruction
+
+
 def main():
     tests = [
         test_content_keywords_are_classified_as_content,
         test_software_keywords_are_classified_as_software,
         test_ambiguous_or_unmatched_requests_default_to_software,
         test_explicit_research_instruction_overrides_keyword_classification,
+        test_build_module_breakdown_prompt_uses_content_template_and_embeds_research_notes,
+        test_build_module_breakdown_prompt_still_uses_software_template_for_software_requests,
+        test_build_design_dialogue_output_instruction_embeds_research_notes_for_content,
+        test_build_design_dialogue_output_instruction_defaults_to_software_behavior,
     ]
     failures = 0
     for test in tests:
