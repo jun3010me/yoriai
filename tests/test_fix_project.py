@@ -1801,6 +1801,124 @@ def test_decide_fix_task_split_falls_back_to_empty_on_error():
     assert subtasks == []
 
 
+# ---------------------------------------------------------------------------
+# _expand_multi_file_subtasks: 複数ファイルにまたがるサブタスクの機械分割
+# ---------------------------------------------------------------------------
+#
+# 実機で、「index.html、plugins-guide.html、workflow.htmlにrole="navigation"
+# およびaria-labelを追加」のように、1つのサブタスク文の中に複数ファイルが
+# 列挙されたまま`_decide_fix_task_split`の判定が返るケースが繰り返し報告
+# された。これをLLMの気まぐれに任せきりにせず、既知のファイル名が2つ以上
+# 列挙されたサブタスクは決定的に機械分割する。
+
+def test_expand_multi_file_subtasks_splits_subtask_with_two_or_more_known_files():
+    file_list = ["index.html", "plugins-guide.html", "workflow.html"]
+    subtasks = ['index.html、plugins-guide.html、workflow.htmlにrole="navigation"およびaria-labelを追加']
+    expanded = yoriai._expand_multi_file_subtasks(subtasks, file_list)
+    assert len(expanded) == 3, expanded
+    for filename in file_list:
+        matches = [s for s in expanded if f"({yoriai._FIX_SUBTASK_FILE_SCOPE_MARKER}: {filename}のみ)" in s]
+        assert len(matches) == 1, (filename, expanded)
+        assert matches[0].startswith(subtasks[0]), matches[0]
+
+
+def test_expand_multi_file_subtasks_passes_through_single_file_subtask_unchanged():
+    file_list = ["index.html", "plugins-guide.html", "workflow.html"]
+    subtasks = ["index.htmlにナビゲーションを追加する"]
+    assert yoriai._expand_multi_file_subtasks(subtasks, file_list) == subtasks
+
+
+def test_expand_multi_file_subtasks_skips_subtasks_already_marked_to_prevent_infinite_expansion():
+    """無限展開防止の確認: 既にマーカー文言を含むサブタスクは、複数の
+    ファイル名を含んでいても展開対象から除外され、そのまま素通しされる。
+    """
+    file_list = ["index.html", "plugins-guide.html"]
+    already_scoped = (
+        "index.html、plugins-guide.htmlにnavを追加"
+        f"\n({yoriai._FIX_SUBTASK_FILE_SCOPE_MARKER}: index.htmlのみ)"
+    )
+    assert yoriai._expand_multi_file_subtasks([already_scoped], file_list) == [already_scoped]
+
+
+def test_expand_multi_file_subtasks_avoids_false_positive_substring_match():
+    """偽陽性防止の確認: "index.html"と"reindex.html"が両方ファイル一覧に
+    あっても、"reindex.htmlに...を追加"というサブタスクが誤って
+    "index.html"分としてもマッチしてはならない(単純な`in`演算子だと
+    誤検出する)。
+    """
+    file_list = ["index.html", "reindex.html"]
+    subtasks = ["reindex.htmlに再インデックス機能を追加する"]
+    assert yoriai._expand_multi_file_subtasks(subtasks, file_list) == subtasks
+
+
+def test_decide_fix_task_split_machine_splits_even_when_model_says_no_split_needed():
+    """依頼の核心: LLMが「分割不要」と答えても、元の`request`自体が
+    既知ファイル名を2つ以上含んでいれば、機械分割された2件以上の
+    サブタスクが返ることを確認する。
+    """
+    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
+        yield {"content": "分割不要"}
+        yield {"done": True}
+
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._stream_chat_from_candidate = fake_stream
+    try:
+        subtasks = yoriai._decide_fix_task_split(
+            _member("MacStudio", "qwen2.5-coder-32b"), "fingerprint",
+            'index.html、plugins-guide.html、workflow.htmlにrole="navigation"を追加',
+            "index.html: トップページ", ["index.html", "plugins-guide.html", "workflow.html"], "HTML/CSS/JavaScript",
+        )
+    finally:
+        yoriai._stream_chat_from_candidate = original_stream
+
+    assert len(subtasks) == 3, subtasks
+    for filename in ["index.html", "plugins-guide.html", "workflow.html"]:
+        assert any(f"{yoriai._FIX_SUBTASK_FILE_SCOPE_MARKER}: {filename}のみ" in s for s in subtasks), subtasks
+
+
+def test_decide_fix_task_split_machine_splits_even_when_llm_query_errors():
+    """LLMへの問い合わせがエラーになった場合でも、機械分割の決定的な
+    チェックは変わらず働くことを確認する(LLM不調時の安全網)。
+    """
+    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
+        yield {"error": "接続に失敗しました"}
+
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._stream_chat_from_candidate = fake_stream
+    try:
+        subtasks = yoriai._decide_fix_task_split(
+            _member("MacStudio", "qwen2.5-coder-32b"), "fingerprint",
+            'index.html、plugins-guide.html、workflow.htmlにrole="navigation"を追加',
+            "index.html: トップページ", ["index.html", "plugins-guide.html", "workflow.html"], "HTML/CSS/JavaScript",
+        )
+    finally:
+        yoriai._stream_chat_from_candidate = original_stream
+
+    assert len(subtasks) == 3, subtasks
+
+
+def test_decide_fix_task_split_leaves_already_single_file_split_unchanged():
+    """非破壊確認: LLMが最初から2件に分割し、かつそれぞれが単一ファイル
+    だけを参照している場合は、機械展開によって変化しないことを確認する。
+    """
+    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
+        yield {"content": "- index.htmlにナビゲーションを追加する\n- workflow.htmlにナビゲーションを追加する"}
+        yield {"done": True}
+
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._stream_chat_from_candidate = fake_stream
+    try:
+        subtasks = yoriai._decide_fix_task_split(
+            _member("MacStudio", "qwen2.5-coder-32b"), "fingerprint",
+            "ナビゲーションを追加して",
+            "index.html: トップページ", ["index.html", "plugins-guide.html", "workflow.html"], "HTML/CSS/JavaScript",
+        )
+    finally:
+        yoriai._stream_chat_from_candidate = original_stream
+
+    assert subtasks == ["index.htmlにナビゲーションを追加する", "workflow.htmlにナビゲーションを追加する"], subtasks
+
+
 # 分割ありのend-to-endテスト用フェイク。判定ステップ・実装ステップ・
 # レビューステップを、プロンプト本文に含まれる目印(テンプレート内の
 # 固定文言、サブタスクの説明に含めたファイル名)で区別する。

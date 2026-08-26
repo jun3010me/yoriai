@@ -5255,9 +5255,15 @@ def _decide_fix_task_split(
     (2件以上)のリストを、分割不要と判断された場合は空リストを返す。
 
     仮の判断: 問い合わせ自体に失敗した場合・応答が期待した形式で解釈
-    できなかった場合も、安全側(=分割しない、これまで通り1人に依頼する)
-    にフォールバックする。判定のための余計な往復でユーザーの依頼が
-    宙に浮くことを避けるため。
+    できなかった場合も、いったんは安全側(=分割しない、これまで通り
+    1人に依頼する)にフォールバックする。ただしこのフォールバック後も、
+    決定的なチェック(`_expand_multi_file_subtasks`、下記)は必ず適用する:
+    実機で、1つのサブタスク文に複数ファイル名が列挙されたまま(例:
+    「index.html、plugins-guide.html、workflow.htmlにnav属性を追加」)
+    LLMが「分割不要」と判定してしまうケースが繰り返し報告されたため、
+    LLMの判断に頼り切らず、既知のファイル名を2つ以上含む依頼文は
+    機械的にファイル単位へ分割する。LLM問い合わせ自体が失敗した場合も
+    このチェックは変わらず効くため、LLM不調時の安全網にもなる。
     """
     print("[🔍 修正の規模を判定しています...]")
     prompt = _FIX_SPLIT_DECISION_PROMPT_TEMPLATE.format(
@@ -5266,9 +5272,79 @@ def _decide_fix_task_split(
     answer, error, _truncated = _collect_answer_from_candidate(
         candidate, org_fingerprint, [{"role": "user", "content": prompt}],
     )
-    if error or not answer:
-        return []
-    return _parse_fix_split_subtasks(answer)
+    llm_subtasks = [] if (error or not answer) else _parse_fix_split_subtasks(answer)
+    base_subtasks = llm_subtasks if llm_subtasks else [request]
+    expanded_subtasks = _expand_multi_file_subtasks(base_subtasks, file_list)
+    return expanded_subtasks if len(expanded_subtasks) >= 2 else []
+
+
+# 複数ファイルにまたがるサブタスクの機械分割で使う「対象ファイルを1件に
+# 絞り込み済み」マーカー文言。`_expand_multi_file_subtasks`が展開後の
+# サブタスク文の末尾に付け加える一文に含まれる。これが既に含まれる
+# サブタスクは展開対象から除外することで、`_resplit_looping_fix_subtasks`
+# 経由で同じサブタスクに繰り返し適用されても無限に追記され続けることを防ぐ。
+_FIX_SUBTASK_FILE_SCOPE_MARKER = "このサブタスクでの対象ファイル"
+
+# ファイル名の前後がこれらの文字であれば、そのファイル名は別の語の一部
+# (偽陽性)とみなす。単語境界(\b)はマルチバイト文字の扱いが不安定なため、
+# ファイル名として使われがちな文字集合を明示的に列挙して判定する。
+_FILENAME_BOUNDARY_CHARS = r"A-Za-z0-9._\-/"
+
+
+def _find_known_filenames_in_text(text: str, file_list: list) -> list:
+    """`text`中に単語境界相当の位置で実際に出現している`file_list`の
+    ファイル名を、`file_list`の順序で重複なく返す。単純な`in`演算子だと
+    別のファイル名の部分文字列として偽陽性マッチしてしまう
+    (例: "index.html" は "reindex.html" という文字列にも部分一致して
+    しまう)ため、`re.escape`したファイル名を、前後が英数字・`.`・`-`・
+    `_`・`/`のいずれでもない位置でのみマッチする正規表現で判定する。
+    """
+    found = []
+    for filename in file_list:
+        if not filename or filename in found:
+            continue
+        pattern = rf"(?<![{_FILENAME_BOUNDARY_CHARS}]){re.escape(filename)}(?![{_FILENAME_BOUNDARY_CHARS}])"
+        if re.search(pattern, text):
+            found.append(filename)
+    return found
+
+
+def _expand_multi_file_subtasks(subtasks: list, file_list: list) -> list:
+    """各サブタスクの説明文を`file_list`(プロジェクトの既知ファイル名
+    一覧)と照合し、2つ以上の既知ファイル名が含まれるサブタスクだけ、
+    ファイルごとに1件ずつへ機械的に展開する。1つ以下しか含まないサブ
+    タスクはそのまま素通しする。
+
+    ファイル間の依存関係(「utils.pyの関数名を変えて呼び出し元3ファイルも
+    直す」のような、本当は独立して実装できない変更)まで機械的に分割
+    すると壊れるため、この関数はあくまで「ファイル名が2つ以上列挙されて
+    いる」ことだけを根拠にした決定的なチェックであり、依存関係の解析は
+    行わない(そこまではLLMの判断に委ねたままにする設計方針)。
+
+    仮の判断: 元のサブタスク文はそのまま残し、末尾に
+    「({_FIX_SUBTASK_FILE_SCOPE_MARKER}: <ファイル名>のみ)」という一文を
+    追記するだけにする。自然文からファイル名の列挙部分だけを正しく除去
+    する処理は表記ゆれ(「、」「・」「と」「および」等の区切り、順序)に
+    弱く壊れやすいため、あえて元の文を書き換えない。この追記方式は、
+    元のファイル名がテキスト中に残り続けるため、同じサブタスクに再度
+    この関数を適用すると(`_resplit_looping_fix_subtasks`経由など)また
+    「2つ以上のファイル名を含む」と判定されて無限に追記され続けてしまう
+    危険がある。これを防ぐため、既に`_FIX_SUBTASK_FILE_SCOPE_MARKER`を
+    含むサブタスクは、複数ファイル名を含んでいても展開対象から除外し、
+    素通しする(既に1ファイルへ絞り込み済みとみなす)。
+    """
+    expanded = []
+    for subtask in subtasks:
+        if _FIX_SUBTASK_FILE_SCOPE_MARKER in subtask:
+            expanded.append(subtask)
+            continue
+        matched_files = _find_known_filenames_in_text(subtask, file_list)
+        if len(matched_files) < 2:
+            expanded.append(subtask)
+            continue
+        for filename in matched_files:
+            expanded.append(f"{subtask}\n({_FIX_SUBTASK_FILE_SCOPE_MARKER}: {filename}のみ)")
+    return expanded
 
 
 def _parse_fix_split_subtasks(text: str) -> list:
