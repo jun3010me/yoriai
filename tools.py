@@ -1065,6 +1065,7 @@ _NO_TOOL_CALL_NUDGE_MESSAGE = (
 def _collect_answer_with_project_tools(
     candidate: dict, org_fingerprint: str, messages: list, project_dir: str,
     print_lock: threading.Lock = None, tag: str = None,
+    on_web_search: callable = None,
 ):
     """既存プロジェクトへのファイル操作・テスト実行ツール群を提供しながら
     1つの回答を集める。`_collect_review_answer_with_read_file`と同じ
@@ -1082,6 +1083,14 @@ def _collect_answer_with_project_tools(
 
     モデルが説明文だけを返してツールを一度も呼ばなかった場合は、
     `_NO_TOOL_CALL_NUDGE_MESSAGE`参照。
+
+    仮の判断(`//agree`のリサーチフェーズへの対応): `on_web_search`
+    (既定`None`)を渡すと、web_search(既定のCHAT_TOOLS、このプロセスでは
+    実行されずモデル側のキッチンプロセス内で完結する)が呼ばれるたびに
+    引数無しで呼び出す。呼び出し元がweb_searchの呼び出し回数を数えたい
+    場合(例: リサーチ担当が実際に検索したかどうかの検知)に使う。
+    既存の呼び出し元は渡さない(`None`のまま)ため、この引数の追加で
+    既存の挙動は変わらない。
 
     仮の判断(応答切れによるファイル破壊のガード): あるラウンドの応答が
     CHAT_MAX_OUTPUT_TOKENS上限に達して途中で打ち切られていた
@@ -1106,6 +1115,8 @@ def _collect_answer_with_project_tools(
             if "error" in event:
                 error = event["error"]
                 break
+            if on_web_search is not None and event.get("tool_call") == WEB_SEARCH_TOOL_NAME:
+                on_web_search()
             if "pending_tool_calls" in event:
                 pending_tool_calls = event["pending_tool_calls"]
                 pending_truncated = bool(event.get("truncated"))

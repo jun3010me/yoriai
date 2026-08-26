@@ -4301,3 +4301,50 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   - 動作確認: `python3 -m pytest tests/`が483件(既存479件+新規4件)
     全てパス。既存テスト(`test_auto_mode_and_agree.py`等)は無改修で
     パスすることを確認した。
+- **`//agree`へのリサーチ機能組み込み ステップ2: 独立したリサーチ
+  フェーズの新設**。ステップ1のPR(#95)がマージされたことを確認して
+  着手した。コンテンツ生成系の依頼でも「検索した気になって」骨組みだけの
+  内容が生成される問題への対応として、タスク分解より前に、担当メンバーに
+  実際に`web_search`ツールを呼び出させて調べさせる独立したフェーズを
+  追加した(調査結果をコンテンツ用タスク分解プロンプトへ埋め込む処理は
+  ステップ3で追加予定のため、今回は結果の保存までにとどめる)。
+  - `_run_research_phase(researcher, org_fingerprint, request, project_dir) -> str`
+    を新設した。リサーチ担当への指示(`_RESEARCH_PROMPT_TEMPLATE`)で
+    複数の検索クエリを考えさせ、`_collect_answer_with_project_tools`
+    (`tools.py`)を使って問い合わせる。得られた回答を`_write_project_file`
+    で`project_dir`直下に`research_notes.md`として保存し、そのまま
+    呼び出し元にも返す。
+  - `web_search`はモデル側のキッチンプロセス内(サーバー側、
+    `llm_stream.py`の`stream_chat_completion`)で実行され、呼び出し元には
+    `{"tool_call": "web_search", ...}`/`{"tool_result": "web_search", ...}`
+    イベントとして素通しされるだけで、`_collect_answer_with_project_tools`
+    (`tools.py`)はこれまでその回数を数える手段を持っていなかった。
+    そこで`_collect_answer_with_project_tools`に新しい省略可能な引数
+    `on_web_search`(既定`None`)を追加し、渡された場合はweb_searchの
+    tool_callイベントのたびにコールバックするようにした。既存の呼び出し元
+    (`//fix`等)は渡さないため、この追加で既存の戻り値・挙動は変わらない。
+  - 検索が1回も行われなかった場合(`on_web_search`が一度も呼ばれなかった
+    場合)、および問い合わせ自体がエラーになった場合は、その旨を標準出力に
+    警告表示したうえで、`research_notes.md`には空文字列ではなく明示的な
+    `_RESEARCH_NO_RESULTS_MESSAGE`(「検索結果なし: ...」)を保存する
+    (呼び出し元がリサーチ失敗を機械的に検知できるようにするため)。
+  - `_ask_organization_collaborate`内、対話プロトコル有効・無効いずれの
+    分岐に進む前(共通の`request_type`分類の直後)で、
+    `AGREE_REQUEST_TYPE_CONTENT`の場合のみ`_run_research_phase`を呼ぶ
+    ようにした。リサーチ担当は設計担当(`architect`)と同じ候補選定結果
+    (`candidates[0]`)をそのまま流用する。
+  - `tests/test_research_phase.py`(新規)に、`yoriai._stream_chat_from_
+    candidate`をモックして(`tests/test_fix_project.py`の
+    `_fake_stream_fix_with_tools`等と同じ手法)、(1)web_searchが実際に
+    呼ばれた場合に回答がそのまま`research_notes.md`として保存されること、
+    (2)web_searchが一度も呼ばれなかった場合に警告が表示され明示的な
+    メッセージが保存されること、(3)問い合わせ自体がエラーになった場合も
+    同様にフォールバックすることを検証するテストを追加した。
+  - 動作確認: `python3 -m pytest tests/`が486件(既存483件+新規3件)
+    全てパス。フルスイート実行時、`test_task_queue.py`・
+    `test_background_collaborate.py`等のスレッド・タイミング依存のテストが
+    たまに1件だけ失敗することがあったが、変更を一切加えていない
+    このブランチのベースライン(ステップ1マージ直後の状態)でも同様に
+    発生することを確認済みであり、モジュール分割第三弾で既に記録した
+    環境依存のflakinessと同種のもの(今回の変更とは無関係)と判断した。
+    単体・複数回の実行では新規テストを含め安定してパスすることを確認した。

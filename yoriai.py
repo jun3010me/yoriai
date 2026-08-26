@@ -3097,6 +3097,86 @@ def _run_collaborate_implementation_phase(
         completed_box.set(project_dir)
 
 
+# 仮の判断(リサーチ機能組み込み ステップ2): リサーチ担当への指示。
+# ソフトウェア設計用の`_MODULE_BREAKDOWN_PROMPT_TEMPLATE`とは異なり、
+# ファイル分割やインターフェースの厳密な一致は要求せず、「検索した
+# つもり」で一般論だけの調査結果を返すことを防ぐため、必ずweb_search
+# ツールを実際に呼び出して調べるよう明示的に指示する。
+_RESEARCH_PROMPT_TEMPLATE = """あなたはこの依頼のためのリサーチ(下調べ)を担当します。以下の依頼を実現するために必要な情報を、web_searchツールを使って実際に調べてください。
+
+依頼内容: {request}
+
+手順:
+1. 依頼の内容を実現するために必要な検索クエリを複数(2〜5個程度)考えてください。
+2. それぞれのクエリについて、必ずweb_searchツールを実際に呼び出して検索してください。検索した「つもり」で自分の既存知識だけから答えを作ることは禁止します。
+3. 得られた検索結果を踏まえて、この後の内容作成の担当者がそのまま参照できるよう、調査で分かった具体的な情報(固有名詞・数値・手順・用語など)を中心に、調査結果の要点と考察をMarkdown形式の文章にまとめてください。
+
+出力は、上記の調査結果のまとめ本文のみとし、他の前置き・後書きは不要です。
+"""
+
+# 依頼の「空文字列ではなく明示的なメッセージを返す」という要件への対応。
+# 呼び出し元(将来のステップ3で追加予定のコンテンツ用タスク分解)が
+# リサーチ失敗を機械的に検知できるよう、空文字列ではなくこの文言を返す。
+_RESEARCH_NO_RESULTS_MESSAGE = (
+    "検索結果なし: リサーチ担当が一度もWeb検索を実行しなかったため、"
+    "調査結果は得られませんでした。"
+)
+
+
+def _build_research_prompt(request: str) -> str:
+    return _RESEARCH_PROMPT_TEMPLATE.format(request=request)
+
+
+def _run_research_phase(researcher: dict, org_fingerprint: str, request: str, project_dir: str) -> str:
+    """`//agree`のコンテンツ生成系の依頼(`AGREE_REQUEST_TYPE_CONTENT`)向けに、
+    タスク分解より前に独立したリサーチフェーズを実行する。`researcher`に
+    依頼内容を踏まえた検索クエリを複数考えさせ、`tools.web_search`を実際に
+    呼び出して調べさせたうえで、その要点をMarkdownの1つの文章として
+    まとめさせる。結果は`project_dir`直下に`research_notes.md`として保存し、
+    そのまま呼び出し元にも返す(戻り値をステップ3のコンテンツ用タスク分解
+    プロンプトへ埋め込めるようにするため)。
+
+    仮の判断: `_collect_answer_with_project_tools`(`tools.py`)を使って
+    問い合わせる。この関数は既定のCHAT_TOOLS(web_search)に加えて
+    read_file等のプロジェクトツール一式もオファーするが、web_search以外を
+    実際に呼ぶかどうかはリサーチ担当の判断に委ね、ここでは特に制限しない。
+
+    web_searchが一度も呼ばれなかった場合(`on_web_search`コールバックが
+    一度も呼ばれなかった場合)は、その旨を標準出力に警告表示したうえで、
+    `research_notes.md`には`_RESEARCH_NO_RESULTS_MESSAGE`を保存する
+    (呼び出し元がリサーチ失敗を検知できるよう、空文字列ではなく明示的な
+    メッセージを返す)。問い合わせ自体がエラーになった場合も同様に扱う。
+    """
+    print(f"[🔍 リサーチフェーズ開始: {researcher['label']}さんが調査しています...]")
+
+    web_search_call_count = [0]
+
+    def _on_web_search():
+        web_search_call_count[0] += 1
+
+    prompt = _build_research_prompt(request)
+    answer, error, truncated, _modified_files = _collect_answer_with_project_tools(
+        researcher, org_fingerprint, [{"role": "user", "content": prompt}], project_dir,
+        on_web_search=_on_web_search,
+    )
+
+    if error:
+        print(f"[⚠️ リサーチ担当への問い合わせに失敗しました: {error}]")
+        notes = _RESEARCH_NO_RESULTS_MESSAGE
+    elif web_search_call_count[0] == 0:
+        print("[⚠️ リサーチフェーズでWeb検索が一度も行われませんでした。調査結果を「検索結果なし」として記録します]")
+        notes = _RESEARCH_NO_RESULTS_MESSAGE
+    else:
+        if truncated:
+            print(f"[⚠️ リサーチ担当の応答が長すぎたため、{CHAT_MAX_OUTPUT_TOKENS}トークンで打ち切られました]")
+        notes = answer or _RESEARCH_NO_RESULTS_MESSAGE
+        print(f"[🔍 {researcher['label']} の調査結果(research_notes.mdとして保存します)]")
+        print(notes)
+
+    _write_project_file(project_dir, "research_notes.md", notes)
+    return notes
+
+
 def _ask_organization_collaborate(
     port: int, org_fingerprint: str, request: str, out_dir: str, enable_dialogue: bool = False,
     pending_box: "_PendingDesignDialogueBox" = None, completed_box: "_CompletedBuildBox" = None,
@@ -3155,12 +3235,21 @@ def _ask_organization_collaborate(
     project_dir = _resolve_project_dir(projects_root, project_name)
 
     # 仮の判断: 依頼の種類(コンテンツ生成/ソフトウェア実装)を分類する。
-    # 現時点ではこの分類結果を使ってタスク分解の分岐を実際に切り替える
-    # 仕組み(コンテンツ生成用のリサーチフェーズ・タスク分解テンプレート)は
-    # まだ実装しておらず、既存のソフトウェア実装用の分岐
-    # (`_build_module_breakdown_prompt`・`_run_design_dialogue`)をそのまま
-    # 使う。段階的な導入の第一歩として、まず分類だけを追加する。
     request_type = _classify_agree_request_type(request)
+
+    # 仮の判断(リサーチ機能組み込み ステップ2): コンテンツ生成系の依頼
+    # (`AGREE_REQUEST_TYPE_CONTENT`)の場合のみ、タスク分解より前に
+    # リサーチフェーズを実行し、Web検索の結果を`research_notes.md`として
+    # 保存する。リサーチ担当は設計担当(`architect`)と同じ候補選定ロジック
+    # (`_select_chat_candidates`の先頭)で選ばれた候補をそのまま流用する。
+    # ここで得た`research_notes`をコンテンツ用タスク分解プロンプトへ
+    # 埋め込む処理はステップ3で追加するため、現時点ではまだ下流の
+    # `_build_module_breakdown_prompt`・`_run_design_dialogue`(ソフトウェア
+    # 実装用の分岐)には渡さず、保存するだけにとどめる。既存のソフトウェア
+    # 実装系`//agree`の挙動は変更しない。
+    research_notes = ""
+    if request_type == AGREE_REQUEST_TYPE_CONTENT:
+        research_notes = _run_research_phase(architect, org_fingerprint, request, project_dir)
 
     if enable_dialogue:
         answer, aborted, dialogue_result = _run_design_dialogue(org_fingerprint, request, candidates, project_dir)
