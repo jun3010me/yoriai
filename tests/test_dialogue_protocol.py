@@ -263,6 +263,73 @@ def test_run_dialogue_no_engagement_when_proposer_never_answers():
     assert result["total_utterances"] == 1
 
 
+def test_run_dialogue_speak_shows_error_message_on_connection_failure():
+    """接続失敗・タイムアウト等のエラーが、対話プロトコル経由でも
+    (`_ask_organization`同様に)可視化されることを確認する
+    (バグ報告への対応: 以前はこの情報が握りつぶされ、画面には
+    「(応答がありませんでした)」としか出なかった)。
+    """
+    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
+        yield {"error": "Connection refused"}
+
+    candidates = [_candidate("MacStudio", "m1")]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        _with_stream(
+            fake_stream, yoriai._run_dialogue,
+            org_fingerprint="fp", topic="議題", background="背景", candidates=candidates,
+            output_instruction="出力形式の指示",
+        )
+
+    output = buf.getvalue()
+    assert "問い合わせに失敗しました" in output
+    assert "Connection refused" in output
+
+
+def test_run_dialogue_speak_shows_no_response_message_when_answer_is_empty_without_error():
+    """エラーが無く、単に空応答だった場合は従来通り
+    「(応答がありませんでした)」が出ることを確認する
+    (`test_run_dialogue_no_engagement_when_proposer_never_answers`の
+    非破壊確認を兼ねる)。
+    """
+    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
+        yield {"content": ""}
+        yield {"done": True}
+
+    candidates = [_candidate("MacStudio", "m1")]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        _with_stream(
+            fake_stream, yoriai._run_dialogue,
+            org_fingerprint="fp", topic="議題", background="背景", candidates=candidates,
+            output_instruction="出力形式の指示",
+        )
+
+    output = buf.getvalue()
+    assert "(応答がありませんでした)" in output
+    assert "問い合わせに失敗しました" not in output
+
+
+def test_run_dialogue_transcript_does_not_contain_error_text_on_failure():
+    """エラー文言は画面表示専用であり、議事録(transcript、後続ラウンドの
+    プロンプトに埋め込まれる`_format_dialogue_transcript_for_prompt`の
+    元データ)には混入しないことを確認する。
+    """
+    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
+        yield {"error": "Connection refused"}
+
+    candidates = [_candidate("MacStudio", "m1")]
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = _with_stream(
+            fake_stream, yoriai._run_dialogue,
+            org_fingerprint="fp", topic="議題", background="背景", candidates=candidates,
+            output_instruction="出力形式の指示",
+        )
+
+    for utterance in result["transcript"]:
+        assert "問い合わせに失敗しました" not in utterance["content"]
+
+
 # ---------------------------------------------------------------------------
 # 文字化け検出(_looks_garbled)・重大なバグ報告への対応
 # ---------------------------------------------------------------------------
@@ -1072,6 +1139,9 @@ def main():
         test_run_dialogue_pauses_at_safety_limit_of_fifty_utterances,
         test_run_dialogue_gives_up_after_max_rounds_without_consensus,
         test_run_dialogue_no_engagement_when_proposer_never_answers,
+        test_run_dialogue_speak_shows_error_message_on_connection_failure,
+        test_run_dialogue_speak_shows_no_response_message_when_answer_is_empty_without_error,
+        test_run_dialogue_transcript_does_not_contain_error_text_on_failure,
         test_looks_garbled_false_for_normal_japanese_text,
         test_looks_garbled_false_for_short_text_even_if_repetitive,
         test_looks_garbled_true_for_dominant_single_character_repetition,

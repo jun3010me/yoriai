@@ -1923,7 +1923,7 @@ def _run_dialogue(
 
     def speak(role_key: str, prompt: str, round_num: int) -> str:
         candidate = roles[role_key]
-        answer, _error, _truncated = _collect_answer_from_candidate(
+        answer, error, _truncated = _collect_answer_from_candidate(
             candidate, org_fingerprint, [{"role": "user", "content": prompt}],
         )
         state["total_utterances"] += 1
@@ -1939,10 +1939,19 @@ def _run_dialogue(
                 # (メインループ)が直後に打ち切りを判断できるようにする。
                 state["garbled_by"] = candidate["label"]
         role_ja = _DIALOGUE_ROLE_LABEL_JA[role_key]
+        if error:
+            # 仮の判断(バグ修正): 接続失敗・タイムアウト等のエラーを
+            # 画面表示専用の文言として可視化する。議事録(transcript)に
+            # 積む`content`は実際の`answer`のまま変更しない(後続ラウンドの
+            # プロンプトにエラー文言を発言内容として混入させないため)。
+            display_text = f"(問い合わせに失敗しました: {error})"
+        elif answer:
+            display_text = answer
+        else:
+            display_text = "(応答がありませんでした)"
         _print_tagged(
             print_lock, tag or topic,
-            f"[💬 {candidate['label']}さん({role_ja}・ラウンド{round_num})] "
-            + (answer if answer else "(応答がありませんでした)"),
+            f"[💬 {candidate['label']}さん({role_ja}・ラウンド{round_num})] " + display_text,
         )
         transcript.append({
             "round": round_num, "role": role_key, "speaker_label": candidate["label"], "content": answer,

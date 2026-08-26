@@ -11,6 +11,8 @@ importさせる、あるいはその逆にすると、`yoriai.py`⇔各モジュ
 変更していない。
 """
 
+import os
+
 # 仮の判断: チャットの接続確立自体はカード取得と同程度の速さで判定してよいが、
 # LLMの生成そのものは(モデルサイズや質問内容によっては)数十秒かかることが
 # あるため、読み取りタイムアウトは長めに取る。tools.py・llm_stream.py側と
@@ -23,7 +25,15 @@ CHAT_CONNECT_TIMEOUT_SEC = 5
 # ならない(そちらはCHAT_MAX_OUTPUT_TOKENSで別途対応する)。llm_stream.py側
 # (_stream_ollama_turn等)とyoriai.py側(_stream_chat_from_candidate)の
 # 双方から参照される。
-CHAT_READ_TIMEOUT_SEC = 120
+#
+# 仮の判断(実機報告への対応): 大型モデル(例: MacStudio上のqwen3-235b)は
+# 最初の1トークンを出すまでの時間(プロンプト処理+thinking)がこの値を
+# 超えることがあり、特に対話プロトコルはラウンドを重ねるほど議事録全文を
+# プロンプトに累積するため起きやすい。既定値そのものを引き上げるのでは
+# なく、KEEP_ALIVE(llm_stream.py・YORIAI_OLLAMA_KEEP_ALIVE環境変数)と
+# 同じ流儀で環境変数による上書きのみを可能にし、実機の状況を見ながら
+# 調整できるようにする。
+CHAT_READ_TIMEOUT_SEC = int(os.environ.get("YORIAI_CHAT_READ_TIMEOUT_SEC", "120"))
 
 # 仮の判断: 各バックエンドのベースURL。llm_stream.py側(_stream_ollama_turn等)
 # と、yoriai.py側に残るシステム情報取得系(get_ollama_installed_models等)の
