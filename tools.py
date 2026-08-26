@@ -1003,7 +1003,7 @@ def _execute_project_tool_call(
 # 修正では実機で頻繁に上限に達してしまうことが分かった。CHAT_MAX_OUTPUT_TOKENS
 # 等のトークン数上限による暴走防止は別途効いているため、往復回数の上限は
 # 50回まで緩和する。
-MAX_PROJECT_TOOL_ROUNDS = 50
+MAX_PROJECT_TOOL_ROUNDS = 500
 
 # 仮の判断: 実機で、//fixが「修正が完了しました」と表示し、PROGRESS.mdにも
 # 更新履歴を記録したにもかかわらず、実際にはファイルの中身が一切変更
