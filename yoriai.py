@@ -3201,9 +3201,9 @@ _RESEARCH_PROMPT_TEMPLATE = """あなたはこの依頼のためのリサーチ(
 手順:
 1. 依頼の内容を実現するために必要な検索クエリを複数(2〜5個程度)考えてください。
 2. それぞれのクエリについて、必ずweb_searchツールを実際に呼び出して検索してください。検索した「つもり」で自分の既存知識だけから答えを作ることは禁止します。
-3. 得られた検索結果を踏まえて、この後の内容作成の担当者がそのまま参照できるよう、調査で分かった具体的な情報(固有名詞・数値・手順・用語など)を中心に、調査結果の要点と考察をMarkdown形式の文章にまとめてください。
+3. 得られた検索結果を踏まえて、この後の内容作成の担当者がそのまま参照できるよう、調査で分かった具体的な情報(固有名詞・数値・手順・用語など)を中心に、調査結果の要点と考察をMarkdown形式の文章にまとめてください。「自分がこれから何をするか」「まだツールを呼び出していない理由」といった、あなた自身の作業方針や進捗状況の説明を書いてはいけません。あなたの最終回答を読むのは調査結果を待っている次の担当者であり、あなたの作業計画には関心がありません。
 
-出力は、上記の調査結果のまとめ本文のみとし、他の前置き・後書きは不要です。
+出力は、上記の調査結果のまとめ本文のみとし、他の前置き・後書きは不要です。出力の1行目から、調査で分かった具体的な情報(固有名詞・数値・手順・用語など)が始まっている必要があります。「情報収集の最中です」「〜の段階にあります」のような、自分の状態を説明する言い回しは一切使わないでください(悪い例: 「私は現在、依頼内容である『〜』に向けて、情報収集のフェーズにあります。この段階では、write_fileなどのツールはまだ呼び出す必要がありません。」のような文章は、実際の調査結果ではないため出力してはいけません)。
 """
 
 # 依頼の「空文字列ではなく明示的なメッセージを返す」という要件への対応。
@@ -3212,6 +3212,59 @@ _RESEARCH_PROMPT_TEMPLATE = """あなたはこの依頼のためのリサーチ(
 _RESEARCH_NO_RESULTS_MESSAGE = (
     "検索結果なし: リサーチ担当が一度もWeb検索を実行しなかったため、"
     "調査結果は得られませんでした。"
+)
+
+# 仮の判断(リサーチフェーズ頑健性向上): 実機で、web_search自体は実際に
+# 呼ばれた(on_web_searchコールバックがカウントされた)にもかかわらず、
+# 最終回答が「調査結果の要約」ではなく「これから何を調べるか」という
+# 自分の作業方針・進捗状況の説明(プロセスのナレーション)になって
+# しまい、そのままresearch_notes.mdに保存されてしまう現象が確認された。
+# `_classify_agree_request_type`と同じキーワードベースの簡易判定で、
+# この種のナレーションらしき文章を検知する。長文の調査結果の中に
+# 偶然「現時点では」等の語が1箇所含まれるだけで誤検知しないよう、
+# 文字数がある程度短い場合に限定する(長文であれば、たとえ一部に
+# こうした言い回しが混ざっていても実質的な調査結果を含んでいる
+# 可能性が高いため)。
+_PROCESS_NARRATION_KEYWORDS = (
+    "情報収集の最中",
+    "情報収集フェーズ",
+    "現時点では",
+    "この段階では",
+    "まだ呼び出す必要",
+    "呼び出していません",
+    "調査結果は得られませんでした",
+)
+
+# 仮の判断: 実質的な調査結果の要約が800文字を超えることは珍しくないが、
+# 「これから調べます」という作業方針の説明だけであれば通常はこの程度の
+# 文字数に収まる、という経験則に基づく閾値。
+_PROCESS_NARRATION_MAX_CHARS = 800
+
+
+def _looks_like_process_narration(text: str) -> bool:
+    """`text`(リサーチ担当の最終回答)が、実際の調査結果の要約ではなく、
+    「これから何を調べるか」「まだツールを呼んでいない理由」のような
+    自分の作業方針・進捗状況の説明(プロセスのナレーション)に見える
+    場合に`True`を返す。`_PROCESS_NARRATION_KEYWORDS`のいずれかを含み、
+    かつ本文全体が`_PROCESS_NARRATION_MAX_CHARS`未満の短い文章である
+    場合のみ`True`とする。
+    """
+    text = text or ""
+    if len(text) >= _PROCESS_NARRATION_MAX_CHARS:
+        return False
+    return any(keyword in text for keyword in _PROCESS_NARRATION_KEYWORDS)
+
+
+# 仮の判断(リサーチフェーズ頑健性向上): `_looks_like_process_narration`で
+# ナレーションと判定された場合に、1回だけ言い直しを要求するメッセージ。
+# 既存の`_NO_TOOL_CALL_NUDGE_MESSAGE`(tools.py)と同じく、直前の回答が
+# 不十分だった理由を明示したうえで、期待する出力を具体的に指示する
+# 文体に倣った。
+_RESEARCH_SYNTHESIS_NUDGE_MESSAGE = (
+    "あなたは作業方針の説明を返しましたが、これは実際の調査結果の要約ではありません。"
+    "ここまでのweb_search結果を踏まえて、調査で分かった具体的な情報"
+    "(固有名詞・数値・手順・用語など)をMarkdown形式でまとめてください。"
+    "作業方針の説明や前置きは不要です。"
 )
 
 
@@ -3238,6 +3291,18 @@ def _run_research_phase(researcher: dict, org_fingerprint: str, request: str, pr
     `research_notes.md`には`_RESEARCH_NO_RESULTS_MESSAGE`を保存する
     (呼び出し元がリサーチ失敗を検知できるよう、空文字列ではなく明示的な
     メッセージを返す)。問い合わせ自体がエラーになった場合も同様に扱う。
+
+    仮の判断(リサーチフェーズ頑健性向上): web_searchは実際に呼ばれた
+    ものの、最終回答が`_looks_like_process_narration`によって「調査結果
+    ではなく自分の作業方針の説明(プロセスのナレーション)」と判定された
+    場合、1回だけ`_RESEARCH_SYNTHESIS_NUDGE_MESSAGE`で言い直しを要求する
+    (`_collect_answer_with_project_tools`内の既存の
+    `_NO_TOOL_CALL_NUDGE_MESSAGE`によるnudge機構とは別物であり、
+    こちらは「ツールを呼ばなかった」ではなく「ツールは呼んだが最終回答が
+    ナレーションになった」ケースに対応する)。言い直し要求後の回答が
+    エラーでもナレーションでもなければそちらを採用し、それ以外の場合は
+    1回目の回答を(部分的にでも情報がある可能性を優先して)そのまま
+    採用したうえで警告を表示する。
     """
     print(f"[🔍 リサーチフェーズ開始: {researcher['label']}さんが調査しています...]")
 
@@ -3262,6 +3327,28 @@ def _run_research_phase(researcher: dict, org_fingerprint: str, request: str, pr
         if truncated:
             print(f"[⚠️ リサーチ担当の応答が長すぎたため、{CHAT_MAX_OUTPUT_TOKENS}トークンで打ち切られました]")
         notes = answer or _RESEARCH_NO_RESULTS_MESSAGE
+
+        if _looks_like_process_narration(notes):
+            retry_messages = [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": notes},
+                {"role": "user", "content": _RESEARCH_SYNTHESIS_NUDGE_MESSAGE},
+            ]
+            retry_answer, retry_error, retry_truncated, _retry_modified_files = _collect_answer_with_project_tools(
+                researcher, org_fingerprint, retry_messages, project_dir,
+                on_web_search=_on_web_search,
+            )
+            if not retry_error and retry_answer and not _looks_like_process_narration(retry_answer):
+                if retry_truncated:
+                    print(f"[⚠️ リサーチ担当の応答が長すぎたため、{CHAT_MAX_OUTPUT_TOKENS}トークンで打ち切られました]")
+                notes = retry_answer
+                print("[🔁 リサーチ担当への言い直し要求により、調査結果の要約を再取得しました]")
+            else:
+                print(
+                    "[⚠️ リサーチ担当の回答が作業方針の説明のままだった可能性があります。"
+                    "research_notes.mdの内容を一度確認してください]"
+                )
+
         print(f"[🔍 {researcher['label']} の調査結果(research_notes.mdとして保存します)]")
         print(notes)
 
