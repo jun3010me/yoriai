@@ -4701,7 +4701,7 @@ def _resume_project(project_dir: str, port: int, org_fingerprint: str, auto_resu
 # 最大2回まで」という暴走防止の仕組み(内側の歯止め)とは独立した、
 # プロジェクト単位での外側の歯止め。依頼で明示された「3回」を定数として
 # 固定する(無制限に自動で回り続けることは絶対に避けたいという要件)。
-_AUTO_RESUME_MAX_ATTEMPTS = 10
+_AUTO_RESUME_MAX_ATTEMPTS = 5
 
 
 def _maybe_auto_resume(project_dir: str, port: int, org_fingerprint: str) -> None:
