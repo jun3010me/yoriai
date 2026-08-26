@@ -4523,3 +4523,70 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
     `workflow.html`が316バイトと極端に薄く`_check_content_volume`の
     文字数チェックに本来引っかかるはずだった件については、ジュンさんへの
     確認が必要なため、この修正には含めていない。
+- **`_run_review_self_explanation`の申し送り事項消失バグの修正**。実機の
+  実行ログ(`workflow.html`のレビュー前に行われた自己説明対話)で、反論役が
+  2ラウンドにわたり「Moment.jsの代替」「Prism.jsの非同期ロード」
+  「アクセシビリティ」「ファイル名競合対策」「SEO/構造化データ」「CSP」
+  など具体的で妥当な懸念点を7〜8個指摘し、統合役も「判定: 継続」(合意に
+  至っていない)と判断していたにもかかわらず、直後の本番レビューでは
+  「問題なし」と判定され、指摘内容が一切反映されないまま完了していた
+  不具合への対応。
+  - 原因: `_run_review_self_explanation`は`_run_dialogue`の戻り値から
+    `(result.get("final_content") or result.get("summary") or "").strip()`
+    を申し送り事項として使っていたが、`final_content`は合意
+    (`DIALOGUE_STATUS_CONSENSUS`)時にしか入らず、合意に至らず
+    `max_rounds`上限に達した場合(`DIALOGUE_STATUS_NEEDS_HUMAN`)は`None`に
+    なる。この場合の`summary`(`_summarize_dialogue`)は「議論を重ねましたが、
+    まだアイデアが不足しており合意に至りませんでした。アドバイスを
+    ください。」という、反論役・統合役の実際の発言内容とは無関係な定型文
+    になる。結果、反論役が具体的な懸念点を出せば出すほど(=合意に至り
+    にくくなるほど)、その内容が本番レビューに一切引き継がれず定型文に
+    置き換わって消えるという、反論役が仕事をしているほど情報が失われる
+    設計上のミスマッチになっていた。
+  - `_run_dialogue`自体は計画フェーズ・修正フェーズ・レビューフェーズ・
+    `//plan-only`の複数箇所から呼ばれる中核関数であるため、依頼書の指示
+    通り`_run_dialogue`本体・`_finish_dialogue`・`_summarize_dialogue`
+    (他の4箇所の呼び出し元に共通するコード)には一切手を入れず、修正を
+    `_run_review_self_explanation`関数と新設ヘルパーのみに閉じ込めた。
+  - `_latest_critic_utterance(transcript: list) -> str`を新設した。
+    `transcript`(`{"round", "role", "speaker_label", "content"}`のリスト)
+    の中から、反論役(`DIALOGUE_ROLE_CRITIC`)による最新ラウンドの発言
+    内容を返す。反論役の発言が1件も無ければ空文字列を返す。
+  - `_run_review_self_explanation`の戻り値組み立てを分岐させた。
+    `status`が`DIALOGUE_STATUS_CONSENSUS`または`DIALOGUE_STATUS_STAGNANT`
+    (`final_content`に実質的な内容が入っている想定)の場合は従来通り
+    `final_content`をそのまま使う。`DIALOGUE_STATUS_NO_ENGAGEMENT`
+    (提案役からすら実のある応答が一度も得られなかった場合)は従来通り
+    空文字列のまま。それ以外(`DIALOGUE_STATUS_NEEDS_HUMAN`・
+    `DIALOGUE_STATUS_SAFETY_LIMIT`・`DIALOGUE_STATUS_GARBLED`等、合意に
+    至らなかった・打ち切られたケース)は`_latest_critic_utterance`を優先し、
+    反論役の発言が1件も無かった場合のみ`summary`へフォールバックする。
+  - 呼び出し元`_review_and_fix_one_file`から本番レビューのプロンプトへ
+    埋め込む際の文言(`_build_review_prompt`)を確認したところ、
+    「実装担当の設計判断についての申し送り事項(事前の自己説明・質疑
+    より)」という、合意済みであることまでは明言していないものの、
+    やや無条件に「申し送り事項」と呼ぶ文言になっていた。反論役の生の
+    指摘発言がそのまま渡ることがあるため、合意の有無によらず自然に
+    読めるよう「実装担当の設計判断について、事前の自己説明対話で
+    挙がった懸念点(必ずしも合意には至っていません)」という文言に
+    調整した。
+  - `tests/test_review_self_explanation.py`を新設し、
+    `_latest_critic_utterance`単体のテスト(複数ラウンド・複数役割が
+    混在する議事録から最新ラウンドの反論役の発言のみを抽出できること、
+    反論役の発言が0件の場合に空文字列を返すこと)、`_run_dialogue`を
+    モックした`_run_review_self_explanation`のテスト(合意時は
+    `final_content`がそのまま返る既存動作の非破壊確認、`DIALOGUE_STATUS_
+    NEEDS_HUMAN`かつ`final_content=None`で反論役の具体的な指摘が
+    `transcript`にある場合にその指摘内容が返り定型文が返らないことの
+    再現テスト、反論役の発言が1件も無い場合に`summary`へフォールバック
+    すること、`DIALOGUE_STATUS_NO_ENGAGEMENT`では空文字列のままである
+    こと)を計7ケース追加した。
+  - 動作確認: `python3 -m pytest tests/`を実行し、新規の
+    `tests/test_review_self_explanation.py`7件を含め506件全てパス。
+    `test_auto_resume.py::test_collaborate_auto_resume_stops_at_limit_
+    and_reports_clearly`が1件失敗したが、これは前回のステップで既に
+    報告済みの、直前のコミット(「Change max auto-resume attempts from
+    10 to 5」)が上限値を変更した際にこのテスト自身のアサーション文言
+    (「上限(3回)」)を更新し忘れていたことが原因の既存の不具合であり、
+    `git stash`で本修正を退避したベースラインでも同一のテストが同様に
+    失敗することを確認済みのため、今回もスコープ外として修正していない。
