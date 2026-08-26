@@ -20,6 +20,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import progress  # noqa: E402
 import yoriai  # noqa: E402
 
 
@@ -181,7 +182,7 @@ def test_build_task_checklist_creates_two_tasks_per_file():
     assert len(checklist) == 4, checklist
     labels = [t["label"] for t in checklist]
     assert labels == ["storage.py の実装", "storage.py のレビュー", "cli.py の実装", "cli.py のレビュー"], labels
-    assert all(t["status"] == yoriai._TASK_STATUS_PENDING for t in checklist)
+    assert all(t["status"] == progress._TASK_STATUS_PENDING for t in checklist)
 
 
 def test_incomplete_task_labels_only_returns_non_completed():

@@ -18,6 +18,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import progress  # noqa: E402
 import yoriai  # noqa: E402
 
 
@@ -79,11 +80,11 @@ def test_format_and_parse_progress_markdown_round_trips():
     assert by_label["storage.py の実装"]["status"] == yoriai._TASK_STATUS_COMPLETED
     assert by_label["storage.py のレビュー"]["status"] == yoriai._TASK_STATUS_COMPLETED
     assert by_label["cli.py の実装"]["status"] == yoriai._TASK_STATUS_COMPLETED
-    assert by_label["cli.py のレビュー"]["status"] == yoriai._TASK_STATUS_PENDING
+    assert by_label["cli.py のレビュー"]["status"] == progress._TASK_STATUS_PENDING
 
 
 def test_progress_markdown_includes_review_feedback_section():
-    content = yoriai._format_progress_markdown(
+    content = progress._format_progress_markdown(
         "何か作って", [("a.py", "説明")], yoriai._build_task_checklist([("a.py", "説明")]),
         review_feedback={"a.py": "型が計画と一致していません。"},
     )
@@ -93,7 +94,7 @@ def test_progress_markdown_includes_review_feedback_section():
 
 
 def test_progress_markdown_omits_review_feedback_section_when_empty():
-    content = yoriai._format_progress_markdown(
+    content = progress._format_progress_markdown(
         "何か作って", [("a.py", "説明")], yoriai._build_task_checklist([("a.py", "説明")]), review_feedback={},
     )
     assert "## 直近のレビュー指摘" not in content

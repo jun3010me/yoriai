@@ -21,6 +21,7 @@ import tempfile
 import threading
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import progress  # noqa: E402
 import yoriai  # noqa: E402
 
 from prompt_toolkit import PromptSession  # noqa: E402
@@ -83,17 +84,17 @@ def _fake_stream_cli_review_always_fails(candidate, org_fingerprint, messages, *
 
 
 def test_parse_auto_resume_count_defaults_to_zero_when_section_missing():
-    assert yoriai._parse_auto_resume_count("# プロジェクト進行状況\n") == 0
+    assert progress._parse_auto_resume_count("# プロジェクト進行状況\n") == 0
 
 
 def test_parse_auto_resume_count_reads_recorded_value():
     text = "## 自動再開の試行回数\n\n2\n"
-    assert yoriai._parse_auto_resume_count(text) == 2
+    assert progress._parse_auto_resume_count(text) == 2
 
 
 def test_parse_auto_resume_count_defaults_to_zero_when_unparseable():
     text = "## 自動再開の試行回数\n\n(不明)\n"
-    assert yoriai._parse_auto_resume_count(text) == 0
+    assert progress._parse_auto_resume_count(text) == 0
 
 
 def test_progress_markdown_round_trips_auto_resume_count():

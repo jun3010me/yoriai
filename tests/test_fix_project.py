@@ -26,6 +26,7 @@ import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import tools  # noqa: E402
+import progress  # noqa: E402
 import yoriai  # noqa: E402
 
 
@@ -95,7 +96,7 @@ def test_text_similarity_score_is_zero_for_empty_text():
 
 
 def test_parse_changelog_markdown_returns_nonempty_lines():
-    lines = yoriai._parse_changelog_markdown("- 2026-08-21: 修正 (a.py)\n\n- 2026-08-22: 別の修正 (b.py)")
+    lines = progress._parse_changelog_markdown("- 2026-08-21: 修正 (a.py)\n\n- 2026-08-22: 別の修正 (b.py)")
     assert lines == ["- 2026-08-21: 修正 (a.py)", "- 2026-08-22: 別の修正 (b.py)"], lines
 
 
