@@ -1489,7 +1489,9 @@ def test_collect_answer_with_project_tools_detects_identical_repeated_calls_as_l
     ラウンド上限を待たずに検知して打ち切ることを確認する(実機報告:
     上限を50→500に緩和しても、read_file/search_in_file/list_dirだけを
     延々繰り返しwrite_file/edit_fileに一度も到達しないまま止まらなく
-    なった)。
+    なった)。モデルが本当に立ち直らない(促されても同じ呼び出しを続ける)
+    場合を模擬しているため、1度目の閾値到達では言い直し要求(nudge)が
+    入るだけで打ち切られず、2度目の閾値到達で初めて打ち切られる。
     """
     def fake_stream_same_search_forever(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
         yield {"pending_tool_calls": [
@@ -1507,14 +1509,74 @@ def test_collect_answer_with_project_tools_detects_identical_repeated_calls_as_l
         with open(os.path.join(out_dir, "index.html"), "w") as f:
             f.write("<nav></nav>")
         candidate = {"label": "MacStudio", "model": "m", "address": "127.0.0.1", "port": 47120}
-        content, error, truncated, modified_files = yoriai._collect_answer_with_project_tools(
-            candidate, "fingerprint", [{"role": "user", "content": "navを直して"}], out_dir,
-        )
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            content, error, truncated, modified_files = yoriai._collect_answer_with_project_tools(
+                candidate, "fingerprint", [{"role": "user", "content": "navを直して"}], out_dir,
+            )
         assert content == ""
         assert error is not None and "堂々巡り" in error, error
         assert "search_in_file" in error, error
         assert truncated is False
         assert modified_files == [], modified_files
+        assert "促して再試行しています" in buf.getvalue(), "1度は言い直し要求が入っているはずです"
+    finally:
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_collect_answer_with_project_tools_loop_nudge_lets_model_recover_and_succeed():
+    """堂々巡り検知が発火したら、いきなり打ち切るのではなく1度だけ
+    モデルに「探索をやめて修正するか、できない理由を説明するように」
+    促し、モデルがそれを受けて実際にwrite_fileへ切り替えれば、エラーに
+    ならず正常に完了することを確認する(ただ打ち切って人間に投げ返す
+    だけでは//resume-allで再開しても同じ堂々巡りを繰り返すだけだった、
+    という実機報告への対応の中核)。
+    """
+    calls = {"n": 0}
+
+    def fake_stream(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
+        calls["n"] += 1
+        if calls["n"] <= 3:
+            # 3回連続で同じsearch_in_fileを呼び、堂々巡り検知の閾値に
+            # ちょうど達するようにする。
+            yield {"pending_tool_calls": [
+                {
+                    "id": f"search_{calls['n']}", "type": "function",
+                    "function": {"name": "search_in_file", "arguments": {"filename": "index.html", "query": "nav"}},
+                },
+            ]}
+            return
+        if calls["n"] == 4:
+            # 促された直後のラウンドで、探索をやめて実際に修正する
+            # (現実的なモデルの立ち直りを模擬する)。
+            yield {"pending_tool_calls": [
+                {
+                    "id": "write_1", "type": "function",
+                    "function": {"name": "write_file", "arguments": {"filename": "index.html", "content": "<nav role=\"navigation\"></nav>"}},
+                },
+            ]}
+            return
+        yield {"content": "修正完了"}
+        yield {"done": True}
+
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._stream_chat_from_candidate = fake_stream
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_fix_test_")
+    try:
+        with open(os.path.join(out_dir, "index.html"), "w") as f:
+            f.write("<nav></nav>")
+        candidate = {"label": "MacStudio", "model": "m", "address": "127.0.0.1", "port": 47120}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            content, error, truncated, modified_files = yoriai._collect_answer_with_project_tools(
+                candidate, "fingerprint", [{"role": "user", "content": "navを直して"}], out_dir,
+            )
+        assert error is None, error
+        assert modified_files == ["index.html"], modified_files
+        assert content == "修正完了"
+        assert "促して再試行しています" in buf.getvalue()
     finally:
         yoriai._stream_chat_from_candidate = original_stream
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -2169,6 +2231,7 @@ def main():
         test_fix_project_end_to_end_delete_records_two_changelog_entries,
         test_collect_answer_with_project_tools_stops_at_round_cap,
         test_collect_answer_with_project_tools_detects_identical_repeated_calls_as_loop,
+        test_collect_answer_with_project_tools_loop_nudge_lets_model_recover_and_succeed,
         test_collect_answer_with_project_tools_loop_detection_resets_after_a_real_edit,
         test_resume_project_preserves_changelog_from_a_prior_fix,
         test_parse_fix_split_subtasks_extracts_bullet_lines,

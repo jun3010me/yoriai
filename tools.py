@@ -1029,7 +1029,11 @@ _MUTATING_PROJECT_TOOL_NAMES = {
 # 実例が報告された)。回数をいくら許容してもこの種の停滞は解消しないため、
 # 「同じツール名+同じ引数の(ファイルを変更しない)呼び出しが、直近の
 # 変更成功から何回連続したか」を別途数え、これがこの閾値に達した時点で
-# ラウンド上限を待たずに打ち切る。3回(=最低でも一往復は「様子見の
+# ラウンド上限を待たずに、まず1度だけモデルに繰り返しを自覚させて
+# 修正へ着手するよう促し(_PROJECT_TOOL_LOOP_NUDGE_MESSAGE)、それでも
+# 同じ繰り返しが解消しなければ打ち切る。ただ打ち切って人間に投げ返す
+# だけでは、//resume-allで再開しても同じ堂々巡りを繰り返すだけだった
+# (実機で2回連続再現)ための対応。3回(=最低でも一往復は「様子見の
 # 繰り返し」を許し、それでも変わらなければ停滞と判断する)とした。
 PROJECT_TOOL_LOOP_REPEAT_LIMIT = 3
 
@@ -1100,6 +1104,24 @@ _NO_TOOL_CALL_NUDGE_MESSAGE = (
     "その理由を説明してください。"
 )
 
+# 仮の判断(実機報告への対応): 堂々巡り検知(PROJECT_TOOL_LOOP_REPEAT_LIMIT)が
+# 発火した際、ただ打ち切って「未完了のサブタスク」として人間に投げ返すだけでは、
+# //resume-allで再開しても同じ堂々巡りを繰り返すだけで(実際に実機で
+# 2回連続して同じ症状が再現した)、結局人間が手で介入するしかなくなる。
+# 打ち切る前に一度だけ、モデル自身に「同じ呼び出しを繰り返していること」を
+# 明示的に伝え、探索をやめて今ある情報で修正するか、できない理由を説明して
+# 終えるよう促す。_NO_TOOL_CALL_NUDGE_MESSAGE(ツールを一度も呼ばなかった
+# ケース)と対になる、逆方向(ツールを呼びすぎて前進しないケース)の言い直し
+# 要求。
+_PROJECT_TOOL_LOOP_NUDGE_MESSAGE = (
+    "同じツール呼び出し({call_description})を、ファイルの変更を1件も挟まずに"
+    "繰り返しています。これ以上同じ検索・確認を繰り返しても新しい情報は得られません。"
+    "探すのをやめて、ここまでに得られた情報だけを根拠に、今すぐwrite_fileまたは"
+    "edit_fileで実際の修正を行ってください。対象のファイル・箇所がまだ特定できて"
+    "いない場合は、探索を続けるのではなく、何が分からないのか・なぜ対応できないのかを"
+    "具体的に説明した上で作業を終えてください。"
+)
+
 
 def _collect_answer_with_project_tools(
     candidate: dict, org_fingerprint: str, messages: list, project_dir: str,
@@ -1145,14 +1167,20 @@ def _collect_answer_with_project_tools(
     繰り返して一向に前進しない」停滞はラウンド数をいくら増やしても
     解消しない。そのため、ファイルの変更(`_MUTATING_PROJECT_TOOL_NAMES`)を
     1件も挟まずに同じツール名+同じ引数の呼び出しが
-    `PROJECT_TOOL_LOOP_REPEAT_LIMIT`回連続したら、ラウンド上限を待たずに
-    その時点で打ち切り、`error`にその旨を返す(呼び出し元は`error`を
-    `MAX_PROJECT_TOOL_ROUNDS`到達時と同じ経路でそのまま表示・記録できる)。
+    `PROJECT_TOOL_LOOP_REPEAT_LIMIT`回連続したら、まず`_PROJECT_TOOL_
+    LOOP_NUDGE_MESSAGE`で「繰り返しに気づいて探索をやめ、今すぐ修正するか
+    できない理由を説明するように」1度だけ促す(`_NO_TOOL_CALL_NUDGE_
+    MESSAGE`と対になる、ただ打ち切るだけでは`//resume-all`で再開しても
+    同じ堂々巡りを繰り返すだけだった実機報告への対応)。促した後も同じ
+    繰り返しが解消しなければ、その時点でラウンド上限を待たずに打ち切り、
+    `error`にその旨を返す(呼び出し元は`error`を`MAX_PROJECT_TOOL_ROUNDS`
+    到達時と同じ経路でそのまま表示・記録できる)。
     """
     from yoriai import _print_tagged, _stream_chat_from_candidate
     messages = list(messages)
     modified_files = []
     nudged = False
+    loop_nudged = False
     repeat_counts = {}
     for _round_num in range(MAX_PROJECT_TOOL_ROUNDS):
         answer_parts = []
@@ -1193,6 +1221,7 @@ def _collect_answer_with_project_tools(
             return final_answer, None, truncated, modified_files
 
         messages.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
+        loop_trigger = None
         for tool_call in pending_tool_calls:
             function_name = tool_call.get("function", {}).get("name", "")
             if pending_truncated and function_name == WRITE_FILE_TOOL_NAME:
@@ -1217,14 +1246,40 @@ def _collect_answer_with_project_tools(
             _, call_arguments = _normalize_project_tool_call(tool_call)
             repeat_key = _project_tool_call_repeat_key(function_name, call_arguments)
             repeat_counts[repeat_key] = repeat_counts.get(repeat_key, 0) + 1
-            if repeat_counts[repeat_key] >= PROJECT_TOOL_LOOP_REPEAT_LIMIT:
-                loop_error = (
-                    f"同じツール呼び出し({function_name}: "
-                    f"{json.dumps(call_arguments, ensure_ascii=False)})が、"
-                    f"ファイルの変更を1件も挟まずに{PROJECT_TOOL_LOOP_REPEAT_LIMIT}回繰り返されたため、"
-                    "堂々巡りと判断してこの時点で打ち切りました"
+            if repeat_counts[repeat_key] >= PROJECT_TOOL_LOOP_REPEAT_LIMIT and loop_trigger is None:
+                # 仮の判断: 1ラウンドに複数のツール呼び出しが含まれる場合でも、
+                # 残りの呼び出しへの応答(role: tool)は普段どおり返しきる必要が
+                # ある(会話履歴上、assistantのtool_callsに対応するtool応答が
+                # 欠けると次回以降の問い合わせが壊れるため)。そのため検知しても
+                # このforループ自体は抜けず、ラウンドの処理が終わってから対応する。
+                loop_trigger = (function_name, call_arguments)
+
+        if loop_trigger is not None:
+            function_name, call_arguments = loop_trigger
+            call_description = f"{function_name}: {json.dumps(call_arguments, ensure_ascii=False)}"
+            if not loop_nudged:
+                # 仮の判断(実機報告への対応): ただ打ち切って人間に投げ返す
+                # だけでは、//resume-allで再開しても同じ堂々巡りを繰り返す
+                # だけだった(実機で2回連続再現)。打ち切る前に一度だけ、
+                # モデル自身に繰り返しを自覚させ、探索をやめて今ある情報で
+                # 修正するか、できない理由を説明して終えるよう促す。
+                loop_nudged = True
+                repeat_counts = {}
+                _print_tagged(
+                    print_lock, tag or candidate["label"],
+                    f"[⚠️ 同じツール呼び出し({call_description})の繰り返しを検知したため、"
+                    "探索をやめて実際の修正に着手するよう促して再試行しています...]",
                 )
-                return "", loop_error, False, modified_files
+                messages.append({
+                    "role": "user",
+                    "content": _PROJECT_TOOL_LOOP_NUDGE_MESSAGE.format(call_description=call_description),
+                })
+                continue
+            return "", (
+                f"同じツール呼び出し({call_description})が、ファイルの変更を1件も挟まずに"
+                f"{PROJECT_TOOL_LOOP_REPEAT_LIMIT}回繰り返され、探索をやめて修正するよう1度促しても"
+                "改善しなかったため、堂々巡りと判断してこの時点で打ち切りました"
+            ), False, modified_files
 
     return "", f"ツール呼び出しの往復回数が上限({MAX_PROJECT_TOOL_ROUNDS}回)に達しました", False, modified_files
 
