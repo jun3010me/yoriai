@@ -5014,3 +5014,55 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   ばらつき、失敗時のエラー内容も`localhost:47120`への接続失敗という
   スレッドタイミング依存の既知の不安定性と一致したため、今回の変更に
   起因するものではないと判断した。
+
+### リサーチフェーズの「ツールを呼べ」促し直しが、ファイル編集ツールを要求してweb_searchと矛盾していた不具合の修正
+
+- **背景**: 前節の修正後、ユーザーが再度実機で確認したところ、対話
+  プロトコルの提案役は正常に応答するようになったが、別の2つの問題が
+  見つかった: (1) junnoMac-miniへの問い合わせ(反論役・統合役)が
+  `Read timed out`で失敗する、(2) `[🔍 リサーチフェーズ開始]`の直後、
+  MacStudioが結局一度もweb_searchを呼ばないまま「検索結果なし」で
+  終わってしまう。
+- **(1)への対応(設定変更、コード修正無し)**: `CHAT_READ_TIMEOUT_SEC`
+  (既定120秒)は最初の1トークンが返ってくるまでの読み取りタイムアウト。
+  そのラウンドで初めて問い合わせを受けたマシンのモデルがメモリに
+  ロードされておらず、ロード+プロンプト処理に120秒以上かかった場合に
+  発生しうる(空きメモリの有無とは無関係な、モデルのコールドスタート
+  時間の問題)。前々節で追加済みの環境変数`YORIAI_CHAT_READ_TIMEOUT_SEC`
+  で上書きできるため、ユーザーには問い合わせを送信する側のマシンで
+  この環境変数を大きい値(例: 300)に設定するよう案内した。コード自体は
+  変更していない。
+- **(2)の原因(バグ)**: `_run_research_phase`は`_collect_answer_with_
+  project_tools`(`tools.py`)を使って問い合わせるが、この関数は
+  「初回応答でツールが1回も呼ばれなかった場合、1回だけ促し直す」機構を
+  持っており、その促し直しメッセージ`_NO_TOOL_CALL_NUDGE_MESSAGE`は
+  `//fix`のファイル編集セッション向けに書かれた固定文言で、内容が
+  「write_file・move_file・delete_fileのいずれかを実際に呼び出して
+  ください」だった。リサーチ担当はweb_searchだけ呼べばよく(ファイルへの
+  保存自体は`_run_research_phase`自身が行う)、この促し直しをそのまま
+  受け取ると、実際に必要な指示(web_searchを呼べ)と正反対の指示(ファイル
+  編集ツールを呼べ)を受け取ることになり、モデルが混乱してどちらも
+  呼ばないまま終わってしまっていた。
+- **修正**: `_collect_answer_with_project_tools`に`no_tool_call_nudge_
+  message: str = _NO_TOOL_CALL_NUDGE_MESSAGE`引数を追加し、促し直し
+  メッセージを呼び出し元が差し替えられるようにした(既定値は変更して
+  いないため、この引数を渡さない既存の呼び出し元の挙動は変わらない)。
+  `yoriai.py`に`_RESEARCH_NO_TOOL_CALL_NUDGE_MESSAGE`(「ファイル操作
+  ツールは一切不要です。web_searchツールを呼び出して調べてください」)を
+  新設し、`_run_research_phase`の`_collect_answer_with_project_tools`
+  呼び出しにこれを渡した。
+- **テスト**: `tests/test_research_phase.py`に
+  `test_research_phase_recovers_by_nudging_with_web_search_specific_
+  message`を追加した。1回目はツールを呼ばず方針の説明だけを返し、
+  促し直しメッセージの中身に`_RESEARCH_NO_TOOL_CALL_NUDGE_MESSAGE`が
+  含まれている場合に限って実際にweb_searchを呼ぶフェイク
+  (`_fake_stream_narration_first_then_search_after_nudge`)を使い、
+  `_run_research_phase`が正しい促し直しメッセージを渡していること
+  (=最終的に実質的な調査結果が得られ、「検索結果なし」にならないこと)
+  を確認する。
+- **動作確認**: `python3 tests/test_research_phase.py`を実行し、新規1件を
+  含め全件パス。`python3 -m pytest tests/`をフルスイートで実行し、既知の
+  `test_auto_resume.py`・`test_reviewer_read_file_tool.py`の2件(前回
+  までのログに報告済み)に加え、`test_fix_session.py`の別の1件が失敗した
+  が、前節と同様のスレッドタイミング依存の散発的失敗であり、今回の変更に
+  起因するものではないと判断した(531件中528件パス)。
