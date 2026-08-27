@@ -330,6 +330,92 @@ def test_run_dialogue_transcript_does_not_contain_error_text_on_failure():
         assert "問い合わせに失敗しました" not in utterance["content"]
 
 
+def test_run_dialogue_speak_disables_web_search_to_avoid_stalled_responses():
+    """実機バグ報告(リソースに余裕があるのに、対話プロトコルの提案役が
+    「応答がありませんでした」になる)への対応の確認: `_run_dialogue`の
+    各ラウンド(提案役・反論役・統合役)は、既定でオファーされる
+    web_searchツールを、思考系モデルが律儀に呼び続けてツール呼び出し
+    ラウンド上限に達し空の応答のまま打ち切られる現象を避けるため、
+    オファーしないことを確認する。
+    """
+    plan = "storage.py: 実装する"
+    seen_disable_web_search = []
+
+    def fake_stream(candidate, org_fingerprint, messages, **kwargs):
+        seen_disable_web_search.append(kwargs.get("disable_web_search"))
+        text = messages[0]["content"]
+        if _PROPOSER_MARKER in text:
+            yield {"content": plan}
+        elif _CRITIC_MARKER in text:
+            yield {"content": "特に問題なし\n評価: 合意"}
+        elif _INTEGRATOR_MARKER in text:
+            yield {"content": f"判定: 合意\n\n最終合意内容:\n{plan}"}
+        else:
+            raise AssertionError(f"想定外の問い合わせです: {text[:80]}")
+        yield {"done": True}
+
+    candidates = [_candidate("MacStudio", "m1"), _candidate("junnoMac-mini", "m2")]
+    _with_stream(
+        fake_stream, yoriai._run_dialogue,
+        org_fingerprint="fp", topic="議題", background="背景", candidates=candidates,
+        output_instruction="ファイル名: 内容の形式で",
+    )
+
+    assert seen_disable_web_search, "問い合わせが一度も発生していません"
+    assert all(seen_disable_web_search), seen_disable_web_search
+
+
+def test_finalize_dialogue_solo_disables_web_search():
+    """`_finalize_dialogue_solo`(対話が合意に至らなかった場合の単独確定の
+    問い合わせ)も同じ理由でweb_searchをオファーしないことを確認する。
+    """
+    seen_disable_web_search = []
+
+    def fake_stream(candidate, org_fingerprint, messages, **kwargs):
+        seen_disable_web_search.append(kwargs.get("disable_web_search"))
+        yield {"content": "storage.py: 実装する"}
+        yield {"done": True}
+
+    candidates = [_candidate("MacStudio", "m1")]
+    answer, aborted = _with_stream(
+        fake_stream, yoriai._finalize_dialogue_solo, candidates, "fp", "確定してください",
+    )
+
+    assert aborted is False
+    assert answer == "storage.py: 実装する"
+    assert seen_disable_web_search == [True]
+
+
+def test_ask_organization_collaborate_without_dialogue_flag_disables_web_search():
+    """`enable_dialogue`無指定の従来経路(設計担当への1回きりの相談)でも、
+    同じ理由でweb_searchをオファーしないことを確認する。
+    """
+    seen_disable_web_search = []
+
+    def fake_stream(candidate, org_fingerprint, messages, **kwargs):
+        text = messages[0]["content"]
+        if "ファイルに分割する実装計画" in text:
+            seen_disable_web_search.append(kwargs.get("disable_web_search"))
+            yield {"content": "storage.py: 実装する"}
+        else:
+            yield {"content": "```python\npass\n```"}
+        yield {"done": True}
+
+    original_snapshot = yoriai._fetch_org_snapshot
+    yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False: _two_member_snapshot()
+    out_dir = tempfile.mkdtemp(prefix="yoriai_agree_dialogue_test_")
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            _with_stream(
+                fake_stream, yoriai._ask_organization_collaborate,
+                47120, "fingerprint", "何かを作って", out_dir,
+            )
+        assert seen_disable_web_search == [True], seen_disable_web_search
+    finally:
+        yoriai._fetch_org_snapshot = original_snapshot
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # 文字化け検出(_looks_garbled)・重大なバグ報告への対応
 # ---------------------------------------------------------------------------
@@ -1142,6 +1228,9 @@ def main():
         test_run_dialogue_speak_shows_error_message_on_connection_failure,
         test_run_dialogue_speak_shows_no_response_message_when_answer_is_empty_without_error,
         test_run_dialogue_transcript_does_not_contain_error_text_on_failure,
+        test_run_dialogue_speak_disables_web_search_to_avoid_stalled_responses,
+        test_finalize_dialogue_solo_disables_web_search,
+        test_ask_organization_collaborate_without_dialogue_flag_disables_web_search,
         test_looks_garbled_false_for_normal_japanese_text,
         test_looks_garbled_false_for_short_text_even_if_repetitive,
         test_looks_garbled_true_for_dominant_single_character_repetition,
