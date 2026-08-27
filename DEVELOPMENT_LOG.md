@@ -4953,3 +4953,64 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   同様に失敗すること、残り2件(`test_fix_session.py`)は前回までのログに
   「スレッドタイミング依存の不安定性」として報告済みの既知の散発的失敗
   であることを確認し、いずれも今回の変更に起因するものではないと判断した。
+
+### 対話プロトコルの提案役が、リソースに余裕があっても「応答がありませんでした」になる不具合の修正
+
+- **背景**: 上記の内容量チェックの動作確認のためユーザーが実機で`//agree`
+  (対話プロトコル有効)を試したところ、MacStudio・junnoMac-miniの両方
+  (どちらもリソースに余裕がある状態)で、`[🧭 対話プロトコルによる
+  合意フェーズ開始...]`の直後、提案役ラウンド1が`(応答がありませんでした)`
+  のまま「設計担当から応答が得られませんでした。」に終わる不具合が高頻度
+  で再現するという報告があった。表示自体は前々節「対話プロトコルでの
+  応答なし(タイムアウト等)が原因不明になる問題の修正」で追加した
+  可視化(`error`があれば「問い合わせに失敗しました」、無ければ「応答が
+  ありませんでした」)通りに動いており、`error`が`None`のまま`answer`が
+  空、すなわち接続エラーやタイムアウトではなく、モデルの問い合わせ自体は
+  成功したが最終的な回答本文を1文字も生成しなかったことを意味していた。
+- **原因**: `stream_chat_completion`(`llm_stream.py`)は既定で常時
+  web_searchツールをオファーする。前々節・前々々節で「対話プロトコル
+  一時停止後の単発質問フォールバック」限定では、この既定のweb_search
+  オファーが原因で、思考系モデルが律儀に裏付けを取ろうとしてweb_searchを
+  繰り返し要求し、`MAX_TOOL_CALL_ROUNDS`(3)+`FINAL_NO_TOOL_ROUND`
+  (tools無し最終問い合わせ1回)を使い切ってもなお回答本文を1文字も
+  生成できないまま空応答で終わる現象が既に見つかり、その特定の場面
+  だけ`disable_web_search=True`で回避していた。しかし`_run_dialogue`
+  本体(提案役・反論役・統合役の各ラウンド、`speak()`)・合意に至らな
+  かった場合の単独確定(`_finalize_dialogue_solo`)・対話プロトコル
+  無効時のモジュール分割案の相談(`_ask_organization_collaborate`の
+  `else`分岐)は、いずれも`_collect_answer_from_candidate`を
+  `disable_web_search`を渡さず(既定`False`のまま)呼んでおり、同じ
+  空応答パターンに引き続き晒されていた。コンテンツ系の依頼は独立した
+  リサーチフェーズ(`_run_research_phase`)の結果が既に`background`/
+  `output_instruction`に埋め込まれており、それ以外の議論(モジュール
+  分割・設計判断・レビュー自己説明)も外部の裏付けを必要としないため、
+  これら3箇所もすべてweb_searchをオファーする理由が無かった。
+- **修正**: `_collect_answer_from_candidate`(`yoriai.py`)に
+  `disable_web_search: bool = False`引数を追加し、`_stream_chat_from_
+  candidate`にそのまま伝える(既定`False`のため既存呼び出し元・挙動には
+  影響しない)。上記3箇所の呼び出しにのみ`disable_web_search=True`を
+  渡した:
+  - `_run_dialogue`内の`speak()`(提案役・反論役・統合役の全ラウンド)
+  - `_finalize_dialogue_solo`(対話が合意に至らなかった場合の単独確定)
+  - `_ask_organization_collaborate`の`else`分岐(対話プロトコル無効時の
+    モジュール分割案の相談)
+  実装フェーズの問い合わせ(`_run_collaborative_task_queue`のworker・
+  レビュー指摘への修正依頼・`//fix`の分割規模判定等)は、実装中に
+  ライブラリ情報等を調べたい場面がありうるため、意図的に対象外のまま
+  据え置いた(依頼された不具合の再現箇所のみに絞った最小限の修正)。
+- **テスト**: `tests/test_dialogue_protocol.py`に3件追加した。
+  `_run_dialogue`の全ラウンドが`disable_web_search=True`で問い合わせて
+  いることを確認する`test_run_dialogue_speak_disables_web_search_to_
+  avoid_stalled_responses`、`_finalize_dialogue_solo`単体で同様に確認
+  する`test_finalize_dialogue_solo_disables_web_search`、
+  `enable_dialogue`無指定の従来経路でも同様であることを確認する
+  `test_ask_organization_collaborate_without_dialogue_flag_disables_
+  web_search`。
+- **動作確認**: `python3 tests/test_dialogue_protocol.py`を実行し、新規
+  3件を含め全件パス。`python3 -m pytest tests/`をフルスイートで実行し、
+  既知の`test_auto_resume.py`・`test_reviewer_read_file_tool.py`の2件
+  (前回までのログに報告済み)に加え、`test_fix_session.py`の1件が失敗
+  したが、同ファイルを単独で3回連続実行したところ1回失敗・2回成功と
+  ばらつき、失敗時のエラー内容も`localhost:47120`への接続失敗という
+  スレッドタイミング依存の既知の不安定性と一致したため、今回の変更に
+  起因するものではないと判断した。

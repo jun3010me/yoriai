@@ -930,7 +930,9 @@ def _extract_read_file_tool_filename(tool_call_arguments) -> str:
     return _parse_tool_call_arguments(tool_call_arguments).get("filename", "")
 
 
-def _collect_answer_from_candidate(candidate: dict, org_fingerprint: str, messages: list):
+def _collect_answer_from_candidate(
+    candidate: dict, org_fingerprint: str, messages: list, disable_web_search: bool = False,
+):
     """1候補に問い合わせ、回答をすべて集めて文字列として返す
     (content, error, truncated)のタプル。エラー時はcontentが空文字列に
     なる。`truncated`は、応答がCHAT_MAX_OUTPUT_TOKENS上限に達して途中で
@@ -950,11 +952,20 @@ def _collect_answer_from_candidate(candidate: dict, org_fingerprint: str, messag
     `_collect_review_answer_with_read_file`側の責務に移った。この関数は
     「1候補に問い合わせて回答を集めるだけ」という元のシンプルな役割に戻し、
     印字は一切行わない(呼び出し元が候補ごとに区切って表示する)。
+
+    仮の判断(実機バグ報告への対応: リソースに余裕があるのに対話プロトコルの
+    提案役が「応答がありませんでした」になる): `disable_web_search=True`を
+    渡すと、`_ask_organization`の一時停止後フォールバックと同じ理由で、
+    この問い合わせ限定でweb_searchツールをオファーしない(`_stream_chat_
+    from_candidate`にそのまま伝える)。既定は`False`(既存呼び出し元との
+    後方互換性のため)。
     """
     answer_parts = []
     error = None
     truncated = False
-    for event in _stream_chat_from_candidate(candidate, org_fingerprint, messages):
+    for event in _stream_chat_from_candidate(
+        candidate, org_fingerprint, messages, disable_web_search=disable_web_search,
+    ):
         if "error" in event:
             error = event["error"]
             break
@@ -1924,8 +1935,18 @@ def _run_dialogue(
 
     def speak(role_key: str, prompt: str, round_num: int) -> str:
         candidate = roles[role_key]
+        # 仮の判断(実機バグ報告への対応): 対話プロトコルの各ラウンド
+        # (提案役・反論役・統合役)は、コンテンツ系依頼なら別途独立した
+        # リサーチフェーズ(_run_research_phase)の結果が既に`background`/
+        # `output_instruction`に埋め込まれており、それ以外の議論(設計判断・
+        # レビュー自己説明等)も外部の裏付けを必要としない。既定で
+        # オファーされるweb_searchツールを、思考系モデルが律儀に呼び続けて
+        # MAX_TOOL_CALL_ROUNDSに達し空の応答のまま打ち切られる現象(モデル・
+        # マシン自体は正常でリソースにも余裕があるのに「応答がありません
+        # でした」になる)が実機で報告されたため、この問い合わせ限定で
+        # web_searchをオファーしない。
         answer, error, _truncated = _collect_answer_from_candidate(
-            candidate, org_fingerprint, [{"role": "user", "content": prompt}],
+            candidate, org_fingerprint, [{"role": "user", "content": prompt}], disable_web_search=True,
         )
         state["total_utterances"] += 1
         answer = (answer or "").strip()
@@ -2173,11 +2194,14 @@ def _finalize_dialogue_solo(candidates: list, org_fingerprint: str, prompt: str)
     いずれかの候補の応答が明らかに文字化けしている(`_looks_garbled`)場合も
     問い合わせ失敗と同様に扱い、次の候補に切り替える(崩壊した内容を
     そのまま最終合意内容として採用してしまわないため)。
+
+    仮の判断(実機バグ報告への対応): `speak`(`_run_dialogue`)と同じ理由で、
+    この単独確定の問い合わせもweb_searchをオファーしない。
     """
     last_error = "応答がありませんでした"
     for candidate in candidates:
         answer, error, truncated = _collect_answer_from_candidate(
-            candidate, org_fingerprint, [{"role": "user", "content": prompt}],
+            candidate, org_fingerprint, [{"role": "user", "content": prompt}], disable_web_search=True,
         )
         if error or not answer:
             last_error = error or "応答がありませんでした"
@@ -3461,8 +3485,10 @@ def _ask_organization_collaborate(
             f"モジュール分割案とインターフェース設計を相談しています...]"
         )
         breakdown_prompt = _build_module_breakdown_prompt(request, request_type, research_notes)
+        # 仮の判断(実機バグ報告への対応): `speak`(`_run_dialogue`)と同じ
+        # 理由で、モジュール分割案の相談もweb_searchをオファーしない。
         answer, error, truncated = _collect_answer_from_candidate(
-            architect, org_fingerprint, [{"role": "user", "content": breakdown_prompt}],
+            architect, org_fingerprint, [{"role": "user", "content": breakdown_prompt}], disable_web_search=True,
         )
         if error:
             print(f"設計担当への問い合わせに失敗しました: {error}")
