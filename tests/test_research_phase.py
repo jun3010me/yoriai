@@ -117,6 +117,74 @@ def test_research_phase_warns_and_saves_explicit_message_when_no_search_happened
     shutil.rmtree(project_dir, ignore_errors=True)
 
 
+def _fake_stream_narration_first_then_search_after_nudge(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
+    """1回目は方針の説明だけを返し(ツールを一度も呼ばない)、`_collect_
+    answer_with_project_tools`の「ツールが呼ばれなかった」促し直しを
+    受け取った後は、実際にweb_searchを呼んでから調査結果を返すフェイク。
+
+    実機バグ再現用: 促し直しメッセージがファイル編集ツール(write_file等)
+    を呼べという既定文言のままだと、リサーチ担当はweb_searchを呼ぶべき
+    だと認識できず、2回目もツールを呼ばないまま終わってしまう。このフェイクは
+    促し直しメッセージの中身を見て判定するため、`_run_research_phase`が
+    正しいリサーチ専用の促し直し(`_RESEARCH_NO_TOOL_CALL_NUDGE_MESSAGE`、
+    web_searchを呼べという内容)を渡していない限り(例: 既定の
+    `_NO_TOOL_CALL_NUDGE_MESSAGE`のまま)、この関数はどのラウンドでも
+    web_searchを呼ばない。
+    """
+    got_research_nudge = any(
+        message.get("role") == "user" and message.get("content") == yoriai._RESEARCH_NO_TOOL_CALL_NUDGE_MESSAGE
+        for message in messages
+    )
+    if not got_research_nudge:
+        yield {"content": "まず検索クエリを検討します。次のラウンドで実際に検索を行う予定です。"}
+        yield {"done": True}
+        return
+    yield {"tool_call": "web_search", "tool_call_arguments": {"query": "猫 去勢 費用"}}
+    yield {
+        "tool_result": "web_search",
+        "tool_result_content": json.dumps(
+            {"query": "猫 去勢 費用", "results": [{"title": "去勢手術の費用相場", "url": "https://example.com/"}]},
+            ensure_ascii=False,
+        ),
+    }
+    yield {"content": "## 調査結果\n- 去勢手術の費用相場は5,000円〜15,000円程度\n"}
+    yield {"done": True}
+
+
+def test_research_phase_recovers_by_nudging_with_web_search_specific_message():
+    """`_collect_answer_with_project_tools`の既定の促し直し
+    (`_NO_TOOL_CALL_NUDGE_MESSAGE`、「write_file等のファイル操作ツールを
+    呼べ」というファイル編集専用の文言)をそのまま使うと、web_searchだけ
+    呼べばよいリサーチ担当への指示と矛盾し、モデルが混乱して結局検索を
+    一度も行わないまま終わってしまう不具合が実機で報告された。
+    `_run_research_phase`がリサーチ専用の促し直し
+    (`_RESEARCH_NO_TOOL_CALL_NUDGE_MESSAGE`、web_searchを呼べという内容)
+    を使っており、1回目にツールを呼ばなかった担当が、促し直しを受けて
+    実際にweb_searchを呼び、調査結果を返せることを確認する。
+    """
+    project_dir = tempfile.mkdtemp()
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._stream_chat_from_candidate = _fake_stream_narration_first_then_search_after_nudge
+    try:
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            notes = yoriai._run_research_phase(
+                _researcher(), "fp", "猫を初めて飼う人向けに去勢手術について調べて", project_dir,
+            )
+    finally:
+        yoriai._stream_chat_from_candidate = original_stream
+        printed = stdout.getvalue()
+
+    assert "去勢手術の費用相場" in notes, notes
+    assert notes != yoriai._RESEARCH_NO_RESULTS_MESSAGE
+    # ファイル操作ツールは不要である旨と、web_searchを呼ぶべき旨の両方を
+    # 明示していること(既定の_NO_TOOL_CALL_NUDGE_MESSAGEとの意味的な違い)。
+    assert "ファイル操作ツール" in yoriai._RESEARCH_NO_TOOL_CALL_NUDGE_MESSAGE
+    assert "web_searchツールを呼び出して" in yoriai._RESEARCH_NO_TOOL_CALL_NUDGE_MESSAGE
+    assert "説明文だけでツールが実際には呼ばれていない" in printed, printed
+    shutil.rmtree(project_dir, ignore_errors=True)
+
+
 def test_research_phase_falls_back_to_explicit_message_on_query_error():
     """リサーチ担当への問い合わせ自体が失敗した場合も、空文字列ではなく
     明示的な「検索結果なし」メッセージを保存・返却する。
@@ -287,6 +355,7 @@ def main():
     tests = [
         test_research_phase_saves_notes_when_web_search_is_actually_called,
         test_research_phase_warns_and_saves_explicit_message_when_no_search_happened,
+        test_research_phase_recovers_by_nudging_with_web_search_specific_message,
         test_research_phase_falls_back_to_explicit_message_on_query_error,
         test_looks_like_process_narration_detects_actual_reported_case,
         test_looks_like_process_narration_does_not_flag_real_research_summary,

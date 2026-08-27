@@ -3302,6 +3302,24 @@ _RESEARCH_SYNTHESIS_NUDGE_MESSAGE = (
 )
 
 
+# 仮の判断(実機バグ報告への対応: リサーチフェーズでMacStudioがweb_searchを
+# 呼んでくれない): `_collect_answer_with_project_tools`の既定の促し直し
+# メッセージ(`_NO_TOOL_CALL_NUDGE_MESSAGE`、tools.py)は「write_file・
+# move_file・delete_fileを呼べ」というファイル編集専用の固定文言だった。
+# リサーチ担当はファイルを一切編集する必要が無く(web_searchだけ呼べば
+# よく、research_notes.mdへの保存自体はこの関数がYoriai側で行う)、初回
+# 応答でツールが1回も呼ばれなかった場合にこの既定文言で促すと、実際に
+# 必要な指示(web_searchを呼べ)と矛盾し、モデルが混乱して結局どちらも
+# 呼ばないまま「検索結果なし」で終わってしまう不具合が実機で確認された。
+# リサーチフェーズ専用の促し直しメッセージに差し替える。
+_RESEARCH_NO_TOOL_CALL_NUDGE_MESSAGE = (
+    "あなたは調査方針を説明していますが、web_searchツールが実際には呼び出されていません。"
+    "write_file・move_file・delete_fileなどのファイル操作ツールは、このリサーチフェーズでは"
+    "一切不要です。先ほど考えた検索クエリについて、実際にweb_searchツールを呼び出して"
+    "調べてください。"
+)
+
+
 def _build_research_prompt(request: str) -> str:
     return _RESEARCH_PROMPT_TEMPLATE.format(request=request)
 
@@ -3319,6 +3337,10 @@ def _run_research_phase(researcher: dict, org_fingerprint: str, request: str, pr
     問い合わせる。この関数は既定のCHAT_TOOLS(web_search)に加えて
     read_file等のプロジェクトツール一式もオファーするが、web_search以外を
     実際に呼ぶかどうかはリサーチ担当の判断に委ね、ここでは特に制限しない。
+    初回応答でツールが1回も呼ばれなかった場合の促し直しには、ファイル
+    編集ツールではなくweb_searchを呼ぶよう求める`_RESEARCH_NO_TOOL_CALL_
+    NUDGE_MESSAGE`を使う(既定の`_NO_TOOL_CALL_NUDGE_MESSAGE`との違いは
+    同定数のコメントを参照)。
 
     web_searchが一度も呼ばれなかった場合(`on_web_search`コールバックが
     一度も呼ばれなかった場合)は、その旨を標準出力に警告表示したうえで、
@@ -3348,6 +3370,7 @@ def _run_research_phase(researcher: dict, org_fingerprint: str, request: str, pr
     prompt = _build_research_prompt(request)
     answer, error, truncated, _modified_files = _collect_answer_with_project_tools(
         researcher, org_fingerprint, [{"role": "user", "content": prompt}], project_dir,
+        no_tool_call_nudge_message=_RESEARCH_NO_TOOL_CALL_NUDGE_MESSAGE,
         on_web_search=_on_web_search,
     )
 

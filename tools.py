@@ -1164,6 +1164,7 @@ def _collect_answer_with_project_tools(
     candidate: dict, org_fingerprint: str, messages: list, project_dir: str,
     print_lock: threading.Lock = None, tag: str = None,
     on_web_search: callable = None,
+    no_tool_call_nudge_message: str = _NO_TOOL_CALL_NUDGE_MESSAGE,
 ):
     """既存プロジェクトへのファイル操作・テスト実行ツール群を提供しながら
     1つの回答を集める。`_collect_review_answer_with_read_file`と同じ
@@ -1189,6 +1190,18 @@ def _collect_answer_with_project_tools(
     場合(例: リサーチ担当が実際に検索したかどうかの検知)に使う。
     既存の呼び出し元は渡さない(`None`のまま)ため、この引数の追加で
     既存の挙動は変わらない。
+
+    仮の判断(実機バグ報告への対応: リサーチフェーズでMacStudioが
+    web_searchを呼んでくれない): `no_tool_call_nudge_message`(既定
+    `_NO_TOOL_CALL_NUDGE_MESSAGE`)で、初回応答でツールが1回も呼ばれ
+    なかった場合の促し直しメッセージを差し替えられるようにした。既定の
+    `_NO_TOOL_CALL_NUDGE_MESSAGE`は「write_file・move_file・delete_file
+    を呼べ」という、ファイル編集専用の固定文言であり、web_search以外
+    呼ぶ必要が無いリサーチフェーズ(`_run_research_phase`)がこの関数を
+    そのまま使うと、実際に必要な指示(web_searchを呼べ)と矛盾する促しに
+    なってしまい、モデルが混乱して結局どちらも呼ばないまま終わる不具合が
+    実機で確認された。既定値は変更していないため、この引数を渡さない
+    既存の呼び出し元の挙動には影響しない。
 
     仮の判断(応答切れによるファイル破壊のガード): あるラウンドの応答が
     CHAT_MAX_OUTPUT_TOKENS上限に達して途中で打ち切られていた
@@ -1253,7 +1266,7 @@ def _collect_answer_with_project_tools(
                     "[⚠️ 説明文だけでツールが実際には呼ばれていないため、実行するよう促して再試行しています...]",
                 )
                 messages.append({"role": "assistant", "content": final_answer})
-                messages.append({"role": "user", "content": _NO_TOOL_CALL_NUDGE_MESSAGE})
+                messages.append({"role": "user", "content": no_tool_call_nudge_message})
                 continue
             return final_answer, None, truncated, modified_files
 
