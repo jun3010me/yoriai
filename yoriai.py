@@ -2813,7 +2813,7 @@ def _build_collaborative_implementation_request(
 ) -> str:
     full_plan = "\n".join(f"{fn}: {content}" for fn, content in full_breakdown)
     research_notes_section = ""
-    if research_notes and research_notes != _RESEARCH_NO_RESULTS_MESSAGE:
+    if research_notes and not _is_research_failed(research_notes):
         research_notes_section = _COLLABORATIVE_IMPLEMENTATION_RESEARCH_NOTES_SECTION_TEMPLATE.format(
             research_notes=research_notes,
         )
@@ -3298,6 +3298,17 @@ _RESEARCH_NO_RESULTS_MESSAGE = (
     "検索結果なし: リサーチ担当が一度もWeb検索を実行しなかったため、"
     "調査結果は得られませんでした。"
 )
+
+
+def _is_research_failed(notes: str) -> bool:
+    """`notes`(`research_notes.md`の内容)が「検索未実施/失敗」
+    (`_RESEARCH_NO_RESULTS_MESSAGE`)を示しているかを判定する。
+
+    仮の判断: 従来は呼び出し元ごとに`research_notes != _RESEARCH_NO_
+    RESULTS_MESSAGE`という文字列完全一致の判定が直書きされていたが、
+    判定ロジックをこの関数に共通化する(判定条件自体は変更しない)。
+    """
+    return (notes or "").strip() == _RESEARCH_NO_RESULTS_MESSAGE
 
 # 仮の判断(リサーチフェーズ頑健性向上): 実機で、web_search自体は実際に
 # 呼ばれた(on_web_searchコールバックがカウントされた)にもかかわらず、
@@ -3802,7 +3813,7 @@ def _check_content_volume(project_dir: str, tasks: list) -> dict:
                 research_text = f.read()
         except OSError:
             research_text = ""
-        if research_text and research_text != _RESEARCH_NO_RESULTS_MESSAGE:
+        if research_text and not _is_research_failed(research_text):
             keywords = _extract_research_keywords(research_text)
             if len(keywords) >= _CONTENT_KEYWORD_MIN_COUNT_TO_CHECK:
                 combined_content = "\n".join(file_texts.values())
