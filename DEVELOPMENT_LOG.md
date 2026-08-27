@@ -5111,3 +5111,39 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   (534件中532件パス)、失敗したテストの顔ぶれも回ごとに異なったため、
   前節までと同じスレッドタイミング依存の散発的不安定性であり、今回の
   変更に起因するものではないと判断した。
+
+### 「リサーチして」「調べて」が調査系依頼の明示的指示として認識されず、単なる要約依頼がスクレイピングプログラムの実装に化けてしまう不具合の修正
+
+- **背景**: これまでの3つの修正(対話プロトコル・リサーチフェーズの
+  各不具合)を適用したユーザーが、`//agree クロオオアリの飼育方法に
+  ついてリサーチして、結果を保存してください`を試したところ、期待した
+  「Web検索して結果をMarkdownでまとめる」動作にはならず、
+  `research_scraper.py`・`data_saver.py`・`interface_cli.py`・
+  `config.json`という、requestsライブラリでスクレイピングする
+  Pythonプログラム一式が生成されてしまうという報告があった。
+- **原因(バグ)**: `_classify_agree_request_type`の明示的なリサーチ
+  指示の上書き判定`_EXPLICIT_RESEARCH_INSTRUCTION_KEYWORDS`は
+  `("Web検索して", "ウェブ検索して", "調査して")`のみだった。ユーザーの
+  依頼文に含まれる「リサーチして」はこのリストに含まれておらず、かつ
+  `_CONTENT_REQUEST_KEYWORDS`(Webページ・まとめ・記事・ブログ・解説・
+  レポート)・`_SOFTWARE_REQUEST_KEYWORDS`(アプリ・ツール・CLI・
+  スクリプト・API・プログラム)のどちらのキーワードにも該当しなかった
+  ため、「両方に該当しない曖昧な依頼」としてデフォルトの
+  `AGREE_REQUEST_TYPE_SOFTWARE`に倒れていた。「リサーチ」はこの
+  リサーチフェーズ機能自体の呼称としてコード内で一貫して使っている語
+  (`_run_research_phase`等)であるにもかかわらず、判定用のキーワード
+  リストには反映されていなかった。
+- **修正**: `_EXPLICIT_RESEARCH_INSTRUCTION_KEYWORDS`に「リサーチして」
+  「調べて」を追加した(「調べて」も日常的な言い回しとして同様の問題を
+  起こしうるため、併せて対応)。
+- **テスト**: `tests/test_agree_request_classification.py`に
+  `test_research_and_investigate_phrasings_are_classified_as_content`を
+  追加し、実際に報告された依頼文そのもの(「クロオオアリの飼育方法に
+  ついてリサーチして、結果を保存してください」)と、「調べて」を使った
+  もう1例が、いずれも`AGREE_REQUEST_TYPE_CONTENT`に分類されることを
+  確認した。
+- **動作確認**: `python3 tests/test_agree_request_classification.py`を
+  実行し、新規1件を含め全件パス。`python3 -m pytest tests/`をフル
+  スイートで実行し、既知の`test_auto_resume.py`・
+  `test_reviewer_read_file_tool.py`の2件以外は535件中533件パス、
+  リグレッション無しを確認した。
