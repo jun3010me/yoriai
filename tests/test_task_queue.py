@@ -269,6 +269,75 @@ def test_single_candidate_skips_review_but_leaves_review_task_incomplete():
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
+def test_build_collaborative_implementation_request_embeds_research_notes():
+    """実機バグ報告(議事録よりも最終成果物の方が情報量が少ない)への対応の
+    確認: `research_notes`を渡すと、その内容がそのまま実装依頼に埋め込まれ、
+    一般論だけで書くことを禁止する指示も含まれることを確認する。
+    """
+    request = yoriai._build_collaborative_implementation_request(
+        "餌の種類と給水方法.md", "餌の種類について記載する",
+        [("餌の種類と給水方法.md", "餌の種類について記載する")],
+        research_notes="ハチミツや砂糖水、生肉、茹でた肉、昆虫ゼリーを交互に与える(調査結果の具体例)",
+    )
+    assert "ハチミツや砂糖水、生肉、茹でた肉、昆虫ゼリーを交互に与える" in request, request
+    assert "一般論だけで本文を書くことは禁止" in request, request
+
+
+def test_build_collaborative_implementation_request_omits_section_when_no_research_notes():
+    """`research_notes`を渡さない(既定の空文字列)場合、既存のソフトウェア
+    実装系`//agree`の挙動と同じく調査結果セクションが一切含まれないことを
+    確認する(既存呼び出し元との後方互換性の回帰確認)。
+    """
+    request = yoriai._build_collaborative_implementation_request(
+        "storage.py", "データの永続化を担当", [("storage.py", "データの永続化を担当")],
+    )
+    assert "調査結果" not in request, request
+
+
+def test_build_collaborative_implementation_request_omits_section_when_research_notes_is_no_results_message():
+    """`research_notes`が`_RESEARCH_NO_RESULTS_MESSAGE`(検索が一度も
+    行われなかった場合のフォールバック)の場合も、反映すべき具体的な情報が
+    無いため調査結果セクションを省略することを確認する。
+    """
+    request = yoriai._build_collaborative_implementation_request(
+        "飼育環境.md", "環境条件について記載する", [("飼育環境.md", "環境条件について記載する")],
+        research_notes=yoriai._RESEARCH_NO_RESULTS_MESSAGE,
+    )
+    assert "調査結果" not in request, request
+
+
+def test_run_collaborative_task_queue_reads_and_embeds_research_notes_from_project_dir():
+    """`_run_collaborative_task_queue`が`project_dir`直下の`research_notes.md`
+    を実際に読み込み、各ファイルの実装依頼に埋め込むことを確認する
+    (コンテンツ生成系の`//agree`が生成する実際のファイル配置を再現)。
+    """
+    captured_requests = []
+
+    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
+        captured_requests.append(messages[0]["content"])
+        yield {"content": "本文をここに書きます。"}
+        yield {"done": True}
+
+    tasks = [("飼育環境.md", "環境条件について記載する")]
+    candidate = _candidate("MacStudio(自分)", "qwen3-235b")
+    checklist = yoriai._build_task_checklist(tasks)
+    out_dir = tempfile.mkdtemp(prefix="yoriai_task_queue_research_notes_test_")
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._stream_chat_from_candidate = fake_stream
+    try:
+        with open(os.path.join(out_dir, "research_notes.md"), "w", encoding="utf-8") as f:
+            f.write("温度20〜25℃、湿度50〜70%を保つ(調査結果の具体例)")
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            yoriai._run_collaborative_task_queue(tasks, [candidate], "fingerprint", out_dir, checklist)
+    finally:
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+    assert any("温度20〜25℃、湿度50〜70%を保つ" in r for r in captured_requests), captured_requests
+
+
 def main():
     tests = [
         test_estimate_task_weight_is_content_length,
@@ -278,6 +347,10 @@ def main():
         test_task_queue_saves_files_in_nested_subdirectories,
         test_task_queue_rejects_path_traversal_filename,
         test_single_candidate_skips_review_but_leaves_review_task_incomplete,
+        test_build_collaborative_implementation_request_embeds_research_notes,
+        test_build_collaborative_implementation_request_omits_section_when_no_research_notes,
+        test_build_collaborative_implementation_request_omits_section_when_research_notes_is_no_results_message,
+        test_run_collaborative_task_queue_reads_and_embeds_research_notes_from_project_dir,
     ]
     failures = 0
     for test in tests:

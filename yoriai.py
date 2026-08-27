@@ -2783,16 +2783,43 @@ _COLLABORATIVE_IMPLEMENTATION_REQUEST_TEMPLATE = """以下は、組織内の設�
 
 【実装計画全体】
 {full_plan}
-
+{research_notes_section}
 【あなたが実装を担当するファイル】
 {filename}: {own_content}
 """
 
+# 仮の判断(実機バグ報告への対応: 議事録・実装計画の説明文よりも最終成果物
+# の方が情報量が少ない): コンテンツ生成系の`//agree`は、リサーチフェーズ
+# (`_run_research_phase`)の結果をタスク分解プロンプト(`_CONTENT_
+# BREAKDOWN_PROMPT_TEMPLATE`)には埋め込んでいたが、その分解結果を元に
+# 実際の本文を書くこの実装フェーズには一切渡していなかった。実装担当は
+# `full_plan`(「調査結果の『温度』『湿度』に関する情報を反映する」という、
+# キーワードの名前だけを挙げた短い説明行)しか見えず、その元になった
+# 調査結果本体(具体的な数値・固有名詞)を持たないまま本文を書くことに
+# なり、対話プロトコルの議事録(要約時点では調査結果を踏まえていた)より
+# 最終成果物の方が薄い一般論になってしまっていた。`research_notes`
+# (空文字列の場合はセクションごと省略、`_run_collaborative_task_queue`が
+# `research_notes.md`から読み込んで渡す)を実装依頼にも埋め込む。
+_COLLABORATIVE_IMPLEMENTATION_RESEARCH_NOTES_SECTION_TEMPLATE = """
+【調査結果(あなたが担当するファイルの本文に、ここにある固有名詞・数値・手順を具体的に反映すること)】
+{research_notes}
 
-def _build_collaborative_implementation_request(filename: str, own_content: str, full_breakdown: list) -> str:
+上記の調査結果を無視して一般論だけで本文を書くことは禁止します。実装計画の説明文はあくまで構成の指示であり、本文の情報源は上記の調査結果です。
+"""
+
+
+def _build_collaborative_implementation_request(
+    filename: str, own_content: str, full_breakdown: list, research_notes: str = "",
+) -> str:
     full_plan = "\n".join(f"{fn}: {content}" for fn, content in full_breakdown)
+    research_notes_section = ""
+    if research_notes and research_notes != _RESEARCH_NO_RESULTS_MESSAGE:
+        research_notes_section = _COLLABORATIVE_IMPLEMENTATION_RESEARCH_NOTES_SECTION_TEMPLATE.format(
+            research_notes=research_notes,
+        )
     return _COLLABORATIVE_IMPLEMENTATION_REQUEST_TEMPLATE.format(
         full_plan=full_plan, filename=filename, own_content=own_content,
+        research_notes_section=research_notes_section,
     )
 
 
@@ -4660,9 +4687,26 @@ def _run_collaborative_task_queue(
     (再レビューが「問題なし」になれば)そのファイルのエントリは削除される。
     どちらも`None`の場合(既存の呼び出し元・テストとの互換性のため)は
     何もしない。
+
+    仮の判断(実機バグ報告への対応): `project_dir`直下に`research_notes.md`
+    (リサーチフェーズの結果、コンテンツ生成系の`//agree`でのみ存在する)が
+    あれば読み込み、各実装依頼(`_build_collaborative_implementation_
+    request`)に埋め込む。ソフトウェア実装系の`//agree`ではこのファイルが
+    存在しないため`research_notes`は空文字列のままで、既存の挙動は変わらない
+    (`_build_collaborative_implementation_request`は空文字列の場合セクション
+    ごと省略する)。
     """
     full_plan = "\n".join(f"{fn}: {content}" for fn, content in tasks)
     remaining = sorted(tasks, key=lambda t: _estimate_task_weight(t[1]), reverse=True)
+
+    research_notes_path = os.path.join(project_dir, "research_notes.md")
+    research_notes = ""
+    if os.path.exists(research_notes_path):
+        try:
+            with open(research_notes_path, encoding="utf-8") as f:
+                research_notes = f.read()
+        except OSError:
+            research_notes = ""
 
     queue_lock = threading.Lock()
     print_lock = threading.Lock()
@@ -4707,7 +4751,9 @@ def _run_collaborative_task_queue(
             _set_task_status(checklist, filename, "impl", _TASK_STATUS_IN_PROGRESS)
             if on_update:
                 on_update()
-            request_text = _build_collaborative_implementation_request(filename, content, tasks)
+            request_text = _build_collaborative_implementation_request(
+                filename, content, tasks, research_notes=research_notes,
+            )
             answer, error, truncated = _collect_answer_from_candidate(
                 candidate, org_fingerprint, [{"role": "user", "content": request_text}],
             )

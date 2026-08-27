@@ -5147,3 +5147,52 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   スイートで実行し、既知の`test_auto_resume.py`・
   `test_reviewer_read_file_tool.py`の2件以外は535件中533件パス、
   リグレッション無しを確認した。
+
+### 実装フェーズにリサーチ結果が渡っておらず、議事録より最終成果物の方が情報量が少なくなっていた不具合の修正
+
+- **背景**: 前節までの3つの修正を適用したユーザーが、`//agree クロオオ
+  アリの飼育方法についてリサーチして、結果を保存してください`を実行し、
+  `research_notes.md`・`DIALOGUE_LOG_design.md`・`DIALOGUE_SUMMARY_
+  design.md`を確認した。リサーチフェーズは実際に機能し、対話プロトコル
+  の議事録・要約にも(温度20〜25℃・湿度50〜70%・餌の種類等の)具体的な
+  情報が反映されていたが、実際に生成された成果物(各.mdファイルの本文)
+  の方が、それらの議事録・計画よりも情報量が少なく質素になっている、
+  という報告があった。
+- **原因(バグ)**: コンテンツ生成系の`//agree`パイプラインは、
+  リサーチフェーズ(`_run_research_phase`)の結果をタスク分解プロンプト
+  (`_CONTENT_BREAKDOWN_PROMPT_TEMPLATE`、対話プロトコルの議事録・要約は
+  ここでの合意結果)には埋め込んでいたが、その分解結果を元に実際の本文を
+  書く実装フェーズ(`_run_collaborative_task_queue`→`_build_
+  collaborative_implementation_request`)には一切渡していなかった。実装
+  担当は、その分解結果の説明行(例:「調査結果の『温度』『湿度』に関する
+  情報を反映する」という、キーワードの名前だけを挙げた短い一文)しか
+  見えず、その元になった調査結果本体(具体的な数値・固有名詞そのもの)を
+  持たないまま本文を書くことになっていた。設計担当(対話プロトコル)への
+  問い合わせにはリサーチ結果全文が渡っていたのに対し、実装担当への
+  問い合わせには渡っていなかったという、パイプライン中の情報伝達の
+  抜け漏れだった。
+- **修正**: `_build_collaborative_implementation_request`に`research_
+  notes: str = ""`引数を追加し、非空(かつ`_RESEARCH_NO_RESULTS_MESSAGE`
+  でない)場合のみ、新設した`_COLLABORATIVE_IMPLEMENTATION_RESEARCH_
+  NOTES_SECTION_TEMPLATE`(調査結果本文と「一般論だけで書くことを禁止
+  する」指示)を実装依頼に埋め込むようにした(既定は空文字列のため、
+  既存のソフトウェア実装系`//agree`の挙動は変わらない)。
+  `_run_collaborative_task_queue`が`project_dir`直下の`research_notes.md`
+  (存在すれば、コンテンツ生成系の`//agree`でのみ存在する)を読み込み、
+  各ファイルの実装依頼にそのまま渡すようにした。
+- **テスト**: `tests/test_task_queue.py`に4件追加した。
+  `_build_collaborative_implementation_request`単体のテスト3件
+  (`research_notes`を渡すと本文に埋め込まれ「一般論だけで本文を書くこと
+  は禁止」の指示も含まれること、渡さない場合は調査結果セクションが
+  一切含まれないこと、`_RESEARCH_NO_RESULTS_MESSAGE`の場合も同様に
+  省略されること)。エンドツーエンドのテスト
+  `test_run_collaborative_task_queue_reads_and_embeds_research_notes_
+  from_project_dir`では、実際に`project_dir`へ`research_notes.md`を
+  書き込んでおき、`_run_collaborative_task_queue`経由で実装依頼に
+  その内容が実際に埋め込まれることを確認した。
+- **動作確認**: `python3 tests/test_task_queue.py`を実行し、新規4件を
+  含め全件パス。`python3 -m pytest tests/`をフルスイートで実行し、既知の
+  `test_auto_resume.py`・`test_reviewer_read_file_tool.py`に加え、
+  `test_background_collaborate.py`の1件(単独実行では成功、前節までと
+  同じスレッドタイミング依存の散発的失敗と判断)以外は541件中538件パス、
+  リグレッション無しを確認した。
