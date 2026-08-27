@@ -5235,3 +5235,43 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   新規1件を含め全件パス。`python3 -m pytest tests/`をフルスイートで
   実行し、既知の`test_auto_resume.py`・`test_reviewer_read_file_
   tool.py`の2件以外は542件中540件パス、リグレッション無しを確認した。
+
+### リサーチフェーズに検索実行の強制リトライとステータス行出力を追加
+
+- **背景**: `//agree`のコンテンツ生成系タスクで、リサーチ担当が一度も
+  `web_search`を呼ばずに`research_notes.md`が「検索結果なし」のまま
+  合意フェーズ・実装フェーズが素通りしてしまう事象が報告された。診断の
+  結果、「1回目の応答でツール呼び出しが0回だった場合に1回だけ促し
+  直して再試行する」機構は、実は`_run_research_phase`独自のものでは
+  なく`tools.py`の`_collect_answer_with_project_tools`が汎用のツール
+  未呼び出しナッジ機構として既に備えており(`_RESEARCH_NO_TOOL_CALL_
+  NUDGE_MESSAGE`を渡して利用)、`tests/test_research_phase.py`の
+  `test_research_phase_recovers_by_nudging_with_web_search_specific_
+  message`で検証済みだった。そのため、既存の頑健性ロジック(ナレーション
+  検知・空応答リトライ・汎用ナッジ機構)と二重化しないよう、新規の再試行
+  ループやステータスヘッダー形式は追加せず、既存の`_RESEARCH_NO_RESULTS_
+  MESSAGE`センチネル値の判定を`_is_research_failed`関数に共通化する
+  方針に変更した。
+- **変更内容**: `_is_research_failed(notes)`を新設し、`_build_
+  collaborative_implementation_request`(実装フェーズへの調査結果引き
+  継ぎ)・`_check_content_volume`(生成物への調査結果キーワード反映
+  チェック)の2箇所にあった`research_notes != _RESEARCH_NO_RESULTS_
+  MESSAGE`という文字列完全一致の直書き判定を、この関数呼び出しに
+  置き換えた(判定条件・`_RESEARCH_NO_RESULTS_MESSAGE`の文言はいずれも
+  変更していない)。`_build_module_breakdown_prompt`等にある`research_
+  notes or _RESEARCH_NO_RESULTS_MESSAGE`という3箇所は、「検索失敗の
+  判定」ではなく「空文字列に既定の表示文言を補う」という別の関心事
+  (ソフトウェア実装系`//agree`ではリサーチフェーズ自体を実行せず
+  `research_notes`が空文字列のまま渡ってくる)のため、今回は変更して
+  いない。
+- **テスト**: `tests/test_research_phase_enforcement.py`を新設し、
+  `_is_research_failed`単体の判定(完全一致・前後空白付き・空文字列・
+  実質的な調査結果)に加え、`_build_collaborative_implementation_
+  request`・`_check_content_volume`の2箇所が検索失敗を正しく検知する
+  ことを確認した。
+- **動作確認**: `python3 tests/test_research_phase_enforcement.py`・
+  `python3 tests/test_research_phase.py`・`python3 tests/test_content_
+  volume_check.py`を実行し、新規7件を含め全件パス。`python3 -m pytest
+  tests/`をフルスイートで実行し、既知の`test_auto_resume.py`・`test_
+  reviewer_read_file_tool.py`の2件以外は549件中547件パス、リグレッション
+  無しを確認した。
