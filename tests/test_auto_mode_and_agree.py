@@ -127,6 +127,33 @@ def test_parse_module_breakdown_still_handles_flat_single_line_format():
     ], tasks
 
 
+def test_parse_module_breakdown_handles_literal_angle_bracket_placeholders():
+    """実機バグ報告への対応の確認: `_MODULE_BREAKDOWN_PROMPT_TEMPLATE`・
+    `_CONTENT_BREAKDOWN_PROMPT_TEMPLATE`の出力例が`<ファイル名1>: <内容>`
+    という山括弧のプレースホルダー表記のため、設計担当(対話プロトコルの
+    統合役)がこれをプレースホルダーの記法だと認識せず、実際のファイル名を
+    山括弧で囲んだまま出力してしまうケースが実機で確認された
+    (`<産卵セットの組み方.md>: ...`)。この場合も見出し行として正しく
+    認識され、ファイル分割案が1件も読み取れずに`//agree`全体が打ち切られる
+    (「設計担当の回答からファイル分割案を読み取れませんでした」)ことが
+    無いようにする。
+    """
+    answer = (
+        "<産卵セットの組み方.md>: 産卵に適した材木の種類（ハンノキ）、産卵木の切断・洗浄・乾燥の手順\n"
+        "<産卵後の卵の飼育.md>: 産卵後の卵の確認時期（約2週間後）、マットの湿度管理\n"
+    )
+    tasks = yoriai._parse_module_breakdown(answer)
+    filenames = [fn for fn, _content in tasks]
+    assert filenames == ["産卵セットの組み方.md", "産卵後の卵の飼育.md"], filenames
+    # ファイル名自体には山括弧が残っていないことを確認する
+    # (見出し判定に使っただけで、実際のファイル名としては取り除かれる)。
+    assert all("<" not in fn and ">" not in fn for fn in filenames), filenames
+
+    contents = dict(tasks)
+    assert "産卵木の切断・洗浄・乾燥の手順" in contents["産卵セットの組み方.md"]
+    assert "マットの湿度管理" in contents["産卵後の卵の飼育.md"]
+
+
 def _make_card(device_name, model, free_gb):
     return {
         "device_name": device_name,
@@ -421,6 +448,7 @@ def main():
         test_parse_module_breakdown_groups_nested_function_signatures_under_their_file,
         test_parse_module_breakdown_is_not_specific_to_the_todo_example,
         test_parse_module_breakdown_still_handles_flat_single_line_format,
+        test_parse_module_breakdown_handles_literal_angle_bracket_placeholders,
         test_collaborate_dispatches_exactly_two_files_when_architect_uses_nested_format,
         test_agree_uses_top_candidate_as_architect_and_propagates_interface_to_implementers,
         test_agree_aborts_cleanly_when_architect_response_is_unparseable,
