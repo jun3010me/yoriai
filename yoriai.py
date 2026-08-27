@@ -3359,6 +3359,17 @@ def _run_research_phase(researcher: dict, org_fingerprint: str, request: str, pr
     エラーでもナレーションでもなければそちらを採用し、それ以外の場合は
     1回目の回答を(部分的にでも情報がある可能性を優先して)そのまま
     採用したうえで警告を表示する。
+
+    仮の判断(実機バグ報告への対応): 上記の言い直し要求は、`answer`が
+    "\n\n\n"のような空白のみの文字列だったケース(web_searchは実際に
+    呼ばれたが最終的な要約が実質空だった場合)にも発動する。Pythonでは
+    空白のみの文字列もtruthyなため`answer or _RESEARCH_NO_RESULTS_
+    MESSAGE`だけではフォールバックせず、かつ`_looks_like_process_
+    narration`もキーワード不一致でこのケースを検知できず、空白だけの
+    `research_notes.md`がそのまま保存されてしまう不具合が実機で報告
+    された。言い直し要求後も空白のままだった場合は、ナレーション文とは
+    異なり(空白には部分的な情報としての価値すら無いため)1回目の内容を
+    採用せず`_RESEARCH_NO_RESULTS_MESSAGE`に置き換える。
     """
     print(f"[🔍 リサーチフェーズ開始: {researcher['label']}さんが調査しています...]")
 
@@ -3385,7 +3396,15 @@ def _run_research_phase(researcher: dict, org_fingerprint: str, request: str, pr
             print(f"[⚠️ リサーチ担当の応答が長すぎたため、{CHAT_MAX_OUTPUT_TOKENS}トークンで打ち切られました]")
         notes = answer or _RESEARCH_NO_RESULTS_MESSAGE
 
-        if _looks_like_process_narration(notes):
+        # 仮の判断(実機バグ報告への対応: web_searchは実際に呼ばれたのに
+        # research_notes.mdが改行だけの実質空の内容になっていた):
+        # `answer`が"\n\n\n"のような空白のみの文字列だと、Pythonでは
+        # truthyなため`answer or _RESEARCH_NO_RESULTS_MESSAGE`ではフォール
+        # バックされず、かつ`_looks_like_process_narration`は「作業方針の
+        # 説明っぽい語」を探すだけで空白文字列には反応しないため、言い
+        # 直し要求も発動せずそのまま保存されてしまっていた。ナレーション
+        # 判定に加えて「stripすると空」かどうかも言い直し要求の条件に含める。
+        if _looks_like_process_narration(notes) or not notes.strip():
             retry_messages = [
                 {"role": "user", "content": prompt},
                 {"role": "assistant", "content": notes},
@@ -3395,11 +3414,21 @@ def _run_research_phase(researcher: dict, org_fingerprint: str, request: str, pr
                 researcher, org_fingerprint, retry_messages, project_dir,
                 on_web_search=_on_web_search,
             )
-            if not retry_error and retry_answer and not _looks_like_process_narration(retry_answer):
+            if (
+                not retry_error and retry_answer and retry_answer.strip()
+                and not _looks_like_process_narration(retry_answer)
+            ):
                 if retry_truncated:
                     print(f"[⚠️ リサーチ担当の応答が長すぎたため、{CHAT_MAX_OUTPUT_TOKENS}トークンで打ち切られました]")
                 notes = retry_answer
                 print("[🔁 リサーチ担当への言い直し要求により、調査結果の要約を再取得しました]")
+            elif not notes.strip():
+                # 仮の判断: ナレーション文とは異なり、空白のみの内容には
+                # 部分的な情報としての価値すら無いため、そのまま保存する
+                # くらいなら呼び出し元がリサーチ失敗を機械的に検知できる
+                # 明示的な「検索結果なし」に置き換える。
+                notes = _RESEARCH_NO_RESULTS_MESSAGE
+                print("[⚠️ リサーチ担当の回答が実質的に空でした。調査結果を「検索結果なし」として記録します]")
             else:
                 print(
                     "[⚠️ リサーチ担当の回答が作業方針の説明のままだった可能性があります。"

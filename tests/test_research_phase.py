@@ -351,6 +351,106 @@ def test_research_phase_falls_back_to_first_answer_when_retry_still_narration():
     shutil.rmtree(project_dir, ignore_errors=True)
 
 
+def _fake_stream_search_then_blank_always(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
+    """実機バグ再現用: web_searchは実際に呼ばれるが、最終回答が改行だけの
+    実質空の文字列("\\n\\n\\n")になるフェイク。言い直し要求をしても
+    改善しない(常に空のまま)パターン。
+    """
+    yield {"tool_call": "web_search", "tool_call_arguments": {"query": "猫 去勢 費用"}}
+    yield {
+        "tool_result": "web_search",
+        "tool_result_content": json.dumps(
+            {"query": "猫 去勢 費用", "results": [{"title": "去勢手術の費用相場", "url": "https://example.com/"}]},
+            ensure_ascii=False,
+        ),
+    }
+    yield {"content": "\n"}
+    yield {"content": "\n"}
+    yield {"content": "\n"}
+    yield {"done": True}
+
+
+def _fake_stream_search_then_blank_then_recovers(candidate, org_fingerprint, messages, offer_project_tools=False, **_kwargs):
+    """web_searchは呼ばれるが最終回答が空白のみだったのち、言い直し要求
+    (`_RESEARCH_SYNTHESIS_NUDGE_MESSAGE`)を受けて実質的な調査結果の要約を
+    返すフェイク。判定方法は`_fake_stream_narration_then_summary`と同じ
+    (メッセージ履歴のどこかに言い直し要求が含まれるかどうか)。
+    """
+    got_synthesis_nudge = any(
+        message.get("content") == yoriai._RESEARCH_SYNTHESIS_NUDGE_MESSAGE for message in messages
+    )
+    yield {"tool_call": "web_search", "tool_call_arguments": {"query": "猫 去勢 費用"}}
+    yield {
+        "tool_result": "web_search",
+        "tool_result_content": json.dumps(
+            {"query": "猫 去勢 費用", "results": [{"title": "去勢手術の費用相場", "url": "https://example.com/"}]},
+            ensure_ascii=False,
+        ),
+    }
+    if got_synthesis_nudge:
+        yield {"content": "## 調査結果\n- 去勢手術の費用相場は5,000円〜15,000円程度\n"}
+    else:
+        yield {"content": "\n\n\n"}
+    yield {"done": True}
+
+
+def test_research_phase_falls_back_to_no_results_message_when_search_happened_but_summary_is_blank():
+    """実機バグ報告(research_notes.mdの中身が改行だけで実質空だった)への
+    対応の確認: web_searchは実際に呼ばれたが最終回答が空白のみのまま
+    (言い直し要求をしても改善しない)場合、空白をそのまま保存せず、
+    `_RESEARCH_NO_RESULTS_MESSAGE`に置き換えて保存することを確認する。
+    """
+    project_dir = tempfile.mkdtemp()
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._stream_chat_from_candidate = _fake_stream_search_then_blank_always
+    try:
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            notes = yoriai._run_research_phase(
+                _researcher(), "fp", "猫を初めて飼う人向けに去勢手術について調べて", project_dir,
+            )
+    finally:
+        yoriai._stream_chat_from_candidate = original_stream
+        printed = stdout.getvalue()
+
+    assert notes == yoriai._RESEARCH_NO_RESULTS_MESSAGE
+    assert notes.strip() != ""
+    saved_path = os.path.join(project_dir, "research_notes.md")
+    with open(saved_path, encoding="utf-8") as f:
+        saved_content = f.read()
+    assert saved_content == yoriai._RESEARCH_NO_RESULTS_MESSAGE
+    assert "実質的に空でした" in printed, printed
+    shutil.rmtree(project_dir, ignore_errors=True)
+
+
+def test_research_phase_recovers_when_blank_summary_gets_a_real_answer_after_nudge():
+    """web_searchは呼ばれたが最終回答が空白のみだった場合でも、言い直し
+    要求への回答が実質的な内容であれば、そちらが採用されることを確認する
+    (空白判定はナレーション判定と同様、言い直しで回復する余地を残す)。
+    """
+    project_dir = tempfile.mkdtemp()
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._stream_chat_from_candidate = _fake_stream_search_then_blank_then_recovers
+    try:
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            notes = yoriai._run_research_phase(
+                _researcher(), "fp", "猫を初めて飼う人向けに去勢手術について調べて", project_dir,
+            )
+    finally:
+        yoriai._stream_chat_from_candidate = original_stream
+        printed = stdout.getvalue()
+
+    assert "去勢手術の費用相場" in notes, notes
+    assert notes != yoriai._RESEARCH_NO_RESULTS_MESSAGE
+    saved_path = os.path.join(project_dir, "research_notes.md")
+    with open(saved_path, encoding="utf-8") as f:
+        saved_content = f.read()
+    assert saved_content == notes
+    assert "[🔁 リサーチ担当への言い直し要求により、調査結果の要約を再取得しました]" in printed
+    shutil.rmtree(project_dir, ignore_errors=True)
+
+
 def main():
     tests = [
         test_research_phase_saves_notes_when_web_search_is_actually_called,
@@ -362,6 +462,8 @@ def main():
         test_looks_like_process_narration_does_not_flag_long_text_with_incidental_keyword,
         test_research_phase_retries_once_and_adopts_summary_when_first_answer_is_narration,
         test_research_phase_falls_back_to_first_answer_when_retry_still_narration,
+        test_research_phase_falls_back_to_no_results_message_when_search_happened_but_summary_is_blank,
+        test_research_phase_recovers_when_blank_summary_gets_a_real_answer_after_nudge,
     ]
     failures = 0
     for test in tests:
