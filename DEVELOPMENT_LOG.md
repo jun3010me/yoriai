@@ -5066,3 +5066,48 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   までのログに報告済み)に加え、`test_fix_session.py`の別の1件が失敗した
   が、前節と同様のスレッドタイミング依存の散発的失敗であり、今回の変更に
   起因するものではないと判断した(531件中528件パス)。
+
+### リサーチフェーズで、web_searchは実際に呼ばれたのに調査結果が改行だけの実質空のまま保存される不具合の修正
+
+- **背景**: 前節までの2つの修正を適用してユーザーが再度実機で確認した
+  ところ、対話プロトコルの応答なし・web_search未呼び出しの両方は解消
+  したが、生成された`research_notes.md`の中身を開くと改行が3行あるだけの
+  実質空のファイルだったという、さらに重大な報告があった。「リサーチを
+  何もしていない」ことが分かったとのこと。
+- **原因(バグ)**: `_run_research_phase`の`notes = answer or _RESEARCH_
+  NO_RESULTS_MESSAGE`は、`answer`が`"\n\n\n"`のような空白のみの文字列
+  だった場合にフォールバックしない(Pythonでは空白のみの文字列も
+  truthyなため)。かつ、その後の言い直し要求の発動条件
+  `_looks_like_process_narration(notes)`は「作業方針の説明っぽい語」を
+  探すだけの判定であり、空白のみの文字列にはそもそも該当語が含まれない
+  ため、言い直し要求も発動しなかった。結果、web_searchは実際に呼ばれた
+  (`web_search_call_count[0] == 0`のガードは通過する)ものの、最終的な
+  要約の生成に失敗して空白だけを返してきたケースが、何のフォールバックも
+  リトライも無いまま素通りし、`research_notes.md`に改行だけが保存されて
+  しまっていた。
+- **修正**: 言い直し要求の発動条件を`_looks_like_process_narration(notes)
+  or not notes.strip()`に広げた。言い直し要求後の回答についても、
+  採用条件に`retry_answer.strip()`(空白のみでないこと)を追加した。
+  言い直し要求後も空白のままだった場合、既存のナレーション時のフォール
+  バック(1回目の内容をそのまま採用して警告表示、部分的な情報がある
+  可能性を優先する設計)とは分けて扱う: 空白には部分的な情報としての
+  価値すら無いため、1回目の空白内容をそのまま保存せず、`_RESEARCH_NO_
+  RESULTS_MESSAGE`(呼び出し元がリサーチ失敗を機械的に検知できる明示的な
+  メッセージ)に置き換えるようにした。
+- **テスト**: `tests/test_research_phase.py`に2件追加した。web_searchが
+  実際に呼ばれるが最終回答が常に`"\n\n\n"`のままのフェイク
+  (`_fake_stream_search_then_blank_always`)を使い、言い直し要求をしても
+  改善しない場合に`_RESEARCH_NO_RESULTS_MESSAGE`へ置き換わることを確認
+  する`test_research_phase_falls_back_to_no_results_message_when_
+  search_happened_but_summary_is_blank`。言い直し要求への回答では実質的な
+  内容を返すフェイク(`_fake_stream_search_then_blank_then_recovers`)を
+  使い、空白判定でもナレーション判定と同様に言い直しで回復できることを
+  確認する`test_research_phase_recovers_when_blank_summary_gets_a_
+  real_answer_after_nudge`。
+- **動作確認**: `python3 tests/test_research_phase.py`を実行し、新規2件を
+  含め全件パス。`python3 -m pytest tests/`をフルスイートで2回連続実行し、
+  1回目は既知の2件に加え`test_background_collaborate.py`・
+  `test_fix_session.py`系で計6件失敗したが、2回目は既知の2件のみに戻り
+  (534件中532件パス)、失敗したテストの顔ぶれも回ごとに異なったため、
+  前節までと同じスレッドタイミング依存の散発的不安定性であり、今回の
+  変更に起因するものではないと判断した。
