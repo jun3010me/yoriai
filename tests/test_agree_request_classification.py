@@ -76,6 +76,24 @@ def test_explicit_research_instruction_overrides_keyword_classification():
     assert yoriai._classify_agree_request_type(request_with_no_keyword) == yoriai.AGREE_REQUEST_TYPE_CONTENT
 
 
+def test_research_and_investigate_phrasings_are_classified_as_content():
+    """実機バグ報告への対応: 「クロオオアリの飼育方法についてリサーチして、
+    結果を保存してください」のような、ごく自然な依頼文が
+    `_CONTENT_REQUEST_KEYWORDS`/`_SOFTWARE_REQUEST_KEYWORDS`のどちらにも
+    該当せず、デフォルトの`AGREE_REQUEST_TYPE_SOFTWARE`に倒れて、単なる
+    Web検索・要約の依頼のはずが「スクレイピング用のPythonプログラムを
+    作る」という実装依頼に化けてしまっていた。「リサーチして」「調べて」も
+    「調査して」「Web検索して」と同様に明示的なリサーチ指示として
+    CONTENTに分類されることを確認する。
+    """
+    requests = [
+        "クロオオアリの飼育方法についてリサーチして、結果を保存してください",
+        "猫の去勢手術の費用について調べてまとめて",
+    ]
+    for request in requests:
+        assert yoriai._classify_agree_request_type(request) == yoriai.AGREE_REQUEST_TYPE_CONTENT, request
+
+
 # ---------------------------------------------------------------------------
 # ステップ3: コンテンツ生成用タスク分解テンプレートの新設
 # ---------------------------------------------------------------------------
@@ -144,6 +162,7 @@ def main():
         test_software_keywords_are_classified_as_software,
         test_ambiguous_or_unmatched_requests_default_to_software,
         test_explicit_research_instruction_overrides_keyword_classification,
+        test_research_and_investigate_phrasings_are_classified_as_content,
         test_build_module_breakdown_prompt_uses_content_template_and_embeds_research_notes,
         test_build_module_breakdown_prompt_still_uses_software_template_for_software_requests,
         test_build_design_dialogue_output_instruction_embeds_research_notes_for_content,
