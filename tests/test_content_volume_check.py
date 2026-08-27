@@ -117,6 +117,102 @@ def test_check_content_volume_skips_keyword_check_when_research_notes_missing():
         shutil.rmtree(project_dir, ignore_errors=True)
 
 
+def _member(label, model):
+    return {"label": label, "model": model, "address": "127.0.0.1", "port": 47120}
+
+
+def _patched(obj, name, replacement):
+    original = getattr(obj, name)
+    setattr(obj, name, replacement)
+    return original
+
+
+def test_run_content_volume_verification_passes_immediately_without_calling_fixer():
+    """1回目のチェックで既に十分な内容量の場合、担当者への修正依頼は
+    発生せず、`attempts`が1で返ることを確認する。
+    """
+    project_dir = tempfile.mkdtemp()
+    fix_calls = []
+
+    def fake_fix(*args, **kwargs):
+        fix_calls.append(1)
+        return "", None, False, []
+
+    original_fix = _patched(yoriai, "_collect_answer_with_project_tools", fake_fix)
+    try:
+        long_body = "本文のダミーテキストです。" * 40
+        _write_raw(project_dir, "index.html", f"<html><body>{long_body}</body></html>")
+        result = yoriai._run_content_volume_verification(
+            [_member("MacStudio", "qwen3-coder-30b")], "org-fp", project_dir, [("index.html", "説明")],
+        )
+    finally:
+        yoriai._collect_answer_with_project_tools = original_fix
+        shutil.rmtree(project_dir, ignore_errors=True)
+
+    assert result["ok"] is True, result
+    assert result["attempts"] == 1, result
+    assert len(fix_calls) == 0, "1回目で十分な場合、修正依頼は発生してはいけません"
+
+
+def test_run_content_volume_verification_retries_and_succeeds_after_fix():
+    """1回目が薄い内容で警告が出た場合、担当者に修正を依頼し、修正後の
+    再チェックで通過することを確認する(検出→差し戻し→再実行)。
+    """
+    project_dir = tempfile.mkdtemp()
+    fix_calls = []
+
+    def fake_fix(candidate, org_fingerprint, messages, project_dir_arg):
+        fix_calls.append(messages[0]["content"])
+        long_body = (
+            "Obsidianを使ったPKM構築の具体的な解説を書き足しました。バックリンク機能の実例です。"
+        ) * 20
+        _write_raw(project_dir_arg, "index.html", f"<html><body>{long_body}</body></html>")
+        return "本文を書き足しました。", None, False, ["index.html"]
+
+    original_fix = _patched(yoriai, "_collect_answer_with_project_tools", fake_fix)
+    try:
+        _write_raw(project_dir, "index.html", "<html><body>短い内容です</body></html>")
+        result = yoriai._run_content_volume_verification(
+            [_member("MacStudio", "qwen3-coder-30b")], "org-fp", project_dir, [("index.html", "説明")],
+        )
+    finally:
+        yoriai._collect_answer_with_project_tools = original_fix
+        shutil.rmtree(project_dir, ignore_errors=True)
+
+    assert result["ok"] is True, result
+    assert result["attempts"] == 2, result
+    assert len(fix_calls) == 1, "1回の修正依頼で成功する場合、2回目は発生してはいけません"
+    assert "文字数" in fix_calls[0], fix_calls[0]
+
+
+def test_run_content_volume_verification_gives_up_after_max_attempts_without_discarding_output():
+    """`MAX_CONTENT_VOLUME_FIX_ATTEMPTS`回試みても解消しない場合、それ以上
+    リトライせず、警告付きの結果をそのまま返す(生成物は維持される)ことを
+    確認する。
+    """
+    project_dir = tempfile.mkdtemp()
+    fix_calls = []
+
+    def fake_fix(*args, **kwargs):
+        fix_calls.append(1)
+        return "対応しました。", None, False, []
+
+    original_fix = _patched(yoriai, "_collect_answer_with_project_tools", fake_fix)
+    try:
+        _write_raw(project_dir, "index.html", "<html><body>短い内容です</body></html>")
+        result = yoriai._run_content_volume_verification(
+            [_member("MacStudio", "qwen3-coder-30b")], "org-fp", project_dir, [("index.html", "説明")],
+        )
+        assert result["ok"] is False, result
+        assert result["attempts"] == yoriai.MAX_CONTENT_VOLUME_FIX_ATTEMPTS, result
+        assert len(fix_calls) == yoriai.MAX_CONTENT_VOLUME_FIX_ATTEMPTS - 1, fix_calls
+        with open(os.path.join(project_dir, "index.html"), encoding="utf-8") as f:
+            assert "短い内容です" in f.read()
+    finally:
+        yoriai._collect_answer_with_project_tools = original_fix
+        shutil.rmtree(project_dir, ignore_errors=True)
+
+
 def main():
     tests = [
         test_check_content_volume_warns_when_file_is_too_short,
@@ -124,6 +220,9 @@ def main():
         test_check_content_volume_warns_when_research_keywords_are_not_reflected,
         test_check_content_volume_ok_when_content_is_sufficient_and_reflects_keywords,
         test_check_content_volume_skips_keyword_check_when_research_notes_missing,
+        test_run_content_volume_verification_passes_immediately_without_calling_fixer,
+        test_run_content_volume_verification_retries_and_succeeds_after_fix,
+        test_run_content_volume_verification_gives_up_after_max_attempts_without_discarding_output,
     ]
     failures = 0
     for test in tests:

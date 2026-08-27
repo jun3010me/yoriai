@@ -4887,3 +4887,69 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   `test_fix_session.py`系の散発的な失敗は今回は3回とも再現しなかった。
   スレッドタイミング依存の不安定性のため、再現有無自体に意味は無いと
   判断している)。
+
+### 内容量チェックの警告を「表示するだけ」から「担当者への差し戻し→再チェック」の自動修正ループに変更
+
+- **背景**: 「リサーチ連携型コンテンツ執筆パイプライン」の改善依頼を受け、
+  実装前に既存コードを調査したところ、依頼が挙げていた課題(コンテンツ
+  生成系の依頼で骨組みだけの薄い成果物が生成される)自体は、既に
+  `//agreeへのリサーチ機能組み込み ステップ1〜4`(本ログの該当箇所)で
+  段階的に対応済みだったことが分かった。具体的には、依頼文をキーワード
+  ベースで`AGREE_REQUEST_TYPE_CONTENT`/`_SOFTWARE`に分類する
+  `_classify_agree_request_type`、タスク分解前に`web_search`
+  (SearXNGバックエンド、`tools.py`)を実際に呼ばせて`research_notes.md`
+  として保存する独立したリサーチフェーズ`_run_research_phase`、その
+  調査結果を埋め込んだコンテンツ制作用のタスク分解テンプレート
+  `_CONTENT_BREAKDOWN_PROMPT_TEMPLATE`、そして生成物の文字数・
+  プレースホルダー・調査結果キーワードの反映度をチェックする
+  `_check_content_volume`が既に実装・テスト済みだった。依頼が提案していた
+  「タスクごとの`task_type`フィールド」「`research_notes/{task_id}.md`」
+  ではなく、依頼全体を単位とした分類・リサーチフェーズという設計だったが、
+  「検索した情報を素材に本文を書く」「内容が薄い成果物を検出する」という
+  依頼の目的自体は既に満たされていたため、車輪の再発明を避け、既存設計を
+  そのまま踏襲することにした。
+- **見つかった残課題**: `_check_content_volume`はステップ4追加時点の
+  ドキュメントコメントに明記されていた通り、警告を標準出力に表示する
+  だけで、`_run_integration_verification`(検証コマンド失敗時に担当者へ
+  修正を依頼して再実行する既存の統合検証ループ)のような自動修正には
+  繋がっていなかった。依頼の受け入れ条件「閾値を下回る、または未完成
+  文字列が検出された場合は、そのタスクを再実行対象としてキューに戻す」を
+  満たしていなかったため、今回はこの1点に絞って対応した。
+- **修正**: `yoriai.py`に`_run_content_volume_verification(candidates,
+  org_fingerprint, project_dir, tasks, max_attempts=
+  MAX_CONTENT_VOLUME_FIX_ATTEMPTS) -> dict`を新設した。
+  `_run_integration_verification`と同じ「実行して失敗したら担当メンバー
+  1名に修正させて再実行する」というループの構造を、検証コマンドではなく
+  `_check_content_volume`に対して適用したもの。修正の実行には、`//fix`・
+  統合検証の両方が使っている既存の`_collect_answer_with_project_tools`
+  (`tools.py`、read_file/write_file/edit_file等のプロジェクトツール群を
+  提供する問い合わせ関数)をそのまま再利用した(依頼が「既存の`//fix`の
+  タスク再投入の仕組みがあれば流用すること」と挙げていた箇所に対応する、
+  実際に存在する既存の仕組み)。修正依頼のプロンプト
+  (`_CONTENT_VOLUME_FIX_PROMPT_TEMPLATE`)には、検出された警告一覧・
+  `research_notes.md`の内容・最低文字数の目安を埋め込み、「調査結果の
+  具体例・数値・固有名詞を使うこと」「プレースホルダーや抽象的な一般論
+  だけの文章を禁止すること」を明示した。最大試行回数は
+  `MAX_CONTENT_VOLUME_FIX_ATTEMPTS = 2`(統合検証の`MAX_VERIFY_ATTEMPTS`
+  よりコンパクトな値。内容量チェックは1〜2箇所の指摘に対する加筆が
+  中心で、検証コマンドの原因調査ほど多くの往復を要しないと判断した)。
+  上限に達しても解消しない場合は、それ以上リトライせず警告付きの結果を
+  そのまま返す(誤検知で生成物を握りつぶさない、という既存方針を維持)。
+  `_run_collaborative_project`の呼び出し箇所を`_check_content_volume`の
+  直接呼び出しから`_run_content_volume_verification`に差し替え、
+  成功時は試行回数を、解消しなかった場合は残った警告を表示するようにした。
+- **テスト**: `tests/test_content_volume_check.py`に3件追加した。
+  1回目で十分な内容量の場合は修正依頼が発生せず`attempts`が1になること、
+  薄い内容が1回の修正依頼(`_collect_answer_with_project_tools`を
+  差し替えて、実際にファイルを書き足す模擬実装を使う)で解消し
+  `attempts`が2になること、`MAX_CONTENT_VOLUME_FIX_ATTEMPTS`回試みても
+  解消しない場合はそれ以上リトライせず、生成済みファイルの内容が失われず
+  維持されたまま`ok: False`が返ることを確認した。
+- **動作確認**: `python3 -m pytest tests/test_content_volume_check.py`を
+  実行し、新規3件を含め8件全てパス。`python3 -m pytest tests/`を
+  フルスイートで実行し530件中4件失敗を確認したが、変更前の同じ
+  コミット(`git stash`でこの変更を退避したベースライン)でも
+  `test_auto_resume.py`・`test_reviewer_read_file_tool.py`の2件が
+  同様に失敗すること、残り2件(`test_fix_session.py`)は前回までのログに
+  「スレッドタイミング依存の不安定性」として報告済みの既知の散発的失敗
+  であることを確認し、いずれも今回の変更に起因するものではないと判断した。
