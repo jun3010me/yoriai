@@ -334,6 +334,63 @@ def _parse_checklist_markdown(text: str) -> list:
     return checklist
 
 
+def _parse_review_feedback_markdown(text: str) -> dict:
+    """PROGRESS.md全体(`text`)から「## 直近のレビュー指摘」セクション
+    (`_PROGRESS_SECTION_REVIEW`)を取り出し、`_format_progress_markdown`が
+    `f"### {filename}"`という見出しで区切って書き出した内容を
+    `{filename: feedback}`の辞書として読み戻す。セクション自体が
+    無い(旧バージョンのPROGRESS.md・未完了ファイルが1つも無いプロジェクト)
+    場合は空の辞書を返す。
+
+    仮の判断: `_extract_progress_section`と同じ「見出し行から次の見出し
+    行(またはセクション末尾)までを本文として取り出す」ロジックを、
+    "## "見出しではなく"### "見出しの粒度でこの関数内に書き起こす
+    (`_extract_progress_section`自体は"## "しか見ないため、そのまま
+    再利用はできない)。
+    """
+    section = _extract_progress_section(text, _PROGRESS_SECTION_REVIEW)
+    if not section:
+        return {}
+    review_feedback = {}
+    filename = None
+    body_lines = []
+    for line in section.splitlines():
+        if line.startswith("### "):
+            if filename is not None:
+                review_feedback[filename] = "\n".join(body_lines).strip("\n")
+            filename = line[len("### "):].strip()
+            body_lines = []
+        else:
+            body_lines.append(line)
+    if filename is not None:
+        review_feedback[filename] = "\n".join(body_lines).strip("\n")
+    return review_feedback
+
+
+def _find_repeated_review_feedback(previous: dict, current: dict, checklist: list) -> list:
+    """直近の自動再開の前後(`previous`→`current`、いずれも
+    `{filename: feedback}`の辞書)を比較し、`checklist`上でまだ完了して
+    いないファイルのうち、レビュー指摘の文言が(前後の空白を除いて)
+    一字一句変化していないファイル名の一覧をファイル名でソートして返す。
+
+    仮の判断: `previous`・`current`のどちらか一方にしか該当ファイルの
+    記録が無い場合は「変化なし」とはみなさない。初回の自動再開など、
+    比較対象がそもそも存在しないケースまで「変化していない」と誤検知
+    してしまうと、1回もレビュー指摘を受け取っていないファイルまで
+    早期打ち切りの対象になりかねないため。
+    """
+    incomplete_filenames = {
+        task["filename"] for task in checklist if task["status"] != _TASK_STATUS_COMPLETED
+    }
+    repeated = []
+    for filename in incomplete_filenames:
+        if filename not in previous or filename not in current:
+            continue
+        if previous[filename].strip() == current[filename].strip():
+            repeated.append(filename)
+    return sorted(repeated)
+
+
 def _parse_auto_resume_count(text: str) -> int:
     """「自動再開の試行回数」セクションの内容を整数として読み取る。
     セクションが無い(旧バージョンのPROGRESS.md)・内容が数値として
@@ -372,10 +429,16 @@ def _parse_bullet_lines(text: str) -> list:
 def _parse_progress_markdown(path: str):
     """PROGRESS.mdを読み込み、`{"request":, "language":, "tasks":,
     "checklist":, "auto_resume_count":, "changelog":, "pending_fix_request":,
-    "pending_fix_subtasks":, "verify_command":, "verification":}`の辞書として
-    返す。ファイルが存在しない・想定した形式で解析できない場合は`None`を
-    返す(呼び出し元は、そのプロジェクトの再開をスキップすべきという
-    シグナルとして扱う)。
+    "pending_fix_subtasks":, "verify_command":, "verification":,
+    "review_feedback":}`の辞書として返す。ファイルが存在しない・想定した
+    形式で解析できない場合は`None`を返す(呼び出し元は、そのプロジェクトの
+    再開をスキップすべきというシグナルとして扱う)。
+
+    仮の判断(繰り返しレビュー指摘の早期検知への対応): `review_feedback`
+    (この節が無ければ空の辞書)も同じ後方互換の方針。従来この節は
+    `_format_progress_markdown`による書き込み専用で、`_maybe_auto_resume`が
+    「直近の自動再開の前後でレビュー指摘の文言が一字一句変化していないか」
+    を比較する必要が出てきたため、読み戻しに対応した。
 
     仮の判断: `language`は、この節が無い旧バージョンのPROGRESS.mdでは
     空文字列になる(この機能追加より前に作られた既存プロジェクトを
@@ -415,6 +478,7 @@ def _parse_progress_markdown(path: str):
         "pending_fix_subtasks": _parse_bullet_lines(_extract_progress_section(text, _PROGRESS_SECTION_PENDING_FIX_SUBTASKS)),
         "verify_command": _extract_progress_section(text, _PROGRESS_SECTION_VERIFY_COMMAND).strip(),
         "verification": _parse_verification_result(_extract_progress_section(text, _PROGRESS_SECTION_VERIFICATION)),
+        "review_feedback": _parse_review_feedback_markdown(text),
     }
 
 

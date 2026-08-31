@@ -121,6 +121,7 @@ from progress import (
     _TASK_STATUS_IN_PROGRESS,
     _build_task_checklist,
     _find_incomplete_projects,
+    _find_repeated_review_feedback,
     _format_task_checklist,
     _incomplete_task_labels,
     _parse_bullet_lines,
@@ -5035,6 +5036,15 @@ def _maybe_auto_resume(project_dir: str, port: int, org_fingerprint: str) -> Non
 
     再帰呼び出しで次の試行を行う設計にしているが、上限(5回)により
     再帰の深さは物理的に5を超えない。
+
+    仮の判断(繰り返しレビュー指摘の早期検知への対応): レビュー担当が
+    毎回一字一句同じ指摘文言を繰り返し、実装側がそれを活かせないまま
+    上限の5回分を消費して初めて人間にエスカレーションされる不具合が
+    見つかった。指摘文言が変化していない時点で「これ以上粘っても解決
+    しない」と判断できるため、上限到達のチェック(既存)とは独立した
+    早期打ち切り条件として、直近の自動再開の前後でレビュー指摘の文言が
+    一字一句変化していないファイルが無いかを`_find_repeated_review_
+    feedback`で確認する。
     """
     parsed = _parse_progress_markdown(os.path.join(project_dir, PROGRESS_FILENAME))
     if parsed is None or not _progress_checklist_is_incomplete(parsed["checklist"]):
@@ -5048,13 +5058,29 @@ def _maybe_auto_resume(project_dir: str, port: int, org_fingerprint: str) -> Non
         )
         return
 
+    previous_review_feedback = parsed.get("review_feedback", {})
+
     next_attempt = attempt_count + 1
     print(
         f"[🔁 {project_dir}: 未完了のタスクが残っているため、自動的に再開します"
         f"(試行 {next_attempt}/{_AUTO_RESUME_MAX_ATTEMPTS})]"
     )
-    if _resume_project(project_dir, port, org_fingerprint, auto_resume_count=next_attempt):
-        _maybe_auto_resume(project_dir, port, org_fingerprint)
+    if not _resume_project(project_dir, port, org_fingerprint, auto_resume_count=next_attempt):
+        return
+
+    latest_parsed = _parse_progress_markdown(os.path.join(project_dir, PROGRESS_FILENAME))
+    if latest_parsed is not None:
+        repeated = _find_repeated_review_feedback(
+            previous_review_feedback, latest_parsed.get("review_feedback", {}), latest_parsed["checklist"],
+        )
+        if repeated:
+            print(
+                f"[⛔ {project_dir}: {', '.join(repeated)} のレビュー指摘が前回の自動再開と同一のまま"
+                "変わりませんでした。これ以上の自動再開は行いません。人間の確認が必要です]"
+            )
+            return
+
+    _maybe_auto_resume(project_dir, port, org_fingerprint)
 
 
 def _run_resume_all(port: int, org_fingerprint: str, out_dir: str) -> None:

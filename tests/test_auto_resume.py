@@ -68,8 +68,10 @@ def _fake_stream_always_ok(candidate, org_fingerprint, messages, **_kwargs):
 
 
 def _fake_stream_cli_review_always_fails(candidate, org_fingerprint, messages, **_kwargs):
-    """cli.pyのレビューだけが常に「問題あり」を返す(何度再開しても
-    解決しない状況を再現する)。
+    """cli.pyのレビューだけが常に「問題あり」を返す。しかも指摘文言が
+    一字一句(前後の空白を除いても)完全に同一のまま変化しない、
+    という実機で確認された最悪のケース(何度再開しても解決しない
+    うえ、指摘文言からも改善の兆しが読み取れない状況)を再現する。
     """
     text = messages[0]["content"]
     if "ファイルに分割する実装計画" in text:
@@ -81,6 +83,34 @@ def _fake_stream_cli_review_always_fails(candidate, org_fingerprint, messages, *
     else:
         yield {"content": "```python\npass\n```"}
     yield {"done": True}
+
+
+def _make_fake_stream_cli_review_fails_with_changing_text():
+    """`_fake_stream_cli_review_always_fails`と同様にcli.pyのレビューが
+    常に「問題あり」を返すが、指摘文言そのものは呼び出しのたびに変化する
+    (レビュー担当が毎回違う理由を挙げるが、結局どれも直らない)ケースを
+    再現するファクトリ。`_find_repeated_review_feedback`による早期打ち切りが
+    「指摘文言が一字一句同一の場合」だけに反応し、指摘内容が変化し続ける
+    (=改善の余地がまだありそうな)場合には反応しない
+    (`_AUTO_RESUME_MAX_ATTEMPTS`の上限まで従来通り自動再開が続く)ことを
+    確認するために使う。
+    """
+    calls = {"n": 0}
+
+    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
+        text = messages[0]["content"]
+        if "ファイルに分割する実装計画" in text:
+            yield {"content": _TWO_FILE_BREAKDOWN_ANSWER}
+        elif "レビュー対象: cli.py" in text:
+            calls["n"] += 1
+            yield {"content": f"問題あり\ncli.pyの引数の扱いが計画と一致していません(指摘{calls['n']}回目)。"}
+        elif "レビュー対象" in text:
+            yield {"content": "問題なし"}
+        else:
+            yield {"content": "```python\npass\n```"}
+        yield {"done": True}
+
+    return fake_stream
 
 
 def test_parse_auto_resume_count_defaults_to_zero_when_section_missing():
@@ -260,11 +290,20 @@ def test_collaborate_auto_resume_stops_at_limit_and_reports_clearly():
     """依頼の動作確認: 意図的に何度もレビューで問題が指摘され続ける状況を
     作り、5回の自動再開を試みた後、自動的に停止して「人間の確認が必要」
     という報告が出ることを確認する。
+
+    仮の判断(繰り返しレビュー指摘の早期検知への対応): 指摘文言が
+    毎回変化するフェイクストリーム(`_make_fake_stream_cli_review_fails_
+    with_changing_text`)を使う。指摘文言が一字一句同一のまま変わらない
+    ケースは、この機能追加により上限(5回)に達する前に早期停止する
+    ようになった(`test_maybe_auto_resume_stops_early_when_review_
+    feedback_repeats_unchanged`参照)。この統合テストは、指摘内容が
+    (毎回)変化し続けるにもかかわらず一向に解決しない場合には、従来
+    通り上限のちょうど5回まで自動再開が続くことを確認する。
     """
     original_snapshot = yoriai._fetch_org_snapshot
     original_stream = yoriai._stream_chat_from_candidate
     yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False: _two_member_snapshot()
-    yoriai._stream_chat_from_candidate = _fake_stream_cli_review_always_fails
+    yoriai._stream_chat_from_candidate = _make_fake_stream_cli_review_fails_with_changing_text()
 
     out_dir = tempfile.mkdtemp(prefix="yoriai_auto_resume_test_")
     try:
@@ -290,6 +329,93 @@ def test_collaborate_auto_resume_stops_at_limit_and_reports_clearly():
         parsed = yoriai._parse_progress_markdown(os.path.join(project_dir, yoriai.PROGRESS_FILENAME))
         assert parsed["auto_resume_count"] == 5, parsed
         assert yoriai._progress_checklist_is_incomplete(parsed["checklist"]) is True
+    finally:
+        yoriai._fetch_org_snapshot = original_snapshot
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_maybe_auto_resume_stops_early_when_review_feedback_repeats_unchanged():
+    """依頼の背景: レビュー担当が毎回一字一句同じ指摘文言(実機で確認された
+    「cli.pyの引数の扱いが計画と一致していません」)を繰り返し、実装側が
+    それを活かせないまま、`_AUTO_RESUME_MAX_ATTEMPTS`(5回)分の自動再開を
+    消費して初めて人間にエスカレーションされる不具合が見つかった。指摘
+    文言が変化していない時点で「これ以上粘っても解決しない」と判断できる
+    ため、上限に達する前に早期に人間へ確認を求めるようにした
+    (`_find_repeated_review_feedback`)。
+    """
+    original_snapshot = yoriai._fetch_org_snapshot
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False: _two_member_snapshot()
+    yoriai._stream_chat_from_candidate = _fake_stream_cli_review_always_fails
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_auto_resume_test_")
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            yoriai._ask_organization_collaborate(47120, "fingerprint", "ToDoリストのCLIツールを作って", out_dir)
+        output = buf.getvalue()
+
+        assert (
+            "[⛔ " in output
+            and "cli.py のレビュー指摘が前回の自動再開と同一のまま変わりませんでした" in output
+            and "人間の確認が必要です" in output
+        ), output
+        assert "[✅ 全タスク完了" not in output, output
+        assert "自動再開の上限(5回)に達しました" not in output, (
+            f"上限到達より前に早期停止するはずです: {output}"
+        )
+        # 早期停止のため、自動再開の試行回数は上限の5回未満で止まるはずです。
+        attempt_log_count = output.count("自動的に再開します")
+        assert 0 < attempt_log_count < 5, (
+            f"早期停止により5回未満で止まるはずです: {attempt_log_count}回"
+        )
+
+        project_dir = os.path.join(
+            out_dir, yoriai.PROJECTS_SUBDIR_NAME,
+            yoriai._project_name_with_date_prefix("ToDoリストのCLIツールを作って"),
+        )
+        parsed = yoriai._parse_progress_markdown(os.path.join(project_dir, yoriai.PROGRESS_FILENAME))
+        assert parsed["auto_resume_count"] < yoriai._AUTO_RESUME_MAX_ATTEMPTS, parsed
+        assert yoriai._progress_checklist_is_incomplete(parsed["checklist"]) is True
+    finally:
+        yoriai._fetch_org_snapshot = original_snapshot
+        yoriai._stream_chat_from_candidate = original_stream
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_maybe_auto_resume_continues_when_review_feedback_changes_each_time():
+    """リグレッション防止: 同じファイルへの指摘であっても、レビュー担当が
+    指摘するたびに文言を変える(=改善の余地がまだありそうな)場合には
+    早期停止せず、従来通り`_AUTO_RESUME_MAX_ATTEMPTS`(5回)まで自動再開が
+    継続されることを確認する。
+    """
+    original_snapshot = yoriai._fetch_org_snapshot
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False: _two_member_snapshot()
+    yoriai._stream_chat_from_candidate = _make_fake_stream_cli_review_fails_with_changing_text()
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_auto_resume_test_")
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            yoriai._ask_organization_collaborate(47120, "fingerprint", "ToDoリストのCLIツールを作って", out_dir)
+        output = buf.getvalue()
+
+        assert "レビュー指摘が前回の自動再開と同一のまま変わりませんでした" not in output, output
+        assert (
+            "[⛔ " in output and "自動再開の上限(5回)に達しました" in output and "人間の確認が必要です" in output
+        ), output
+        assert output.count("自動的に再開します") == 5, (
+            f"指摘文言が変化し続ける場合は5回まで自動再開が続くはずです: {output.count('自動的に再開します')}回"
+        )
+
+        project_dir = os.path.join(
+            out_dir, yoriai.PROJECTS_SUBDIR_NAME,
+            yoriai._project_name_with_date_prefix("ToDoリストのCLIツールを作って"),
+        )
+        parsed = yoriai._parse_progress_markdown(os.path.join(project_dir, yoriai.PROGRESS_FILENAME))
+        assert parsed["auto_resume_count"] == 5, parsed
     finally:
         yoriai._fetch_org_snapshot = original_snapshot
         yoriai._stream_chat_from_candidate = original_stream
@@ -367,6 +493,8 @@ def main():
         test_maybe_auto_resume_does_nothing_when_project_already_complete,
         test_collaborate_auto_resumes_and_eventually_completes_when_issue_gets_fixed,
         test_collaborate_auto_resume_stops_at_limit_and_reports_clearly,
+        test_maybe_auto_resume_stops_early_when_review_feedback_repeats_unchanged,
+        test_maybe_auto_resume_continues_when_review_feedback_changes_each_time,
         test_auto_resume_runs_in_background_without_blocking_next_input,
     ]
     failures = 0

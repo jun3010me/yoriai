@@ -5329,3 +5329,75 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   スレッドタイミング依存の既知の散発的失敗で、今回の修正とは無関係)。
   549件全件パスするフルスイート実行も複数回確認できており、今回の
   2件についてはリグレッション無しを確認した。
+
+### レビュー指摘の文言が同一のまま変わらない場合、自動再開の上限に達する前に早期エスカレーションする
+
+- **背景**: `_maybe_auto_resume`(`yoriai.py`)は、プロジェクトが未完了で
+  ある限り`_AUTO_RESUME_MAX_ATTEMPTS`(5回)まで無条件に自動再開を
+  繰り返す。しかし実際の失敗パターンとして、レビュー担当が毎回一字一句
+  同じ指摘文言(例:「cli.pyの引数の扱いが計画と一致していません」)を
+  繰り返し、実装側がその指摘を活かせないまま5回分の再開を消費して
+  初めて人間にエスカレーションされるケースが確認されていた。指摘の
+  文言が変化していない時点で「これ以上粘っても解決しない」と判断
+  できるはずであり、上限に達する前に早期に人間へ確認を求める必要が
+  あった。
+- **原因/経緯**: PROGRESS.mdには既に「## 直近のレビュー指摘」セクション
+  (`_PROGRESS_SECTION_REVIEW`)としてファイルごとのレビュー指摘文言が
+  書き出されていたが、`_parse_progress_markdown`はこのセクションを
+  読み戻しておらず(書き込み専用)、`_maybe_auto_resume`が直近の自動
+  再開の前後で指摘文言を比較する手段が無かった。
+- **修正**: `progress.py`に、PROGRESS.md全体から「## 直近のレビュー
+  指摘」セクションを取り出し、`_format_progress_markdown`が書き出した
+  `"### <filename>"`見出しごとに`{filename: feedback}`の辞書として
+  読み戻す`_parse_review_feedback_markdown`を新設し、`_parse_progress_
+  markdown`が返す辞書に`"review_feedback"`キー(このセクションが無い
+  PROGRESS.mdでは空の辞書になる後方互換の挙動)として追加した。あわせて、
+  直近の自動再開の前後(`previous`→`current`、いずれも
+  `{filename: feedback}`の辞書)を比較し、`checklist`上でまだ完了して
+  いないファイルのうち指摘文言が(前後の空白を除いて)一字一句変化して
+  いないファイル名の一覧を返す`_find_repeated_review_feedback`を新設
+  した。`previous`・`current`のどちらか一方にしか該当ファイルの記録が
+  無い場合(初回の自動再開など、比較対象がそもそも無いケース)は
+  「変化なし」とみなさないようにし、誤検知を避けている。`yoriai.py`の
+  `_maybe_auto_resume`は、`_resume_project`を呼び出す直前の`parsed`から
+  `previous_review_feedback`を取得しておき、`_resume_project`が`True`を
+  返した後、再帰呼び出しの前にPROGRESS.mdを`latest_parsed`として
+  再読み込みし、`_find_repeated_review_feedback`で比較する。結果が
+  空でなければ、上限到達時のメッセージと同じ形式で
+  `[⛔ {project_dir}: {filenames} のレビュー指摘が前回の自動再開と
+  同一のまま変わりませんでした。これ以上の自動再開は行いません。
+  人間の確認が必要です]`と表示し、再帰呼び出しをせずに関数を終了する。
+  既存の`_AUTO_RESUME_MAX_ATTEMPTS`到達による打ち切りとは独立した、
+  早期打ち切り条件として実装しており、上限到達のチェック自体は変更
+  していない。
+- **テスト**: `tests/test_progress_persistence.py`に、
+  `_format_progress_markdown`で書き出したreview_feedbackを
+  `_parse_review_feedback_markdown`で読み戻す往復テスト・セクションが
+  無い場合に空の辞書を返すテスト・`_find_repeated_review_feedback`が
+  未完了ファイルの指摘文言の不変を検出するテスト・完了済みファイルを
+  無視するテスト・文言が変化していれば無視するテスト・比較対象が
+  無い初回の自動再開を誤検知しないテストを追加した。`tests/
+  test_auto_resume.py`には、`_ask_organization_collaborate`を通した
+  統合テストとして、cli.pyのレビューが毎回一字一句同じ指摘文言を
+  返すシナリオで`_AUTO_RESUME_MAX_ATTEMPTS`(5回)に達する前に早期
+  停止し「レビュー指摘が前回の自動再開と同一のまま変わりませんでした」
+  というメッセージが出力されることを確認する
+  `test_maybe_auto_resume_stops_early_when_review_feedback_repeats_
+  unchanged`と、指摘文言が毎回変化するシナリオでは従来通り上限の5回
+  まで自動再開が継続されることを確認する`test_maybe_auto_resume_
+  continues_when_review_feedback_changes_each_time`を追加した。なお
+  既存の`test_collaborate_auto_resume_stops_at_limit_and_reports_
+  clearly`は、指摘文言が完全に同一のまま変わらないモック
+  (`_fake_stream_cli_review_always_fails`)を使っていたため、今回の
+  早期エスカレーション機能により1回目の自動再開後に早期停止するように
+  なり、そのままでは「上限のちょうど5回まで自動再開が続く」という
+  従来の期待値と矛盾してしまう。指摘文言が呼び出しのたびに変化する
+  新設のフェイクストリーム(`_make_fake_stream_cli_review_fails_with_
+  changing_text`)に差し替え、指摘内容が変化し続けるにもかかわらず
+  一向に解決しない場合には従来通り上限まで自動再開が続くことを検証する
+  テストとして存続させた。
+- **動作確認**: `python3 tests/test_progress_persistence.py`・
+  `python3 tests/test_auto_resume.py`を実行し、新規追加分も含め全件
+  パスすることを確認した。そのうえで`python3 -m pytest tests/`を
+  フルスイートで実行し、557件全件パスし新たなリグレッションが無い
+  ことを確認した。
