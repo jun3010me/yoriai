@@ -5275,3 +5275,57 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   tests/`をフルスイートで実行し、既知の`test_auto_resume.py`・`test_
   reviewer_read_file_tool.py`の2件以外は549件中547件パス、リグレッション
   無しを確認した。
+
+### 「既知の失敗2件」として除外され続けていたtest_auto_resume.py・test_reviewer_read_file_tool.pyの期待値を修正
+
+- **背景**: `tests/test_auto_resume.py`と`tests/test_reviewer_read_file_
+  tool.py`は、本ログの複数のエントリで繰り返し「既知の失敗2件」として
+  `python3 -m pytest tests/`のフルスイート実行結果から除外され続けて
+  いた。実際にコードのバグがあるのか、単にテスト側の期待値が古いだけ
+  なのかを確認したところ、後者だった。
+- **原因**: `yoriai.py`の`_AUTO_RESUME_MAX_ATTEMPTS`(協業モードの自動
+  再開の上限回数)は現在`5`だが、`test_auto_resume.py`の
+  `test_collaborate_auto_resume_stops_at_limit_and_reports_clearly`は
+  依頼当初の値である`3`を前提に、上限到達メッセージの文字列
+  (`自動再開の上限(3回)に達しました`)や試行回数の期待値を書いていた。
+  同様に、`yoriai.py`の`MAX_READ_FILE_CALLS_PER_REVIEW`(レビュー1回
+  あたりのread_file/search_in_fileの呼び出し上限)は現在`6`だが、
+  `test_reviewer_read_file_tool.py`の`test_collect_review_answer_with_
+  read_file_caps_at_max_calls`は当初の値である`3`を前提にした期待値
+  (`read_calls["n"] == 3`)のままだった。加えて同テストの`fake_stream`は
+  `len(tool_messages) < 4`までしかread_fileを要求しないモックだった
+  ため、これは新しい上限6回を一度も超えず、上限到達時のキャップ動作を
+  検証できていなかった(上限が引き上げられた後も、テストとしては
+  「たまたま上限未満で通っていた」状態になっていた)。定数側は両方とも
+  実装のバグではなく、意図した引き上げがそのまま反映されているだけ
+  だった。
+- **修正**: `test_auto_resume.py`は、上限到達メッセージの期待値を
+  `自動再開の上限(5回)に達しました`に、試行回数・ログ出現回数の期待値を
+  いずれも`5`に修正した。なお`cli.pyのレビューが同じ指摘で失敗し続ける`
+  モック(`_fake_stream_cli_review_always_fails`)はもともと呼び出し
+  回数に関係なく無条件に「問題あり」を返す作りだったため、モック応答
+  自体の追加は不要だった。`test_reviewer_read_file_tool.py`は、
+  `read_calls["n"] == 3`を`read_calls["n"] == 6`に、`fake_stream`の
+  リクエスト回数を`len(tool_messages) < 4`から`len(tool_messages) < 7`
+  (上限6回を実際に1回超えて7回目で上限メッセージを受け取り、それを
+  踏まえてモデルが最終回答を出す形)に修正し、関連するコメント・
+  docstring中の回数表記もあわせて直した。また`yoriai.py`側の
+  `_AUTO_RESUME_MAX_ATTEMPTS`直前のコメント(「依頼で明示された『3回』を
+  定数として固定する」)と`_maybe_auto_resume`のdocstring(「上限(3回)に
+  より再帰の深さは物理的に3を超えない」)も、定数の値が5に引き上げ
+  られた後も古い「3回」のまま残っていたため、実際の値である「5回」に
+  修正した(`_AUTO_RESUME_MAX_ATTEMPTS`という定数名で参照している箇所は
+  変更不要なためそのまま)。
+- **テスト**: 既存テストの期待値・モックの調整のみで、新規テストの追加は
+  行っていない。
+- **動作確認**: `python3 tests/test_auto_resume.py`・`python3 tests/
+  test_reviewer_read_file_tool.py`を実行し、いずれも全件パス(この単体
+  実行では毎回確実にパスすることを複数回確認)。`python3 -m pytest
+  tests/`をフルスイートで複数回実行したところ、今回の修正対象だった
+  2件は毎回除外なしでパスした一方、`test_fix_session.py`・`test_
+  background_collaborate.py`・`test_double_ctrl_c_emergency_exit.py`の
+  うちいずれか1件が実行のたびに入れ替わりで散発的に失敗することがあった
+  (いずれも単体実行では毎回パスし、本ログの前節までにも記載のある
+  スレッドタイミング依存の既知の散発的失敗で、今回の修正とは無関係)。
+  549件全件パスするフルスイート実行も複数回確認できており、今回の
+  2件についてはリグレッション無しを確認した。
