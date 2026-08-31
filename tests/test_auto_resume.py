@@ -258,7 +258,7 @@ def test_collaborate_auto_resumes_and_eventually_completes_when_issue_gets_fixed
 
 def test_collaborate_auto_resume_stops_at_limit_and_reports_clearly():
     """依頼の動作確認: 意図的に何度もレビューで問題が指摘され続ける状況を
-    作り、3回の自動再開を試みた後、自動的に停止して「人間の確認が必要」
+    作り、5回の自動再開を試みた後、自動的に停止して「人間の確認が必要」
     という報告が出ることを確認する。
     """
     original_snapshot = yoriai._fetch_org_snapshot
@@ -274,13 +274,13 @@ def test_collaborate_auto_resume_stops_at_limit_and_reports_clearly():
         output = buf.getvalue()
 
         assert (
-            "[⛔ " in output and "自動再開の上限(3回)に達しました" in output and "人間の確認が必要です" in output
+            "[⛔ " in output and "自動再開の上限(5回)に達しました" in output and "人間の確認が必要です" in output
         ), output
         assert "[✅ 全タスク完了" not in output, output
         # 上限に達した後は、それ以上自動再開の試行が続かない
-        # (試行ログの出現回数が上限のちょうど3回で止まっていること)。
-        assert output.count("自動的に再開します") == 3, (
-            f"自動再開の試行は3回で止まるはずです: {output.count('自動的に再開します')}回"
+        # (試行ログの出現回数が上限のちょうど5回で止まっていること)。
+        assert output.count("自動的に再開します") == 5, (
+            f"自動再開の試行は5回で止まるはずです: {output.count('自動的に再開します')}回"
         )
 
         project_dir = os.path.join(
@@ -288,7 +288,7 @@ def test_collaborate_auto_resume_stops_at_limit_and_reports_clearly():
             yoriai._project_name_with_date_prefix("ToDoリストのCLIツールを作って"),
         )
         parsed = yoriai._parse_progress_markdown(os.path.join(project_dir, yoriai.PROGRESS_FILENAME))
-        assert parsed["auto_resume_count"] == 3, parsed
+        assert parsed["auto_resume_count"] == 5, parsed
         assert yoriai._progress_checklist_is_incomplete(parsed["checklist"]) is True
     finally:
         yoriai._fetch_org_snapshot = original_snapshot

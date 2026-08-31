@@ -257,9 +257,9 @@ def test_collect_review_answer_with_read_file_rereads_disk_between_rounds():
 
 
 def test_collect_review_answer_with_read_file_caps_at_max_calls():
-    """1回のレビューにつきread_fileの呼び出しは最大3回までで、それ以上は
+    """1回のレビューにつきread_fileの呼び出しは最大6回までで、それ以上は
     上限メッセージが返り、実際のディスク読み取り(_read_project_file_fresh)
-    は行われないことを確認する。モデルは4回目の要求が上限メッセージで
+    は行われないことを確認する。モデルは7回目の要求が上限メッセージで
     返ってきたことを踏まえて、そこで最終回答を出す(現実的なモデルの
     振る舞いを模擬する)。
     """
@@ -272,13 +272,13 @@ def test_collect_review_answer_with_read_file_caps_at_max_calls():
 
     def fake_stream(candidate, org_fingerprint, messages, offer_read_file_tool=False, **_kwargs):
         tool_messages = [m for m in messages if m.get("role") == "tool"]
-        if len(tool_messages) < 4:
-            # 4回目まではリクエストしてみる(上限3回を超える)。
+        if len(tool_messages) < 7:
+            # 7回目まではリクエストしてみる(上限6回を超える)。
             yield {"pending_tool_calls": [
                 {"id": f"call_{len(tool_messages)}", "type": "function", "function": {"name": "read_file", "arguments": {"filename": "storage.py"}}},
             ]}
             return
-        # 4回目の要求が上限メッセージで返ってきたので、それを踏まえて最終回答を出す。
+        # 7回目の要求が上限メッセージで返ってきたので、それを踏まえて最終回答を出す。
         yield {"content": "問題なし"}
         yield {"done": True}
 
@@ -296,7 +296,7 @@ def test_collect_review_answer_with_read_file_caps_at_max_calls():
         yoriai._read_project_file_fresh = original_read
         shutil.rmtree(out_dir, ignore_errors=True)
 
-    assert read_calls["n"] == 3, f"実際のディスク読み取りは最大3回までのはずです: {read_calls}"
+    assert read_calls["n"] == 6, f"実際のディスク読み取りは最大6回までのはずです: {read_calls}"
     assert error is None, error
     assert "問題なし" in answer, answer
 

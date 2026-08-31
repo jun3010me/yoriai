@@ -5011,7 +5011,7 @@ def _resume_project(project_dir: str, port: int, org_fingerprint: str, auto_resu
 # 仮の判断: 未完了で終わった協業モードを、ユーザーの確認を挟まずに
 # 自動的に再開できる上限回数。既存の「1ファイルあたりレビュー往復は
 # 最大2回まで」という暴走防止の仕組み(内側の歯止め)とは独立した、
-# プロジェクト単位での外側の歯止め。依頼で明示された「3回」を定数として
+# プロジェクト単位での外側の歯止め。依頼で明示された「5回」を定数として
 # 固定する(無制限に自動で回り続けることは絶対に避けたいという要件)。
 _AUTO_RESUME_MAX_ATTEMPTS = 5
 
@@ -5033,8 +5033,8 @@ def _maybe_auto_resume(project_dir: str, port: int, org_fingerprint: str) -> Non
     即座にディスクへ書き込まれるため、この関数自身が別途書き込む
     必要はない。
 
-    再帰呼び出しで次の試行を行う設計にしているが、上限(3回)により
-    再帰の深さは物理的に3を超えない。
+    再帰呼び出しで次の試行を行う設計にしているが、上限(5回)により
+    再帰の深さは物理的に5を超えない。
     """
     parsed = _parse_progress_markdown(os.path.join(project_dir, PROGRESS_FILENAME))
     if parsed is None or not _progress_checklist_is_incomplete(parsed["checklist"]):
