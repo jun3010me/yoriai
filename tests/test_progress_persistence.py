@@ -100,6 +100,64 @@ def test_progress_markdown_omits_review_feedback_section_when_empty():
     assert "## 直近のレビュー指摘" not in content
 
 
+def test_parse_review_feedback_markdown_reads_back_per_file_sections():
+    """`_format_progress_markdown`が書き出した「## 直近のレビュー指摘」
+    セクションを`_parse_review_feedback_markdown`に渡すと、元の
+    `{filename: feedback}`辞書がそのまま復元できることを確認する
+    (往復テスト)。複数行にまたがる指摘文言(実際のレビュー担当の
+    返答は「問題あり」の行に続けて理由が書かれる)も崩れないことを
+    合わせて確認する。
+    """
+    review_feedback = {
+        "cli.py": "cli.pyの引数の扱いが計画と一致していません。",
+        "config.py": "問題あり\nconfig.pyの定数名が計画と一致していません。",
+    }
+    content = progress._format_progress_markdown(
+        "何か作って", [("cli.py", "説明"), ("config.py", "説明")],
+        yoriai._build_task_checklist([("cli.py", "説明"), ("config.py", "説明")]),
+        review_feedback=review_feedback,
+    )
+    assert progress._parse_review_feedback_markdown(content) == review_feedback
+
+
+def test_parse_review_feedback_markdown_returns_empty_dict_when_section_missing():
+    content = progress._format_progress_markdown(
+        "何か作って", [("a.py", "説明")], yoriai._build_task_checklist([("a.py", "説明")]), review_feedback={},
+    )
+    assert progress._parse_review_feedback_markdown(content) == {}
+
+
+def test_find_repeated_review_feedback_detects_unchanged_text_for_incomplete_file():
+    checklist = yoriai._build_task_checklist([("cli.py", "説明")])
+    # cli.pyのレビューは未完了のままにする。
+    previous = {"cli.py": "cli.pyの引数の扱いが計画と一致していません。"}
+    current = {"cli.py": "cli.pyの引数の扱いが計画と一致していません。"}
+    assert progress._find_repeated_review_feedback(previous, current, checklist) == ["cli.py"]
+
+
+def test_find_repeated_review_feedback_ignores_completed_files():
+    checklist = yoriai._build_task_checklist([("cli.py", "説明")])
+    yoriai._set_task_status(checklist, "cli.py", "impl", yoriai._TASK_STATUS_COMPLETED)
+    yoriai._set_task_status(checklist, "cli.py", "review", yoriai._TASK_STATUS_COMPLETED)
+    previous = {"cli.py": "cli.pyの引数の扱いが計画と一致していません。"}
+    current = {"cli.py": "cli.pyの引数の扱いが計画と一致していません。"}
+    assert progress._find_repeated_review_feedback(previous, current, checklist) == []
+
+
+def test_find_repeated_review_feedback_ignores_when_text_changed():
+    checklist = yoriai._build_task_checklist([("cli.py", "説明")])
+    previous = {"cli.py": "cli.pyの引数の扱いが計画と一致していません。"}
+    current = {"cli.py": "cli.pyの戻り値の型が計画と一致していません。"}
+    assert progress._find_repeated_review_feedback(previous, current, checklist) == []
+
+
+def test_find_repeated_review_feedback_ignores_first_attempt_with_no_previous_record():
+    checklist = yoriai._build_task_checklist([("cli.py", "説明")])
+    previous = {}
+    current = {"cli.py": "cli.pyの引数の扱いが計画と一致していません。"}
+    assert progress._find_repeated_review_feedback(previous, current, checklist) == []
+
+
 def test_progress_checklist_is_incomplete_detects_pending_and_in_progress():
     tasks = [("a.py", "説明")]
     checklist = yoriai._build_task_checklist(tasks)
@@ -235,6 +293,12 @@ def main():
         test_format_and_parse_progress_markdown_round_trips,
         test_progress_markdown_includes_review_feedback_section,
         test_progress_markdown_omits_review_feedback_section_when_empty,
+        test_parse_review_feedback_markdown_reads_back_per_file_sections,
+        test_parse_review_feedback_markdown_returns_empty_dict_when_section_missing,
+        test_find_repeated_review_feedback_detects_unchanged_text_for_incomplete_file,
+        test_find_repeated_review_feedback_ignores_completed_files,
+        test_find_repeated_review_feedback_ignores_when_text_changed,
+        test_find_repeated_review_feedback_ignores_first_attempt_with_no_previous_record,
         test_progress_checklist_is_incomplete_detects_pending_and_in_progress,
         test_pending_tasks_from_checklist_returns_only_incomplete_files,
         test_parse_progress_markdown_returns_none_for_missing_file,
