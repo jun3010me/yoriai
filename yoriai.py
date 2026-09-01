@@ -1662,6 +1662,19 @@ DIALOGUE_SAFETY_LIMIT_UTTERANCES = 50
 # `_resume_design_dialogue`等)は、必要に応じてこの既定値を上書きできる。
 DIALOGUE_MAX_ROUNDS_DEFAULT = 5
 
+# 仮の判断(実機バグ報告への対応: `//agree`の対話プロトコルで、SSEの
+# deltaチャンク(数文字〜1単語程度)が届くたびに`speak()`が`_print_tagged`を
+# 呼んでいたため、単語1つごとにプレフィックス([🤔 ...さん(...) 思考中])
+# 付きで改行される非常に読みにくい表示になっていた): `_print_tagged`は
+# 「並行ワーカーの出力が混ざらないようにする」役割(print_lockを保持して
+# 1回のprintでまとめて出す)を担っているため置き換えず、チャンクを
+# 一定量まで貯めてからまとめて1回だけ`_print_tagged`を呼ぶバッファリング
+# 方式にする。閾値の文字数(40)は、深く考えずに調整できる目安として
+# 決めた仮の値。英語のreasoning本文と日本語の最終回答が混在しうるため、
+# 文末記号は半角(. ! ?)・全角(。！？)の両方を対象にする。
+_THINKING_DISPLAY_BUFFER_FLUSH_CHARS = 40
+_THINKING_DISPLAY_SENTENCE_END_CHARS = ".!?。！？\n"
+
 DIALOGUE_STATUS_CONSENSUS = "consensus"
 DIALOGUE_STATUS_SAFETY_LIMIT = "safety_limit"
 DIALOGUE_STATUS_NEEDS_HUMAN = "needs_human"
@@ -2041,13 +2054,31 @@ def _run_dialogue(
         # とは別枠でその場で画面に出し、後で議事録に記録できるよう収集も
         # 行う。
         reasoning_chunks = []
+        # 仮の判断(実機バグ報告への対応: 上記_THINKING_DISPLAY_BUFFER_
+        # FLUSH_CHARS参照): まだ画面に出力していないチャンクをここに貯め、
+        # 一定量たまるか文末記号で終わるまでは`_print_tagged`を呼ばない。
+        # `reasoning_chunks`(議事録記録用の全文収集)とは別枠で、届いた
+        # チャンクは表示タイミングに関わらずそちらへは即座に追記する。
+        pending_display = []
+
+        def _flush_pending_display() -> None:
+            if not pending_display:
+                return
+            buffered = "".join(pending_display)
+            pending_display.clear()
+            _print_tagged(
+                print_lock, tag or topic,
+                f"[🤔 {candidate['label']}さん({role_ja}・ラウンド{round_num}) 思考中] " + buffered,
+            )
 
         def _on_thinking(text: str) -> None:
             reasoning_chunks.append(text)
-            _print_tagged(
-                print_lock, tag or topic,
-                f"[🤔 {candidate['label']}さん({role_ja}・ラウンド{round_num}) 思考中] " + text,
-            )
+            pending_display.append(text)
+            buffered_tail = "".join(pending_display)
+            if len(buffered_tail) >= _THINKING_DISPLAY_BUFFER_FLUSH_CHARS or (
+                buffered_tail and buffered_tail[-1] in _THINKING_DISPLAY_SENTENCE_END_CHARS
+            ):
+                _flush_pending_display()
 
         # 仮の判断(実機バグ報告への対応): 対話プロトコルの各ラウンド
         # (提案役・反論役・統合役)は、コンテンツ系依頼なら別途独立した
@@ -2063,6 +2094,9 @@ def _run_dialogue(
             candidate, org_fingerprint, [{"role": "user", "content": prompt}], disable_web_search=True,
             on_thinking=_on_thinking,
         )
+        # 閾値にも文末記号にも達しないまま端数がバッファに残っている可能性が
+        # あるため(問い合わせ完了時点で必ず1回)、取りこぼさず最後に出し切る。
+        _flush_pending_display()
         reasoning = "".join(reasoning_chunks).strip()
         state["total_utterances"] += 1
         answer = (answer or "").strip()
