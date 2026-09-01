@@ -67,6 +67,23 @@ def _with_stream(fake_stream, fn, *args, **kwargs):
         yoriai._stream_chat_from_candidate = original
 
 
+def _with_collect_answer(fake_collect, fn, *args, **kwargs):
+    """`_collect_answer_from_candidate`自体を差し替えて`speak()`の
+    表示分岐(`error`/`answer`/`truncated`の組み合わせ)を直接検証する
+    ためのヘルパー。`_with_stream`が1段下の`_stream_chat_from_candidate`
+    を差し替えるのに対し、こちらは`(content, error, truncated)`タプルを
+    直接指定できるため、`_stream_chat_from_candidate`のイベント列では
+    表現しづらい組み合わせ(例: エラーとtruncated=Trueの同時指定)も
+    検証できる。
+    """
+    original = yoriai._collect_answer_from_candidate
+    yoriai._collect_answer_from_candidate = fake_collect
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        yoriai._collect_answer_from_candidate = original
+
+
 # ---------------------------------------------------------------------------
 # 役割割り振り(_assign_discourse_roles)
 # ---------------------------------------------------------------------------
@@ -363,6 +380,78 @@ def test_run_dialogue_speak_disables_web_search_to_avoid_stalled_responses():
 
     assert seen_disable_web_search, "問い合わせが一度も発生していません"
     assert all(seen_disable_web_search), seen_disable_web_search
+
+
+def test_speak_reports_truncated_thinking_distinctly_from_no_response():
+    """思考モード対応モデル(reasoning_content・<think>タグ)が思考を長く
+    続け、CHAT_MAX_OUTPUT_TOKENS(8192)を思考だけで使い切って最終回答が
+    1文字も生成されないまま打ち切られた場合(`_collect_answer_from_
+    candidate`が`("", None, True)`を返す場合)、原因不明を示す
+    「(応答がありませんでした)」ではなく、原因を特定できる専用の文言が
+    表示されることを確認する(バグ報告への対応: 以前はこの場合も
+    「(応答がありませんでした)」となり、モデル・接続とも正常なのに
+    応答が返ってこないように見え、原因の切り分けができなかった)。
+    """
+    def fake_collect(candidate, org_fingerprint, messages, disable_web_search=False, on_thinking=None):
+        return "", None, True
+
+    candidates = [_candidate("MacStudio", "m1")]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        _with_collect_answer(
+            fake_collect, yoriai._run_dialogue,
+            org_fingerprint="fp", topic="議題", background="背景", candidates=candidates,
+            output_instruction="出力形式の指示",
+        )
+
+    output = buf.getvalue()
+    assert "(思考の途中でトークン上限(8192)に達し、回答が生成されませんでした)" in output
+    assert "(応答がありませんでした)" not in output
+
+
+def test_speak_still_shows_generic_no_response_when_not_truncated():
+    """エラーも無くtruncatedでもないのに`answer`が空、という原因を断定
+    できない異常系では、従来通り「(応答がありませんでした)」のままで
+    あることを確認する(今回追加したtruncated分岐が既存の挙動を壊して
+    いないことのリグレッション防止)。
+    """
+    def fake_collect(candidate, org_fingerprint, messages, disable_web_search=False, on_thinking=None):
+        return "", None, False
+
+    candidates = [_candidate("MacStudio", "m1")]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        _with_collect_answer(
+            fake_collect, yoriai._run_dialogue,
+            org_fingerprint="fp", topic="議題", background="背景", candidates=candidates,
+            output_instruction="出力形式の指示",
+        )
+
+    output = buf.getvalue()
+    assert "(応答がありませんでした)" in output
+    assert "トークン上限" not in output
+
+
+def test_speak_error_message_takes_priority_over_truncated_flag():
+    """`error`が設定されている場合は、`truncated`の値に関わらず従来通り
+    「(問い合わせに失敗しました: ...)」が優先されることを確認する。
+    """
+    def fake_collect(candidate, org_fingerprint, messages, disable_web_search=False, on_thinking=None):
+        return "", "Connection refused", True
+
+    candidates = [_candidate("MacStudio", "m1")]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        _with_collect_answer(
+            fake_collect, yoriai._run_dialogue,
+            org_fingerprint="fp", topic="議題", background="背景", candidates=candidates,
+            output_instruction="出力形式の指示",
+        )
+
+    output = buf.getvalue()
+    assert "問い合わせに失敗しました" in output
+    assert "Connection refused" in output
+    assert "トークン上限" not in output
 
 
 def test_finalize_dialogue_solo_disables_web_search():
@@ -1229,6 +1318,9 @@ def main():
         test_run_dialogue_speak_shows_no_response_message_when_answer_is_empty_without_error,
         test_run_dialogue_transcript_does_not_contain_error_text_on_failure,
         test_run_dialogue_speak_disables_web_search_to_avoid_stalled_responses,
+        test_speak_reports_truncated_thinking_distinctly_from_no_response,
+        test_speak_still_shows_generic_no_response_when_not_truncated,
+        test_speak_error_message_takes_priority_over_truncated_flag,
         test_finalize_dialogue_solo_disables_web_search,
         test_ask_organization_collaborate_without_dialogue_flag_disables_web_search,
         test_looks_garbled_false_for_normal_japanese_text,
