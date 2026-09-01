@@ -829,6 +829,39 @@ def _format_web_search_result_summary(tool_result_content: str) -> str:
     return "\n".join(lines)
 
 
+# 仮の判断(実機報告への対応: 大規模な//agreeセッション等で議事録全文が
+# 累積プロンプトに積まれると、モデルが思考している間コンソールに何も
+# 表示されず、実際には正常に動作しているにもかかわらず「応答が返って
+# こない・固まっている」ように見えてしまう問題): {"thinking": ...}
+# イベント(llm_stream._stream_openai_compatible_turnがdelta.reasoning_
+# content/<think>タグから抽出したもの)を、既存のcontent表示と見分けが
+# つく固定の絵文字付きprefixで画面に逐次表示する。thinking本文そのもの
+# (モデル生成テキスト、信頼できない入力)はANSIエスケープシーケンスで
+# 装飾せず、prefix(固定文字列)のみを目印として使う(既存のロゴ表示部の
+# コメントにある通り、LLMの応答テキストを色付けの経路に乗せると、
+# 応答に紛れ込んだ端末制御シーケンスで表示が乗っ取られるリスクがあるため)。
+_THINKING_DISPLAY_PREFIX = "\n[🤔 思考中] "
+
+
+def _print_thinking_chunk(thinking_text: str, in_thinking: bool) -> bool:
+    """thinking(思考過程)のチャンクを画面に逐次表示する。まだ思考表示中で
+    なければ先頭にprefixを付ける。戻り値は更新後の`in_thinking`(常にTrue)。
+    """
+    if not in_thinking:
+        print(_THINKING_DISPLAY_PREFIX, end="", flush=True)
+    print(thinking_text, end="", flush=True)
+    return True
+
+
+def _end_thinking_display(in_thinking: bool) -> bool:
+    """思考表示中であれば改行して区切りをつける。戻り値は更新後の
+    `in_thinking`(常にFalse)。
+    """
+    if in_thinking:
+        print()
+    return False
+
+
 def _ask_organization(port: int, org_fingerprint: str, messages: list, disable_web_search: bool = False) -> None:
     """自分のキッチン(常駐エージェント)の`/status`で組織内の候補を集め、順番に
     問い合わせて、失敗したら次に空きメモリが多い候補へ自動でフォールバックしながら
@@ -862,6 +895,7 @@ def _ask_organization(port: int, org_fingerprint: str, messages: list, disable_w
 
         answer_parts = []
         failed = False
+        in_thinking = False
         for event in _stream_chat_from_candidate(
             candidate, org_fingerprint, messages, disable_web_search=disable_web_search,
         ):
@@ -870,24 +904,34 @@ def _ask_organization(port: int, org_fingerprint: str, messages: list, disable_w
                 failed = True
                 break
             if event.get("tool_call_failed"):
+                in_thinking = _end_thinking_display(in_thinking)
                 print("\n[⚠️ このモデルはツール呼び出しの構造化出力に対応していないようです。ツールなしで再試行しています...]")
                 continue
             tool_call_name = event.get("tool_call")
             if tool_call_name == WEB_SEARCH_TOOL_NAME:
+                in_thinking = _end_thinking_display(in_thinking)
                 query = _parse_tool_call_arguments(event.get("tool_call_arguments")).get("query", "")
                 print(f"\n[🔍 「{query}」を検索しています...]" if query else "\n[🔍 ウェブ検索しています...]")
                 continue
             elif tool_call_name:
+                in_thinking = _end_thinking_display(in_thinking)
                 print(f"\n[🔧 {tool_call_name} を実行しています...]")
                 continue
             if event.get("tool_result") == WEB_SEARCH_TOOL_NAME:
+                in_thinking = _end_thinking_display(in_thinking)
                 print(_format_web_search_result_summary(event.get("tool_result_content", "")))
+                continue
+            thinking = event.get("thinking")
+            if thinking:
+                in_thinking = _print_thinking_chunk(thinking, in_thinking)
                 continue
             content = event.get("content")
             if content:
+                in_thinking = _end_thinking_display(in_thinking)
                 print(content, end="", flush=True)
                 answer_parts.append(content)
             if event.get("done"):
+                in_thinking = _end_thinking_display(in_thinking)
                 break
 
         if answer_parts:
@@ -933,6 +977,7 @@ def _extract_read_file_tool_filename(tool_call_arguments) -> str:
 
 def _collect_answer_from_candidate(
     candidate: dict, org_fingerprint: str, messages: list, disable_web_search: bool = False,
+    on_thinking=None,
 ):
     """1候補に問い合わせ、回答をすべて集めて文字列として返す
     (content, error, truncated)のタプル。エラー時はcontentが空文字列に
@@ -960,6 +1005,13 @@ def _collect_answer_from_candidate(
     この問い合わせ限定でweb_searchツールをオファーしない(`_stream_chat_
     from_candidate`にそのまま伝える)。既定は`False`(既存呼び出し元との
     後方互換性のため)。
+
+    仮の判断(思考モード対応モデルの応答が見えない問題への対応): この関数
+    自体は上記の通り印字を一切行わない設計を維持するため、
+    {"thinking": ...}イベント(思考過程)を受け取っても既定では何もしない。
+    `on_thinking`(1引数のcallable)を渡した場合のみ、思考過程のチャンクが
+    届くたびにそれを呼び出す(画面表示・収集などは呼び出し元に委ねる)。
+    既定はNoneで、既存の呼び出し元はすべて指定しないため挙動は変わらない。
     """
     answer_parts = []
     error = None
@@ -970,6 +1022,11 @@ def _collect_answer_from_candidate(
         if "error" in event:
             error = event["error"]
             break
+        thinking = event.get("thinking")
+        if thinking:
+            if on_thinking:
+                on_thinking(thinking)
+            continue
         content = event.get("content")
         if content:
             answer_parts.append(content)
@@ -1268,6 +1325,16 @@ def _collect_review_answer_with_read_file(
             if "pending_tool_calls" in event:
                 pending_tool_calls = event["pending_tool_calls"]
                 break
+            thinking = event.get("thinking")
+            if thinking:
+                # 仮の判断: このループはタスクキュー方式で複数ワーカー
+                # スレッドから並行に呼ばれうるため、1チャンクごとに
+                # `_print_tagged`(ロック保護・タグ付き)で1行として出力する
+                # (このループ自身は`content`をその場で表示しない設計のため、
+                # 思考過程だけをこの場で見せることで「まだ動いている」ことを
+                # 可視化する)。
+                _print_tagged(print_lock, tag or candidate["label"], f"[🤔 思考中] {thinking}")
+                continue
             content = event.get("content")
             if content:
                 answer_parts.append(content)
@@ -1936,6 +2003,23 @@ def _run_dialogue(
 
     def speak(role_key: str, prompt: str, round_num: int) -> str:
         candidate = roles[role_key]
+        role_ja = _DIALOGUE_ROLE_LABEL_JA[role_key]
+
+        # 仮の判断(実機報告への対応: 大規模な//agreeセッションでは議事録
+        # 全文が累積プロンプトに積まれ、モデルが思考している間コンソールに
+        # 何も表示されないため「固まっている」ように見える): 思考過程の
+        # チャンクが届くたびに、既存のcontent表示(発言全体をまとめて表示)
+        # とは別枠でその場で画面に出し、後で議事録に記録できるよう収集も
+        # 行う。
+        reasoning_chunks = []
+
+        def _on_thinking(text: str) -> None:
+            reasoning_chunks.append(text)
+            _print_tagged(
+                print_lock, tag or topic,
+                f"[🤔 {candidate['label']}さん({role_ja}・ラウンド{round_num}) 思考中] " + text,
+            )
+
         # 仮の判断(実機バグ報告への対応): 対話プロトコルの各ラウンド
         # (提案役・反論役・統合役)は、コンテンツ系依頼なら別途独立した
         # リサーチフェーズ(_run_research_phase)の結果が既に`background`/
@@ -1948,7 +2032,9 @@ def _run_dialogue(
         # web_searchをオファーしない。
         answer, error, _truncated = _collect_answer_from_candidate(
             candidate, org_fingerprint, [{"role": "user", "content": prompt}], disable_web_search=True,
+            on_thinking=_on_thinking,
         )
+        reasoning = "".join(reasoning_chunks).strip()
         state["total_utterances"] += 1
         answer = (answer or "").strip()
         if answer:
@@ -1961,7 +2047,6 @@ def _run_dialogue(
                 # 残しつつ、`state["garbled_by"]`に記録して呼び出し元
                 # (メインループ)が直後に打ち切りを判断できるようにする。
                 state["garbled_by"] = candidate["label"]
-        role_ja = _DIALOGUE_ROLE_LABEL_JA[role_key]
         if error:
             # 仮の判断(バグ修正): 接続失敗・タイムアウト等のエラーを
             # 画面表示専用の文言として可視化する。議事録(transcript)に
@@ -1976,9 +2061,15 @@ def _run_dialogue(
             print_lock, tag or topic,
             f"[💬 {candidate['label']}さん({role_ja}・ラウンド{round_num})] " + display_text,
         )
-        transcript.append({
+        utterance = {
             "round": round_num, "role": role_key, "speaker_label": candidate["label"], "content": answer,
-        })
+        }
+        if reasoning:
+            # 仮の判断(依頼: 思考過程が最終的に取得できた場合のみ議事録に
+            # 記録し、無い場合は何も出力しない): reasoning_content/<think>
+            # タグから抽出できたときに限り"reasoning"キーを追加する。
+            utterance["reasoning"] = reasoning
+        transcript.append(utterance)
         return answer
 
     def garbled_finish():
@@ -2082,12 +2173,25 @@ def _format_dialogue_log_markdown(topic: str, transcript: list) -> str:
     """議事録(逐語ログ)を組み立てる。誰が・どの役割で・何を発言したかを
     発言順にすべて保持する(後から「なぜこの結論になったのか」を遡れる
     ようにするための、要約とは別に必ず保存する記録)。
+
+    仮の判断(依頼: 思考過程が最終的に取得できた場合のみ議事録に記録する):
+    `utterance`に"reasoning"キーがある場合(`speak`が
+    reasoning_content/<think>タグから抽出できた場合)のみ、発言本文の前に
+    「思考過程」の節を追加する。無い場合はこの節ごと出力しない。
+    reasoning_contentの中身は最終回答が日本語であっても英語で生成される
+    傾向がある(Qwen系の既知挙動)ため、その旨を見出しに明記する。
     """
     lines = [f"# 対話ログ: {topic}", ""]
     for utterance in transcript:
         role_ja = _DIALOGUE_ROLE_LABEL_JA.get(utterance["role"], utterance["role"])
         lines.append(f"## ラウンド{utterance['round']} - {utterance['speaker_label']}さん({role_ja})")
         lines.append("")
+        reasoning = utterance.get("reasoning")
+        if reasoning:
+            lines.append("### 思考過程(英語で出力される場合があります)")
+            lines.append("")
+            lines.append(reasoning)
+            lines.append("")
         lines.append(utterance["content"] or "(応答なし)")
         lines.append("")
     return "\n".join(lines).rstrip("\n") + "\n"

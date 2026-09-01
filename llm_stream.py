@@ -182,6 +182,80 @@ def _stream_ollama_turn(model: str, messages: list, tools: list):
     yield {"tool_calls": tool_calls, "truncated": truncated}
 
 
+_THINK_OPEN_TAG = "<think>"
+_THINK_CLOSE_TAG = "</think>"
+
+
+def _longest_tag_prefix_overlap(buffer: str, tag: str) -> int:
+    """`buffer`の末尾が`tag`の先頭部分と一致している場合、その長さを返す
+    (一致していなければ0)。`tag`自体が丸ごと`buffer`に含まれるケースは
+    ここでは扱わない(呼び出し元が先に`buffer.find(tag)`で確認済みの
+    前提)。開始/終了タグそのものが複数チャンクに分割されて届く場合
+    (例: 1チャンク目が"<th"、2チャンク目が"ink>")に、タグの途中までを
+    誤って通常のcontent/thinkingとして確定させてしまわないようにするために使う。
+    """
+    max_len = min(len(buffer), len(tag) - 1)
+    for length in range(max_len, 0, -1):
+        if buffer.endswith(tag[:length]):
+            return length
+    return 0
+
+
+class _ThinkTagSplitter:
+    """delta.contentに<think>...</think>タグの形で混在する思考過程を、
+    タグが複数チャンクに分割されて届く場合であっても正しく検出し、
+    タグの内側を{"thinking": ...}、外側を{"content": ...}としてyieldする
+    ステートマシン。
+
+    仮の判断: `_run_turn_with_leak_detection`の先頭ピークバッファと同じ
+    考え方で、開始/終了タグの途中までしか届いていない末尾はバッファに
+    保持し、タグ全体が確定するか、ストリーム終了(`flush()`)まで確定を
+    保留する。<think>タグが一切現れない応答では、バッファの末尾が
+    "<"を含まない限りこの保留は発生しないため、既存の挙動(chunkが
+    届いたその場でそのまま{"content": ...}としてyieldする)は実質的に
+    変わらない。
+    """
+
+    def __init__(self):
+        self._inside = False
+        self._buffer = ""
+
+    def feed(self, text: str):
+        if not text:
+            return
+        self._buffer += text
+        yield from self._drain(final=False)
+
+    def flush(self):
+        yield from self._drain(final=True)
+
+    def _drain(self, final: bool):
+        while True:
+            tag = _THINK_CLOSE_TAG if self._inside else _THINK_OPEN_TAG
+            event_key = "thinking" if self._inside else "content"
+            idx = self._buffer.find(tag)
+            if idx != -1:
+                before = self._buffer[:idx]
+                if before:
+                    yield {event_key: before}
+                self._buffer = self._buffer[idx + len(tag):]
+                self._inside = not self._inside
+                continue
+
+            if final:
+                if self._buffer:
+                    yield {event_key: self._buffer}
+                    self._buffer = ""
+                return
+
+            overlap = _longest_tag_prefix_overlap(self._buffer, tag)
+            emit_len = len(self._buffer) - overlap
+            if emit_len > 0:
+                yield {event_key: self._buffer[:emit_len]}
+                self._buffer = self._buffer[emit_len:]
+            return
+
+
 def _stream_openai_compatible_turn(base_url: str, model: str, messages: list, tools: list):
     """OpenAI互換のstreaming chat completions API(/v1/chat/completions、SSE)に
     1往復だけ問い合わせ、正規化イベントを順にyieldする。LM Studio・MLX-LMは
@@ -200,6 +274,21 @@ def _stream_openai_compatible_turn(base_url: str, model: str, messages: list, to
     入力側のコンテキスト長とは別物)。そのため、この2バックエンドに
     関しては「モデルロード時に十分な長さを設定しておいてもらう」ことが
     前提になり、Yoriai側からリクエスト単位で制御する手段は無い。
+
+    仮の判断(思考モード対応モデルの応答が見えない問題への対応): 思考
+    モード対応モデル(Qwen3.5-Flash-Next等)の思考過程は、(1)LM Studio側の
+    設定で有効化されていれば独立したdelta.reasoning_contentとして、
+    (2)そうでなければdelta.contentに<think>...</think>タグとして混在した
+    形で、それぞれチャンクごとに届く。前者はそのまま{"thinking": ...}として
+    yieldし、後者は`_ThinkTagSplitter`でタグの外側/内側を分離して
+    {"content": ...}/{"thinking": ...}としてyieldする(タグ自体が複数
+    チャンクに分割されて届く場合にも対応するため、ステートフルな
+    パーサーとして1ターンにつき1つだけ生成する)。どちらの形式も一切
+    現れない応答では、`_ThinkTagSplitter`は実質的に何もせずcontentを
+    そのまま素通しするため、既存の挙動は変わらない。reasoning_effortの
+    ようなパラメータでの思考の深さの制御、および最初の1トークンが
+    出るまでのprefill待ち時間そのものへの対策は、このPRのスコープ外
+    として別途扱う。
     """
     try:
         resp = requests.post(
@@ -220,6 +309,7 @@ def _stream_openai_compatible_turn(base_url: str, model: str, messages: list, to
 
     tool_calls_by_index = {}
     truncated = False
+    think_splitter = _ThinkTagSplitter()
     try:
         for raw_line in resp.iter_lines():
             if not raw_line:
@@ -243,9 +333,13 @@ def _stream_openai_compatible_turn(base_url: str, model: str, messages: list, to
             if choice.get("finish_reason") == "length":
                 truncated = True
             delta = choice.get("delta", {})
+            reasoning_content = delta.get("reasoning_content")
+            if reasoning_content:
+                yield {"thinking": reasoning_content}
             content = delta.get("content")
             if content:
-                yield {"content": content}
+                for think_event in think_splitter.feed(content):
+                    yield think_event
             for tc_delta in delta.get("tool_calls") or []:
                 index = tc_delta.get("index", 0)
                 entry = tool_calls_by_index.setdefault(index, {"id": None, "function": {"name": "", "arguments": ""}})
@@ -259,6 +353,8 @@ def _stream_openai_compatible_turn(base_url: str, model: str, messages: list, to
     except Exception as exc:
         yield {"error": str(exc)}
         return
+    for think_event in think_splitter.flush():
+        yield think_event
 
     # 仮の判断: OpenAI互換のtool_calls形式は各要素に"type": "function"を
     # 必須で要求する。これを省いたまま次のラウンドでmessages履歴に含めて
@@ -420,10 +516,17 @@ def stream_chat_completion(
     disable_default_tools: bool = False,
 ):
     """モデル名からOllama/LM Studio/MLX-LMのどれにチャットを振るかを決め、
-    正規化されたストリーミングイベント({"content": ...} / {"tool_call": <ツール名>} /
-    {"pending_tool_calls": [...], "truncated": bool} / {"done": True, "truncated": bool} /
-    {"error": ...})を順にyieldする。`truncated`は、それぞれそのラウンドの応答が
-    CHAT_MAX_OUTPUT_TOKENS上限に達して途中で打ち切られたかどうかを表す。
+    正規化されたストリーミングイベント({"content": ...} / {"thinking": ...} /
+    {"tool_call": <ツール名>} / {"pending_tool_calls": [...], "truncated": bool} /
+    {"done": True, "truncated": bool} / {"error": ...})を順にyieldする。
+    `truncated`は、それぞれそのラウンドの応答がCHAT_MAX_OUTPUT_TOKENS上限に
+    達して途中で打ち切られたかどうかを表す。
+
+    仮の判断: {"thinking": ...}は、LM Studio/MLX-LM(OpenAI互換API)経由の
+    問い合わせで、思考モード対応モデルの思考過程(delta.reasoning_content、
+    または<think>タグ)が検出された場合にのみ発生する
+    (`_stream_openai_compatible_turn`を参照)。Ollama経由の問い合わせでは
+    現時点では発生しない(スコープ外)。
 
     モデルがツール(既定ではweb_searchのみ)の呼び出しを要求した場合は、
     ここでツールを実行して結果を会話履歴に追加し、モデルに再度問い合わせる
@@ -576,6 +679,8 @@ def stream_chat_completion(
             if "content" in event:
                 if event["content"]:
                     round_content_yielded = True
+                yield event
+            elif "thinking" in event:
                 yield event
             elif "tool_calls" in event:
                 tool_calls = event["tool_calls"]
