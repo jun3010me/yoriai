@@ -5401,3 +5401,45 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   パスすることを確認した。そのうえで`python3 -m pytest tests/`を
   フルスイートで実行し、557件全件パスし新たなリグレッションが無い
   ことを確認した。
+
+### LM Studio経由のメンバーの自己紹介カードでcontext_lengthsが常に空になっていた不具合の修正
+
+- **背景**: `build_profile_card`(`llm_stream.py`)が返す自己紹介カードには
+  `models.context_lengths`というフィールドがあるが、中身は`get_ollama_
+  context_length`(Ollamaの`/api/show`をモデルごとに問い合わせる)でしか
+  埋めておらず、LM Studio経由のメンバーでは常に空になっていた。LM
+  StudioのHTTP APIには`/api/v0/models`という拡張エンドポイントがあり、
+  モデル一覧と一緒に`max_context_length`・`loaded_context_length`が
+  1回のリクエストでまとめて返ってくる(モデルごとに問い合わせ直す
+  必要が無い)。
+- **修正**: `yoriai.py`に`get_lmstudio_context_lengths()`を新設し、
+  `/api/v0/models`のレスポンスから`state`が`"loaded"`のモデルだけを
+  対象に`{model_id: context_length}`の辞書を組み立てるようにした。
+  `loaded_context_length`が取得できればその値を、`"loaded"`状態だが
+  `loaded_context_length`キーが無い場合(ロード完了直前などを想定)は
+  `max_context_length`をフォールバックとして使う。接続失敗時は
+  `get_ollama_installed_models`等の既存の取得系関数と同じ方針で例外を
+  握りつぶし、空の辞書を返す。`get_ollama_context_length`とは異なり
+  モデルごとの再問い合わせが不要な設計のため、キャッシュは設けていない。
+  `build_profile_card`側は、既存の`{m: get_ollama_context_length(m) for
+  m in ollama_loaded}`と`get_lmstudio_context_lengths()`の戻り値を
+  `{**ollama分, **lmstudio分}`の形で単純に結合するように変更した(両方に
+  同名のモデルが存在することは通常想定しないため、優先順位を持たせる
+  必要は無いと判断した)。MLX-LM経由のモデルについては、MLX-LMの
+  サーバーに同等のメタデータ取得APIが無いため今回は対象外とし、別PRへ
+  明示的にdeferした。
+- **テスト**: `tests/test_num_ctx.py`に、`state: "loaded"`かつ
+  `loaded_context_length`を持つモデルの値がそのまま反映される
+  ケース・`loaded_context_length`が無い場合に`max_context_length`へ
+  フォールバックするケース・`"loaded"`でないモデルが辞書から除外される
+  ケース・接続失敗時に空の辞書を返すケースの4件を追加した。`tests/
+  test_model_backend_priority.py`には、`build_profile_card`が返す
+  `models.context_lengths`にOllama・LM Studio両方のモデルの値が
+  含まれることを確認する`test_build_profile_card_merges_ollama_and_
+  lmstudio_context_lengths`を追加した(既存の`_with_patched_backends`と
+  同様、`yoriai`モジュールの取得系関数を直接差し替えるモック方式)。
+- **動作確認**: `python3 tests/test_num_ctx.py`・`python3 tests/test_
+  model_backend_priority.py`を実行し、新規追加分も含め全件パスすることを
+  確認した。そのうえで`python3 -m pytest tests/`をフルスイートで実行し、
+  569件全件パスし新たなリグレッションが無いことを確認した。実機での
+  `/status`表示確認は本セッションの環境からは行えなかったため未実施。

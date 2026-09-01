@@ -453,6 +453,35 @@ def get_lmstudio_models() -> list:
         return []
 
 
+def get_lmstudio_context_lengths() -> dict:
+    """LM Studioの`/api/v0/models`から、ロード済みモデルの
+    {model_id: context_length}の辞書を返す。`loaded_context_length`
+    が取得できるモデルはその値を、"loaded"状態だが
+    `loaded_context_length`が無い場合は`max_context_length`を
+    フォールバックとして使う。"loaded"状態でないモデル・接続失敗時は
+    辞書に含めない(例外を握りつぶし、取得できたモデルだけを返す)。
+
+    仮の判断: get_ollama_context_length()は`/api/show`をモデルごとに
+    問い合わせる設計だが、LM Studioの`/api/v0/models`は1回のGETで
+    ロード済み・未ロードを含む全モデルの情報をまとめて返すため、
+    ここではモデルごとの再問い合わせは行わない。
+    """
+    context_lengths = {}
+    try:
+        resp = requests.get(f"{LMSTUDIO_BASE_URL}/api/v0/models", timeout=3)
+        resp.raise_for_status()
+        for m in resp.json().get("data", []):
+            if m.get("state") != "loaded":
+                continue
+            model_id = m.get("id")
+            context_length = m.get("loaded_context_length", m.get("max_context_length"))
+            if model_id is not None and context_length is not None:
+                context_lengths[model_id] = context_length
+    except Exception as exc:
+        logger.warning("LM Studioのコンテキスト長一覧の取得に失敗しました: %s", exc)
+    return context_lengths
+
+
 def get_mlx_lm_models() -> list:
     """MLX-LM(`python -m mlx_lm.server`)のOpenAI互換APIからモデル一覧を取得する。
 
