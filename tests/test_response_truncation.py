@@ -153,7 +153,7 @@ def test_stream_openai_compatible_turn_reports_not_truncated_on_normal_stop():
 # ---------------------------------------------------------------------------
 
 def test_stream_chat_completion_propagates_truncated_flag_to_done_event():
-    def fake_lmstudio_turn(model, messages, tools):
+    def fake_lmstudio_turn(model, messages, tools, max_output_tokens=None):
         yield {"content": "途中まで生成された内容"}
         yield {"tool_calls": [], "truncated": True}
 

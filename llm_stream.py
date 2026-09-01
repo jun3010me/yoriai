@@ -17,7 +17,8 @@
 取得系の関数(`get_ollama_installed_models`・`get_ollama_loaded_models`・
 `get_lmstudio_models`・`get_mlx_lm_models`・`get_short_hostname`・
 `get_chip_info`・`get_memory_info`・`_merge_model_lists`・
-`_infer_specialties`・`_decide_num_ctx`)を呼ぶ必要があるが、それらの一部
+`_infer_specialties`・`_decide_num_ctx`・`_decide_max_output_tokens`)を
+呼ぶ必要があるが、それらの一部
 (`get_ollama_loaded_models`・`get_mlx_lm_models`)は`yoriai.py`側の
 `_decide_num_ctx`等からも使われる「システム情報取得系」としてyoriai.py
 側に残す設計とした。`yoriai.py`が本モジュールをimportしていないため
@@ -112,11 +113,11 @@ _NUM_CTX_WARNING_RATIO = 0.8
 KEEP_ALIVE = os.environ.get("YORIAI_OLLAMA_KEEP_ALIVE", "30m")
 
 
-def _stream_ollama_turn(model: str, messages: list, tools: list):
+def _stream_ollama_turn(model: str, messages: list, tools: list, max_output_tokens: int = CHAT_MAX_OUTPUT_TOKENS):
     """OllamaのネイティブAPI(/api/chat、NDJSONストリーミング)に1往復だけ
     問い合わせ、正規化したイベント({"content": ...} / {"error": ...})を
     順にyieldし、最後にそのターンで要求されたtool_calls一覧と、応答が
-    CHAT_MAX_OUTPUT_TOKENS上限に達して打ち切られたかどうか
+    max_output_tokens上限に達して打ち切られたかどうか
     ({"tool_calls": [...], "truncated": bool})をyieldする。
 
     仮の判断: options.num_ctx(コンテキストウィンドウの長さ)とkeep_alive
@@ -124,10 +125,15 @@ def _stream_ollama_turn(model: str, messages: list, tools: list):
     KEEP_ALIVE定義部のコメントを参照)。num_ctxが決定できなかった場合
     (_decide_num_ctxがNoneを返した場合)はキー自体を送らず、Ollama側の
     デフォルト挙動に委ねる(従来の挙動のまま)。
+
+    仮の判断: `max_output_tokens`は既定でCHAT_MAX_OUTPUT_TOKENSとする
+    (既存の呼び出し元との後方互換性のため)。`stream_chat_completion`から
+    呼ばれる場合は、モデルのコンテキスト長に応じて自動調整された値
+    (`_decide_max_output_tokens`の結果)が渡される。
     """
     from yoriai import _decide_num_ctx
     num_ctx = _decide_num_ctx(model)
-    options = {"num_predict": CHAT_MAX_OUTPUT_TOKENS}
+    options = {"num_predict": max_output_tokens}
     if num_ctx is not None:
         options["num_ctx"] = num_ctx
         estimated_tokens = _estimate_tokens(messages)
@@ -256,10 +262,17 @@ class _ThinkTagSplitter:
             return
 
 
-def _stream_openai_compatible_turn(base_url: str, model: str, messages: list, tools: list):
+def _stream_openai_compatible_turn(
+    base_url: str, model: str, messages: list, tools: list, max_output_tokens: int = CHAT_MAX_OUTPUT_TOKENS,
+):
     """OpenAI互換のstreaming chat completions API(/v1/chat/completions、SSE)に
     1往復だけ問い合わせ、正規化イベントを順にyieldする。LM Studio・MLX-LMは
     どちらもこの同じワイヤ形式を話すため、共通の実装として1箇所にまとめている。
+
+    仮の判断: `max_output_tokens`は既定でCHAT_MAX_OUTPUT_TOKENSとする
+    (既存の呼び出し元との後方互換性のため)。`stream_chat_completion`から
+    呼ばれる場合は、モデルのコンテキスト長に応じて自動調整された値
+    (`_decide_max_output_tokens`の結果)が渡される。
 
     仮の判断: OpenAI互換のストリーミングではtool_callsが複数チャンクに
     分割されて送られてくる(引数のJSON文字列が少しずつ届く)ため、
@@ -295,7 +308,7 @@ def _stream_openai_compatible_turn(base_url: str, model: str, messages: list, to
             f"{base_url}/v1/chat/completions",
             json={
                 "model": model, "messages": messages, "tools": tools, "stream": True,
-                "max_tokens": CHAT_MAX_OUTPUT_TOKENS,
+                "max_tokens": max_output_tokens,
             },
             stream=True,
             timeout=(CHAT_CONNECT_TIMEOUT_SEC, CHAT_READ_TIMEOUT_SEC),
@@ -373,17 +386,17 @@ def _stream_openai_compatible_turn(base_url: str, model: str, messages: list, to
     yield {"tool_calls": tool_calls, "truncated": truncated}
 
 
-def _stream_lmstudio_turn(model: str, messages: list, tools: list):
-    yield from _stream_openai_compatible_turn(LMSTUDIO_BASE_URL, model, messages, tools)
+def _stream_lmstudio_turn(model: str, messages: list, tools: list, max_output_tokens: int = CHAT_MAX_OUTPUT_TOKENS):
+    yield from _stream_openai_compatible_turn(LMSTUDIO_BASE_URL, model, messages, tools, max_output_tokens)
 
 
-def _stream_mlx_lm_turn(model: str, messages: list, tools: list):
+def _stream_mlx_lm_turn(model: str, messages: list, tools: list, max_output_tokens: int = CHAT_MAX_OUTPUT_TOKENS):
     # 仮の判断: MLX-LMのFunction Calling対応はバックエンド/バージョンによって
     # 未対応・不安定な場合がある。未対応の場合はエラーになるかtoolsを無視して
     # 通常のチャットとして応答するかのどちらかになりうるが、いずれの場合も
     # 既存のエラーハンドリング/漏れ検出フォールバックがそのまま機能するため、
     # ここで特別な分岐は設けていない。
-    yield from _stream_openai_compatible_turn(MLX_LM_BASE_URL, model, messages, tools)
+    yield from _stream_openai_compatible_turn(MLX_LM_BASE_URL, model, messages, tools, max_output_tokens)
 
 
 # 仮の判断: 一部のモデル/バックエンドの組み合わせ(例: LM Studioで一部の
@@ -519,8 +532,10 @@ def stream_chat_completion(
     正規化されたストリーミングイベント({"content": ...} / {"thinking": ...} /
     {"tool_call": <ツール名>} / {"pending_tool_calls": [...], "truncated": bool} /
     {"done": True, "truncated": bool} / {"error": ...})を順にyieldする。
-    `truncated`は、それぞれそのラウンドの応答がCHAT_MAX_OUTPUT_TOKENS上限に
-    達して途中で打ち切られたかどうかを表す。
+    `truncated`は、それぞれそのラウンドの応答が出力トークン上限
+    (`_decide_max_output_tokens`が決めた、モデルのコンテキスト長に応じて
+    自動調整されうるCHAT_MAX_OUTPUT_TOKENS以上の値)に達して途中で
+    打ち切られたかどうかを表す。
 
     仮の判断: {"thinking": ...}は、LM Studio/MLX-LM(OpenAI互換API)経由の
     問い合わせで、思考モード対応モデルの思考過程(delta.reasoning_content、
@@ -594,7 +609,7 @@ def stream_chat_completion(
     その結果を最終回答として採用する。この最終問い合わせでもcontentが
     空だった場合は、従来通り空のまま終了する(無限ループにはしない)。
     """
-    from yoriai import get_mlx_lm_models, get_ollama_loaded_models
+    from yoriai import _decide_max_output_tokens, get_mlx_lm_models, get_ollama_loaded_models
     messages = list(messages)  # 呼び出し元のリストをツール実行の追記で汚さない
     base_tools = [] if disable_default_tools else CHAT_TOOLS
     tools = base_tools + list(extra_tools) if extra_tools else base_tools
@@ -617,11 +632,26 @@ def stream_chat_completion(
             })
 
         if model in get_ollama_loaded_models():
-            turn = _stream_ollama_turn(model, messages, tools)
+            backend = "ollama"
         elif model in get_mlx_lm_models():
-            turn = _stream_mlx_lm_turn(model, messages, tools)
+            backend = "mlx_lm"
         else:
-            turn = _stream_lmstudio_turn(model, messages, tools)
+            backend = "lmstudio"
+
+        # 仮の判断: バックエンド/モデルが確定したこの場所で、モデルの
+        # コンテキスト長に応じた出力トークン上限を決める(詳細は
+        # yoriai.py側の_decide_max_output_tokensを参照)。`_stream_chat_from_candidate`
+        # がHTTP越しにこの/chatへ問い合わせる設計上、自分自身のプロフィール
+        # (自分が動かしているモデルのコンテキスト長)を参照すればよく、
+        # ネットワーク越しに他メンバーのプロフィールを取りに行く必要は無い。
+        effective_max_output_tokens = _decide_max_output_tokens(backend, model)
+
+        if backend == "ollama":
+            turn = _stream_ollama_turn(model, messages, tools, effective_max_output_tokens)
+        elif backend == "mlx_lm":
+            turn = _stream_mlx_lm_turn(model, messages, tools, effective_max_output_tokens)
+        else:
+            turn = _stream_lmstudio_turn(model, messages, tools, effective_max_output_tokens)
 
         tool_calls = []
         round_truncated = False

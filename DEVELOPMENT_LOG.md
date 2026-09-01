@@ -5541,3 +5541,77 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   そのうえで`python3 -m pytest tests/`をフルスイートで実行し、
   578件全件パスし新たなリグレッションが無いことを確認した。実機の
   `//agree`での動作確認は本セッションの環境からは行えなかったため未実施。
+
+### コンテキスト長の大きいモデルでは、応答の最大出力トークン数(CHAT_MAX_OUTPUT_TOKENS)を自動的に引き上げるようにした
+
+- **背景**: `CHAT_MAX_OUTPUT_TOKENS`(既定8192)は、機体の性能やモデルの
+  コンテキスト長に関わらず一律の値だった。一方、自己紹介カード
+  (`build_profile_card`)には既にモデルごとのコンテキスト長
+  (`models.context_lengths`、Ollama/LM Studio双方に対応済み)が含まれて
+  おり、「そのモデルがどれだけ大きな入出力に耐えられるか」という情報は
+  既に機体自身が把握していた。この情報を活かさず一律8192で打ち切って
+  いたため、コンテキスト長の大きいモデル(例: MacStudio上のLM Studio、
+  262144)を思考モードで動かしている場合、長い思考の途中でトークン上限に
+  達して最終回答にたどり着けない不具合につながっていた。
+- **修正**: `yoriai.py`の`_decide_num_ctx`の近くに`_decide_max_output_
+  tokens(backend, model)`を新設した。backendが`"ollama"`なら`get_ollama_
+  context_length(model)`、`"lmstudio"`なら`get_lmstudio_context_lengths().
+  get(model)`でモデルのコンテキスト長を調べ、取得できた場合はその1/8を
+  目安の値とし、新設した`_MAX_OUTPUT_TOKENS_HARD_CAP`(65536、実機で試し
+  ながら調整する前提の初期値)を上限として採用する(1/8という比率にも
+  厳密な根拠は無く、同じく実機で調整する前提の初期値)。`"mlx_lm"`
+  (同等のメタデータ取得APIが無い)、またはコンテキスト長が取得できな
+  かった場合はCHAT_MAX_OUTPUT_TOKENSをそのまま返す。いずれの場合も、
+  最終的にCHAT_MAX_OUTPUT_TOKENSを下回ることは無い(環境変数
+  `YORIAI_CHAT_MAX_OUTPUT_TOKENS`による手動指定を常に下限として尊重する
+  ため)。この手動上書き自体も本PRで新設し、`CHAT_READ_TIMEOUT_SEC`
+  (`yoriai_types.py`)と同じ流儀で`CHAT_MAX_OUTPUT_TOKENS = int(os.
+  environ.get("YORIAI_CHAT_MAX_OUTPUT_TOKENS", "8192"))`にした。
+  `llm_stream.py`の`stream_chat_completion`は、バックエンド(Ollama/
+  MLX-LM/LM Studio)とモデルを確定した直後に`_decide_max_output_tokens`
+  を呼んで`effective_max_output_tokens`を求め、`_stream_ollama_turn`・
+  `_stream_openai_compatible_turn`(`_stream_lmstudio_turn`・`_stream_
+  mlx_lm_turn`経由)へ新設した`max_output_tokens`引数として渡すように
+  した(両関数とも既定値はCHAT_MAX_OUTPUT_TOKENSのままとし、既存の
+  直接呼び出し元との後方互換性を保った)。リクエスト組み立て部分の
+  `"num_predict": CHAT_MAX_OUTPUT_TOKENS`・`"max_tokens": CHAT_MAX_
+  OUTPUT_TOKENS`をそれぞれ`max_output_tokens`引数を使うよう変更した。
+  `truncated`の判定ロジック自体(応答が実際に使われた上限に達したか)は
+  変更していない。`_stream_chat_from_candidate`が候補メンバーの`/chat`に
+  HTTPで問い合わせる設計上、実際にこの上限を使ってバックエンドに問い
+  合わせているのは、そのメンバー自身のマシン上で動くYoriaiプロセス
+  自身であるため、各マシンが自分自身のプロフィール(自分が動かしている
+  モデルのコンテキスト長)から自分の出力上限を決めればよく、ネットワーク
+  越しに他メンバーのプロフィールを参照する必要は無い。
+- **テスト**: 新規`tests/test_dynamic_max_output_tokens.py`を追加した。
+  `_decide_max_output_tokens`について、コンテキスト長262144のモデルでは
+  CHAT_MAX_OUTPUT_TOKENS(8192)より大きい32768(262144 // 8)が返る
+  `test_decide_max_output_tokens_scales_up_for_large_context_model`、
+  極端に大きいコンテキスト長(1000000)でも_MAX_OUTPUT_TOKENS_HARD_CAP
+  (65536)を超えない`test_decide_max_output_tokens_respects_hard_cap`、
+  コンテキスト長が取得できない場合(Noneが返る、またはbackendが
+  "mlx_lm")にCHAT_MAX_OUTPUT_TOKENSがそのまま返る`test_decide_max_
+  output_tokens_falls_back_to_default_when_unknown`、環境変数由来の
+  CHAT_MAX_OUTPUT_TOKENSが自動計算結果より大きい場合はその値を下回らない
+  `test_decide_max_output_tokens_never_goes_below_env_override`
+  (`tests/test_num_ctx.py`の`_NUM_CTX_MEMORY_TIERS`直接差し替えと同じ
+  要領で`yoriai.CHAT_MAX_OUTPUT_TOKENS`を直接差し替えて模擬した)の4件を
+  追加した。加えて、`stream_chat_completion`が振り分けたバックエンド
+  (LM Studio)の`_stream_lmstudio_turn`へ`_decide_max_output_tokens`の
+  結果をそのまま渡していることを確認する`test_stream_chat_completion_
+  passes_effective_max_output_tokens_to_backend`を追加した。既存の
+  `_stream_openai_compatible_turn`を丸ごと差し替えるモック
+  (`tests/test_tools_fallback_logging.py`・`tests/test_final_no_tool_
+  retry.py`・`tests/test_reviewer_read_file_tool.py`・`tests/test_web_
+  search_visibility.py`の`fake_turn(base_url, model, messages, tools)`、
+  `tests/test_response_truncation.py`の`fake_lmstudio_turn(model,
+  messages, tools)`)は、新設した`max_output_tokens`引数が実引数として
+  渡されるようになったため、いずれも`max_output_tokens=None`を追加した
+  シグネチャに更新し、既存テストが壊れないようにした。
+- **動作確認**: `python3 -m pytest tests/test_dynamic_max_output_
+  tokens.py`を実行し、新規追加分5件全件パスすることを確認した。その
+  うえで`python3 -m pytest tests/`をフルスイートで実行し、583件全件
+  パスし新たなリグレッションが無いことを確認した。実機のMacStudio
+  (LM Studio、コンテキスト長262144)での「(思考の途中でトークン上限
+  (8192)に達し…)」表示が出なくなることの確認は、本セッションの
+  環境からは行えなかったため未実施。
