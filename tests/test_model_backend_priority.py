@@ -88,6 +88,37 @@ def test_ollama_still_wins_over_mlx_lm_and_lmstudio():
     )
 
 
+def test_build_profile_card_merges_ollama_and_lmstudio_context_lengths():
+    """models.context_lengthsに、OllamaとLM Studio両方のモデルの値が
+    含まれることを確認する(get_lmstudio_context_lengthsが追加される前は
+    LM Studio・MLX-LM経由のメンバーでは常に空になっていた不具合の検証)。
+    """
+    originals = {
+        "get_ollama_installed_models": yoriai.get_ollama_installed_models,
+        "get_ollama_loaded_models": yoriai.get_ollama_loaded_models,
+        "get_lmstudio_models": yoriai.get_lmstudio_models,
+        "get_lmstudio_context_lengths": yoriai.get_lmstudio_context_lengths,
+        "get_mlx_lm_models": yoriai.get_mlx_lm_models,
+        "get_ollama_context_length": yoriai.get_ollama_context_length,
+    }
+    yoriai.get_ollama_installed_models = lambda: ["llama3"]
+    yoriai.get_ollama_loaded_models = lambda: ["llama3"]
+    yoriai.get_lmstudio_models = lambda: ["qwen3-235b-a22b"]
+    yoriai.get_lmstudio_context_lengths = lambda: {"qwen3-235b-a22b": 262144}
+    yoriai.get_mlx_lm_models = lambda: []
+    yoriai.get_ollama_context_length = lambda model: 131072
+    try:
+        card = llm_stream.build_profile_card("test-agent")
+    finally:
+        for name, original in originals.items():
+            setattr(yoriai, name, original)
+
+    assert card["models"]["context_lengths"] == {
+        "llama3": 131072,
+        "qwen3-235b-a22b": 262144,
+    }, card["models"]["context_lengths"]
+
+
 def test_lmstudio_used_when_mlx_lm_not_running():
     """MLX-LMが動いていない場合は、これまで通りLM Studio側のモデルが
     選ばれることを確認する(MLX-LM優先化がLM Studioを排除していないことの確認)。
@@ -110,6 +141,7 @@ def main():
     tests = [
         test_mlx_lm_prioritized_over_lmstudio_when_no_ollama,
         test_ollama_still_wins_over_mlx_lm_and_lmstudio,
+        test_build_profile_card_merges_ollama_and_lmstudio_context_lengths,
         test_lmstudio_used_when_mlx_lm_not_running,
     ]
     failures = 0

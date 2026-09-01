@@ -169,6 +169,91 @@ def test_none_result_is_also_cached():
 
 
 # ---------------------------------------------------------------------------
+# get_lmstudio_context_lengths()
+# ---------------------------------------------------------------------------
+
+class _FakeLmstudioModelsResponse:
+    def __init__(self, data, status_code=200):
+        self.status_code = status_code
+        self._data = data
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise Exception(f"{self.status_code} Client Error")
+
+    def json(self):
+        return {"data": self._data}
+
+
+def test_get_lmstudio_context_lengths_returns_loaded_context_length_when_available():
+    data = [
+        {
+            "id": "qwen3-235b-a22b",
+            "state": "loaded",
+            "max_context_length": 262144,
+            "loaded_context_length": 262144,
+        },
+    ]
+    original = yoriai.requests.get
+    yoriai.requests.get = lambda url, timeout=None: _FakeLmstudioModelsResponse(data)
+    try:
+        result = yoriai.get_lmstudio_context_lengths()
+    finally:
+        yoriai.requests.get = original
+    assert result == {"qwen3-235b-a22b": 262144}, result
+
+
+def test_get_lmstudio_context_lengths_falls_back_to_max_context_length():
+    data = [
+        {
+            "id": "loading-model",
+            "state": "loaded",
+            "max_context_length": 32768,
+            # loaded_context_length未取得(ロード完了直前などを想定)
+        },
+    ]
+    original = yoriai.requests.get
+    yoriai.requests.get = lambda url, timeout=None: _FakeLmstudioModelsResponse(data)
+    try:
+        result = yoriai.get_lmstudio_context_lengths()
+    finally:
+        yoriai.requests.get = original
+    assert result == {"loading-model": 32768}, result
+
+
+def test_get_lmstudio_context_lengths_excludes_not_loaded_models():
+    data = [
+        {"id": "not-loaded-model", "state": "not-loaded", "max_context_length": 8192},
+        {
+            "id": "loaded-model",
+            "state": "loaded",
+            "max_context_length": 16384,
+            "loaded_context_length": 16384,
+        },
+    ]
+    original = yoriai.requests.get
+    yoriai.requests.get = lambda url, timeout=None: _FakeLmstudioModelsResponse(data)
+    try:
+        result = yoriai.get_lmstudio_context_lengths()
+    finally:
+        yoriai.requests.get = original
+    assert result == {"loaded-model": 16384}, result
+
+
+def test_get_lmstudio_context_lengths_returns_empty_dict_on_connection_failure():
+    def fake_get(url, timeout=None):
+        raise Exception("接続できません")
+
+    original = yoriai.requests.get
+    yoriai.requests.get = fake_get
+    try:
+        result = yoriai.get_lmstudio_context_lengths()
+    finally:
+        yoriai.requests.get = original
+    assert result == {}, result
+
+
+# ---------------------------------------------------------------------------
 # _decide_num_ctx()
 # ---------------------------------------------------------------------------
 
@@ -293,6 +378,10 @@ def main():
         test_context_length_returns_none_when_no_matching_key,
         test_context_length_is_cached_after_first_call,
         test_none_result_is_also_cached,
+        test_get_lmstudio_context_lengths_returns_loaded_context_length_when_available,
+        test_get_lmstudio_context_lengths_falls_back_to_max_context_length,
+        test_get_lmstudio_context_lengths_excludes_not_loaded_models,
+        test_get_lmstudio_context_lengths_returns_empty_dict_on_connection_failure,
         test_decide_num_ctx_picks_minimum_of_model_memory_and_max,
         test_decide_num_ctx_picks_model_limit_when_smallest,
         test_decide_num_ctx_falls_back_to_memory_limit_when_model_limit_unknown,

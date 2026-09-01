@@ -746,6 +746,7 @@ def build_profile_card(agent_id: str) -> dict:
         _infer_specialties,
         _merge_model_lists,
         get_chip_info,
+        get_lmstudio_context_lengths,
         get_lmstudio_models,
         get_memory_info,
         get_mlx_lm_models,
@@ -811,8 +812,15 @@ def build_profile_card(agent_id: str) -> dict:
             # 遅くなりかねないため、実際にロード済みのOllamaモデルだけに
             # 限定する(インストール済みだが未ロードのモデルは、どのみち
             # チャットの相手として選ばれるまでは表示する意味が薄い)。
+            # LM Studioは`/api/v0/models`が1回のGETでロード済みモデル分の
+            # コンテキスト長をまとめて返すため、get_lmstudio_context_lengths()
+            # の結果をそのままマージする(同名モデルが両バックエンドに
+            # 存在することは通常想定しないが、念のためOllama分を優先する
+            # 並びにはせず、単純に両辞書を結合する)。MLX-LM経由のモデルは
+            # 同等のメタデータ取得APIが無いため今回は対象外(別PRでdeferする)。
             "context_lengths": {
-                m: get_ollama_context_length(m) for m in ollama_loaded
+                **{m: get_ollama_context_length(m) for m in ollama_loaded},
+                **get_lmstudio_context_lengths(),
             },
         },
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
