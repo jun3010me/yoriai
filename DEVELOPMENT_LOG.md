@@ -5485,3 +5485,59 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   依存する既知のflakyなテストとして偶発的に失敗することがあるが、本
   修正前のベース状態でも同様に発生することを確認済みで、今回の変更とは
   無関係)。
+
+### `//agree`の対話プロトコルで、思考過程(thinking)がチャンク単位(1単語程度)で改行表示され読みにくかった不具合の修正
+
+- **背景**: `//agree`の対話プロトコル(`_run_dialogue`)で思考過程の表示が
+  実機で確認できたが、SSEのdeltaチャンク(数文字〜1単語程度)が届くたびに
+  `speak()`内の`_on_thinking`が`_print_tagged`を呼んでおり、`_print_tagged`は
+  呼ばれるたびに改行付きでprintするため、単語1つごとにプレフィックス
+  (`[🤔 MacStudioさん(提案役・ラウンド1) 思考中]`)が繰り返し表示され、
+  非常に読みにくいという実機報告があった。`_ask_organization`側には既に
+  `_print_thinking_chunk`/`_end_thinking_display`という、プレフィックスを
+  最初の1回だけ出して`end=""`で流し込む読みやすい実装があるが、これを
+  そのまま`speak()`に持ってくると、`_print_tagged`が本来担っている
+  「並行ワーカーの出力が混ざらないようにする」役割(`print_lock`を保持して
+  1回のprintでまとめて出す)が失われてしまう懸念があった。
+- **修正**: `_print_tagged`はそのまま使い続けつつ、`speak()`内の
+  `_on_thinking`をバッファリング方式に変更した。議事録記録用の
+  `reasoning_chunks`とは別に、まだ画面に出力していないチャンクを溜める
+  `pending_display`を用意し、チャンクが届くたびに追記する。以下のいずれかの
+  条件を満たしたときだけ`_flush_pending_display()`を呼び、バッファの中身を
+  まとめて1回`_print_tagged`で出力してから空にする: (1)バッファの文字数が
+  `_THINKING_DISPLAY_BUFFER_FLUSH_CHARS`(40、深く考えずに調整できる目安と
+  して決めた仮の値)以上になった場合、(2)バッファの末尾が文末を表す記号
+  (半角`.`/`!`/`?`、全角`。`/`!`/`?`、または改行。英語のreasoning本文と
+  日本語の最終回答が混在しうるため両方の記号セットを`_THINKING_DISPLAY_
+  SENTENCE_END_CHARS`に含めた)で終わっている場合。`_collect_answer_from_
+  candidate`の呼び出しが完了した直後にも必ず`_flush_pending_display()`を
+  呼び、端数のまま尻切れで消えるチャンクが出ないようにした。`_print_tagged`
+  へ渡すテキストの形式(プレフィックスの文言・絵文字)は変更していない。
+  `reasoning_chunks`への追記(議事録記録用の全文収集)は、表示用バッファ
+  リングとは独立して、チャンクが届くたびにこれまで通り即座に行う。
+- **テスト**: 新規`tests/test_thinking_display_buffering.py`を追加した。
+  既存の`tests/test_dialogue_protocol.py`の`_with_collect_answer`
+  ヘルパーと同じ方式(`_collect_answer_from_candidate`自体を差し替えて
+  `on_thinking`コールバックを直接呼び出す)に加え、単一候補・空応答で
+  `_run_dialogue`が提案役ラウンド1の1発言だけでNO_ENGAGEMENTとして
+  打ち切られる経路(既存の`test_run_dialogue_no_engagement_when_
+  proposer_never_answers`と同じ)を使うことで、`speak()`(と`_on_thinking`)
+  がちょうど1回だけ呼ばれる状況を作り、チャンク単位の挙動を直接観察できる
+  ようにした。40文字未満の短いチャンクが複数回届いても閾値に達するまでは
+  `_print_tagged`が呼ばれないことを確認する
+  `test_on_thinking_buffers_short_chunks_until_threshold`・
+  `test_on_thinking_does_not_flush_mid_stream_below_threshold`、半角・
+  全角の文末記号で終わっていれば閾値未満でも即座にフラッシュされることを
+  確認する`test_on_thinking_flushes_on_sentence_ending_punctuation`・
+  `test_on_thinking_flushes_on_full_width_sentence_ending_punctuation`、
+  問い合わせ完了時点で端数が残っていても最終的に必ず画面に出力される
+  (取りこぼされない)ことを確認する`test_on_thinking_flushes_remaining_
+  buffer_after_answer_completes`、複数回に分けて届いたチャンクをすべて
+  結合したものとフラッシュされた出力をすべて結合したものが完全に一致する
+  (表示の間引きで文字が欠けたり順序が入れ替わったりしない)ことを確認する
+  `test_on_thinking_display_does_not_lose_or_reorder_content`を追加した。
+- **動作確認**: `python3 -m pytest tests/test_thinking_display_
+  buffering.py`を実行し、新規追加分6件全件パスすることを確認した。
+  そのうえで`python3 -m pytest tests/`をフルスイートで実行し、
+  578件全件パスし新たなリグレッションが無いことを確認した。実機の
+  `//agree`での動作確認は本セッションの環境からは行えなかったため未実施。
