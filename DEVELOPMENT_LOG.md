@@ -5443,3 +5443,45 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   確認した。そのうえで`python3 -m pytest tests/`をフルスイートで実行し、
   569件全件パスし新たなリグレッションが無いことを確認した。実機での
   `/status`表示確認は本セッションの環境からは行えなかったため未実施。
+
+### 対話プロトコルで、思考モード対応モデルが思考だけでトークン上限に達した場合も「応答がありませんでした」と表示されていた不具合の修正
+
+- **背景**: `_collect_answer_from_candidate`は`(content, error,
+  truncated)`のタプルを返し、`truncated`は応答が`CHAT_MAX_OUTPUT_
+  TOKENS`(8192)の上限に達して途中で打ち切られたかどうかを表す。
+  reasoning_content・`<think>`タグに対応した思考モードのモデルが
+  思考を長く続けると、8192トークンを思考だけで使い切ってしまい、
+  最終回答(`content`)が1文字も生成されないまま打ち切られることが
+  ある。対話プロトコルの`_run_dialogue`内の`speak()`はこの
+  `truncated`を`_truncated`という名前で受け取ったまま一切使っておらず、
+  このケースも接続エラー等と同じ「(応答がありませんでした)」という
+  文言で表示していたため、実際にはモデル・接続とも正常なのに
+  「応答が返ってこない」ように見え、原因の切り分けができなかった。
+- **修正**: `yoriai.py`の`speak()`で、`_collect_answer_from_candidate`
+  の戻り値を`_truncated`ではなく`truncated`として受け取るように変更
+  した。`display_text`を決める既存の分岐(`error`→`answer`→それ以外は
+  「(応答がありませんでした)」)に、`error`が無く`answer`が空文字列で
+  `truncated`が`True`の場合だけを扱う分岐を追加し、その場合のみ
+  「(思考の途中でトークン上限(8192)に達し、回答が生成されませんでした)」
+  という固定文言を表示するようにした。`error`も無く`truncated`でも
+  ないのに`answer`が空、という原因を断定できないケースは、誤った原因を
+  伝えることを避けるため、従来通り「(応答がありませんでした)」のまま
+  残している。
+- **テスト**: `tests/test_dialogue_protocol.py`に、`_stream_chat_from_
+  candidate`ではなく`_collect_answer_from_candidate`自体を直接差し替える
+  `_with_collect_answer`ヘルパーを新設し(既存の`_with_stream`と同様の
+  方式)、`("", None, True)`を返すとトークン上限文言が表示される
+  `test_speak_reports_truncated_thinking_distinctly_from_no_response`・
+  `("", None, False)`では従来通り「(応答がありませんでした)」のままである
+  ことを確認する`test_speak_still_shows_generic_no_response_when_not_
+  truncated`・`error`が設定されていれば`truncated`の値に関わらず
+  「(問い合わせに失敗しました: ...)」が優先されることを確認する
+  `test_speak_error_message_takes_priority_over_truncated_flag`を追加した。
+- **動作確認**: `python3 tests/test_dialogue_protocol.py`を実行し、
+  新規追加分も含め全件パスすることを確認した。そのうえで`python3 -m
+  pytest tests/`をフルスイートで実行し、新規3件を含む572件全件パスし
+  新たなリグレッションが無いことを確認した(既存の`test_background_
+  collaborate.py`・`test_fix_session.py`の一部テストが実HTTP接続失敗に
+  依存する既知のflakyなテストとして偶発的に失敗することがあるが、本
+  修正前のベース状態でも同様に発生することを確認済みで、今回の変更とは
+  無関係)。

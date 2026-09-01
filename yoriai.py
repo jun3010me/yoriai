@@ -2059,7 +2059,7 @@ def _run_dialogue(
         # マシン自体は正常でリソースにも余裕があるのに「応答がありません
         # でした」になる)が実機で報告されたため、この問い合わせ限定で
         # web_searchをオファーしない。
-        answer, error, _truncated = _collect_answer_from_candidate(
+        answer, error, truncated = _collect_answer_from_candidate(
             candidate, org_fingerprint, [{"role": "user", "content": prompt}], disable_web_search=True,
             on_thinking=_on_thinking,
         )
@@ -2084,6 +2084,14 @@ def _run_dialogue(
             display_text = f"(問い合わせに失敗しました: {error})"
         elif answer:
             display_text = answer
+        elif truncated:
+            # 仮の判断(実機バグ報告への対応: 思考モード対応モデルが
+            # 思考だけでCHAT_MAX_OUTPUT_TOKENS上限を使い切り、最終回答が
+            # 1文字も生成されないまま打ち切られるケース): エラーでも
+            # 接続断でもなく、単に思考が長すぎて回答に到達できなかった
+            # ことが分かっているため、原因不明を示す「応答がありません
+            # でした」とは区別し、原因を特定できる文言を表示する。
+            display_text = "(思考の途中でトークン上限(8192)に達し、回答が生成されませんでした)"
         else:
             display_text = "(応答がありませんでした)"
         _print_tagged(
