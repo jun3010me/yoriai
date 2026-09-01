@@ -777,6 +777,7 @@ def build_profile_card(agent_id: str) -> dict:
         _merge_model_lists,
         get_chip_info,
         get_lmstudio_context_lengths,
+        get_lmstudio_loaded_models,
         get_lmstudio_models,
         get_memory_info,
         get_mlx_lm_models,
@@ -786,13 +787,22 @@ def build_profile_card(agent_id: str) -> dict:
         get_short_hostname,
     )
     # 仮の判断: 「インストール済み/ロード済みモデル」と「利用可能なバックエンド」を
-    # それぞれ別々の関数で問い合わせると、同じバックエンド(特にLM Studio・
-    # MLX-LMのように問い合わせ1回でインストール済み=ロード済みを兼ねるもの)に
-    # 何度も重複してHTTPリクエストを送ることになるため、ここで各バックエンドに
-    # 1回ずつ問い合わせて使い回す。
+    # それぞれ別々の関数で問い合わせると、同じバックエンド(特にMLX-LMのように
+    # 問い合わせ1回でインストール済み=ロード済みを兼ねるもの)に何度も重複して
+    # HTTPリクエストを送ることになるため、ここで各バックエンドに1回ずつ
+    # 問い合わせて使い回す。LM Studioだけは例外で、インストール済み一覧
+    # (get_lmstudio_models、`/v1/models`)とロード済み一覧
+    # (get_lmstudio_loaded_models、`/api/v0/models`)が別APIになるため
+    # それぞれ1回ずつ問い合わせる(合計2回)。
     ollama_installed = get_ollama_installed_models()
     ollama_loaded = get_ollama_loaded_models()
     lmstudio_models = get_lmstudio_models()
+    # 仮の判断: LM Studioの`/v1/models`はロード状態を区別できないため
+    # (get_lmstudio_modelsのdocstring参照)、「インストール済み」一覧
+    # (lmstudio_models)とは別に、"state"フィールドで実際のロード状態を
+    # 区別できる`/api/v0/models`経由のget_lmstudio_loaded_models()を
+    # 「ロード済み」一覧として使う。
+    lmstudio_loaded = get_lmstudio_loaded_models()
     mlx_lm_models = get_mlx_lm_models()
 
     backends = []
@@ -824,7 +834,7 @@ def build_profile_card(agent_id: str) -> dict:
         "memory": get_memory_info(),
         "models": {
             "installed": _merge_model_lists(ollama_installed, mlx_lm_models, lmstudio_models),
-            "loaded": _merge_model_lists(ollama_loaded, mlx_lm_models, lmstudio_models),
+            "loaded": _merge_model_lists(ollama_loaded, mlx_lm_models, lmstudio_loaded),
             "backends": backends,
             # 仮の判断(対話プロトコル用): 寄合の対話プロトコルが役割
             # (提案役・反論役・統合役)を動的に割り振る際の「得意分野」

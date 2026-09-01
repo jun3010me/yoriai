@@ -254,6 +254,81 @@ def test_get_lmstudio_context_lengths_returns_empty_dict_on_connection_failure()
 
 
 # ---------------------------------------------------------------------------
+# get_lmstudio_loaded_models()
+# ---------------------------------------------------------------------------
+
+def test_get_lmstudio_loaded_models_returns_only_loaded_state_models():
+    """`/api/v0/models`のレスポンスにstate:"loaded"とstate:"not-loaded"が
+    混在する場合、"loaded"のものだけが返ることを確認する
+    (get_lmstudio_context_lengthsと同じ`/api/v0/models`の"state"フィールドを
+    使い、`/v1/models`と違って実際のロード状態を区別できることの検証)。
+    """
+    data = [
+        {"id": "not-loaded-model", "state": "not-loaded", "max_context_length": 8192},
+        {"id": "loaded-model", "state": "loaded", "max_context_length": 16384},
+    ]
+    original = yoriai.requests.get
+    yoriai.requests.get = lambda url, timeout=None: _FakeLmstudioModelsResponse(data)
+    try:
+        result = yoriai.get_lmstudio_loaded_models()
+    finally:
+        yoriai.requests.get = original
+    assert result == ["loaded-model"], result
+
+
+def test_get_lmstudio_loaded_models_returns_empty_list_on_connection_failure():
+    def fake_get(url, timeout=None):
+        raise Exception("接続できません")
+
+    original = yoriai.requests.get
+    yoriai.requests.get = fake_get
+    try:
+        result = yoriai.get_lmstudio_loaded_models()
+    finally:
+        yoriai.requests.get = original
+    assert result == [], result
+
+
+# ---------------------------------------------------------------------------
+# build_profile_card() - LM Studioのロード状態
+# ---------------------------------------------------------------------------
+
+def test_build_profile_card_loaded_uses_true_lmstudio_load_state():
+    """build_profile_card()のmodels.loadedに、インストール済みだが未ロードの
+    LM Studioモデルが含まれないことを確認する(一方models.installedには
+    含まれ続けることも合わせて確認する)。実機(MacStudio・junnoMac-mini)で、
+    `/v1/models`を使うget_lmstudio_models()を「ロード済み」判定にも
+    流用していたために、実際にはロードされていないモデルまで
+    「ロード済み」欄に表示されてしまっていた不具合の再現・検証。
+    """
+    originals = {
+        "get_ollama_installed_models": yoriai.get_ollama_installed_models,
+        "get_ollama_loaded_models": yoriai.get_ollama_loaded_models,
+        "get_lmstudio_models": yoriai.get_lmstudio_models,
+        "get_lmstudio_loaded_models": yoriai.get_lmstudio_loaded_models,
+        "get_lmstudio_context_lengths": yoriai.get_lmstudio_context_lengths,
+        "get_mlx_lm_models": yoriai.get_mlx_lm_models,
+    }
+    yoriai.get_ollama_installed_models = lambda: []
+    yoriai.get_ollama_loaded_models = lambda: []
+    yoriai.get_lmstudio_models = lambda: ["not-loaded-model", "loaded-model"]
+    yoriai.get_lmstudio_loaded_models = lambda: ["loaded-model"]
+    yoriai.get_lmstudio_context_lengths = lambda: {"loaded-model": 16384}
+    yoriai.get_mlx_lm_models = lambda: []
+    try:
+        card = llm_stream.build_profile_card("test-agent")
+    finally:
+        for name, original in originals.items():
+            setattr(yoriai, name, original)
+
+    assert card["models"]["installed"] == ["not-loaded-model", "loaded-model"], (
+        card["models"]["installed"]
+    )
+    assert card["models"]["loaded"] == ["loaded-model"], card["models"]["loaded"]
+    assert "not-loaded-model" not in card["models"]["loaded"], card["models"]["loaded"]
+
+
+# ---------------------------------------------------------------------------
 # _decide_num_ctx()
 # ---------------------------------------------------------------------------
 
@@ -382,6 +457,9 @@ def main():
         test_get_lmstudio_context_lengths_falls_back_to_max_context_length,
         test_get_lmstudio_context_lengths_excludes_not_loaded_models,
         test_get_lmstudio_context_lengths_returns_empty_dict_on_connection_failure,
+        test_get_lmstudio_loaded_models_returns_only_loaded_state_models,
+        test_get_lmstudio_loaded_models_returns_empty_list_on_connection_failure,
+        test_build_profile_card_loaded_uses_true_lmstudio_load_state,
         test_decide_num_ctx_picks_minimum_of_model_memory_and_max,
         test_decide_num_ctx_picks_model_limit_when_smallest,
         test_decide_num_ctx_falls_back_to_memory_limit_when_model_limit_unknown,
