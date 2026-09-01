@@ -53,7 +53,7 @@ def test_tools_rejected_triggers_retry_and_logs_it():
     ものを使う: 「This model does not support tools/function calling with the
     current context settings.」
     """
-    def fake_turn(base_url, model, messages, tools):
+    def fake_turn(base_url, model, messages, tools, max_output_tokens=None):
         if tools:
             yield {
                 "error": "400: Trying to keep the first 32768 tokens when the context the model "
@@ -90,7 +90,7 @@ def test_resource_error_does_not_trigger_retry_despite_matching_status_code():
     実際に報告されたものを使う: 「Model loading was stopped due to
     insufficient system resources.」
     """
-    def fake_turn(base_url, model, messages, tools):
+    def fake_turn(base_url, model, messages, tools, max_output_tokens=None):
         yield {
             "error": '400: Failed to load model "qwen/qwen3-coder-30b". Error: Model loading was '
                       "stopped due to insufficient system resources. Continuing to load the model "
@@ -122,7 +122,7 @@ def test_non_tools_status_code_does_not_trigger_retry_and_logs_it():
     """401のような、tools無し再試行の対象外のステータスコードでは再試行せず、
     [tools無し再試行なし]ログを出したうえでエラーをそのまま伝播することを確認する。
     """
-    def fake_turn(base_url, model, messages, tools):
+    def fake_turn(base_url, model, messages, tools, max_output_tokens=None):
         yield {"error": "401: unauthorized", "status_code": 401}
 
     original = llm_stream._stream_openai_compatible_turn

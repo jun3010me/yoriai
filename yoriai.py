@@ -436,6 +436,40 @@ def _decide_num_ctx(model: str) -> int | None:
     return max(num_ctx, CHAT_MAX_OUTPUT_TOKENS * 2)
 
 
+# 仮の判断: 初期値。実機で試しながら調整する前提。
+_MAX_OUTPUT_TOKENS_HARD_CAP = 65536
+
+
+def _decide_max_output_tokens(backend: str, model: str) -> int:
+    """バックエンド("ollama"・"lmstudio"・"mlx_lm"のいずれか)とモデル名から、
+    そのモデルのコンテキスト長を(該当する取得関数で)調べ、
+    CHAT_MAX_OUTPUT_TOKENSとの大きい方を返す(CHAT_MAX_OUTPUT_TOKENSを
+    下回ることは無い。環境変数YORIAI_CHAT_MAX_OUTPUT_TOKENSによる
+    手動指定を、常に下限として尊重するため)。
+
+    backendが"ollama"ならget_ollama_context_length(model)、"lmstudio"なら
+    get_lmstudio_context_lengths().get(model)でコンテキスト長を調べる。
+    "mlx_lm"またはコンテキスト長が取得できない場合はNone扱いとし、その
+    場合はCHAT_MAX_OUTPUT_TOKENSをそのまま返す。
+
+    仮の判断: コンテキスト長が取得できた場合、その1/8を目安の値とし、
+    _MAX_OUTPUT_TOKENS_HARD_CAPを上限として採用する(1/8という比率に
+    厳密な根拠は無く、実機で試しながら調整する前提の初期値)。
+    """
+    if backend == "ollama":
+        context_length = get_ollama_context_length(model)
+    elif backend == "lmstudio":
+        context_length = get_lmstudio_context_lengths().get(model)
+    else:
+        context_length = None
+
+    if not context_length:
+        return CHAT_MAX_OUTPUT_TOKENS
+
+    auto_tokens = min(context_length // 8, _MAX_OUTPUT_TOKENS_HARD_CAP)
+    return max(auto_tokens, CHAT_MAX_OUTPUT_TOKENS)
+
+
 def get_lmstudio_models() -> list:
     """LM Studioのローカルサーバー(OpenAI互換API)からモデル一覧を取得する。
 

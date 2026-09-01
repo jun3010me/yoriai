@@ -48,7 +48,7 @@ def test_stream_chat_completion_yields_tool_result_event_for_web_search():
     """
     call_count = {"n": 0}
 
-    def fake_turn(base_url, model, messages, tools):
+    def fake_turn(base_url, model, messages, tools, max_output_tokens=None):
         call_count["n"] += 1
         if call_count["n"] == 1:
             yield {

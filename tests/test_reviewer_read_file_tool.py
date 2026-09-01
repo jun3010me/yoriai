@@ -173,7 +173,7 @@ def test_stream_chat_completion_yields_pending_tool_calls_for_client_tool_withou
     確認する。実機のOllama/LM Studio/MLX-LMに接続できない環境のため、
     ワイヤレベルのターン関数(`_stream_openai_compatible_turn`)を差し替える。
     """
-    def fake_turn(base_url, model, messages, tools):
+    def fake_turn(base_url, model, messages, tools, max_output_tokens=None):
         tool_names = {t["function"]["name"] for t in (tools or [])}
         assert yoriai.READ_FILE_TOOL_NAME in tool_names, f"read_fileツールがオファーされていません: {tools}"
         yield {
@@ -491,7 +491,7 @@ def test_review_offers_search_in_file_tool_alongside_read_file():
     含まれることを確認する(依頼の項目1・2: 「まず検索してから部分的に
     読む」2段階アプローチをレビューフェーズでも使えるようにする)。
     """
-    def fake_turn(base_url, model, messages, tools):
+    def fake_turn(base_url, model, messages, tools, max_output_tokens=None):
         tool_names = {t["function"]["name"] for t in (tools or [])}
         assert yoriai.SEARCH_IN_FILE_TOOL_NAME in tool_names, f"search_in_fileがオファーされていません: {tools}"
         yield {"content": "問題なし"}

@@ -29,7 +29,7 @@ def test_round_limit_with_empty_content_falls_back_to_final_no_tool_query():
     """
     call_count = {"n": 0}
 
-    def fake_turn(base_url, model, messages, tools):
+    def fake_turn(base_url, model, messages, tools, max_output_tokens=None):
         call_count["n"] += 1
         if tools:
             yield {
@@ -73,7 +73,7 @@ def test_final_no_tool_query_still_empty_is_treated_as_no_valid_response():
     """
     call_count = {"n": 0}
 
-    def fake_turn(base_url, model, messages, tools):
+    def fake_turn(base_url, model, messages, tools, max_output_tokens=None):
         call_count["n"] += 1
         if tools:
             yield {
@@ -123,7 +123,7 @@ def test_final_no_tool_query_still_detects_leaked_tool_call_syntax():
     """
     call_count = {"n": 0}
 
-    def fake_turn(base_url, model, messages, tools):
+    def fake_turn(base_url, model, messages, tools, max_output_tokens=None):
         call_count["n"] += 1
         if tools:
             yield {
@@ -164,7 +164,7 @@ def test_content_produced_before_round_limit_does_not_trigger_final_no_tool_quer
     """
     call_count = {"n": 0}
 
-    def fake_turn(base_url, model, messages, tools):
+    def fake_turn(base_url, model, messages, tools, max_output_tokens=None):
         call_count["n"] += 1
         yield {"content": "1回で答えられます"}
         yield {"tool_calls": []}

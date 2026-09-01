@@ -61,7 +61,16 @@ CARD_REQUEST_TIMEOUT_SEC = 5
 # 仮の判断: バックエンド(Ollama/LM Studio/MLX-LM)への問い合わせに応答の
 # 最大トークン数を指定していなかったため、生成が延々と続いてしまう不具合が
 # 実機で報告された。詳細はyoriai.py側の元のコメントを参照。
-CHAT_MAX_OUTPUT_TOKENS = 8192
+#
+# 仮の判断(実機報告への対応): コンテキスト長の大きいモデルを動かしている
+# 機体では、思考モデルの長い思考にもこの上限が頭打ちになってしまう
+# (yoriai.py側の_decide_max_output_tokensで、モデルのコンテキスト長に
+# 応じて自動的に引き上げる)。それでもなお手動で明示的に上書きしたい
+# 場合のため、CHAT_READ_TIMEOUT_SECと同じ流儀で環境変数
+# YORIAI_CHAT_MAX_OUTPUT_TOKENSによる上書きを可能にする
+# (_decide_max_output_tokensは、この値を自動計算結果の下限として
+# 常に尊重する)。
+CHAT_MAX_OUTPUT_TOKENS = int(os.environ.get("YORIAI_CHAT_MAX_OUTPUT_TOKENS", "8192"))
 
 # 仮の判断: 依頼文の「空きリソース上位2〜3台」という表現の範囲内で、
 # 上限を3台に固定する(候補がそれより少ない場合は、いる分だけに送る)。
