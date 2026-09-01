@@ -28,11 +28,19 @@ def _with_patched_backends(ollama_installed, ollama_loaded, lmstudio_models, mlx
         "get_ollama_installed_models": yoriai.get_ollama_installed_models,
         "get_ollama_loaded_models": yoriai.get_ollama_loaded_models,
         "get_lmstudio_models": yoriai.get_lmstudio_models,
+        # 仮の判断: このテストファイルはバックエンドの優先順位(並び順)を
+        # 検証するためのもので、LM Studioのインストール済み/ロード済みの
+        # 区別自体はスコープ外。そのため従来通り「インストール済み=
+        # ロード済み」として扱えるよう、get_lmstudio_loaded_modelsも
+        # lmstudio_modelsと同じ内容を返すよう揃えてパッチする
+        # (実際のロード状態の区別はtest_num_ctx.py側で検証する)。
+        "get_lmstudio_loaded_models": yoriai.get_lmstudio_loaded_models,
         "get_mlx_lm_models": yoriai.get_mlx_lm_models,
     }
     yoriai.get_ollama_installed_models = lambda: ollama_installed
     yoriai.get_ollama_loaded_models = lambda: ollama_loaded
     yoriai.get_lmstudio_models = lambda: lmstudio_models
+    yoriai.get_lmstudio_loaded_models = lambda: lmstudio_models
     yoriai.get_mlx_lm_models = lambda: mlx_lm_models
     try:
         return fn()
@@ -97,6 +105,7 @@ def test_build_profile_card_merges_ollama_and_lmstudio_context_lengths():
         "get_ollama_installed_models": yoriai.get_ollama_installed_models,
         "get_ollama_loaded_models": yoriai.get_ollama_loaded_models,
         "get_lmstudio_models": yoriai.get_lmstudio_models,
+        "get_lmstudio_loaded_models": yoriai.get_lmstudio_loaded_models,
         "get_lmstudio_context_lengths": yoriai.get_lmstudio_context_lengths,
         "get_mlx_lm_models": yoriai.get_mlx_lm_models,
         "get_ollama_context_length": yoriai.get_ollama_context_length,
@@ -104,6 +113,7 @@ def test_build_profile_card_merges_ollama_and_lmstudio_context_lengths():
     yoriai.get_ollama_installed_models = lambda: ["llama3"]
     yoriai.get_ollama_loaded_models = lambda: ["llama3"]
     yoriai.get_lmstudio_models = lambda: ["qwen3-235b-a22b"]
+    yoriai.get_lmstudio_loaded_models = lambda: ["qwen3-235b-a22b"]
     yoriai.get_lmstudio_context_lengths = lambda: {"qwen3-235b-a22b": 262144}
     yoriai.get_mlx_lm_models = lambda: []
     yoriai.get_ollama_context_length = lambda model: 131072

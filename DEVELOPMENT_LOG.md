@@ -5615,3 +5615,76 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   (LM Studio、コンテキスト長262144)での「(思考の途中でトークン上限
   (8192)に達し…)」表示が出なくなることの確認は、本セッションの
   環境からは行えなかったため未実施。
+
+### `--status`のLM Studio機「ロード済みモデル」欄が、実際にはロードされていないモデルまで表示していた不具合を修正した
+
+- **背景**: 実機の`--status`確認により、LM Studio機(MacStudio・
+  junnoMac-mini)の「ロード済みモデル」欄が実態と合っていないことが
+  判明した。原因は、`build_profile_card`(`llm_stream.py`)がLM Studio
+  由来の`models.loaded`に`get_lmstudio_models`(`/v1/models`)の結果を
+  そのまま使っていたこと。`/v1/models`はOpenAI互換のモデル一覧APIで、
+  ロード状態(インストール済みかロード済みか)を区別せず、LM Studioに
+  インストール済みの全モデルを返す。一方、既に実装済みの`get_lmstudio_
+  context_lengths`は`/api/v0/models`の`state`フィールド(`"loaded"`/
+  `"not-loaded"`で実際のロード状態を返す)を見ており、こちらの方が
+  正確な情報を持っていた。
+- **修正**: `yoriai.py`に、`get_lmstudio_context_lengths`と同じ
+  `/api/v0/models`をデータソースとする`get_lmstudio_loaded_models()`を
+  新設した(戻り値は`state`が`"loaded"`のモデルIDのリスト。接続失敗・
+  古いLM Studioバージョンなど`/api/v0/models`自体が使えない場合は例外を
+  握りつぶし空リストを返す、既存の`get_ollama_installed_models`等と
+  同じ方針)。1回のGETで両関数分のデータを賄えるよう、`/api/v0/models`
+  へのGETと生データの取得自体は内部ヘルパー`_fetch_lmstudio_v0_models()`
+  に切り出し、`get_lmstudio_context_lengths`と`get_lmstudio_loaded_
+  models`の両方がこれを使うようにした(呼び出しごとに毎回GETし直す
+  シンプルな実装にとどめ、`build_profile_card`側で両関数を呼んだ場合に
+  1回ずつ計2回GETが飛ぶこと自体は許容する。キャッシュ化はパフォーマンス
+  上の懸念が出た場合の別PR送りとした)。`llm_stream.py`の`build_profile_
+  card`では、`models.installed`側は従来通り`_merge_model_lists(ollama_
+  installed, mlx_lm_models, lmstudio_models)`(`get_lmstudio_models`の
+  全件、インストール済みという情報自体は元々正しかったため変更なし)の
+  ままとし、`models.loaded`側だけ`lmstudio_models`を`get_lmstudio_
+  loaded_models()`の結果(`lmstudio_loaded`)に差し替えた。MLX-LMは
+  スコープ外(同等のロード状態を区別する手段がAPIに無いため、従来通り
+  「インストール済み=ロード済み」として扱う)。`--status`の表示コード
+  (`_format_status_member`)には、LM Studioの`/api/v0/models`が使える
+  バージョンでのみロード状態を正確に区別できること、古いバージョンや
+  `/api/v0/models`未対応の場合は接続失敗と同じ例外パスに入り空リスト
+  (「ロード済みモデル: なし」表示)になること、この場合「接続はできて
+  いるが`/api/v0/models`が無い」ケースと「本当に何もロードされていない」
+  ケースを区別する情報がカードには無いこと、そのため既存の`get_ollama_
+  installed_models`等と同じ「例外理由を区別せず空のコレクションを返す」
+  方針をここでも踏襲し、特別なフォールバック表示は設けないという判断を
+  コメントとして残した。
+- **テスト**: `tests/test_num_ctx.py`に、`/api/v0/models`のレスポンスに
+  `state: "loaded"`と`state: "not-loaded"`が混在する場合に`"loaded"`の
+  ものだけが返ることを確認する`test_get_lmstudio_loaded_models_returns_
+  only_loaded_state_models`、接続失敗時に例外を送出せず空リストを返す
+  ことを確認する`test_get_lmstudio_loaded_models_returns_empty_list_on_
+  connection_failure`、`build_profile_card`が返す`models.loaded`に
+  インストール済みだが未ロードのLM Studioモデルが含まれない(一方
+  `models.installed`にはそのモデルが含まれ続ける)ことを確認する
+  `test_build_profile_card_loaded_uses_true_lmstudio_load_state`の3件を
+  追加した。既存の`tests/test_model_backend_priority.py`は`_with_
+  patched_backends`ヘルパー(バックエンド優先順位の検証が目的で、LM
+  Studioのインストール済み/ロード済みの区別自体はスコープ外)が`get_
+  lmstudio_models`しかパッチしていなかったため、新設した`get_lmstudio_
+  loaded_models`も未パッチのまま呼ばれて実ネットワークに問い合わせに
+  行ってしまう(テスト環境では接続失敗して空リストになり、既存の
+  「LM Studio側のモデルがloaded[0]になる」という一部アサーションが
+  崩れる)問題があった。そのため同ヘルパーと個別に差し替えていた
+  `test_build_profile_card_merges_ollama_and_lmstudio_context_lengths`
+  の両方で、`get_lmstudio_loaded_models`を`lmstudio_models`と同じ内容を
+  返すようパッチに追加し、既存テストの前提(インストール済み=ロード済み)
+  を保った。
+- **動作確認**: `python3 -m pytest tests/`をフルスイートで実行し、
+  新規追加分3件を含め586件中582件がパスすることを確認した(残り4件
+  `test_background_collaborate.py::test_followup_right_after_a_dialogue_
+  pause_is_not_reclassified`・`test_double_ctrl_c_emergency_exit.py::
+  test_repl_terminates_on_double_ctrl_c_spanning_response_wait_and_
+  input`・`test_fix_session.py`の2件は、本修正を反映する前のクリーンな
+  チェックアウトでも同様に失敗する既存の不安定なテスト(常駐エージェント
+  ポートへの接続を前提とするテスト環境依存の問題)であることを確認
+  済みで、本修正によるリグレッションではない)。実機のMacStudio・
+  junnoMac-miniでの`--status`確認による「ロード済みモデル」欄の実態
+  一致は、本セッションの環境からは行えなかったため未実施。

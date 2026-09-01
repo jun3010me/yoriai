@@ -474,9 +474,12 @@ def get_lmstudio_models() -> list:
     """LM Studioのローカルサーバー(OpenAI互換API)からモデル一覧を取得する。
 
     仮の判断: `/v1/models` はロード状態(インストール済みかロード済みか)を
-    区別して返してくれないため、ここで取得できたモデルは「インストール済み」
-    「ロード済み」の両方として扱う。LM Studio側で「Local Server」を
-    起動していない場合は空リストを返す(エラーにはしない)。
+    区別して返してくれないため、この関数は「インストール済み」モデルの
+    一覧として使う(build_profile_cardのmodels.installed)。ロード済みかどうかの
+    判定には、"state"フィールドで区別できる`/api/v0/models`を見る
+    `get_lmstudio_loaded_models`の方を使う(build_profile_cardのmodels.loaded)。
+    LM Studio側で「Local Server」を起動していない場合は空リストを返す
+    (エラーにはしない)。
     """
     try:
         resp = requests.get(f"{LMSTUDIO_BASE_URL}/v1/models", timeout=3)
@@ -487,6 +490,33 @@ def get_lmstudio_models() -> list:
         return []
 
 
+def _fetch_lmstudio_v0_models() -> list:
+    """LM Studioの`/api/v0/models`から、生のモデル情報一覧(dataフィールドの
+    中身)をそのまま返す内部ヘルパー。`get_lmstudio_context_lengths`と
+    `get_lmstudio_loaded_models`の両方が使うデータソースが同じ
+    (どちらも各モデルの"state"を見る)ため、ここに1本化する。接続失敗・
+    古いLM Studioバージョンなど`/api/v0/models`自体が使えない場合は
+    例外を握りつぶし、空リストを返す(呼び出し側は「1件もモデルが
+    無かった」場合と区別しない。既存のget_ollama_installed_models等と
+    同じ、例外を握りつぶして空のコレクションを返す方針を踏襲する)。
+
+    仮の判断: get_ollama_context_length()は`/api/show`をモデルごとに
+    問い合わせる設計だが、LM Studioの`/api/v0/models`は1回のGETで
+    ロード済み・未ロードを含む全モデルの情報をまとめて返すため、
+    ここではモデルごとの再問い合わせは行わない。パフォーマンス上の
+    懸念が出るまでは、呼び出しごとに(コンテキスト長取得・ロード済み
+    判定のそれぞれで)GETし直すシンプルな実装にとどめ、キャッシュ化は
+    別PRとする。
+    """
+    try:
+        resp = requests.get(f"{LMSTUDIO_BASE_URL}/api/v0/models", timeout=3)
+        resp.raise_for_status()
+        return resp.json().get("data", [])
+    except Exception as exc:
+        logger.warning("LM Studioの'/api/v0/models'の取得に失敗しました: %s", exc)
+        return []
+
+
 def get_lmstudio_context_lengths() -> dict:
     """LM Studioの`/api/v0/models`から、ロード済みモデルの
     {model_id: context_length}の辞書を返す。`loaded_context_length`
@@ -494,26 +524,32 @@ def get_lmstudio_context_lengths() -> dict:
     `loaded_context_length`が無い場合は`max_context_length`を
     フォールバックとして使う。"loaded"状態でないモデル・接続失敗時は
     辞書に含めない(例外を握りつぶし、取得できたモデルだけを返す)。
-
-    仮の判断: get_ollama_context_length()は`/api/show`をモデルごとに
-    問い合わせる設計だが、LM Studioの`/api/v0/models`は1回のGETで
-    ロード済み・未ロードを含む全モデルの情報をまとめて返すため、
-    ここではモデルごとの再問い合わせは行わない。
     """
     context_lengths = {}
-    try:
-        resp = requests.get(f"{LMSTUDIO_BASE_URL}/api/v0/models", timeout=3)
-        resp.raise_for_status()
-        for m in resp.json().get("data", []):
-            if m.get("state") != "loaded":
-                continue
-            model_id = m.get("id")
-            context_length = m.get("loaded_context_length", m.get("max_context_length"))
-            if model_id is not None and context_length is not None:
-                context_lengths[model_id] = context_length
-    except Exception as exc:
-        logger.warning("LM Studioのコンテキスト長一覧の取得に失敗しました: %s", exc)
+    for m in _fetch_lmstudio_v0_models():
+        if m.get("state") != "loaded":
+            continue
+        model_id = m.get("id")
+        context_length = m.get("loaded_context_length", m.get("max_context_length"))
+        if model_id is not None and context_length is not None:
+            context_lengths[model_id] = context_length
     return context_lengths
+
+
+def get_lmstudio_loaded_models() -> list:
+    """LM Studioの`/api/v0/models`から、state が "loaded" の
+    モデルIDの一覧を返す(get_lmstudio_context_lengthsと同じ
+    データソース)。接続失敗時は空リストを返す。
+
+    仮の判断: `get_lmstudio_models`(`/v1/models`)は「インストール済み」の
+    一覧としては引き続き使うが、ロード状態(実際に今メモリに載っている
+    かどうか)の判定には`/api/v0/models`の"state"フィールドの方を正とする。
+    """
+    return [
+        m.get("id")
+        for m in _fetch_lmstudio_v0_models()
+        if m.get("state") == "loaded" and m.get("id") is not None
+    ]
 
 
 def get_mlx_lm_models() -> list:
@@ -7836,6 +7872,22 @@ def _format_seconds_ago(timestamp: float) -> str:
 
 
 def _format_status_member(card: dict, index: int, label: str, last_seen: float = None) -> str:
+    # 仮の判断: ここで表示する"ロード済みモデル"のうちLM Studio分は、
+    # build_profile_card()がget_lmstudio_loaded_models()(`/api/v0/models`の
+    # "state"フィールドを見る)で判定したもの。このAPIはLM Studioの比較的
+    # 新しいバージョンでのみ使え、古いバージョンや`/api/v0/models`に
+    # 対応していない場合は接続失敗と同じ例外パスに入り、空リストとして
+    # 扱われる(get_lmstudio_loaded_modelsのdocstring参照)。
+    #
+    # そのため「接続はできているが/api/v0/modelsが無い」場合と「本当に
+    # 何もロードされていない」場合を、このカードの情報だけでは区別できない
+    # (どちらも"ロード済みモデル: なし"と表示される)。既存の
+    # get_ollama_installed_models等、この周辺の関数群がいずれも例外理由を
+    # 区別せず空のコレクションを返す方針を踏襲しているため、ここでも
+    # 区別のための特別なフォールバック表示(「不明」等)は設けない。
+    # 実際に古いLM Studioバージョンで"インストール済み"欄は非空なのに
+    # "ロード済み"欄だけ常に「なし」になる場合は、LM Studioのバージョンを
+    # 上げて`/api/v0/models`に対応させることで解決する。
     device_name = card.get("device_name", "unknown")
     chip = card.get("os", {}).get("chip", "unknown")
     memory = card.get("memory", {})
