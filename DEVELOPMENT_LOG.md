@@ -5689,6 +5689,81 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   junnoMac-miniでの`--status`確認による「ロード済みモデル」欄の実態
   一致は、本セッションの環境からは行えなかったため未実施。
 
+### Ollama経由の思考モード対応モデル(GLM-4.7-flash・Kimi K2.5)の思考過程が対話プロトコルに一切表示されない不具合の修正
+
+- **背景**: GLM-4.7-flash・Kimi K2.5(いずれもOllama経由、MacBook-Pro-
+  de-dxadminで動作中)はどちらもモデル自体は思考モードに対応している
+  が、`llm_stream._stream_ollama_turn`はこれまでリクエストに`"think"`
+  パラメータを一切含めておらず、レスポンスの`message.thinking`
+  フィールドも見ていなかった。そのため、これらのモデルがどれだけ
+  思考していてもYoriaiの対話プロトコルには一切表示されなかった
+  (llama3.3:70bのように元々思考モードを持たないモデルは、この対応
+  をしても表示が増えないのが想定通りの挙動)。LM Studio対応時に作った
+  `_ThinkTagSplitter`(delta.contentに混在する`<think>`タグを、チャンク
+  をまたぐ場合も含めて正しく検出し{"thinking": ...}/{"content": ...}に
+  振り分けるステートマシン)はLM Studio専用の実装になっておらず汎用に
+  使える設計だったため、Ollama側でも再利用できると判断した。
+- **修正**: `llm_stream._stream_ollama_turn`のリクエストのJSONペイロード
+  に、トップレベル(`"model"`・`"messages"`・`"stream"`と同じ階層、
+  `options`辞書の中ではない)に`"think": True`を追加した。レスポンスの
+  パースループで`message.get("thinking")`を確認し、値があれば
+  {"thinking": ...}をyieldするようにした(`message.get("content")`の
+  yieldとは独立しており、両方存在する行では両方yieldされる)。
+  `message.get("content")`は、1回の問い合わせにつき1つ生成した
+  `_ThinkTagSplitter`のインスタンス(`_stream_openai_compatible_turn`
+  側と同じパターン)の`feed()`に通し、そこでyieldされるイベントを
+  そのまま外側にyieldする形に変更した。ストリーム終了時
+  (`obj.get("done")`がTrueになった時)には`splitter.flush()`を呼び、
+  バッファに残っている内容も取りこぼさず出力するようにした。
+  `message.thinking`と`<think>`タグの両方が同時に出現するケースは
+  想定しにくいが、仮に両方出現しても両方とも{"thinking": ...}として
+  扱われるため実害は無く、特別なハンドリングは設けていない。
+  `think`に非対応のモデル(llama3.3:70b等)に`"think": true`を送った
+  場合の実機での挙動(単に無視されるのか、エラーになるのか)を本
+  セッションの環境からは確認できなかったため、どちらの挙動でも
+  問題なく動作するよう、`"think": true`を含めたリクエストが失敗
+  (`resp.ok`がFalse)した場合に限り、`"think"`キー無しで1回だけ
+  自動的に再試行するフォールバックを追加した(既存の
+  `_looks_like_tools_related_error`によるtools無し再試行と同じ、
+  「まず付けて送ってみて拒否されたら外して再試行する」という考え方。
+  再試行も失敗した場合は従来通りエラーとして扱う)。単に無視される
+  (エラーにならない)ことが実機で確認できれば、このフォールバックは
+  実質発火しなくなるだけで害は無い。`stream_chat_completion`・
+  `_collect_answer_from_candidate`・`speak()`の{"thinking": ...}
+  イベントの扱いは、発生元(LM Studio/Ollama)を区別しない汎用設計に
+  既になっていたため、これらのファイルは変更していない。
+- **テスト**: `tests/test_ollama_thinking_mode.py`を新設し、
+  (1)リクエストのトップレベルに`"think": true`が含まれることを確認する
+  `test_stream_ollama_turn_sends_think_true_in_request_payload`、
+  (2)NDJSONの各行に`message.thinking`が含まれる場合に対応する
+  {"thinking": ...}イベントが正しくyieldされることを確認する
+  `test_stream_ollama_turn_yields_thinking_event_from_message_thinking_
+  field`(および同一行にthinking/contentが両方含まれる場合の
+  `test_stream_ollama_turn_yields_both_thinking_and_content_from_same_
+  line`)、(3)`message.content`に<think>タグが複数チャンクにまたがって
+  現れる場合も正しく分割されることを確認する`test_stream_ollama_turn_
+  splits_think_tags_in_content_across_chunks`(および閉じタグが来る前に
+  ストリームが終了した場合のflush挙動を確認する`test_stream_ollama_
+  turn_flushes_unterminated_think_tag_at_stream_end`)、(4)`message.
+  thinking`も<think>タグも無い通常の応答では{"content": ...}イベント
+  のみが発生し{"thinking": ...}イベントが一切発生しないことを確認する
+  `test_stream_ollama_turn_unaffected_when_no_thinking_present`、
+  (5)think付きリクエストが失敗した場合にthinkキー無しで1回だけ自動
+  再試行することを確認する`test_stream_ollama_turn_retries_without_
+  think_key_when_think_request_fails`、その再試行も失敗した場合は
+  従来通りエラーとして扱われることを確認する`test_stream_ollama_turn_
+  reports_error_when_both_think_and_fallback_requests_fail`の計8件を
+  追加した。
+- **動作確認**: `python3 -m pytest tests/test_ollama_thinking_mode.py`
+  を実行し、新規追加分8件全件パスすることを確認した。そのうえで
+  `python3 -m pytest tests/`をフルスイートで実行し、594件全件パスし
+  新たなリグレッションが無いことを確認した。実機のMacBook-Pro-
+  de-dxadminでGLM-4.7-flash・Kimi K2.5に`//agree`で発言してもらい
+  思考過程が画面に表示されること、および`"think": true`に非対応の
+  モデル(llama3.3:70b)への実際の挙動(無視されるかエラーになるか)・
+  表示が従来通り増えないことの確認は、本セッションの環境から実機の
+  MacBook-Pro-de-dxadminに接続できないため行えなかった(未実施)。
+
 ### 対話プロトコルの議事録圧縮を、ラウンド数基準から合計文字数基準に変更した(ラウンド4の統合役が文字化けで打ち切られる実機バグへの対応)
 
 - **背景**: 実機の対話ログ(DIALOGUE_LOG_design.md)を調査した結果、
