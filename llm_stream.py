@@ -115,9 +115,9 @@ KEEP_ALIVE = os.environ.get("YORIAI_OLLAMA_KEEP_ALIVE", "30m")
 
 def _stream_ollama_turn(model: str, messages: list, tools: list, max_output_tokens: int = CHAT_MAX_OUTPUT_TOKENS):
     """OllamaのネイティブAPI(/api/chat、NDJSONストリーミング)に1往復だけ
-    問い合わせ、正規化したイベント({"content": ...} / {"error": ...})を
-    順にyieldし、最後にそのターンで要求されたtool_calls一覧と、応答が
-    max_output_tokens上限に達して打ち切られたかどうか
+    問い合わせ、正規化したイベント({"content": ...} / {"thinking": ...} /
+    {"error": ...})を順にyieldし、最後にそのターンで要求されたtool_calls
+    一覧と、応答がmax_output_tokens上限に達して打ち切られたかどうか
     ({"tool_calls": [...], "truncated": bool})をyieldする。
 
     仮の判断: options.num_ctx(コンテキストウィンドウの長さ)とkeep_alive
@@ -130,6 +130,28 @@ def _stream_ollama_turn(model: str, messages: list, tools: list, max_output_toke
     (既存の呼び出し元との後方互換性のため)。`stream_chat_completion`から
     呼ばれる場合は、モデルのコンテキスト長に応じて自動調整された値
     (`_decide_max_output_tokens`の結果)が渡される。
+
+    仮の判断(思考モード対応モデル(GLM-4.7-flash・Kimi K2.5等)の思考過程が
+    一切表示されない問題への対応): リクエストのトップレベルに`"think": True`
+    を付与する(Ollama API仕様上、`think`は`options`辞書の中ではなく
+    "model"・"messages"・"stream"と同じ階層のトップレベルパラメータ)。
+    `think`に対応していないモデル(llama3.3:70b等)にこれを送った場合の
+    実機の挙動を確認できなかったため、単に無視されるのかエラーになるのか
+    どちらでも問題なく動作するよう、リクエストが失敗した場合に限り
+    `"think"`キー無しで1回だけ再試行するフォールバックを設けている
+    (既存の`_looks_like_tools_related_error`によるtools無し再試行と
+    同じ「まず付けて送ってみて、拒否されたら外して再試行する」という
+    考え方)。単に無視される(エラーにならない)ことが実機で確認できれば、
+    このフォールバックは実質発火しなくなるだけで、害はない。
+
+    仮の判断(同上): Ollamaは思考過程を専用の`message.thinking`フィールドで
+    返すモデルが大半だが、モデルによっては(LM Studio同様に)`<think>`タグを
+    `message.content`に埋め込む形で返す可能性もあるため、LM Studio対応時に
+    作った`_ThinkTagSplitter`をここでも再利用し、`message.content`を
+    そのステートマシンに通してから{"content": ...}/{"thinking": ...}に
+    振り分ける。`message.thinking`と`<think>`タグの両方が同時に出現する
+    ケースは想定しにくいが、仮に両方出現しても両方とも{"thinking": ...}
+    として扱われるだけで実害は無い。
     """
     from yoriai import _decide_num_ctx
     num_ctx = _decide_num_ctx(model)
@@ -144,16 +166,31 @@ def _stream_ollama_turn(model: str, messages: list, tools: list, max_output_toke
                 "黙って切り捨てます。",
                 model, estimated_tokens, num_ctx, int(_NUM_CTX_WARNING_RATIO * 100),
             )
+    payload = {
+        "model": model, "messages": messages, "tools": tools, "stream": True,
+        "options": options, "keep_alive": KEEP_ALIVE, "think": True,
+    }
     try:
         resp = requests.post(
             f"{OLLAMA_BASE_URL}/api/chat",
-            json={
-                "model": model, "messages": messages, "tools": tools, "stream": True,
-                "options": options, "keep_alive": KEEP_ALIVE,
-            },
+            json=payload,
             stream=True,
             timeout=(CHAT_CONNECT_TIMEOUT_SEC, CHAT_READ_TIMEOUT_SEC),
         )
+        if not resp.ok:
+            logger.warning(
+                "%s への'think'付きリクエストがステータス%dで拒否されました。"
+                "モデル '%s' が思考モードに対応していない可能性があるため、"
+                "'think'キー無しで1回だけ再試行します。",
+                OLLAMA_BASE_URL, resp.status_code, model,
+            )
+            payload_without_think = {k: v for k, v in payload.items() if k != "think"}
+            resp = requests.post(
+                f"{OLLAMA_BASE_URL}/api/chat",
+                json=payload_without_think,
+                stream=True,
+                timeout=(CHAT_CONNECT_TIMEOUT_SEC, CHAT_READ_TIMEOUT_SEC),
+            )
         if not resp.ok:
             yield _log_and_build_http_error(OLLAMA_BASE_URL, resp)
             return
@@ -163,6 +200,7 @@ def _stream_ollama_turn(model: str, messages: list, tools: list, max_output_toke
 
     tool_calls = []
     truncated = False
+    think_splitter = _ThinkTagSplitter()
     try:
         for line in resp.iter_lines():
             if not line:
@@ -172,9 +210,13 @@ def _stream_ollama_turn(model: str, messages: list, tools: list, max_output_toke
             except json.JSONDecodeError:
                 continue
             message = obj.get("message", {})
+            thinking = message.get("thinking")
+            if thinking:
+                yield {"thinking": thinking}
             content = message.get("content")
             if content:
-                yield {"content": content}
+                for think_event in think_splitter.feed(content):
+                    yield think_event
             if message.get("tool_calls"):
                 tool_calls.extend(message["tool_calls"])
             if obj.get("done"):
@@ -185,6 +227,8 @@ def _stream_ollama_turn(model: str, messages: list, tools: list, max_output_toke
     except Exception as exc:
         yield {"error": str(exc)}
         return
+    for think_event in think_splitter.flush():
+        yield think_event
     yield {"tool_calls": tool_calls, "truncated": truncated}
 
 
