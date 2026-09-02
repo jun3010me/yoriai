@@ -1992,26 +1992,45 @@ def _extract_dialogue_section(answer: str, heading: str) -> str:
 # 仮の判断(重大なバグ報告への対応: 長時間の対話で応答が文字化けに崩壊
 # する): 以前はラウンドを重ねるたびに「これまでの議論」全文をそのまま
 # 毎回のプロンプトに埋め込んでいたため、ラウンドを重ねるほど入力トークン数が
-# 線形に増え続けていた。直近`_DIALOGUE_TRANSCRIPT_RECENT_ROUNDS_FULL`
-# ラウンド分の発言は判断に直結するため全文を残しつつ、それより古いラウンド
-# (既に検討済みで、直近の発言に要点が引き継がれているはずの発言)は
-# 要点(先頭`_DIALOGUE_TRANSCRIPT_OLDER_ROUND_CHARS`文字)だけに圧縮する。
-# 完全な逐語記録は`_format_dialogue_transcript_for_prompt`とは別に
-# `_format_dialogue_log_markdown`が議事録ファイルへそのまま保存するため、
-# ここで要点だけに圧縮しても「なぜこの結論になったか」を後から遡る手段は
-# 失われない。
-_DIALOGUE_TRANSCRIPT_RECENT_ROUNDS_FULL = 2
+# 線形に増え続けていた。当初は「直近2ラウンド分は全文、それより古い
+# ラウンドは要点のみ」というラウンド数基準の圧縮を入れていたが、これは
+# 「1ラウンドあたりの発言量」が一定であることを前提にしていた。実際には
+# `_decide_max_output_tokens`により1ラウンドあたりの発言量(特に提案役・
+# 反論役の発言)が大きく増える余地があり、実機ではラウンド4の統合役に
+# 渡す直近2ラウンド全文だけで20万字前後に達し、統合役の応答が文字化けに
+# 崩壊して記録すら残らない事例が確認された。ラウンド数ではなく「新しい
+# 発言から遡った合計文字数」を基準にすることで、1ラウンドの分量に関わらず
+# 統合役に渡す入力サイズの上限を一定に保つ。60000という値に厳密な根拠は
+# 無く、実機で試しながら調整する前提の初期値。
+# 予算を超えた時点より古い発言は要点(先頭`_DIALOGUE_TRANSCRIPT_OLDER_ROUND_CHARS`
+# 文字)だけに圧縮する。完全な逐語記録は`_format_dialogue_transcript_for_prompt`
+# とは別に`_format_dialogue_log_markdown`が議事録ファイルへそのまま保存する
+# ため、ここで要点だけに圧縮しても「なぜこの結論になったか」を後から遡る
+# 手段は失われない。
+_DIALOGUE_TRANSCRIPT_TOTAL_CHAR_BUDGET = 60000
 _DIALOGUE_TRANSCRIPT_OLDER_ROUND_CHARS = 200
 
 
 def _format_dialogue_transcript_for_prompt(transcript: list) -> str:
-    latest_round = max((u["round"] for u in transcript), default=0)
+    # 新しい発言から遡って合計文字数を積算し、予算を超えた時点の発言までを
+    # 全文保持の対象とする(その発言自体は含めてよい)。それより古い発言は
+    # 要点のみに圧縮する。少なくとも最新の発言1件は、それ単体で予算を
+    # 超えていても全文保持の対象になる(ループの初回で必ずbreakするため)。
+    full_from_index = 0
+    total_chars = 0
+    for index in range(len(transcript) - 1, -1, -1):
+        content = transcript[index]["content"] or "(応答なし)"
+        total_chars += len(content)
+        full_from_index = index
+        if total_chars > _DIALOGUE_TRANSCRIPT_TOTAL_CHAR_BUDGET:
+            break
+
     lines = []
-    for utterance in transcript:
+    for index, utterance in enumerate(transcript):
         role_ja = _DIALOGUE_ROLE_LABEL_JA.get(utterance["role"], utterance["role"])
         lines.append(f"[{utterance['speaker_label']}さん・{role_ja}・ラウンド{utterance['round']}]")
         content = utterance["content"] or "(応答なし)"
-        if latest_round - utterance["round"] >= _DIALOGUE_TRANSCRIPT_RECENT_ROUNDS_FULL and len(content) > _DIALOGUE_TRANSCRIPT_OLDER_ROUND_CHARS:
+        if index < full_from_index and len(content) > _DIALOGUE_TRANSCRIPT_OLDER_ROUND_CHARS:
             content = content[:_DIALOGUE_TRANSCRIPT_OLDER_ROUND_CHARS] + "...(以下省略。古いラウンドのため要点のみ表示)"
         lines.append(content)
         lines.append("")
