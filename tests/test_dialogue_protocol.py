@@ -534,6 +534,43 @@ def test_looks_garbled_false_for_long_but_diverse_text():
     assert yoriai._looks_garbled(diverse) is False
 
 
+def test_looks_garbled_false_for_verbose_technical_spec_with_low_unique_ratio():
+    """重大なバグ報告への対応: 実機で、関数シグネチャや型注釈を精密に繰り返す
+    詳細な技術仕様書スタイルの発言(ラウンド3の提案役)が「文字化けの疑いに
+    より打ち切り」と誤判定された。型注釈の反復で文字種の多様性
+    (unique_ratio)が閾値未満に落ちても、短いパターンの連続繰り返し
+    (_has_dominant_repeated_run)が無い限り文字化けと判定してはならない。
+    """
+    spec_text = "load_tasks(path: str) -> list[dict[str, object]]を" * 120
+    unique_ratio = len(set(spec_text)) / len(spec_text)
+    assert unique_ratio < yoriai._GARBLED_UNIQUE_CHAR_RATIO_THRESHOLD
+    assert yoriai._has_dominant_repeated_run(spec_text) is False
+    assert yoriai._looks_garbled(spec_text) is False
+
+
+def test_looks_garbled_true_when_both_low_unique_ratio_and_repeated_run():
+    # AND判定への変更後も、真の生成崩壊(連続繰り返し・低いunique_ratioの
+    # 両方を満たすケース)は引き続き検出できることを確認する。
+    single_char = "呵" * 60
+    short_pattern = "ㅋㅋ" * 40
+    for garbled in (single_char, short_pattern):
+        unique_ratio = len(set(garbled)) / len(garbled)
+        assert unique_ratio < yoriai._GARBLED_UNIQUE_CHAR_RATIO_THRESHOLD
+        assert yoriai._has_dominant_repeated_run(garbled) is True
+        assert yoriai._looks_garbled(garbled) is True
+
+
+def test_looks_garbled_false_for_low_unique_ratio_without_repeated_run():
+    # Thue-Morse数列: 2文字("a"/"b")だけで構成され unique_ratio は閾値未満
+    # だが、3回以上の連続反復(cube)を含まないため _has_dominant_repeated_run
+    # は False になる。AND判定になったことのユニットテスト。
+    thue_morse = "".join("ab"[bin(i).count("1") % 2] for i in range(64))
+    unique_ratio = len(set(thue_morse)) / len(thue_morse)
+    assert unique_ratio < yoriai._GARBLED_UNIQUE_CHAR_RATIO_THRESHOLD
+    assert yoriai._has_dominant_repeated_run(thue_morse) is False
+    assert yoriai._looks_garbled(thue_morse) is False
+
+
 def test_utterances_are_near_duplicate_detects_identical_and_distinct_text():
     a = "storage.pyでadd_todoを実装し、cli.pyから呼び出す設計にします。"
     assert yoriai._utterances_are_near_duplicate(a, a) is True
@@ -1328,6 +1365,9 @@ def main():
         test_looks_garbled_true_for_dominant_single_character_repetition,
         test_looks_garbled_true_for_dominant_short_pattern_repetition,
         test_looks_garbled_false_for_long_but_diverse_text,
+        test_looks_garbled_false_for_verbose_technical_spec_with_low_unique_ratio,
+        test_looks_garbled_true_when_both_low_unique_ratio_and_repeated_run,
+        test_looks_garbled_false_for_low_unique_ratio_without_repeated_run,
         test_utterances_are_near_duplicate_detects_identical_and_distinct_text,
         test_run_dialogue_stops_and_reports_garbled_when_a_speaker_collapses,
         test_run_dialogue_stops_as_stagnant_when_rounds_repeat_and_adopts_latest_proposal,

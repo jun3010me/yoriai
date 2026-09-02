@@ -5826,3 +5826,68 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   「予算をまたぐ発言は全文保持側に含めてよい」という仕様上の許容により
   出力が10万字強になるケースも確認したが、これは仕様通りの動作であり、
   少なくとも修正前の約20万字からは大幅に削減されている。
+
+### 文字化け検出(`_looks_garbled`)が、型注釈を精密に繰り返す正常な技術仕様書を誤って文字化け扱いしていた不具合の修正
+
+- **背景**: 実機で`//agree`のタスク管理CLI依頼を実行したところ、ラウンド3
+  の提案役(MacStudio)の発言が「文字化けの疑いにより打ち切り」
+  (`DIALOGUE_STATUS_GARBLED`)と判定され、対話プロトコルが中断した。
+  しかし該当の発言は実際には文字化けしておらず、関数シグネチャ・型注釈
+  (`list[dict[str, object]]`等)を一字一句正確に繰り返す、依頼通りの
+  詳細な技術仕様書として完全に一貫した内容だった。手元で該当テキスト
+  (約5100文字)を`_looks_garbled`に通して検証したところ、
+  `unique_ratio`が0.0585(閾値`_GARBLED_UNIQUE_CHAR_RATIO_THRESHOLD`=
+  0.06をわずかに下回る)である一方、`_has_dominant_repeated_run`
+  (短いパターンが連続して大部分を占める、本来の生成崩壊の検出)は
+  `False`であるにもかかわらず、`_looks_garbled`全体は`True`(文字化け
+  判定)を返していた。
+- **原因**: 従来の`_looks_garbled`は、`unique_ratio`が閾値未満なら
+  `_has_dominant_repeated_run`の結果を見ずに即座に`True`を返す
+  (実質OR判定)実装になっていた。型注釈や専門用語の反復が多い正常な
+  技術仕様書スタイルの文章は、内容が正常であっても英数記号・特定の語彙
+  の比率が高くなり、文字種の多様性(`unique_ratio`)を自然に押し下げて
+  しまう。そのため、本来の生成崩壊を示す強いシグナルである
+  `_has_dominant_repeated_run`が`False`でも、弱いシグナルにすぎない
+  `unique_ratio`単体の低下だけで文字化け扱いになってしまっていた。
+- **修正**: `yoriai.py`の`_looks_garbled`を、`_has_dominant_repeated_run`
+  (短いパターンの連続繰り返し、本来の崩壊パターンに直結する強い
+  シグナル)を先に評価し、それが`False`であれば`unique_ratio`を計算する
+  までもなく`False`を返すよう変更した。`_has_dominant_repeated_run`が
+  `True`の場合のみ`unique_ratio`を計算し、閾値未満であって初めて
+  文字化けと判定する(AND判定)。`_has_dominant_repeated_run`を先に
+  評価する順序にしたのは、通常の文章では連続繰り返しが見つからず
+  すぐ`False`になるため、計算コストの軽い早期リターンになりやすい
+  ことも理由の一つ。ロジックの意味自体も「連続繰り返しがあり、かつ
+  文字種も極端に少ない場合のみ文字化けと判定する」に変わる点を、
+  実機での誤検知報告があった経緯とあわせてコメントに明記した。
+  `_GARBLED_MIN_LENGTH`・`_GARBLED_UNIQUE_CHAR_RATIO_THRESHOLD`・
+  `_GARBLED_REPEATED_RUN_RATIO_THRESHOLD`・
+  `_GARBLED_REPEATED_RUN_PATTERN_LENGTHS`の値自体は、今回の修正が
+  ロジックの組み合わせ方の問題であり個々の閾値の妥当性の問題ではないと
+  判断し、変更していない。
+- **テスト**: `tests/test_dialogue_protocol.py`の「文字化け検出
+  (`_looks_garbled`)」セクションに、関数シグネチャや型注釈を繰り返す
+  詳細な技術仕様書スタイルの文章(`unique_ratio`が閾値未満に落ちる
+  ことをまずアサートで確認したうえで)が`_has_dominant_repeated_run`が
+  `False`である限り文字化け判定されないことを確認する
+  `test_looks_garbled_false_for_verbose_technical_spec_with_low_unique_
+  ratio`、AND判定への変更後も`_has_dominant_repeated_run`・
+  `unique_ratio`の両方が条件を満たす真の崩壊パターン(既存の`"呵" * 60`・
+  `"ㅋㅋ" * 40`)は引き続き`True`と判定されることを確認する
+  `test_looks_garbled_true_when_both_low_unique_ratio_and_repeated_run`、
+  `unique_ratio`は閾値未満だが`_has_dominant_repeated_run`が`False`と
+  なる人工的な文字列(Thue-Morse数列。2文字だけで構成され`unique_ratio`
+  は低いが3回以上の連続反復を含まない)で`_looks_garbled`が`False`を
+  返すことを確認する
+  `test_looks_garbled_false_for_low_unique_ratio_without_repeated_run`
+  の3件を追加した。既存の`test_looks_garbled_false_for_long_but_
+  diverse_text`を含む既存の`test_looks_garbled_*`系テストは、修正後の
+  ロジックでもすべて引き続きパスすることを確認済み。
+- **動作確認**: `python3 -m pytest tests/`をフルスイートで実行し、
+  新規追加分3件を含め601件全件パスし、リグレッションが無いことを確認
+  した。加えて、実機で報告された誤検知の元テキストの統計(長さ約5100
+  文字・`unique_ratio`≈0.0585・`_has_dominant_repeated_run`は`False`)
+  を再現した、型注釈を反復する技術仕様書スタイルの文章を手元の
+  スクリプトで`_looks_garbled`に直接渡し、修正前のOR判定ロジックでは
+  `True`(誤検知)、修正後のAND判定ロジックでは`False`になることを
+  確認した。
