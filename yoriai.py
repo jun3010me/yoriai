@@ -1787,6 +1787,19 @@ _DIALOGUE_STATUS_LABEL_JA = {
 # いずれかに該当する場合を「文字化けの疑い」とする。短い応答(既定
 # 40文字未満)は判断材料が少なく誤検知しやすいため対象外にする。
 _GARBLED_MIN_LENGTH = 40
+# 仮の判断(バグ報告への対応: 詳細な技術仕様書スタイルの発言が誤って
+# 文字化け判定される): 実機で、関数シグネチャや型注釈(`list[dict[str,
+# object]]`等)を一字一句正確に繰り返す、内容として完全に一貫した長文の
+# 技術仕様書が「文字化けの疑いにより打ち切り」と誤判定される事例が
+# 報告された。原因は、(1)(2)を単純にOR判定していたため、真の生成崩壊を
+# 示す(1)(=`_has_dominant_repeated_run`)が`False`であっても、(2)の
+# `unique_ratio`だけが閾値をわずかに下回れば全体が文字化け扱いになって
+# いたこと。型注釈や専門用語の反復が多い正常な文章は、内容が正常でも
+# 文字種の多様性(unique_ratio)が自然に低くなりやすく、(2)単独は
+# 誤検知しやすい弱いシグナルにすぎない。一方(1)は短いパターンの連続
+# 繰り返しという、本来の生成崩壊に直結する強いシグナルである。そのため
+# `_looks_garbled`では(1)と(2)の両方が真の場合にのみ文字化けと判定する
+# (AND判定)よう変更した。
 _GARBLED_UNIQUE_CHAR_RATIO_THRESHOLD = 0.06
 _GARBLED_REPEATED_RUN_RATIO_THRESHOLD = 0.4
 _GARBLED_REPEATED_RUN_PATTERN_LENGTHS = range(1, 7)
@@ -1820,14 +1833,21 @@ def _has_dominant_repeated_run(text: str) -> bool:
 
 
 def _looks_garbled(text: str) -> bool:
-    """発言`text`が文字化け・生成崩壊している疑いが強いかどうかを返す。"""
+    """発言`text`が文字化け・生成崩壊している疑いが強いかどうかを返す。
+
+    短いパターンの連続繰り返し(`_has_dominant_repeated_run`、真の生成崩壊に
+    直結する強いシグナル)を先に評価し、それが無い場合は文字種の多様性
+    (`unique_ratio`)だけでは文字化けと判定しない。`_has_dominant_repeated_run`
+    を先に評価するのは、通常の文章では連続繰り返しが見つからずすぐ`False`に
+    なるため、計算コストの軽い早期リターンになりやすいことも理由の一つ。
+    """
     stripped = (text or "").strip()
     if len(stripped) < _GARBLED_MIN_LENGTH:
         return False
+    if not _has_dominant_repeated_run(stripped):
+        return False
     unique_ratio = len(set(stripped)) / len(stripped)
-    if unique_ratio < _GARBLED_UNIQUE_CHAR_RATIO_THRESHOLD:
-        return True
-    return _has_dominant_repeated_run(stripped)
+    return unique_ratio < _GARBLED_UNIQUE_CHAR_RATIO_THRESHOLD
 
 
 # 仮の判断(バグ報告への対応: 同じ内容の繰り返しで議論が"進化"しない):
