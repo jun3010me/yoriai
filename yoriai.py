@@ -105,6 +105,7 @@ from tools import (
     _resolve_safe_project_path,
     _run_project_command,
     _syntax_check_all_files,
+    _validate_run_command,
     _write_project_file,
     web_search,
 )
@@ -2586,6 +2587,32 @@ def _classify_agree_request_type(request: str) -> str:
 # (//agree)・修正モード(//fix)とは独立したコマンドとして実装する。
 PLAN_ONLY_COMMAND = "//plan-only"
 
+# 仮の判断(実機バグ報告への対応: 統合検証が「実装は正しいのに検証コマンド
+# 自体が実行できない」せいで何度リトライしても失敗し続ける): 設計担当への
+# 検証コマンドの指示は、従来「1つのコマンドを書いてください」としか
+# 伝えていなかった。しかし検証コマンドを実際に実行するのは`run_command`
+# ツール(`tools.py`の`_validate_run_command`)であり、安全対策として
+# シェル制御文字(; | & ` < > や改行、$())を含むコマンドや、`python3 -c`の
+# ようなインラインコード直接実行を一律拒否する。この制約を伝えていなかった
+# ため、仕様が細かい依頼で検証ロジックを1行にまとめようとした設計担当が
+# `python3 -c '...(セミコロン区切りの長いコード)...'`のような実行不可能な
+# 形式を選んでしまい、統合検証が実際には一度も実行されないまま
+# (「シェルの制御文字を含むコマンドは実行できません」という`run_command`の
+# エラーだけを見て)3回とも失敗する不具合が実機で確認された。そこで
+# `run_command`が実際に許可する形式を具体的に明記し、複雑な検証ロジックが
+# 必要な場合はテスト用ファイルとして計画に含めるよう誘導する文言を、
+# 検証コマンドを指示する4箇所(`_MODULE_BREAKDOWN_PROMPT_TEMPLATE`・
+# `_CONTENT_BREAKDOWN_PROMPT_TEMPLATE`・`_build_design_dialogue_output_
+# instruction`のソフトウェア/コンテンツ両分岐)すべてに共通で埋め込む。
+_VERIFY_COMMAND_FORMAT_NOTE = (
+    "検証コマンドは、実行ファイルと引数だけをスペース区切りで並べた単純な1コマンドにしてください。"
+    "セミコロン(;)・パイプ(|)・&・バッククォート・<・>・改行・$()で複数の処理をつなげることはできません。"
+    "`python3 -c '...'`のような、インタプリタにコードを直接文字列で渡す実行方法も使えません。"
+    "複雑な検証ロジックが必要な場合は、そのロジックをテスト用のファイル(例: test_verify.py)として"
+    "上記の計画にファイルの1つとして追加し、検証コマンドはそのファイルを実行するだけの形"
+    "(例: python3 test_verify.py)にしてください。"
+)
+
 # 仮の判断: 設計担当への指示は、出力形式をできるだけ単純な1行1ファイル形式に
 # 寄せるために日本語のプロンプトテンプレートとして持つ。ただし実際には
 # モデルがこの形式を厳密に守るとは限らず、ファイル名を見出しとして詳細を
@@ -2606,7 +2633,7 @@ _MODULE_BREAKDOWN_PROMPT_TEMPLATE = """あなたはソフトウェア設計を�
 <ファイル名1>: <実装すべき内容をここに>
 <ファイル名2>: <実装すべき内容をここに(<ファイル名1>の行と完全に同じ関数名を使うこと)>
 
-最後にもう1行、「検証コマンド: <コマンド>」という形式で、このプロジェクトが正しく動くことを確認できる、1つのコマンドを書いてください(例: 検証コマンド: python3 main.py)。実行に人間の入力(標準入力)が必要な対話型ツールの場合や、適切なコマンドが無い場合は「検証コマンド: なし」と書いてください。
+最後にもう1行、「検証コマンド: <コマンド>」という形式で、このプロジェクトが正しく動くことを確認できる、1つのコマンドを書いてください(例: 検証コマンド: python3 main.py)。実行に人間の入力(標準入力)が必要な対話型ツールの場合や、適切なコマンドが無い場合は「検証コマンド: なし」と書いてください。{verify_command_format_note}
 
 依頼内容: {request}
 """
@@ -2636,7 +2663,7 @@ _CONTENT_BREAKDOWN_PROMPT_TEMPLATE = """あなたはコンテンツ制作の構�
 <ファイル名1>: <作成すべき内容をここに>
 <ファイル名2>: <作成すべき内容をここに(<ファイル名1>の行と同じ用語・見出しレベルを使うこと)>
 
-最後にもう1行、「検証コマンド: <コマンド>」という形式で書いてください。コンテンツ制作では動作確認用のコマンドが無いことが多いため、適切なコマンドが無い場合は「検証コマンド: なし」と書いてください。
+最後にもう1行、「検証コマンド: <コマンド>」という形式で書いてください。コンテンツ制作では動作確認用のコマンドが無いことが多いため、適切なコマンドが無い場合は「検証コマンド: なし」と書いてください。{verify_command_format_note}
 
 依頼内容: {request}
 """
@@ -2695,6 +2722,7 @@ def _build_module_breakdown_prompt(request: str, request_type: str, research_not
     if request_type == AGREE_REQUEST_TYPE_CONTENT:
         return _CONTENT_BREAKDOWN_PROMPT_TEMPLATE.format(
             request=request, research_notes=research_notes or _RESEARCH_NO_RESULTS_MESSAGE,
+            verify_command_format_note=_VERIFY_COMMAND_FORMAT_NOTE,
         )
     requested_language = _detect_requested_language(request)
     if requested_language:
@@ -2707,7 +2735,10 @@ def _build_module_breakdown_prompt(request: str, request_type: str, research_not
             "(Pythonとは限りません。HTML/CSS/JavaScript・C言語等、依頼の内容に応じて適切なものを選んでください)。"
             "ファイルの拡張子もその言語に合わせてください。"
         )
-    return _MODULE_BREAKDOWN_PROMPT_TEMPLATE.format(request=request, language_instruction=language_instruction)
+    return _MODULE_BREAKDOWN_PROMPT_TEMPLATE.format(
+        request=request, language_instruction=language_instruction,
+        verify_command_format_note=_VERIFY_COMMAND_FORMAT_NOTE,
+    )
 
 
 def _build_design_dialogue_background(request: str) -> str:
@@ -2745,7 +2776,7 @@ def _build_design_dialogue_output_instruction(
             "<ファイル名1>: <作成すべき内容をここに>\n"
             "<ファイル名2>: <作成すべき内容をここに(<ファイル名1>の行と同じ用語・見出しレベルを使うこと)>\n\n"
             "最後にもう1行、「検証コマンド: <コマンド>」という形式で書いてください。適切なコマンドが無い場合は"
-            "「検証コマンド: なし」と書いてください。"
+            "「検証コマンド: なし」と書いてください。" + _VERIFY_COMMAND_FORMAT_NOTE
         )
     requested_language = _detect_requested_language(request)
     if requested_language:
@@ -2769,7 +2800,7 @@ def _build_design_dialogue_output_instruction(
         "最後にもう1行、「検証コマンド: <コマンド>」という形式で、このプロジェクトが正しく動くことを"
         "確認できる、1つのコマンドを書いてください(例: 検証コマンド: python3 main.py)。実行に人間の"
         "入力(標準入力)が必要な対話型ツールの場合や、適切なコマンドが無い場合は"
-        "「検証コマンド: なし」と書いてください。"
+        "「検証コマンド: なし」と書いてください。" + _VERIFY_COMMAND_FORMAT_NOTE
     )
 
 
@@ -4275,11 +4306,31 @@ def _run_collaborative_project(
     # 無駄な問い合わせと誤解を招く報告になるため)。検証コマンドが
     # 「なし」または未設定の場合もスキップする。どちらもスキップした旨を
     # 表示するにとどめ、エラーやタスクの未完了扱いにはしない。
+    #
+    # 仮の判断(実機バグ報告への対応): 設計担当への指示(`_VERIFY_COMMAND_
+    # FORMAT_NOTE`)で誘導していても、検証コマンドが`run_command`ツール
+    # (`_validate_run_command`)の安全制約(シェル制御文字・`python3 -c`等の
+    # インラインコード実行の禁止)に反する形式で出力される可能性は残る。
+    # その場合、実装自体は正しくても検証コマンドが実行される前に毎回
+    # 弾かれ、最大試行回数まで無意味な失敗を繰り返した末に「統合検証に
+    # 失敗しました」という、実装の不備であるかのような誤解を招く報告に
+    # なってしまう。そこで`_run_integration_verification`を呼ぶ前に
+    # `_validate_run_command`で実行可能な形式かを検査し、そうでなければ
+    # 検証コマンド無しの場合と同様にスキップした上で、原因(コマンドの
+    # どの部分が使えないか)を明示する。
     incomplete_labels = _incomplete_task_labels(checklist)
+    _, verify_command_error = (
+        _validate_run_command(verify_command) if _has_verify_command(verify_command) else (None, None)
+    )
     if incomplete_labels:
         print(f"[⏭️ 統合検証: 未完了のタスクが残っているためスキップします]")
     elif not _has_verify_command(verify_command):
         print("[⏭️ 統合検証: 検証コマンドが指定されていないためスキップします]")
+    elif verify_command_error:
+        print(
+            f"[⏭️ 統合検証: 検証コマンド「{verify_command}」は実行できない形式のためスキップします"
+            f"({verify_command_error})]"
+        )
     else:
         print(f"[🔍 統合検証: {verify_command} を実行します]")
         success, last_output, attempts = _run_integration_verification(
