@@ -1,10 +1,22 @@
 #!/usr/bin/env python3
 """対話モード(`--chat`)のステータスパネル(参加デバイス全員の「今何を
-しているか」を、入力行の直上に常時表示する`bottom_toolbar`)を検証する。
+しているか」を、入力行の直上に常時表示するパネル)を検証する。
 
-対象は`_DeviceStatusBoard`(状態を保持するスレッドセーフな共有レジストリ)、
+対象は`_DeviceStatusBoard`(ジョブ参加状況を保持するスレッドセーフな共有
+レジストリ)、`_LiveOrgMembers`(定期ポーリングで把握した現在オンラインの
+組織メンバーを保持するスレッドセーフな共有レジストリ)、
 `_format_device_status_line`(1デバイス分の表示行の組み立て)、
-`_render_status_panel`(パネル全体のテキスト組み立て)の3つ。
+`_render_status_panel`(両者を突き合わせたパネル全体のテキスト組み立て)、
+`_fetch_known_member_labels`(組織スナップショットからラベル集合を作る)の
+5つ。
+
+仮の判断(実機バグ報告への対応): 当初`bottom_toolbar`を使っていたが、
+`patch_stdout()`が高頻度に`print()`する状況(協業モードの思考過程表示等)
+では`prompt_toolkit`自体のCPR(カーソル位置問い合わせ)依存の挙動により
+パネルが二度と表示されなくなる不具合を実機・疑似端末の両方で確認した。
+現在は`_attach_status_panel`が、既存のレイアウト全体をCPRに依存しない
+自前の`Window`でラップする方式に変更している(詳細は`yoriai.py`の
+`_attach_status_panel`・ステータスパネルのセクション冒頭のコメントを参照)。
 
 - 参加デバイス数の増減に応じて行数が変わること
 - 状態種別(思考中🧠・実装中💻・待機中⏳)ごとにアイコン・文言が正しいこと
@@ -12,8 +24,12 @@
 - デバイスが離脱した場合(`remove`)、一覧から正しく消えること
 - 複数のバックグラウンドスレッドから同時に更新しても壊れないこと
   (スレッドセーフ性)
+- ジョブに参加していない(が組織には接続している)デバイスも、待機中の
+  1行としてパネルに表示され続けること(参加台数のリアルタイム増減対応)
 に加え、実際のタスクキュー方式(`_run_collaborative_task_queue`)を
-1台構成で走らせた後、ステータスパネルの一覧が空に戻ることも確認する。
+1台構成で走らせた後、ステータスパネルの一覧が空に戻ることと、
+`_create_repl_prompt_session`(本番のセッション構築処理そのもの)が
+レイアウトを組み替えた後も実際に入力を受け付けられることを確認する。
 
 使い方: python3 tests/test_status_panel.py
 """
@@ -27,6 +43,10 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import yoriai  # noqa: E402
+
+from prompt_toolkit.application import create_app_session  # noqa: E402
+from prompt_toolkit.input import create_pipe_input  # noqa: E402
+from prompt_toolkit.output import DummyOutput  # noqa: E402
 
 
 def test_panel_empty_when_no_devices():
@@ -304,6 +324,129 @@ def test_run_dialogue_clears_status_board_after_completion():
     assert yoriai._render_status_panel(yoriai._ACTIVE_STATUS_BOARD) == ""
 
 
+# ---------------------------------------------------------------------------
+# 参加台数のリアルタイム増減対応(_LiveOrgMembers・_fetch_known_member_labels・
+# _render_status_panelのknown_labels引数)
+# ---------------------------------------------------------------------------
+
+def test_live_org_members_update_and_snapshot():
+    members = yoriai._LiveOrgMembers()
+    assert members.snapshot() == set()
+    members.update({"MacStudio", "raspi4"})
+    assert members.snapshot() == {"MacStudio", "raspi4"}
+    members.update({"junnoMac-mini"})
+    assert members.snapshot() == {"junnoMac-mini"}, "updateのたびに集合全体が置き換わるはず"
+
+
+def test_fetch_known_member_labels_matches_build_chat_candidate_label_format():
+    """`_fetch_known_member_labels`が組み立てるラベルが、
+    `_build_chat_candidate`(`_ACTIVE_STATUS_BOARD`が実際に使うラベルの
+    出処)と完全に同じ形式(自分は"(自分)"付き、ピアはそのまま)である
+    ことを確認する。ここがずれると、同一デバイスが2行として重複表示
+    されてしまう。
+    """
+    original_snapshot = yoriai._fetch_org_snapshot
+    yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False, quiet=False: {
+        "self": {"device_name": "MacStudio"},
+        "peers": [
+            {"card": {"device_name": "junnoMac-mini"}},
+            {"card": {"device_name": "raspi4"}},
+        ],
+    }
+    try:
+        labels = yoriai._fetch_known_member_labels(47120, "fingerprint")
+    finally:
+        yoriai._fetch_org_snapshot = original_snapshot
+
+    assert labels == {"MacStudio(自分)", "junnoMac-mini", "raspi4"}, labels
+
+
+def test_fetch_known_member_labels_returns_empty_set_when_snapshot_unavailable():
+    original_snapshot = yoriai._fetch_org_snapshot
+    yoriai._fetch_org_snapshot = lambda port, fp, fail_fast=False, quiet=False: None
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            labels = yoriai._fetch_known_member_labels(47120, "fingerprint")
+    finally:
+        yoriai._fetch_org_snapshot = original_snapshot
+    assert labels == set()
+
+
+def test_fetch_org_snapshot_quiet_mode_prints_nothing_on_connection_failure():
+    """`_poll_org_members_forever`のような数秒おきの繰り返し呼び出しで
+    キッチンに接続できない場合でも、`quiet=True`なら失敗の案内文を
+    一切出力しないことを確認する(実際の`requests.get`を、到達不能な
+    ポートに対して本物のまま実行する。詳細は`_fetch_org_snapshot`の
+    `quiet`引数のコメントを参照: これが無いと、対話モードの画面が
+    キッチン一時停止のたびに延々とエラー表示で埋め尽くされてしまう)。
+    """
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        result = yoriai._fetch_org_snapshot(47120, "fingerprint", quiet=True)
+    assert result is None
+    assert buf.getvalue() == "", repr(buf.getvalue())
+
+
+def test_panel_shows_idle_known_members_alongside_active_job_participants():
+    """ジョブに参加していない(が組織には接続している)デバイスも、
+    待機中の1行としてパネルに表示され続けることを確認する(依頼の
+    「参加台数の行数をちゃんと確保してほしい」への対応の中核)。
+    """
+    board = yoriai._DeviceStatusBoard()
+    board.set("MacStudio", yoriai._DEVICE_STATUS_WORKING, "storage.py を実装中")
+    # raspi4はジョブには参加していないが、組織には接続中(known_labelsのみに存在)。
+    known_labels = {"MacStudio", "raspi4"}
+
+    panel = yoriai._render_status_panel(board, known_labels)
+    lines = panel.split("\n")
+    assert len(lines) == 2, panel
+    assert any("MacStudio" in line and "実装中" in line for line in lines), panel
+    assert any(line == "⏳ raspi4 待機" for line in lines), panel
+
+
+def test_panel_known_labels_defaults_to_board_only_for_backward_compatibility():
+    """`known_labels`を渡さない既存の呼び出し(`test_task_queue_clears_
+    status_board_after_completion`等)が、これまで通り`board`の内容
+    だけで完結することを確認する(後方互換性の回帰検知)。
+    """
+    board = yoriai._DeviceStatusBoard()
+    board.set("MacStudio", yoriai._DEVICE_STATUS_WAITING)
+    assert yoriai._render_status_panel(board) == "⏳ MacStudio 待機"
+
+
+def test_panel_union_shows_board_only_labels_even_if_poll_has_not_caught_up():
+    """`known_labels`にまだ反映されていない(ポーリングが追いついて
+    いない)デバイスでも、`board`に載っていれば表示から漏れないことを
+    確認する(和集合を取っていることの検証)。
+    """
+    board = yoriai._DeviceStatusBoard()
+    board.set("new-device", yoriai._DEVICE_STATUS_THINKING, "")
+    panel = yoriai._render_status_panel(board, known_labels=set())
+    assert "new-device" in panel, panel
+
+
+# ---------------------------------------------------------------------------
+# _create_repl_prompt_session本番のセッション構築処理そのものが、レイアウトを
+# 組み替えた後も実際に入力を受け付けられることの回帰検知
+# ---------------------------------------------------------------------------
+
+def test_create_repl_prompt_session_still_accepts_input_after_layout_wrap():
+    """`_attach_status_panel`が`session.app.layout`を組み替えた後も、
+    デフォルトバッファ(入力欄)へのフォーカスが正しく保たれ、実際に
+    メッセージを送信できることを確認する(bottom_toolbarをやめて自前の
+    Windowでラップする方式に変更したことによる、既存の入力機能への
+    回帰が無いことの検証)。
+    """
+    yoriai._ACTIVE_ORG_MEMBERS.update(set())
+    with create_pipe_input() as pipe_input, create_app_session(input=pipe_input, output=DummyOutput()):
+        session = yoriai._create_repl_prompt_session()
+        pipe_input.send_text("こんにちは\r")
+        text, terminate = yoriai._read_multiline_input(session, yoriai._DoubleInterruptGuard())
+    assert terminate is False
+    assert text == "こんにちは", repr(text)
+
+
 def main():
     tests = [
         test_panel_empty_when_no_devices,
@@ -318,6 +461,14 @@ def main():
         test_task_queue_clears_status_board_after_completion,
         test_run_dialogue_shows_active_speaker_thinking_and_others_waiting,
         test_run_dialogue_clears_status_board_after_completion,
+        test_live_org_members_update_and_snapshot,
+        test_fetch_known_member_labels_matches_build_chat_candidate_label_format,
+        test_fetch_known_member_labels_returns_empty_set_when_snapshot_unavailable,
+        test_fetch_org_snapshot_quiet_mode_prints_nothing_on_connection_failure,
+        test_panel_shows_idle_known_members_alongside_active_job_participants,
+        test_panel_known_labels_defaults_to_board_only_for_backward_compatibility,
+        test_panel_union_shows_board_only_labels_even_if_poll_has_not_caught_up,
+        test_create_repl_prompt_session_still_accepts_input_after_layout_wrap,
     ]
     failures = 0
     for test in tests:

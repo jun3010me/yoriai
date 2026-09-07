@@ -58,6 +58,9 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.application import create_app_session
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.patch_stdout import patch_stdout
 from zeroconf import ServiceBrowser, ServiceInfo, Zeroconf, IPVersion, InterfaceChoice
 
@@ -691,10 +694,19 @@ MAX_READ_FILE_CALLS_PER_REVIEW = 6
 # 常駐サービスを止めずに何度でも起動でき、複数の対話モードを同時に開くことすらできる。
 # ---------------------------------------------------------------------------
 
-def _fetch_org_snapshot(port: int, org_fingerprint: str, fail_fast: bool = False):
+def _fetch_org_snapshot(port: int, org_fingerprint: str, fail_fast: bool = False, quiet: bool = False):
     """キッチン(常駐エージェント)の`/status`に問い合わせ、自分自身のカードと
     ピア一覧を取得する。接続できない場合はNoneを返す
     (fail_fast=Trueの場合は案内を表示してプロセスごと終了する)。
+
+    仮の判断: `quiet=True`の場合、失敗時の案内文を一切出力しない。
+    ステータスパネルの参加台数ポーリング(`_poll_org_members_forever`)の
+    ように数秒おきに繰り返し呼ばれる用途では、キッチンが一時的に
+    落ちているだけでも「実行中のYoriaiエージェントに接続できませんでした」
+    という案内が延々と流れ続けてしまい、対話モードの画面が実害の無い
+    エラーメッセージで埋め尽くされる(本来ユーザーに見せたいのは協業
+    モード等の実際のログ)。1回きりの疎通確認(起動時・`_count_org_members`
+    等)ではこれまで通り案内を出す。
     """
     try:
         resp = requests.get(
@@ -705,10 +717,11 @@ def _fetch_org_snapshot(port: int, org_fingerprint: str, fail_fast: bool = False
         resp.raise_for_status()
         return resp.json()
     except Exception as exc:
-        print("実行中のYoriaiエージェントに接続できませんでした。")
-        print(f"詳細: {exc}")
-        print("先に python3 yoriai.py でエージェント(常駐プロセス)を起動してください")
-        print("(常駐化している場合は、想定しているポートで動作しているか確認してください)。")
+        if not quiet:
+            print("実行中のYoriaiエージェントに接続できませんでした。")
+            print(f"詳細: {exc}")
+            print("先に python3 yoriai.py でエージェント(常駐プロセス)を起動してください")
+            print("(常駐化している場合は、想定しているポートで動作しているか確認してください)。")
         if fail_fast:
             sys.exit(1)
         return None
@@ -5025,15 +5038,39 @@ def _review_and_fix_one_file(
 # 依頼: 対話モード(`--chat`)の画面に、協業モード等のバックグラウンド
 # ジョブに参加しているデバイス全員の「今何をしているか」を常時表示したい。
 #
-# 仮の判断: `prompt_toolkit`の`PromptSession`が標準で持つ`bottom_toolbar`
-# (callableを渡せる、入力行の直上に常時固定表示される機能)を使う。独自の
-# フルスクリーン`Application`を組む必要は無いと判断した根拠は次の2点。
-# (1) `bottom_toolbar`はcallableを渡せるため、下記`_DeviceStatusBoard`の
-# 中身を毎回組み立て直して返せば、再描画のたびに最新の状態を表示できる。
-# (2) `bottom_toolbar`の実描画は`Window(height=Dimension(min=1),
-# dont_extend_height=True)`という、高さの上限を固定しない実装になっている
-# (`prompt_toolkit.shortcuts.prompt`のソースで確認済み)。返すテキストに
-# `\n`で複数行を含めれば、行数は参加デバイス数に応じて自然に伸縮する。
+# 仮の判断(実機バグ報告への対応・重要): 当初`prompt_toolkit`の
+# `PromptSession`が標準で持つ`bottom_toolbar`(callableを渡せる、入力行の
+# 直上に表示される機能)を使っていたが、実機で「起動直後は一瞬映るが、
+# 協業モードのログが流れ始めると二度と表示されなくなる」という報告を
+# 受けた。疑似端末(pty)を使って実際に再現・調査したところ、原因は
+# `prompt_toolkit`3.0.53自体の以下の挙動の組み合わせだと判明した。
+# `bottom_toolbar`の表示は`renderer_height_is_known`という、端末への
+# カーソル位置問い合わせ(CPR: Cursor Position Report、応答は非同期)が
+# 一度でも成功して初めて`True`になる条件でガードされている
+# (`prompt_toolkit.shortcuts.prompt`のソース参照)。一方`patch_stdout()`は
+# `print()`を処理するたびに`Renderer.reset()`を呼び、これが
+# `_min_available_height`(=CPRで分かった「使える行数」)を0に戻した
+# うえで新しいCPR問い合わせを送り直す仕組みになっている
+# (`prompt_toolkit.application.run_in_terminal.in_terminal`参照)。協業
+# モードの思考過程ストリーミング表示のように`print()`が高頻度に続く
+# 状況では、この問い合わせが(何らかの理由で)再送されなくなり、
+# `_min_available_height`が0のまま固定されてしまうことを確認した
+# (再現スクリプトで実際に「最初の1回だけCPR応答が処理され、以降は
+# 二度と問い合わせが送られない」ことを確認済み)。つまり`bottom_toolbar`
+# はこの用途(高頻度な`print()`と共存する常時表示パネル)には耐えられ
+# ないという、独自コードの不具合ではなく`prompt_toolkit`自体の制約。
+#
+# 仮の判断(対策): `bottom_toolbar`は使わず、`PromptSession`が組み立てる
+# 既存のレイアウト全体を、自前の(何のConditionも付けない、常時表示の)
+# `Window`で上からラップする方式にした(`_attach_status_panel`)。この
+# 自前のWindowは`renderer_height_is_known`のようなCPR依存のガードを
+# 一切持たないため、`patch_stdout()`がどれだけ高頻度に`print()`を処理
+# しても表示され続ける。実際に疑似端末で「協業モードの思考過程表示を
+# 400行連続で流し込む」状況を再現し、この方式なら最後までパネルが
+# 表示され続けることを確認済み(旧`bottom_toolbar`方式では最初の1回を
+# 最後に二度と表示されなかった)。既存のレイアウト(フレーム・検索
+# ツールバー等を含む)はラップして下に配置し直すだけなので、キー割り
+# 当て・履歴・複数行編集などの既存の挙動には一切影響しない。
 #
 # 状態は`_DeviceStatusBoard`という、ラベル(デバイス名)ごとに1件の
 # (状態種別, 詳細テキスト, 開始時刻)を保持するスレッドセーフな辞書で
@@ -5088,10 +5125,118 @@ _DEVICE_STATUS_SHOWS_ELAPSED = {
     _DEVICE_STATUS_WAITING: False,
 }
 
-# 対話モードのbottom_toolbarを、体感できるレベルで(=経過秒表示が
-# 実際に増えていくのが見える程度に)定期的に再描画させるための間隔。
+# ステータスパネルを、体感できるレベルで(=経過秒表示が実際に増えて
+# いくのが見える程度に)定期的に再描画させるための間隔。
 # `PromptSession(refresh_interval=...)`にそのまま渡す。
 _STATUS_PANEL_REFRESH_INTERVAL_SECONDS = 1.0
+
+
+# 仮の判断(依頼: 参加台数のリアルタイム増減にも対応してほしい):
+# yoriaiはmDNSでのデバイスの発見・消失を常時バックグラウンドで検知して
+# おり(`network.PeerRegistry`)、組織の参加台数はチャット起動時点の値に
+# 固定されるものではない。ただし`--chat`(対話モードのプロセス)と、
+# 実際にmDNSで発見し続けている「キッチン」(常駐エージェント)は別
+# プロセスであり、`--chat`側は`/status`にHTTPで問い合わせて初めてその
+# 時点の組織構成を知れる。そのため、ステータスパネルの行数を実際の
+# 参加台数に追従させるには、`--chat`プロセス内で定期的に`/status`へ
+# 問い合わせ続ける必要がある。ローカルホストへの軽量なHTTP GETであり、
+# mDNSの再スキャン(`TAILSCALE_RESCAN_INTERVAL_SEC`=30秒、ネットワーク
+# 全体の再走査で相応に重い)とは性質が異なるコストの低い操作のため、
+# それより短い間隔で継続的にポーリングしてよいと判断した。
+_STATUS_PANEL_MEMBER_POLL_INTERVAL_SECONDS = 3.0
+
+
+class _LiveOrgMembers:
+    """定期ポーリングで取得した「現在オンラインの組織メンバー」のラベル
+    集合を保持する、スレッドセーフな共有レジストリ。
+
+    仮の判断: ステータスパネルの行数を「今バックグラウンドジョブに
+    参加しているデバイス」(`_DeviceStatusBoard`)だけでなく「今実際に
+    組織に接続しているデバイス全員」に一致させるために使う。ジョブに
+    参加していないデバイスも、待機中の1行としてパネルに表示され続ける
+    ようにする(依頼の「yoriaiに参加している台数の行数をちゃんと
+    確保してほしい」への対応)。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._labels = set()
+
+    def update(self, labels) -> None:
+        with self._lock:
+            self._labels = set(labels)
+
+    def snapshot(self) -> set:
+        with self._lock:
+            return set(self._labels)
+
+
+# 仮の判断: `_ACTIVE_STATUS_BOARD`と同じ理由(モジュール単一の理由の
+# コメント参照)でモジュールレベルの単一インスタンスとして持つ。
+_ACTIVE_ORG_MEMBERS = _LiveOrgMembers()
+
+
+def _fetch_known_member_labels(port: int, org_fingerprint: str) -> set:
+    """ステータスパネル用に、現在オンラインの組織メンバーのラベル集合
+    (`_ACTIVE_STATUS_BOARD`が使うラベルと完全に同じ形式)を取得する。
+
+    仮の判断(重要): `_build_chat_candidate`のラベル組み立てロジック
+    (自分自身は`device_name`に"(自分)"を付け、ピアはそのまま)と
+    完全に一致させる必要がある。一致しないと、同一デバイスが
+    「(自分)」付き・無しの2行として重複表示されてしまう
+    (`_ACTIVE_STATUS_BOARD`には`_build_chat_candidate`が作った
+    `candidate["label"]`がそのまま使われるため)。
+
+    仮の判断: `quiet=True`で問い合わせる。`_poll_org_members_forever`から
+    数秒おきに繰り返し呼ばれるため、失敗のたびに案内文を出すと画面が
+    埋め尽くされてしまう(詳細は`_fetch_org_snapshot`の`quiet`引数の
+    コメントを参照)。
+    """
+    data = _fetch_org_snapshot(port, org_fingerprint, quiet=True)
+    if data is None:
+        return set()
+    labels = set()
+    self_name = data.get("self", {}).get("device_name")
+    if self_name:
+        labels.add(f"{self_name}(自分)")
+    for peer in data.get("peers", []):
+        peer_name = peer.get("card", {}).get("device_name")
+        if peer_name:
+            labels.add(peer_name)
+    return labels
+
+
+def _poll_org_members_forever(port: int, org_fingerprint: str) -> None:
+    """`--chat`の起動中、`_ACTIVE_ORG_MEMBERS`を実際の組織メンバー構成に
+    追従させ続ける。`--chat`プロセスの生存期間中ずっと動き続ける前提の
+    無限ループで、`_start_org_member_poller`がデーモンスレッドとして
+    起動する(既存の`_BackgroundJobRunner`等と同様、プロセス終了時に
+    明示的な停止処理は行わない)。
+
+    仮の判断(`_BackgroundJobRunner._run`と同じ理由): 1回分の問い合わせで
+    何らかの例外が起きても、ループ自体は継続する(`logger.exception`で
+    記録するだけで、このスレッド自体は死なせない)。テストのように
+    同一プロセス内で`--chat`を何度も起動するケースでは、このスレッドは
+    プロセスの生存期間中ずっと動き続けるため、後から実行される別の
+    テストが`_fetch_org_snapshot`等を一時的に差し替えている最中に
+    このスレッドが問い合わせに行くことがありうる。その際に想定外の
+    シグネチャ不一致等で例外が起きても、この対話モードのセッション
+    自体やテストプロセス全体を巻き込んで壊さないようにする。
+    """
+    while True:
+        try:
+            _ACTIVE_ORG_MEMBERS.update(_fetch_known_member_labels(port, org_fingerprint))
+        except Exception:
+            logger.exception("組織メンバーのポーリング中にエラーが発生しました")
+        time.sleep(_STATUS_PANEL_MEMBER_POLL_INTERVAL_SECONDS)
+
+
+def _start_org_member_poller(port: int, org_fingerprint: str) -> threading.Thread:
+    thread = threading.Thread(
+        target=_poll_org_members_forever, args=(port, org_fingerprint), daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 class _DeviceStatusBoard:
@@ -5155,27 +5300,48 @@ def _format_device_status_line(label: str, status_kind: str, detail: str, elapse
     return f"{icon} {label} が {text}"
 
 
-def _render_status_panel(board: "_DeviceStatusBoard") -> str:
-    """`board`の現在の内容から、ステータスパネル全体のテキスト
-    (`bottom_toolbar`にそのまま渡せる、行数が可変の複数行テキスト)を
-    組み立てる。参加デバイスがいない場合は空文字列を返す(この場合でも
-    `bottom_toolbar`自体は`Window(height=Dimension(min=1))`のため1行分の
-    高さは残るが、依頼の「常時表示」は「callableを渡し続けること」で
-    満たしていると判断し、何も無い時に無理に案内文を出すことはしない)。
+def _render_status_panel(board: "_DeviceStatusBoard", known_labels: set = None) -> str:
+    """`board`(バックグラウンドジョブの参加状況)と`known_labels`
+    (`_ACTIVE_ORG_MEMBERS`が定期ポーリングで把握している、現在オンライン
+    の組織メンバー全員のラベル集合)を突き合わせ、ステータスパネル全体の
+    テキスト(自前のWindowにそのまま渡せる、行数が可変の複数行テキスト)を
+    組み立てる。
+
+    仮の判断: `known_labels`に含まれるが`board`に(ジョブ参加としての)
+    エントリが無いデバイスは「待機」として表示する。これにより、ジョブに
+    参加していないデバイスも含めて「今実際に接続している台数」ぶんの
+    行が常に確保される(依頼の「yoriaiに参加している台数の行数をちゃんと
+    確保してほしい」への対応)。`known_labels`を渡さない場合(既定は
+    `None`)は、従来通り`board`に載っているデバイスだけを表示する
+    (既存の呼び出し・テストとの後方互換性のため)。`board`側にしか無い
+    ラベル(ポーリングがまだ追いついていないタイミング等)も表示から
+    漏らさないよう、両者の和集合を使う。
+
+    参加デバイスが1台も無い場合は空文字列を返す(自前のWindowは
+    `dont_extend_height=True`のみで高さの下限を強制しないため、この
+    場合は1行分の高さも使わない)。
 
     仮の判断: 行の並び順はラベルの辞書順に固定する。ワーカースレッドの
-    完了順(=`_DeviceStatusBoard`への書き込み順)に依存すると、同じ
-    参加メンバー構成でも実行のたびに行の並びが変わってしまい、画面が
-    ちらついて見えるため。
+    完了順(=`_DeviceStatusBoard`への書き込み順)やポーリングの取得順に
+    依存すると、同じ参加メンバー構成でも実行のたびに行の並びが変わって
+    しまい、画面がちらついて見えるため。
     """
-    entries = board.snapshot()
-    if not entries:
+    board_entries = {
+        label: (status_kind, detail, started_at)
+        for label, status_kind, detail, started_at in board.snapshot()
+    }
+    all_labels = set(board_entries) | (known_labels or set())
+    if not all_labels:
         return ""
     now = time.monotonic()
-    lines = [
-        _format_device_status_line(label, status_kind, detail, int(now - started_at))
-        for label, status_kind, detail, started_at in sorted(entries, key=lambda entry: entry[0])
-    ]
+    lines = []
+    for label in sorted(all_labels):
+        if label in board_entries:
+            status_kind, detail, started_at = board_entries[label]
+            elapsed_seconds = int(now - started_at)
+        else:
+            status_kind, detail, elapsed_seconds = _DEVICE_STATUS_WAITING, "", 0
+        lines.append(_format_device_status_line(label, status_kind, detail, elapsed_seconds))
     return "\n".join(lines)
 
 
@@ -7289,6 +7455,41 @@ def _make_repl_key_bindings() -> KeyBindings:
     return bindings
 
 
+def _attach_status_panel(session: PromptSession) -> None:
+    """`session`の画面を「ステータス一覧(常時表示)」+「既存のレイアウト
+    (入力行・作業ログはpatch_stdout経由で別途流れる)」の2段構成に組み
+    替える。
+
+    仮の判断(実機バグ報告への対応・重要、詳細はこのセクション冒頭の
+    コメント参照): `bottom_toolbar`は使わない。`renderer_height_is_known`
+    という、端末へのカーソル位置問い合わせ(CPR)が成功して初めて`True`に
+    なる条件でガードされており、`patch_stdout()`が高頻度に`print()`を
+    処理する状況(協業モードの思考過程ストリーミング表示等)ではこの
+    問い合わせが再送されなくなり、パネルがセッション中ずっと非表示に
+    なる不具合を実機・疑似端末での再現の両方で確認した。
+
+    代わりに、`session`が組み立て済みの既存レイアウト全体
+    (`session.layout.container`。フレーム・検索ツールバー等を含む)を、
+    何のConditionも付けない自前の`Window`(常時表示、CPR非依存)で
+    上からラップする。既存レイアウトの中身には一切手を加えないため、
+    キー割り当て・履歴・複数行編集などの挙動には影響しない。ラップ後は
+    デフォルトバッファ(入力欄)へ明示的にフォーカスを戻す必要がある
+    (`Layout(container)`は素朴にはこの`container`内の最初のフォーカス
+    可能な要素にフォーカスするため、それが偶然にも入力欄と一致すると
+    保証できない)。
+    """
+    status_window = Window(
+        FormattedTextControl(
+            lambda: _render_status_panel(_ACTIVE_STATUS_BOARD, _ACTIVE_ORG_MEMBERS.snapshot())
+        ),
+        height=Dimension(min=0),
+        dont_extend_height=True,
+    )
+    wrapped_layout = Layout(HSplit([status_window, session.layout.container]))
+    wrapped_layout.focus(session.default_buffer)
+    session.app.layout = wrapped_layout
+
+
 def _create_repl_prompt_session() -> PromptSession:
     """対話モードのメッセージ入力用に、複数行編集対応のセッションを1つ
     作る。`_run_repl_client`が起動時に1回だけ作り、以後の全メッセージ
@@ -7301,20 +7502,18 @@ def _create_repl_prompt_session() -> PromptSession:
     前回の入力を引き継ぐ機能)は今回のスコープ外で、プロセス終了とともに
     履歴も破棄される。
     """
-    return PromptSession(
+    session = PromptSession(
         history=InMemoryHistory(),
         key_bindings=_make_repl_key_bindings(),
-        # 依頼: 画面を「作業ログ(patch_stdout経由で流れる)/ステータス
-        # 一覧(常時表示)/プロンプト入力行(常時表示)」の3層構成にしたい。
-        # `bottom_toolbar`はcallableを渡すと再描画のたびに呼び直される
-        # ため、`_ACTIVE_STATUS_BOARD`(協業モード等のワーカーループが
-        # 更新する、参加デバイスごとの状態を保持するモジュール単一の
-        # レジストリ)の現在の内容を毎回組み立て直して返す。
-        bottom_toolbar=lambda: _render_status_panel(_ACTIVE_STATUS_BOARD),
         # 経過時間(例: 思考中の"(42s)")表示が実際に増えていくのが見える
-        # よう、入力が無くても定期的に再描画させる。
+        # よう、入力が無くても定期的に再描画させる(`bottom_toolbar`は
+        # 使わないが、`refresh_interval`自体は`Application`全体の設定
+        # であり、`_attach_status_panel`が組み替えた後のレイアウトにも
+        # そのまま効く)。
         refresh_interval=_STATUS_PANEL_REFRESH_INTERVAL_SECONDS,
     )
+    _attach_status_panel(session)
+    return session
 
 
 def _read_multiline_input(session: PromptSession, interrupt_guard: "_DoubleInterruptGuard") -> tuple:
@@ -7831,9 +8030,14 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
 
     # 仮の判断: テストのように同一プロセス内で`_run_repl_client`を複数回
     # 呼び出すケースに備え、起動のたびにステータスパネルの状態を空に
-    # しておく(前回起動時の残骸が新しいセッションのbottom_toolbarに
-    # 表示されてしまうことを防ぐ)。
+    # しておく(前回起動時の残骸が新しいセッションのレイアウトに表示
+    # されてしまうことを防ぐ)。
     _ACTIVE_STATUS_BOARD.clear()
+    _ACTIVE_ORG_MEMBERS.update(set())
+    # 仮の判断: ステータスパネルの行数を実際の参加台数に追従させるため、
+    # `--chat`の起動中ずっと定期的に`/status`へ問い合わせ続けるスレッドを
+    # ここで開始する(詳細は`_poll_org_members_forever`のコメント参照)。
+    _start_org_member_poller(port, org_fingerprint)
 
     # 仮の判断: 対話モードのセッション本体を`patch_stdout()`で包む。
     # バックグラウンドジョブ(協業モード等)がメインスレッドの入力待ち中に
