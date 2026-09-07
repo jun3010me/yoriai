@@ -204,6 +204,106 @@ def test_task_queue_clears_status_board_after_completion():
     assert yoriai._render_status_panel(yoriai._ACTIVE_STATUS_BOARD) == ""
 
 
+# ---------------------------------------------------------------------------
+# 対話プロトコル(_run_dialogue、合意フェーズ・修正フェーズ・レビューフェーズ・
+# 計画のみモードすべてで共通利用される中核関数)へのステータスパネル連携
+# ---------------------------------------------------------------------------
+
+_PROPOSER_MARKER = "「提案役」として参加しています"
+_CRITIC_MARKER = "「反論役」として参加しています"
+_INTEGRATOR_MARKER = "「統合役」として参加しています"
+
+
+def test_run_dialogue_shows_active_speaker_thinking_and_others_waiting():
+    """対話プロトコルは提案役→反論役→統合役の順で1人ずつ直列に発言する
+    (各役割が前の役割の発言を踏まえてプロンプトを組むため並列化できない)。
+    ステータスパネルは、今喋っている役割の担当デバイスだけが「思考中」に
+    なり、それ以外の参加デバイスは「待機」のままであることを反映する
+    べきで、それを確認する。
+    """
+    candidates = [_candidate("MacStudio", "m1"), _candidate("junnoMac-mini", "m2"), _candidate("raspi4", "m3")]
+    observed = {}
+
+    def fake_collect(candidate, org_fingerprint, messages, **_kwargs):
+        text = messages[0]["content"]
+        snapshot = {
+            label: status_kind for label, status_kind, _detail, _started in yoriai._ACTIVE_STATUS_BOARD.snapshot()
+        }
+        observed.setdefault(candidate["label"], []).append(snapshot)
+        if _PROPOSER_MARKER in text:
+            return "提案内容", None, False
+        if _CRITIC_MARKER in text:
+            return "特に問題なし\n評価: 合意", None, False
+        if _INTEGRATOR_MARKER in text:
+            return "判定: 合意\n\n最終合意内容:\n提案内容", None, False
+        raise AssertionError(f"想定外の問い合わせです: {text[:80]}")
+
+    original_collect = yoriai._collect_answer_from_candidate
+    yoriai._collect_answer_from_candidate = fake_collect
+    yoriai._ACTIVE_STATUS_BOARD.clear()
+    try:
+        result = yoriai._run_dialogue(
+            org_fingerprint="fp", topic="議題", background="背景", candidates=candidates,
+            output_instruction="形式",
+        )
+    finally:
+        yoriai._collect_answer_from_candidate = original_collect
+
+    assert result["status"] == yoriai.DIALOGUE_STATUS_CONSENSUS, result
+
+    # ラウンド1の提案役(MacStudio)呼び出し時点: 自分は思考中、他は待機。
+    macstudio_snapshot = observed["MacStudio"][0]
+    assert macstudio_snapshot["MacStudio"] == yoriai._DEVICE_STATUS_THINKING, macstudio_snapshot
+    assert macstudio_snapshot["junnoMac-mini"] == yoriai._DEVICE_STATUS_WAITING, macstudio_snapshot
+    assert macstudio_snapshot["raspi4"] == yoriai._DEVICE_STATUS_WAITING, macstudio_snapshot
+
+    # ラウンド1の反論役(junnoMac-mini)呼び出し時点: 提案役は待機へ戻り、
+    # 反論役だけが思考中になる。
+    junno_snapshot = observed["junnoMac-mini"][0]
+    assert junno_snapshot["MacStudio"] == yoriai._DEVICE_STATUS_WAITING, junno_snapshot
+    assert junno_snapshot["junnoMac-mini"] == yoriai._DEVICE_STATUS_THINKING, junno_snapshot
+    assert junno_snapshot["raspi4"] == yoriai._DEVICE_STATUS_WAITING, junno_snapshot
+
+    # ラウンド1の統合役(raspi4)呼び出し時点: 提案役・反論役は待機へ戻る。
+    raspi4_snapshot = observed["raspi4"][0]
+    assert raspi4_snapshot["MacStudio"] == yoriai._DEVICE_STATUS_WAITING, raspi4_snapshot
+    assert raspi4_snapshot["junnoMac-mini"] == yoriai._DEVICE_STATUS_WAITING, raspi4_snapshot
+    assert raspi4_snapshot["raspi4"] == yoriai._DEVICE_STATUS_THINKING, raspi4_snapshot
+
+
+def test_run_dialogue_clears_status_board_after_completion():
+    """`_run_dialogue`の終了経路(このテストでは早期の人間確認への
+    エスカレーション)を通ったあと、参加デバイス全員がステータスパネルの
+    一覧から消えることを確認する(`_finish_dialogue`に集約した後始末の
+    検証)。
+    """
+    candidates = [_candidate("MacStudio", "m1"), _candidate("junnoMac-mini", "m2")]
+
+    def fake_collect(candidate, org_fingerprint, messages, **_kwargs):
+        text = messages[0]["content"]
+        if _PROPOSER_MARKER in text:
+            return "とりあえずの案", None, False
+        if _CRITIC_MARKER in text:
+            return "議論を重ねてもアイデアが出ません。\n評価: 情報不足", None, False
+        if _INTEGRATOR_MARKER in text:
+            return "判定: 人間に確認\n\n人間への確認事項:\nどの方向性で進めるべきか助言をください。", None, False
+        raise AssertionError(f"想定外の問い合わせです: {text[:80]}")
+
+    original_collect = yoriai._collect_answer_from_candidate
+    yoriai._collect_answer_from_candidate = fake_collect
+    yoriai._ACTIVE_STATUS_BOARD.clear()
+    try:
+        result = yoriai._run_dialogue(
+            org_fingerprint="fp", topic="議題", background="背景", candidates=candidates,
+            output_instruction="形式",
+        )
+    finally:
+        yoriai._collect_answer_from_candidate = original_collect
+
+    assert result["status"] == yoriai.DIALOGUE_STATUS_NEEDS_HUMAN, result
+    assert yoriai._render_status_panel(yoriai._ACTIVE_STATUS_BOARD) == ""
+
+
 def main():
     tests = [
         test_panel_empty_when_no_devices,
@@ -216,6 +316,8 @@ def main():
         test_clear_removes_all_devices,
         test_concurrent_updates_from_many_threads_do_not_corrupt_state,
         test_task_queue_clears_status_board_after_completion,
+        test_run_dialogue_shows_active_speaker_thinking_and_others_waiting,
+        test_run_dialogue_clears_status_board_after_completion,
     ]
     failures = 0
     for test in tests:
