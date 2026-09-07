@@ -6063,3 +6063,114 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   フレーキーな(実ネットワークへの接続を試みるバックグラウンドスレッドが
   テスト間で残ってしまう)テストであると判断した。今回のPRのスコープ外
   のため、そのまま残している。
+
+### ステータスパネルの土台を`bottom_toolbar`から自前のWindowへ全面変更(実機バグ修正)+参加台数のリアルタイム反映
+
+- **背景**: 実機で協業モード(`//agree`)を試した利用者から、「一瞬パネルが
+  映ったかと思ったら、ログが流れ始めたら二度と表示されなくなった」という
+  報告を受けた。また「対話プロトコルは誰か1人が考えている間、他のメンバー
+  は暇しているのか」「yoriaiは参加台数のリアルタイム増減に対応している
+  のか」という質問もあった。
+- **調査(重要)**: 疑似端末(pty、`pyte`で仮想端末を描画)を使い、
+  `bottom_toolbar`+`patch_stdout()`+高頻度`print()`の組み合わせを実際に
+  再現した。原因は`prompt_toolkit`(3.0.53)自体の以下の挙動の組み合わせ
+  だと判明した。`bottom_toolbar`は`renderer_height_is_known`という、
+  端末へのカーソル位置問い合わせ(CPR)が成功して初めて`True`になる
+  Conditionでガードされている。一方`patch_stdout()`は`print()`を処理
+  するたびに`Renderer.reset()`を呼び、これが`_min_available_height`
+  (CPRで分かった「使える行数」)を0に戻したうえで新しいCPR問い合わせを
+  送り直す仕組みになっている(`prompt_toolkit.application.run_in_terminal.
+  in_terminal`)。協業モードの思考過程ストリーミング表示のように
+  `print()`が高頻度に続く状況では、この問い合わせが再送されなくなり、
+  `_min_available_height`が0のまま固定されることを、CPR応答を実際に
+  返す疑似端末を使った再現テストで確認した(「最初の1回だけCPR応答が
+  処理され、以降は二度と問い合わせが送られない」ことをログで確認)。
+  つまりこれは独自コードの不具合ではなく、この用途(高頻度な`print()`と
+  共存する常時表示パネル)には`bottom_toolbar`自体が耐えられないという
+  `prompt_toolkit`の制約だった。
+  合わせて、対話プロトコル(`_run_dialogue`)が本当に「提案役→反論役→
+  統合役」の順で1人ずつ直列に進む設計であることを実装から確認し、利用者
+  の「他のメンバーは暇している」という観察が正しい・意図した挙動である
+  ことを回答した。また、`--chat`(対話モードのプロセス)とmDNSで実際に
+  ピアを発見し続けている「キッチン」(常駐エージェント)は別プロセスで
+  あり、`--chat`は`/status`にHTTPで問い合わせない限り最新の組織構成を
+  知れないため、参加台数をリアルタイムに反映するには`--chat`プロセス内に
+  新たに定期ポーリングが必要であることも確認・回答した。
+- **実装**:
+  - `bottom_toolbar`をやめ、`_attach_status_panel`を新設した。
+    `PromptSession`が組み立てる既存のレイアウト全体
+    (`session.layout.container`、フレーム・検索ツールバー等を含む)を、
+    何のConditionも付けない自前の`Window`(CPR非依存、常時表示)で
+    `HSplit`で上からラップし直すだけの方式にした。`Layout(HSplit([...]))`
+    構築後に`layout.focus(session.default_buffer)`で入力欄へ明示的に
+    フォーカスを戻す必要がある(既存レイアウトの中身自体には一切手を
+    加えないため、キー割り当て・履歴・複数行編集などの挙動には影響
+    しない)。同じ疑似端末での再現テストで、この方式なら400行連続の
+    `print()`フラッドの後もパネルが表示され続けることを確認した。
+  - `_render_status_panel`に`known_labels`引数(省略可、既定`None`で
+    従来通りの後方互換動作)を追加し、「バックグラウンドジョブに参加中の
+    デバイス(`_DeviceStatusBoard`)」と「今実際にオンラインの組織メンバー
+    全員(`_LiveOrgMembers`)」の和集合でパネルの行を組み立てるように
+    変更した。ジョブに参加していない(が組織には接続中の)デバイスは
+    「⏳ 待機」として表示される。
+  - `_LiveOrgMembers`(定期ポーリング結果を保持するスレッドセーフな
+    集合)・`_fetch_known_member_labels`(`/status`のスナップショットから
+    ラベル集合を作る。`_build_chat_candidate`のラベル組み立て(自分自身は
+    `device_name`に"(自分)"を付ける)と完全に一致させないと同一デバイスが
+    2行として重複表示されてしまうため、そこを慎重に合わせた)・
+    `_poll_org_members_forever`(`--chat`の生存期間中、3秒おきに
+    `/status`へ問い合わせ続ける。ローカルホストへの軽量なGETのため、
+    mDNSの再スキャン(`TAILSCALE_RESCAN_INTERVAL_SEC`=30秒)より高頻度でも
+    実害は無いと判断)を新設し、`_run_repl_client`の起動時に
+    `_start_org_member_poller`でデーモンスレッドとして起動する。
+  - `_fetch_org_snapshot`に`quiet`引数を追加した。数秒おきに繰り返し
+    呼ばれるポーリング用途で、キッチンが一時的に落ちているだけでも
+    「実行中のYoriaiエージェントに接続できませんでした」が延々と
+    出力され続けると対話モードの画面が実害の無いエラーメッセージで
+    埋め尽くされてしまうため、`_fetch_known_member_labels`はこの引数を
+    `True`にして問い合わせる(起動時の1回きりの疎通確認である
+    `_count_org_members`等は従来通り`quiet`を渡さず案内文を出す)。
+  - `_poll_org_members_forever`は`_BackgroundJobRunner._run`と同じ
+    理由で、1回分の問い合わせで例外が起きてもループ自体は継続する
+    (`logger.exception`で記録するだけ)。テストのように同一プロセス内で
+    `--chat`を何度も起動するケースでは、このスレッドはプロセスの生存
+    期間中ずっと動き続ける(既存の`_BackgroundJobRunner`等と同様、
+    明示的な停止処理は行わない設計)ため、後から実行される別のテストが
+    `_fetch_org_snapshot`を一時的に差し替えている最中にこのスレッドが
+    問い合わせに行き、想定外の例外(シグネチャ不一致等)が起きることが
+    実際にあった(`pytest.PytestUnhandledThreadExceptionWarning`として
+    検出)。この防御が無いとテストプロセス全体に影響しかねないため、
+    必ず入れておく必要があると判断した。
+- **テスト**: `tests/test_status_panel.py`に、`_LiveOrgMembers`の
+  `update`/`snapshot`を確認する`test_live_org_members_update_and_
+  snapshot`、`_fetch_known_member_labels`が`_build_chat_candidate`と
+  完全に同じラベル形式(自分は"(自分)"付き)を組み立てることを確認する
+  `test_fetch_known_member_labels_matches_build_chat_candidate_label_
+  format`、スナップショット取得不可時に空集合を返すことを確認する
+  `test_fetch_known_member_labels_returns_empty_set_when_snapshot_
+  unavailable`、`quiet=True`では接続失敗時に一切出力しないことを実際の
+  `requests.get`で確認する`test_fetch_org_snapshot_quiet_mode_prints_
+  nothing_on_connection_failure`、ジョブに参加していない既知メンバーが
+  待機中の1行として表示され続けることを確認する
+  `test_panel_shows_idle_known_members_alongside_active_job_
+  participants`、`known_labels`省略時の後方互換動作を確認する
+  `test_panel_known_labels_defaults_to_board_only_for_backward_
+  compatibility`、ポーリングが追いついていないデバイスも和集合により
+  表示から漏れないことを確認する`test_panel_union_shows_board_only_
+  labels_even_if_poll_has_not_caught_up`、そして`_create_repl_prompt_
+  session`本番の処理そのものがレイアウト組み替え後も実際に入力を
+  受け付けられることを`create_pipe_input`/`DummyOutput`で確認する
+  `test_create_repl_prompt_session_still_accepts_input_after_layout_
+  wrap`(bottom_toolbar廃止による既存の入力機能への回帰が無いことの
+  検証)の8件を追加した。
+- **動作確認**: `python3 -m pytest tests/`をフルスイートで実行し、新規
+  追加分8件を含め621件全件パスすることを確認した。フルスイートを複数回
+  繰り返したところ、既存の(今回の変更前のブランチでも同じ頻度・同じ
+  性質で再現する)フレーキーなテスト群が単発で失敗することがあったが、
+  変更前後で失敗率・失敗するテストの傾向に有意な差は無く、今回の変更に
+  よる回帰ではないと判断した。加えて、実際の`yoriai._create_repl_
+  prompt_session()`・`_ACTIVE_STATUS_BOARD`・`_ACTIVE_ORG_MEMBERS`を
+  疑似端末上で動かし、協業モードの思考過程表示を模した400行の`print()`
+  フラッドの後も、パネルが3台分(ジョブ参加中1台+待機中2台)の行を
+  表示し続けることを目視で確認した(旧`bottom_toolbar`方式では最初の
+  1回を最後に二度と表示されなかった)。
