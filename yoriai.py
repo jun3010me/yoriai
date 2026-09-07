@@ -1613,8 +1613,13 @@ def _dispatch_and_save_parallel_tasks(tasks: list, candidates: list, org_fingerp
     print_lock = threading.Lock()
 
     def worker(index: int, filename: str, request: str, candidate: dict) -> None:
+        # `//parallel`は実装・レビューに分かれるタスクキュー方式とは違い、
+        # 1メンバー1回きりの問い合わせで完結するため、状態種別は「思考中」
+        # (ステータスパネルの説明コメント参照)を使う。
+        _ACTIVE_STATUS_BOARD.set(candidate["label"], _DEVICE_STATUS_THINKING, f"{filename} について検討中")
         task_messages = [{"role": "user", "content": request}]
         answer, error, truncated = _collect_answer_from_candidate(candidate, org_fingerprint, task_messages)
+        _ACTIVE_STATUS_BOARD.remove(candidate["label"])
         results[index] = (filename, candidate, answer, error)
         with print_lock:
             print()
@@ -4980,6 +4985,167 @@ def _review_and_fix_one_file(
 
 
 # ---------------------------------------------------------------------------
+# 対話モードのステータスパネル(参加デバイスごとの現在の状態を常時表示)
+# ---------------------------------------------------------------------------
+#
+# 依頼: 対話モード(`--chat`)の画面に、協業モード等のバックグラウンド
+# ジョブに参加しているデバイス全員の「今何をしているか」を常時表示したい。
+#
+# 仮の判断: `prompt_toolkit`の`PromptSession`が標準で持つ`bottom_toolbar`
+# (callableを渡せる、入力行の直上に常時固定表示される機能)を使う。独自の
+# フルスクリーン`Application`を組む必要は無いと判断した根拠は次の2点。
+# (1) `bottom_toolbar`はcallableを渡せるため、下記`_DeviceStatusBoard`の
+# 中身を毎回組み立て直して返せば、再描画のたびに最新の状態を表示できる。
+# (2) `bottom_toolbar`の実描画は`Window(height=Dimension(min=1),
+# dont_extend_height=True)`という、高さの上限を固定しない実装になっている
+# (`prompt_toolkit.shortcuts.prompt`のソースで確認済み)。返すテキストに
+# `\n`で複数行を含めれば、行数は参加デバイス数に応じて自然に伸縮する。
+#
+# 状態は`_DeviceStatusBoard`という、ラベル(デバイス名)ごとに1件の
+# (状態種別, 詳細テキスト, 開始時刻)を保持するスレッドセーフな辞書で
+# 管理する。複数のバックグラウンドワーカースレッド(協業モード等の
+# タスクキューの各メンバー担当スレッド)が同時に読み書きするため、
+# 単純な`dict`ではなく内部で`threading.Lock`を持たせている。
+#
+# 仮の判断(シングルトンにした理由): `_run_collaborative_task_queue`や
+# `_run_fix_task_queue`は、`_ask_organization_collaborate`や`//fix`の
+# 各処理チェーンの奥深く(複数階層のバックグラウンドジョブ経由)から
+# 呼ばれており、ここへ新しい必須引数(状態ボード)を追加すると、対話
+# モードのコマンド1つ1つの呼び出しチェーン全体に波及する大きな変更に
+# なってしまう(「1PR1修正」の方針に反する)。`--chat`は1プロセスにつき
+# 対話モードのセッションが同時に1つしか走らない前提のCLIツールであるため、
+# モジュールレベルの単一インスタンス`_ACTIVE_STATUS_BOARD`を各ワーカー
+# ループから直接参照する設計にした。これにより既存関数のシグネチャは
+# 一切変更せずに済み、既存テスト(`test_task_queue.py`等)への影響も無い。
+#
+# 仮の判断(状態種別を3種に絞った理由): 依頼で例示されたアイコン対応表
+# (思考中→🧠・実装中→💻・待機中→⏳)をそのまま採用した。レビュー中の
+# デバイスも「実装中」(`_DEVICE_STATUS_WORKING`)の詳細テキストを
+# 「〜をレビュー中」に変えるだけで表現し、専用の状態種別は追加しない
+# (依頼の例示に無い状態を独自に増やすと、依頼にない挙動を作り込む
+# ことになるため)。
+#
+# 仮の判断(同一デバイスへの同時多重アクセスについて): あるデバイスが
+# 自分の担当タスクを実装している最中に、別のメンバーからそのデバイスへ
+# レビュー依頼が飛ぶことは実際にありうる(レビュー依頼は依頼元スレッドが
+# 別デバイスへHTTPで問い合わせるだけで、専用のスレッドを介さないため)。
+# この場合、同じラベルの行に対して2つのスレッドが状態を書き込み合う
+# ことになるが、`_DeviceStatusBoard`は「最後に書き込まれた状態を表示する」
+# という単純な仕様に割り切った(依頼の主旨は「ざっくり今何をしているか
+# 分かる」ことであり、同一デバイスの多重タスクを正確に併記する表示までは
+# スコープ外と判断した)。
+_DEVICE_STATUS_WAITING = "waiting"
+_DEVICE_STATUS_THINKING = "thinking"
+_DEVICE_STATUS_WORKING = "working"
+
+_DEVICE_STATUS_ICONS = {
+    _DEVICE_STATUS_THINKING: "🧠",
+    _DEVICE_STATUS_WORKING: "💻",
+    _DEVICE_STATUS_WAITING: "⏳",
+}
+
+# 仮の判断: 経過時間の表示は状態種別ごとに固定する(依頼例の「思考中は
+# (42s)を出すが、実装中・待機中は出さない」という混在イメージをそのまま
+# 踏襲)。ファイル名などの詳細テキストがすでに分かっている「実装中」は、
+# 経過時間よりも「何を」やっているかの情報の方が有用と判断した。
+_DEVICE_STATUS_SHOWS_ELAPSED = {
+    _DEVICE_STATUS_THINKING: True,
+    _DEVICE_STATUS_WORKING: False,
+    _DEVICE_STATUS_WAITING: False,
+}
+
+# 対話モードのbottom_toolbarを、体感できるレベルで(=経過秒表示が
+# 実際に増えていくのが見える程度に)定期的に再描画させるための間隔。
+# `PromptSession(refresh_interval=...)`にそのまま渡す。
+_STATUS_PANEL_REFRESH_INTERVAL_SECONDS = 1.0
+
+
+class _DeviceStatusBoard:
+    """バックグラウンドジョブ(協業モード等)に参加しているデバイスごとの
+    「今何をしているか」を保持する、スレッドセーフな共有レジストリ。
+
+    ラベル(デバイス名)をキーに`(状態種別, 詳細テキスト, 開始時刻)`を
+    1件だけ保持する単純な辞書のラッパー。複数のワーカースレッドから
+    同時に`set`/`remove`が呼ばれても壊れないよう、すべての読み書きを
+    1つの`threading.Lock`で保護する。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._entries = {}  # label -> (status_kind, detail, started_at(monotonic))
+
+    def set(self, label: str, status_kind: str, detail: str = "") -> None:
+        with self._lock:
+            self._entries[label] = (status_kind, detail, time.monotonic())
+
+    def remove(self, label: str) -> None:
+        """`label`のデバイスがこのジョブでの作業を終えた(離脱した)ことを
+        表す。一覧から該当行を消す。存在しないラベルを渡しても何もしない
+        (複数箇所からの防御的な呼び出しを許容するため)。
+        """
+        with self._lock:
+            self._entries.pop(label, None)
+
+    def clear(self) -> None:
+        """全件消去する。1つのバックグラウンドジョブ(タスクキュー等)が
+        完了した後の後始末、および対話モードの起動時の初期化に使う。
+        """
+        with self._lock:
+            self._entries.clear()
+
+    def snapshot(self) -> list:
+        """`[(label, status_kind, detail, started_at), ...]`を返す。
+        ロック保持中に値をコピーして返すことで、呼び出し元(描画処理)が
+        ロックを持たずに安全に読める。
+        """
+        with self._lock:
+            return [
+                (label, status_kind, detail, started_at)
+                for label, (status_kind, detail, started_at) in self._entries.items()
+            ]
+
+
+# 仮の判断: `--chat`のセッションはプロセスにつき1つしか走らない前提のため、
+# モジュールレベルの単一インスタンスとして持つ(理由は上のコメント参照)。
+_ACTIVE_STATUS_BOARD = _DeviceStatusBoard()
+
+
+def _format_device_status_line(label: str, status_kind: str, detail: str, elapsed_seconds: int) -> str:
+    """ステータスパネルの1デバイス分の表示行を組み立てる。"""
+    icon = _DEVICE_STATUS_ICONS.get(status_kind, "❔")
+    if status_kind == _DEVICE_STATUS_WAITING:
+        return f"{icon} {label} 待機"
+    text = detail if detail else "処理中..."
+    if _DEVICE_STATUS_SHOWS_ELAPSED.get(status_kind, False):
+        return f"{icon} {label} が {text} ({elapsed_seconds}s)"
+    return f"{icon} {label} が {text}"
+
+
+def _render_status_panel(board: "_DeviceStatusBoard") -> str:
+    """`board`の現在の内容から、ステータスパネル全体のテキスト
+    (`bottom_toolbar`にそのまま渡せる、行数が可変の複数行テキスト)を
+    組み立てる。参加デバイスがいない場合は空文字列を返す(この場合でも
+    `bottom_toolbar`自体は`Window(height=Dimension(min=1))`のため1行分の
+    高さは残るが、依頼の「常時表示」は「callableを渡し続けること」で
+    満たしていると判断し、何も無い時に無理に案内文を出すことはしない)。
+
+    仮の判断: 行の並び順はラベルの辞書順に固定する。ワーカースレッドの
+    完了順(=`_DeviceStatusBoard`への書き込み順)に依存すると、同じ
+    参加メンバー構成でも実行のたびに行の並びが変わってしまい、画面が
+    ちらついて見えるため。
+    """
+    entries = board.snapshot()
+    if not entries:
+        return ""
+    now = time.monotonic()
+    lines = [
+        _format_device_status_line(label, status_kind, detail, int(now - started_at))
+        for label, status_kind, detail, started_at in sorted(entries, key=lambda entry: entry[0])
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # タスクキュー方式による実装・レビュー
 # ---------------------------------------------------------------------------
 #
@@ -5090,6 +5256,11 @@ def _run_collaborative_task_queue(
         while True:
             popped = pop_next()
             if popped is None:
+                # このメンバーに割り当てるタスクがもう無い(=このジョブでの
+                # 作業を終えた)ため、ステータスパネルの一覧からこの
+                # メンバーの行を消す(依頼の「デバイスが離脱した場合、
+                # 一覧から正しく消える」という要件への対応)。
+                _ACTIVE_STATUS_BOARD.remove(candidate["label"])
                 return
             (filename, content), remaining_after = popped
 
@@ -5109,6 +5280,7 @@ def _run_collaborative_task_queue(
             is_first = False
 
             _set_task_status(checklist, filename, "impl", _TASK_STATUS_IN_PROGRESS)
+            _ACTIVE_STATUS_BOARD.set(candidate["label"], _DEVICE_STATUS_WORKING, f"{filename} を実装中")
             if on_update:
                 on_update()
             request_text = _build_collaborative_implementation_request(
@@ -5172,6 +5344,15 @@ def _run_collaborative_task_queue(
                 reviewer_own_code = "(まだ実装したファイルがありません)"
 
             _set_task_status(checklist, filename, "review", _TASK_STATUS_IN_PROGRESS)
+            # 仮の判断: レビューの実処理(LLMへの問い合わせ)は`reviewer`
+            # (実装担当とは別のメンバー)側で行われる一方、この呼び出し
+            # 自体は実装担当のワーカースレッドが同期的にブロックして待つ
+            # (`_run_collaborative_task_queue`のクラスコメント参照)。その
+            # ため「今動いているのは誰か」という観点では、reviewer側を
+            # 「実装中(詳細はレビュー中)」、実装担当側は「待機」として
+            # 表示するのが実態に近い。
+            _ACTIVE_STATUS_BOARD.set(reviewer["label"], _DEVICE_STATUS_WORKING, f"{filename} をレビュー中")
+            _ACTIVE_STATUS_BOARD.set(candidate["label"], _DEVICE_STATUS_WAITING)
             if on_update:
                 on_update()
             ok, feedback = _review_and_fix_one_file(
@@ -5184,6 +5365,10 @@ def _run_collaborative_task_queue(
                 # 常に行う。
                 enable_self_explanation=True,
             )
+            # レビューが終わった時点で、reviewer側の行を一旦「待機」に
+            # 戻す。reviewer自身のワーカースレッドが自分のタスクを持って
+            # いれば、そちらの`set`がすぐ上書きするため実害は無い。
+            _ACTIVE_STATUS_BOARD.set(reviewer["label"], _DEVICE_STATUS_WAITING)
             if ok:
                 _set_task_status(checklist, filename, "review", _TASK_STATUS_COMPLETED)
             if review_feedback is not None:
@@ -5199,11 +5384,22 @@ def _run_collaborative_task_queue(
                 latest_completed[candidate["label"]] = (filename, code)
 
     print(f"[📋 タスクキュー方式で実装フェーズを開始します: {len(tasks)}件のタスクを{len(candidates)}台のメンバーで処理します]")
+    # 仮の判断: スレッド開始前に参加メンバー全員を「待機」として登録して
+    # おく。こうしないと、まだ1度もタスクを取っていないメンバー(タスク数
+    # よりメンバー数が多い場合)がステータスパネルに一切表示されず、
+    # 依頼の「参加デバイス全員」を満たせない。
+    for c in candidates:
+        _ACTIVE_STATUS_BOARD.set(c["label"], _DEVICE_STATUS_WAITING)
     threads = [threading.Thread(target=worker, args=(c,), daemon=True) for c in candidates]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
+    # 仮の判断: 全ワーカーが`return`前に自分の行を`remove`する設計だが、
+    # 念のため(例外発生時等の防御)ジョブ終了時にこのジョブ由来の行を
+    # 確実に消しておく。
+    for c in candidates:
+        _ACTIVE_STATUS_BOARD.remove(c["label"])
 
 
 # ---------------------------------------------------------------------------
@@ -6231,6 +6427,9 @@ def _run_fix_task_queue(
         while True:
             popped = pop_next()
             if popped is None:
+                # 依頼の「デバイスが離脱した場合、一覧から正しく消える」
+                # 要件への対応(`_run_collaborative_task_queue`と同じ設計)。
+                _ACTIVE_STATUS_BOARD.remove(candidate["label"])
                 return
             index, subtask = popped
             task_key = f"サブタスク{index}"
@@ -6240,6 +6439,7 @@ def _run_fix_task_queue(
                 f"[📋 タスクキュー: {candidate['label']} に {task_key}「{subtask}」を割り当てました]",
             )
             _set_task_status(checklist, task_key, "impl", _TASK_STATUS_IN_PROGRESS)
+            _ACTIVE_STATUS_BOARD.set(candidate["label"], _DEVICE_STATUS_WORKING, f"{task_key}を実装中")
 
             impl_prompt = _FIX_REQUEST_TOOL_PROMPT_TEMPLATE.format(
                 full_plan=full_plan, file_list="\n".join(file_list), request=subtask, language=language,
@@ -6287,6 +6487,13 @@ def _run_fix_task_queue(
                 continue
 
             _set_task_status(checklist, task_key, "review", _TASK_STATUS_IN_PROGRESS)
+            # `_run_collaborative_task_queue`と同じ理由(クラスコメント
+            # 参照): レビューの実処理はreviewer側で行われるが、呼び出し
+            # 自体は実装担当のスレッドが同期的にブロックして待つため、
+            # reviewer側を「実装中(詳細はレビュー中)」、実装担当側は
+            # 「待機」として表示する。
+            _ACTIVE_STATUS_BOARD.set(reviewer["label"], _DEVICE_STATUS_WORKING, f"{task_key}をレビュー中")
+            _ACTIVE_STATUS_BOARD.set(candidate["label"], _DEVICE_STATUS_WAITING)
             review_prompt = _build_fix_subtask_review_prompt(
                 subtask, full_plan, language, list(dict.fromkeys(modified)),
             )
@@ -6294,6 +6501,7 @@ def _run_fix_task_queue(
                 reviewer, org_fingerprint, [{"role": "user", "content": review_prompt}], project_dir,
                 print_lock=print_lock, tag=task_key,
             )
+            _ACTIVE_STATUS_BOARD.set(reviewer["label"], _DEVICE_STATUS_WAITING)
             record_modified(review_modified)
             review_preview = [f"--- {task_key} のレビュー ← {reviewer['label']} (モデル: {reviewer['model']}) ---"]
             if review_error:
@@ -6308,11 +6516,19 @@ def _run_fix_task_queue(
 
             _set_task_status(checklist, task_key, "review", _TASK_STATUS_COMPLETED)
 
+    # `_run_collaborative_task_queue`と同じ理由(そちらのコメント参照):
+    # タスク数よりメンバー数が多い場合でも参加デバイス全員をパネルに
+    # 表示するため、スレッド開始前に全員を「待機」として登録しておく。
+    for c in candidates:
+        _ACTIVE_STATUS_BOARD.set(c["label"], _DEVICE_STATUS_WAITING)
     threads = [threading.Thread(target=worker, args=(c,)) for c in candidates]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
+    # 防御的な後始末(`_run_collaborative_task_queue`と同じ理由)。
+    for c in candidates:
+        _ACTIVE_STATUS_BOARD.remove(c["label"])
 
     print()
     print(_format_task_checklist(checklist))
@@ -7051,7 +7267,20 @@ def _create_repl_prompt_session() -> PromptSession:
     前回の入力を引き継ぐ機能)は今回のスコープ外で、プロセス終了とともに
     履歴も破棄される。
     """
-    return PromptSession(history=InMemoryHistory(), key_bindings=_make_repl_key_bindings())
+    return PromptSession(
+        history=InMemoryHistory(),
+        key_bindings=_make_repl_key_bindings(),
+        # 依頼: 画面を「作業ログ(patch_stdout経由で流れる)/ステータス
+        # 一覧(常時表示)/プロンプト入力行(常時表示)」の3層構成にしたい。
+        # `bottom_toolbar`はcallableを渡すと再描画のたびに呼び直される
+        # ため、`_ACTIVE_STATUS_BOARD`(協業モード等のワーカーループが
+        # 更新する、参加デバイスごとの状態を保持するモジュール単一の
+        # レジストリ)の現在の内容を毎回組み立て直して返す。
+        bottom_toolbar=lambda: _render_status_panel(_ACTIVE_STATUS_BOARD),
+        # 経過時間(例: 思考中の"(42s)")表示が実際に増えていくのが見える
+        # よう、入力が無くても定期的に再描画させる。
+        refresh_interval=_STATUS_PANEL_REFRESH_INTERVAL_SECONDS,
+    )
 
 
 def _read_multiline_input(session: PromptSession, interrupt_guard: "_DoubleInterruptGuard") -> tuple:
@@ -7565,6 +7794,12 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
     member_count = _count_org_members(port, org_fingerprint)
     print(_format_startup_banner(out_dir, member_count, _supports_ansi_color()))
     print()
+
+    # 仮の判断: テストのように同一プロセス内で`_run_repl_client`を複数回
+    # 呼び出すケースに備え、起動のたびにステータスパネルの状態を空に
+    # しておく(前回起動時の残骸が新しいセッションのbottom_toolbarに
+    # 表示されてしまうことを防ぐ)。
+    _ACTIVE_STATUS_BOARD.clear()
 
     # 仮の判断: 対話モードのセッション本体を`patch_stdout()`で包む。
     # バックグラウンドジョブ(協業モード等)がメインスレッドの入力待ち中に

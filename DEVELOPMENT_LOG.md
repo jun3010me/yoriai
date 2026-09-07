@@ -5891,3 +5891,110 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   スクリプトで`_looks_garbled`に直接渡し、修正前のOR判定ロジックでは
   `True`(誤検知)、修正後のAND判定ロジックでは`False`になることを
   確認した。
+
+### 対話モードへのステータスパネル(参加デバイス全員の「今何をしているか」を常時表示)の追加
+
+- **背景**: 協業モード(`//agree`)等のバックグラウンドジョブが動いている間、
+  対話モードの画面には各メンバーの実装結果・レビュー結果が`patch_stdout()`
+  経由のログとして流れていくのみで、「今この瞬間、参加デバイスそれぞれが
+  何をしているか」を一目で把握できる場所が無かった。依頼を受け、画面を
+  (1)作業ログ(従来通り流れていくエリア)、(2)ステータス一覧(新規、
+  常時表示)、(3)プロンプト入力行、の3層構成にした。
+- **調査**: 実装前に`prompt_toolkit`(3.0.53)のソース(`shortcuts/prompt.py`)
+  を読んで確認したところ、`PromptSession`の`bottom_toolbar`引数(callableを
+  渡せる、入力行の直上に常時固定表示される機能)は、内部で
+  `Window(height=Dimension(min=1), dont_extend_height=True)`という高さの
+  上限を固定しない実装になっており、返すテキストに`\n`を含めれば行数が
+  自然に伸縮することを確認した。また`refresh_interval`引数で、入力が
+  無くても定期的に再描画させられることも確認した。この2つで要件を満たせる
+  ため、独自のフルスクリーン`Application`化は不要と判断した。一方、
+  バックグラウンドジョブの進捗管理(`_run_collaborative_task_queue`・
+  `_run_fix_task_queue`・`_dispatch_and_save_parallel_tasks`の3箇所の
+  ワーカースレッドループ)を調べたところ、ファイル単位のチェックリスト
+  (`_set_task_status`)はあったが、「デバイスごとの現在の状態」という
+  横断的なデータ構造は存在しなかったため、新規に用意した。
+- **実装**:
+  - `yoriai.py`に`_DeviceStatusBoard`(ラベル→`(状態種別, 詳細テキスト,
+    開始時刻)`を保持する、`threading.Lock`で保護されたスレッドセーフな
+    辞書ラッパー)を新設し、モジュールレベルの単一インスタンス
+    `_ACTIVE_STATUS_BOARD`として持つ。`_run_collaborative_task_queue`等は
+    `_ask_organization_collaborate`や`//fix`の処理チェーンの奥深くから
+    呼ばれており、新しい必須引数を追加すると呼び出しチェーン全体に波及する
+    大きな変更になってしまうため(「1PR1修正」の方針に反する)、シングル
+    トンとして各ワーカーループから直接参照する設計にした。`--chat`は
+    1プロセスにつき対話モードのセッションが同時に1つしか走らない前提の
+    CLIツールであるため、この前提は成立する。既存関数のシグネチャは一切
+    変更していないため、既存テスト(`test_task_queue.py`等)への影響は無い。
+  - 状態種別は依頼で例示されたアイコン対応表(思考中→🧠・実装中→💻・
+    待機中→⏳)をそのまま採用した(`_DEVICE_STATUS_ICONS`)。経過時間の
+    表示は状態種別ごとに固定し(`_DEVICE_STATUS_SHOWS_ELAPSED`)、「思考中」
+    にのみ経過秒を付け、ファイル名等の詳細テキストが分かっている
+    「実装中」・詳細の無い「待機中」には付けない(依頼の「経過時間の表示が
+    あるものと無いものが混在してよい」という要件への対応)。レビュー中の
+    デバイスも専用の状態種別は増やさず、「実装中」の詳細テキストを
+    「〜をレビュー中」に変えるだけで表現した(依頼の例示に無い状態を
+    独自に増やさないための判断)。
+  - `_run_collaborative_task_queue`・`_run_fix_task_queue`のワーカーループを
+    それぞれ次のように更新した: スレッド開始前に参加候補全員を「待機」として
+    登録(タスク数よりメンバー数が多い場合でも全員がパネルに表示されるよう
+    にするため)。タスクを取ったら「実装中(ファイル名付き)」に更新。
+    レビューの問い合わせは実装担当のスレッドが同期的にブロックして
+    reviewer側へHTTPで問い合わせる設計のため、「今動いているのは誰か」を
+    実態に合わせ、reviewer側を「実装中(詳細はレビュー中)」・実装担当側を
+    「待機」として表示するようにした。タスクが尽きてワーカーが`return`する
+    直前に自分の行を`remove`し、依頼の「デバイスが離脱した場合、一覧から
+    正しく消える」という要件に対応した(全スレッド終了後にも念のため防御的な
+    後始末を入れている)。`_dispatch_and_save_parallel_tasks`(`//parallel`)は
+    実装・レビューの区別が無い1回きりの問い合わせのため、「思考中」を使い、
+    問い合わせが終わったら`remove`する。
+  - `_create_repl_prompt_session`に`bottom_toolbar=lambda:
+    _render_status_panel(_ACTIVE_STATUS_BOARD)`と、経過秒表示が実際に
+    増えていくのが見えるよう`refresh_interval=1.0`を追加した。`_run_repl_client`
+    の起動時には`_ACTIVE_STATUS_BOARD.clear()`を呼び、同一プロセス内で
+    複数回起動するテスト等で前回起動時の残骸が残らないようにした。
+  - 参加デバイスがいない(=バックグラウンドジョブが何も動いていない)間は
+    `_render_status_panel`が空文字列を返す。`bottom_toolbar`のWindowは
+    `height=Dimension(min=1)`のため空行1行分の高さは残るが、これは
+    「callableを渡し続けることで常時表示は満たしている」という判断に基づく
+    許容したトレードオフとして、実装コメントに明記した。
+  - 仮の判断(同一デバイスへの同時多重アクセスについて): あるデバイスが
+    自分の担当タスクを実装中に、別のメンバーからそのデバイスへレビュー
+    依頼が飛ぶことは実際にありうる(レビュー依頼は依頼元スレッドが別
+    デバイスへHTTPで問い合わせるだけで、専用のスレッドを介さないため)。
+    この場合、同じラベルの行に対して2つのスレッドが状態を書き込み合う
+    ことになるが、`_DeviceStatusBoard`は「最後に書き込まれた状態を表示
+    する」という単純な仕様に割り切った(依頼の主旨は「ざっくり今何を
+    しているか分かる」ことであり、同一デバイスの多重タスクを正確に
+    併記する表示までは今回のスコープ外と判断した)。
+- **テスト**: 新設した`tests/test_status_panel.py`に、参加デバイス数の
+  増減(2台・5台)に応じてパネルの行数が正しく変わることを確認する
+  `test_panel_line_count_scales_with_participant_count`、状態種別ごとの
+  アイコン・文言が正しく生成されることを確認する
+  `test_status_icons_and_text_per_kind`、経過時間の表示が「思考中」にのみ
+  付くことを確認する`test_elapsed_time_is_shown_only_for_thinking`、
+  `_render_status_panel`が実際の経過時間を計算して埋め込むことを確認する
+  `test_elapsed_seconds_reflect_render_time`、デバイスが離脱した場合に
+  一覧から正しく消えることを確認する
+  `test_device_removed_from_panel_when_it_leaves`、存在しないラベルへの
+  `remove`が安全に無視されることを確認する
+  `test_remove_of_unknown_label_is_a_no_op`、`clear`で全件消去されることを
+  確認する`test_clear_removes_all_devices`、20台分のスレッドが同時に
+  `set`・`snapshot`・`remove`を200回ずつ叩いても例外を起こさず最終状態が
+  一貫していることを確認する
+  `test_concurrent_updates_from_many_threads_do_not_corrupt_state`
+  (スレッドセーフ性)、実際に`_run_collaborative_task_queue`を1台構成で
+  走らせた後にステータスボードが空に戻ることを確認する
+  `test_task_queue_clears_status_board_after_completion`の9件を追加した。
+- **動作確認**: `python3 -m pytest tests/`をフルスイートで実行し、新規
+  追加分10件を含め611件全件パスし、リグレッションが無いことを確認した。
+  加えて、`prompt_toolkit`の`create_pipe_input`/`DummyOutput`を使い、
+  実際に`bottom_toolbar`・`refresh_interval`を指定した`PromptSession`を
+  構築して`_ACTIVE_STATUS_BOARD`に3台分の状態(思考中・実装中・待機中)を
+  積んだ状態で`prompt()`を実行し、例外なく動作すること、および
+  `_render_status_panel`が
+  ```
+  🧠 MacStudio が 処理中... (0s)
+  💻 junnoMac-mini が storage.py を実装中
+  ⏳ raspi4 待機
+  ```
+  という3行構成のテキストを返すことを手元のスクリプトで確認した。
