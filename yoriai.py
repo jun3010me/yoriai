@@ -2090,7 +2090,19 @@ def _summarize_dialogue(status: str, transcript: list, final_content: str, human
     return "議論への応答が得られませんでした。"
 
 
-def _finish_dialogue(status: str, transcript: list, total_utterances: int, final_content: str, human_message: str) -> dict:
+def _finish_dialogue(
+    status: str, transcript: list, total_utterances: int, final_content: str, human_message: str,
+    participant_labels: set = None,
+) -> dict:
+    """`_run_dialogue`の全ての終了経路(合意・打ち切り・安全装置作動等)は
+    必ずここを通る。仮の判断: ステータスパネルの後始末(この対話に参加した
+    デバイスをパネルから消す)を、個々の`return`の直前ではなくここに
+    集約した。`_run_dialogue`は終了経路が10箇所近くあり、それぞれに
+    後始末を書くと書き漏れの温床になるため。
+    """
+    if participant_labels:
+        for label in participant_labels:
+            _ACTIVE_STATUS_BOARD.remove(label)
     return {
         "status": status,
         "transcript": transcript,
@@ -2155,12 +2167,30 @@ def _run_dialogue(
     if not roles:
         return _finish_dialogue(DIALOGUE_STATUS_NO_ENGAGEMENT, [], 0, None, None)
 
+    # 仮の判断(ステータスパネルを合意フェーズ等にも広げる依頼への対応):
+    # `_run_dialogue`は合意フェーズ・修正フェーズ・レビューフェーズ・
+    # 計画のみモードすべてで共通利用される中核関数のため、ここ1箇所に
+    # 状態パネル連携を入れるだけで全フェーズに反映できる。役割は「提案役・
+    # 反論役・統合役」の3つだが、候補が3台に満たない場合は同じデバイスが
+    # 複数役を兼務する(`_assign_discourse_roles`参照)ため、参加デバイスは
+    # ラベルの集合(重複排除)として扱う。
+    participant_labels = {c["label"] for c in roles.values()}
+    for label in participant_labels:
+        _ACTIVE_STATUS_BOARD.set(label, _DEVICE_STATUS_WAITING)
+
     transcript = list(resume_transcript) if resume_transcript else []
     state = {"total_utterances": 0, "any_real_content": False}
 
     def speak(role_key: str, prompt: str, round_num: int) -> str:
         candidate = roles[role_key]
         role_ja = _DIALOGUE_ROLE_LABEL_JA[role_key]
+        # 対話プロトコルは「提案役→反論役→統合役」の順で1人ずつ発言する
+        # 直列の設計(各役割が前の役割の発言を踏まえてプロンプトを組む
+        # ため、並列化はできない)。そのため、今喋っている役割の担当
+        # デバイスだけが「思考中」になり、それ以外は出番が来るまで
+        # 「待機」のまま表示される。これは意図した挙動であり、ステータス
+        # パネルにもその実態をそのまま反映する。
+        _ACTIVE_STATUS_BOARD.set(candidate["label"], _DEVICE_STATUS_THINKING, f"{role_ja}・ラウンド{round_num}")
 
         # 仮の判断(実機報告への対応: 大規模な//agreeセッションでは議事録
         # 全文が累積プロンプトに積まれ、モデルが思考している間コンソールに
@@ -2209,6 +2239,9 @@ def _run_dialogue(
             candidate, org_fingerprint, [{"role": "user", "content": prompt}], disable_web_search=True,
             on_thinking=_on_thinking,
         )
+        # この役割の出番が終わったので「待機」へ戻す。次に自分の出番が
+        # 来た時点で再び上の`set`が「思考中」に上書きする。
+        _ACTIVE_STATUS_BOARD.set(candidate["label"], _DEVICE_STATUS_WAITING)
         # 閾値にも文末記号にも達しないまま端数がバッファに残っている可能性が
         # あるため(問い合わせ完了時点で必ず1回)、取りこぼさず最後に出し切る。
         _flush_pending_display()
@@ -2264,12 +2297,12 @@ def _run_dialogue(
             f"{speaker_label}さんの発言が文字化け・異常な繰り返しパターンと判定されたため、"
             "この時点で議論を打ち切りました。"
         )
-        return _finish_dialogue(DIALOGUE_STATUS_GARBLED, transcript, state["total_utterances"], None, human_message)
+        return _finish_dialogue(DIALOGUE_STATUS_GARBLED, transcript, state["total_utterances"], None, human_message, participant_labels)
 
     round_num = resume_round
     while True:
         if state["total_utterances"] >= DIALOGUE_SAFETY_LIMIT_UTTERANCES:
-            return _finish_dialogue(DIALOGUE_STATUS_SAFETY_LIMIT, transcript, state["total_utterances"], None, None)
+            return _finish_dialogue(DIALOGUE_STATUS_SAFETY_LIMIT, transcript, state["total_utterances"], None, None, participant_labels)
 
         if round_num == 1:
             proposer_prompt = _DIALOGUE_PROPOSER_ROUND1_TEMPLATE.format(
@@ -2287,11 +2320,11 @@ def _run_dialogue(
             # これ以上反論役・統合役に問い合わせても無駄になる可能性が
             # 高いため、早期に切り上げる(疎通の問題であって議論の
             # 結果ではないため、呼び出し元は安全側フォールバックしてよい)。
-            return _finish_dialogue(DIALOGUE_STATUS_NO_ENGAGEMENT, transcript, state["total_utterances"], None, None)
+            return _finish_dialogue(DIALOGUE_STATUS_NO_ENGAGEMENT, transcript, state["total_utterances"], None, None, participant_labels)
         if state.get("garbled_by"):
             return garbled_finish()
         if state["total_utterances"] >= DIALOGUE_SAFETY_LIMIT_UTTERANCES:
-            return _finish_dialogue(DIALOGUE_STATUS_SAFETY_LIMIT, transcript, state["total_utterances"], None, None)
+            return _finish_dialogue(DIALOGUE_STATUS_SAFETY_LIMIT, transcript, state["total_utterances"], None, None, participant_labels)
 
         critic_prompt = _DIALOGUE_CRITIC_TEMPLATE.format(
             speaker_label=roles[DIALOGUE_ROLE_CRITIC]["label"], topic=topic, background=background,
@@ -2302,7 +2335,7 @@ def _run_dialogue(
         if state.get("garbled_by"):
             return garbled_finish()
         if state["total_utterances"] >= DIALOGUE_SAFETY_LIMIT_UTTERANCES:
-            return _finish_dialogue(DIALOGUE_STATUS_SAFETY_LIMIT, transcript, state["total_utterances"], None, None)
+            return _finish_dialogue(DIALOGUE_STATUS_SAFETY_LIMIT, transcript, state["total_utterances"], None, None, participant_labels)
 
         integrator_prompt = _DIALOGUE_INTEGRATOR_TEMPLATE.format(
             speaker_label=roles[DIALOGUE_ROLE_INTEGRATOR]["label"], topic=topic, background=background,
@@ -2315,11 +2348,11 @@ def _run_dialogue(
 
         if critic_verdict == "情報不足" or integrator_verdict == "人間に確認":
             human_message = _extract_dialogue_section(integrator_answer, "人間への確認事項:")
-            return _finish_dialogue(DIALOGUE_STATUS_NEEDS_HUMAN, transcript, state["total_utterances"], None, human_message)
+            return _finish_dialogue(DIALOGUE_STATUS_NEEDS_HUMAN, transcript, state["total_utterances"], None, human_message, participant_labels)
 
         if integrator_verdict == "合意" and critic_verdict == "合意" and round_num >= min_rounds:
             final_content = _extract_dialogue_section(integrator_answer, "最終合意内容:")
-            return _finish_dialogue(DIALOGUE_STATUS_CONSENSUS, transcript, state["total_utterances"], final_content, None)
+            return _finish_dialogue(DIALOGUE_STATUS_CONSENSUS, transcript, state["total_utterances"], final_content, None, participant_labels)
 
         # 仮の判断(バグ報告への対応: 同じ内容の繰り返しで議論が"進化"しない):
         # 合意にも人間への確認にも至らなかった("判定: 継続"のまま)場合に
@@ -2345,13 +2378,14 @@ def _run_dialogue(
                 )
             ):
                 final_content = this_round_by_role.get(DIALOGUE_ROLE_PROPOSER) or ""
-                return _finish_dialogue(DIALOGUE_STATUS_STAGNANT, transcript, state["total_utterances"], final_content, None)
+                return _finish_dialogue(DIALOGUE_STATUS_STAGNANT, transcript, state["total_utterances"], final_content, None, participant_labels)
 
         round_num += 1
         if round_num > max_rounds:
             return _finish_dialogue(
                 DIALOGUE_STATUS_NEEDS_HUMAN, transcript, state["total_utterances"], None,
                 "議論を重ねましたが、まだアイデアが不足しており合意に至りませんでした。アドバイスをください。",
+                participant_labels,
             )
 
 
