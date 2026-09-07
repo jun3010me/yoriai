@@ -6174,3 +6174,115 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   フラッドの後も、パネルが3台分(ジョブ参加中1台+待機中2台)の行を
   表示し続けることを目視で確認した(旧`bottom_toolbar`方式では最初の
   1回を最後に二度と表示されなかった)。
+
+### ステータスパネルの土台を`patch_stdout()`からフルスクリーンApplicationへ全面変更(実機バグ修正・第2弾)
+
+- **背景**: 前回(`bottom_toolbar`→自前Windowでのラップ)の修正を実機に
+  取り込んで`//agree`を試した利用者から、「パネルは消えなくなったが、
+  今度はホスト名の表示が画面下部に固定されず、ログと一緒に上へ流れて
+  いってしまう。ずっと画面下部に止まってほしい」という報告を受けた。
+- **調査(重要)**: 疑似端末(pty、`pyte`で仮想端末を描画)を使い、
+  実際に協業モードの思考過程表示を模した`print()`を0.005秒間隔で
+  400回連続で流し込み、0.15秒おきに画面をスナップショットして原因を
+  調査した。判明した原因は`patch_stdout()`自体の設計にあった:
+  `patch_stdout()`は`print()`を処理するたびに「現在描画されている
+  ウィジェット(ステータスパネル+入力行)をいったん消す→印字する→
+  その直後のカーソル位置に再描画する」を繰り返す仕組み
+  (`prompt_toolkit.application.run_in_terminal`)。つまりパネルは常に
+  「その時点までの最新ログの直下」に印字されるだけで、次のログが
+  来ればまたその上へ押し出されていく。実際に「起動から1秒足らずで
+  パネルが画面の2行目(24行中)まで押し上げられていた」ことを
+  スナップショットのログで確認した。`patch_stdout()`は「印字した内容を
+  通常のターミナルのスクロールバックに残す」設計を優先しており、
+  ウィジェットを画面の決まった位置に物理的に固定する機能を持たない
+  ため、この仕組みの上にどう工夫を重ねても「下部に固定」は実現でき
+  ないと判断した。
+- **実装**: `patch_stdout()`をやめ、対話モードの画面全体を
+  `prompt_toolkit`のフルスクリーンApplication(`full_screen=True`)として
+  組み直した。
+  - ログ欄(`Window`+`BufferControl`、`_CHAT_LOG_BUFFER`という専用の
+    `Buffer`を描画。フォーカス不可・`read_only=True`)・ステータス欄
+    (既存の`_render_status_panel`をそのまま流用)・入力欄(既存の
+    `PromptSession`のレイアウトをそのまま流用)を`HSplit`で明示的に
+    分割する`_attach_full_screen_chat_ui`を新設した。ログ欄は
+    `height=Dimension(weight=1)`で残りの縦幅をすべて占有し、その
+    Window内でのみ内容がスクロールする(`Buffer`のカーソルを常に末尾に
+    置くことで自動的に最新行へスクロールする、追記型の一般的な
+    `prompt_toolkit`のパターン)。ステータス欄・入力欄は画面上の
+    決まった行範囲に物理的に固定されるため、ログがどれだけ流れても
+    位置がずれない。
+  - `session.app.renderer.full_screen = True`を直接設定する形にした。
+    `PromptSession`には`full_screen`を指定する公式な手段が無い
+    (`__init__`にも`.prompt()`にも存在しない)ため、`Renderer.
+    full_screen`(`render()`が呼ばれるたびに動的参照される、単なる
+    属性であることをソースで確認済み)を直接書き換える形にした。
+  - `patch_stdout()`の代替として`_ChatOutputRouter`(`sys.stdout`/
+    `sys.stderr`の差し替え先)を新設した。印字内容を素のターミナルへ
+    直接書くのではなく`_CHAT_LOG_BUFFER`へ追記し、フルスクリーン
+    Applicationが動いている間(=`session.prompt()`実行中、協業モード等の
+    バックグラウンドジョブの出力が流れうる期間)は`Application.
+    invalidate()`で再描画を促す。Applicationが動いていない間(=単発
+    質問等の同期処理中、`session.prompt()`の外側)は、その場で見える
+    よう素の出力先へも直接書き出す(この期間はまだ通常のターミナル
+    表示のままのため)。「今Applicationが動いているか」の判定は
+    `patch_stdout`自身が使うのと同じ手法(`get_app_session()`が返す
+    `AppSession`の`.app`属性)を踏襲した。
+  - `_run_repl_client`の全体構造(1メッセージごとに`_read_multiline_
+    input`→`session.prompt()`を呼び、戻ってきたら単発質問等を同期的に
+    処理する既存のループ)自体は一切変更していない。単発質問の同期
+    処理は従来通り`session.prompt()`の外側(フルスクリーンApplicationが
+    動いていない期間)で行われるため、その間のCtrl+Cが実際のOSレベルの
+    SIGINT(`KeyboardInterrupt`)として届く既存の仕組み(`prompt_toolkit`の
+    raw modeは`session.prompt()`の呼び出し単位でのみ有効になる)・
+    `_DoubleInterruptGuard`・`_handle_repl_command_interrupt`は無改修の
+    ままそのまま機能する。既存の10本のテストファイル(`_read_multiline_
+    input`・`PromptSession`を直接構築するテスト群)はいずれも
+    `_create_repl_prompt_session`を経由しない独自のセッション構築を
+    行っているため、この変更の影響を一切受けない。
+- **不具合修正(実装中に新たに特定): `Output`の遅延生成タイミング問題**:
+  実装直後、疑似端末での動作確認で「1バイトも画面に出力されない
+  (真っ黒のまま固まる)」という別の不具合を作り込んでしまった。原因を
+  切り分けたところ、`prompt_toolkit.application.current.AppSession.
+  output`は遅延生成(`_output`が`None`の間だけ、初めてアクセスされた
+  時点で`sys.stdout.isatty()`等を見て実端末向けか判定し生成する)であり、
+  `_ChatOutputRouter`のコンストラクタで`.output`に触れずに`sys.stdout`を
+  差し替えてしまうと、後から`PromptSession`が初めて`.output`へアクセス
+  する時点(=既に`sys.stdout`がこの`_ChatOutputRouter`、`isatty()`は
+  常に`False`、に差し替わった後)で生成されてしまい、非対話的な出力先と
+  誤判定されて何も描画されなくなっていた。`patch_stdout.StdoutProxy.
+  __init__`が全く同じ理由で`sys.stdout`を差し替える前に`self.app_session.
+  output`を参照していることに気づき、`_ChatOutputRouter.__init__`でも
+  同じタイミングで`self._app_session.output`に触れて生成を強制する
+  ことで解決した。既存のテスト(`DummyOutput`を明示的に渡す)ではこの
+  クラスの不具合を検出できない(`DummyOutput`を明示指定する経路は
+  `AppSession`の遅延生成を経由しないため)ことが分かったため、この
+  問題を再現する専用のテストを追加した(下記参照)。
+- **テスト**: `tests/test_status_panel.py`に、`_ChatOutputRouter`の
+  コンストラクタが`AppSession.output`の遅延生成を強制していることを
+  確認する`test_chat_output_router_forces_output_creation_before_
+  swapping_stdout`(上記の不具合の直接の回帰検知)、フルスクリーン
+  Applicationが動いている間は印字内容がログ欄バッファへ追記され
+  `invalidate()`が呼ばれることを確認する`test_chat_output_router_
+  writes_to_log_buffer_and_invalidates_when_app_running`、動いていない
+  間は素の出力先へも直接書き出されることを確認する`test_chat_output_
+  router_writes_to_real_output_when_app_not_running`、`_reset_chat_log_
+  buffer`がバッファを空にすることを確認する`test_reset_chat_log_
+  buffer_clears_content`、ログ欄バッファが上限を超えたら古い方から
+  切り捨てられることを確認する`test_chat_log_buffer_caps_size_by_
+  dropping_oldest_content`の5件を追加した。既存の`test_create_repl_
+  prompt_session_still_accepts_input_after_layout_wrap`(前回の修正時に
+  追加した、`_create_repl_prompt_session`が実際に入力を受け付けられる
+  ことを確認する回帰テスト)は、docstringをフルスクリーン化後の実態に
+  合わせて更新したうえでそのまま(無改修で)パスすることを確認した。
+- **動作確認**: `python3 -m pytest tests/`をフルスイートで実行し、新規
+  追加分5件を含め626件全件パスすることを確認した。フルスイートを複数回
+  繰り返したところ、既存の(今回の変更前のブランチでも同じ頻度・同じ
+  性質で再現する)フレーキーなテストが単発で失敗することがあったが、
+  変更前後で傾向に有意な差は無かった。加えて、疑似端末を使い、実際の
+  `_run_repl_client`(本番の関数そのもの、`job_runner`経由で`//agree`を
+  擬似的にディスパッチ)を0.2秒おきにスナップショットしながら動かし、
+  400行の思考過程表示フラッドの間(t=0.83秒〜2.66秒)、ステータス欄が
+  画面上の同じ行(24行中の22行目)に留まり続けることを確認した
+  (旧`patch_stdout()`方式では同条件で1秒足らずのうちに2行目まで押し
+  上げられていた)。フラッド終了後の`Ctrl+D`によるフルスクリーン終了・
+  「対話モードを終了します。」の表示も正常に動作することを確認した。
