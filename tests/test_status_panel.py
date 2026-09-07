@@ -427,16 +427,16 @@ def test_panel_union_shows_board_only_labels_even_if_poll_has_not_caught_up():
 
 
 # ---------------------------------------------------------------------------
-# _create_repl_prompt_session本番のセッション構築処理そのものが、レイアウトを
-# 組み替えた後も実際に入力を受け付けられることの回帰検知
+# _create_repl_prompt_session本番のセッション構築処理そのものが、フルスクリーン
+# 化した後も実際に入力を受け付けられることの回帰検知
 # ---------------------------------------------------------------------------
 
 def test_create_repl_prompt_session_still_accepts_input_after_layout_wrap():
-    """`_attach_status_panel`が`session.app.layout`を組み替えた後も、
-    デフォルトバッファ(入力欄)へのフォーカスが正しく保たれ、実際に
-    メッセージを送信できることを確認する(bottom_toolbarをやめて自前の
-    Windowでラップする方式に変更したことによる、既存の入力機能への
-    回帰が無いことの検証)。
+    """`_attach_full_screen_chat_ui`が`session.app.layout`を組み替え、
+    `full_screen=True`にした後も、デフォルトバッファ(入力欄)への
+    フォーカスが正しく保たれ、実際にメッセージを送信できることを
+    確認する(`bottom_toolbar`→自前レイアウト→フルスクリーン化と、
+    土台を作り変えるたびに既存の入力機能への回帰が無いことを検証する)。
     """
     yoriai._ACTIVE_ORG_MEMBERS.update(set())
     with create_pipe_input() as pipe_input, create_app_session(input=pipe_input, output=DummyOutput()):
@@ -445,6 +445,121 @@ def test_create_repl_prompt_session_still_accepts_input_after_layout_wrap():
         text, terminate = yoriai._read_multiline_input(session, yoriai._DoubleInterruptGuard())
     assert terminate is False
     assert text == "こんにちは", repr(text)
+
+
+# ---------------------------------------------------------------------------
+# _ChatOutputRouter・_chat_output_context・ログ欄バッファ(patch_stdout廃止後の
+# フルスクリーンUIへの出力差し込み)
+# ---------------------------------------------------------------------------
+
+def test_chat_output_router_forces_output_creation_before_swapping_stdout():
+    """`_ChatOutputRouter`のコンストラクタが、`sys.stdout`を差し替える前に
+    `AppSession.output`(遅延生成)を強制的に確定させておくことを確認する。
+
+    仮の判断(実機バグ修正・重要): これが無いと、`PromptSession`が後で
+    初めて`.output`にアクセスする時点では既に`sys.stdout`がこの
+    `_ChatOutputRouter`(`isatty()`は常に`False`)に差し替わっており、
+    実端末ではなく非対話的な出力先だと誤判定されて画面が一切描画され
+    なくなる(疑似端末を使った実機同等の再現で「1バイトも出力されない」
+    不具合として実際に特定した)。`patch_stdout.StdoutProxy.__init__`も
+    全く同じ理由で`sys.stdout`を差し替える前に`self.app_session.output`
+    を参照しており、同じ対策をここでも踏襲している。
+    """
+    with create_app_session() as app_session:
+        # 親セッションが既にOutputを持っている場合があるため、前提条件
+        # (=まだ誰も`.output`にアクセスしていない状態)を明示的に作る。
+        app_session._output = None
+        yoriai._ChatOutputRouter(sys.stdout)
+        assert app_session._output is not None, (
+            "コンストラクタの時点でAppSession.outputの遅延生成を強制するべきです"
+        )
+
+
+def test_chat_output_router_writes_to_log_buffer_and_invalidates_when_app_running():
+    """フルスクリーンApplicationが動いている間(`app_session.app`が
+    設定されている間)は、印字内容がログ欄のバッファへ追記され、
+    `Application.invalidate()`が呼ばれることを確認する。
+    """
+    yoriai._reset_chat_log_buffer()
+    invalidated = {"count": 0}
+
+    class _FakeApp:
+        def invalidate(self):
+            invalidated["count"] += 1
+
+    with create_app_session() as app_session:
+        app_session._output = object()  # .outputへのアクセスで例外にならないよう仮の値を入れる
+        router = yoriai._ChatOutputRouter(sys.stdout)
+        app_session.app = _FakeApp()
+        try:
+            router.write("[議題] こんにちは\n")
+        finally:
+            app_session.app = None
+
+    assert "[議題] こんにちは" in yoriai._CHAT_LOG_BUFFER.text
+    assert invalidated["count"] == 1
+
+
+def test_chat_output_router_writes_to_real_output_when_app_not_running():
+    """フルスクリーンApplicationが動いていない間(単発質問等の同期処理中)
+    は、印字内容がログ欄のバッファに記録されつつ、その場で見えるよう
+    素の出力先へも直接書き出されることを確認する。
+    """
+    yoriai._reset_chat_log_buffer()
+
+    class _FakeRealOutput:
+        def __init__(self):
+            self.written = []
+
+        def write(self, text):
+            self.written.append(text)
+
+        def flush(self):
+            pass
+
+    fake_real_output = _FakeRealOutput()
+    with create_app_session() as app_session:
+        app_session._output = object()
+        router = yoriai._ChatOutputRouter(fake_real_output)
+        assert app_session.app is None
+        router.write("実行中のYoriaiエージェントに接続できませんでした。\n")
+
+    assert "実行中のYoriaiエージェントに接続できませんでした。" in yoriai._CHAT_LOG_BUFFER.text
+    assert fake_real_output.written == ["実行中のYoriaiエージェントに接続できませんでした。\n"]
+
+
+def test_reset_chat_log_buffer_clears_content():
+    yoriai._CHAT_LOG_BUFFER.set_document(
+        yoriai.Document("残っていてはいけない古い内容"), bypass_readonly=True,
+    )
+    yoriai._reset_chat_log_buffer()
+    assert yoriai._CHAT_LOG_BUFFER.text == ""
+
+
+def test_chat_log_buffer_caps_size_by_dropping_oldest_content():
+    """長時間の`--chat`セッションでログ欄が際限なく肥大化しないよう、
+    上限を超えたら古い方から切り捨てられることを確認する。
+    """
+    yoriai._reset_chat_log_buffer()
+
+    class _FakeApp:
+        def invalidate(self):
+            pass
+
+    with create_app_session() as app_session:
+        app_session._output = object()
+        router = yoriai._ChatOutputRouter(sys.stdout)
+        app_session.app = _FakeApp()  # 実際のsys.stdoutへ書き出させないため
+        try:
+            router.write("A" * (yoriai._CHAT_LOG_BUFFER_MAX_CHARS - 10))
+            router.write("B" * 100)
+        finally:
+            app_session.app = None
+
+    text = yoriai._CHAT_LOG_BUFFER.text
+    assert len(text) == yoriai._CHAT_LOG_BUFFER_MAX_CHARS
+    assert text.endswith("B" * 100), "末尾(新しい内容)は保持されるはずです"
+    assert "A" * (yoriai._CHAT_LOG_BUFFER_MAX_CHARS - 10) not in text, "先頭(古い内容)は切り捨てられるはずです"
 
 
 def main():
@@ -469,6 +584,11 @@ def main():
         test_panel_known_labels_defaults_to_board_only_for_backward_compatibility,
         test_panel_union_shows_board_only_labels_even_if_poll_has_not_caught_up,
         test_create_repl_prompt_session_still_accepts_input_after_layout_wrap,
+        test_chat_output_router_forces_output_creation_before_swapping_stdout,
+        test_chat_output_router_writes_to_log_buffer_and_invalidates_when_app_running,
+        test_chat_output_router_writes_to_real_output_when_app_not_running,
+        test_reset_chat_log_buffer_clears_content,
+        test_chat_log_buffer_caps_size_by_dropping_oldest_content,
     ]
     failures = 0
     for test in tests:

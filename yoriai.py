@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import contextlib
 import datetime
 import difflib
 import json
@@ -55,13 +56,14 @@ except ImportError:
 
 import requests
 from prompt_toolkit import PromptSession
-from prompt_toolkit.application import create_app_session
+from prompt_toolkit.application import create_app_session, get_app_session
+from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.document import Document
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import HSplit, Layout, Window
-from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
-from prompt_toolkit.patch_stdout import patch_stdout
 from zeroconf import ServiceBrowser, ServiceInfo, Zeroconf, IPVersion, InterfaceChoice
 
 import config
@@ -5060,17 +5062,54 @@ def _review_and_fix_one_file(
 # はこの用途(高頻度な`print()`と共存する常時表示パネル)には耐えられ
 # ないという、独自コードの不具合ではなく`prompt_toolkit`自体の制約。
 #
-# 仮の判断(対策): `bottom_toolbar`は使わず、`PromptSession`が組み立てる
-# 既存のレイアウト全体を、自前の(何のConditionも付けない、常時表示の)
-# `Window`で上からラップする方式にした(`_attach_status_panel`)。この
-# 自前のWindowは`renderer_height_is_known`のようなCPR依存のガードを
-# 一切持たないため、`patch_stdout()`がどれだけ高頻度に`print()`を処理
-# しても表示され続ける。実際に疑似端末で「協業モードの思考過程表示を
-# 400行連続で流し込む」状況を再現し、この方式なら最後までパネルが
-# 表示され続けることを確認済み(旧`bottom_toolbar`方式では最初の1回を
-# 最後に二度と表示されなかった)。既存のレイアウト(フレーム・検索
-# ツールバー等を含む)はラップして下に配置し直すだけなので、キー割り
-# 当て・履歴・複数行編集などの既存の挙動には一切影響しない。
+# 仮の判断(対策・第1弾): `bottom_toolbar`は使わず、`PromptSession`が
+# 組み立てる既存のレイアウト全体を、自前の(何のConditionも付けない、
+# 常時表示の)`Window`で上からラップする方式にした。この自前のWindowは
+# `renderer_height_is_known`のようなCPR依存のガードを一切持たないため、
+# `patch_stdout()`がどれだけ高頻度に`print()`を処理しても「消えたまま
+# 戻らない」ことは無くなった。
+#
+# 仮の判断(実機バグ報告への対応・第2弾、重要): ところが、この対策後も
+# 実機から「パネルが画面下部に固定されず、ログと一緒に上に流れて
+# いってしまう」という報告を受けた。疑似端末で0.15秒おきに画面を撮影して
+# 調査したところ、`patch_stdout()`自体の設計に起因すると判明した。
+# `patch_stdout()`は`print()`を処理するたびに「現在描画されている
+# ウィジェット(パネル+入力行)をいったん消す→印字する→その直後の
+# カーソル位置に再描画する」を繰り返す(`prompt_toolkit.application.
+# run_in_terminal`)。つまりパネルは常に「その時点までの最新ログの直下」
+# に印字されるだけで、次のログが来ればまたその上へ押し出されていく。
+# 実際に「起動から1秒足らずでパネルが画面の2行目(24行中)まで押し
+# 上げられていた」ことをログで確認した。`patch_stdout()`は「印字した
+# 内容は通常のターミナルのスクロールバックに残す」設計を優先しており、
+# ウィジェットを画面の決まった位置に物理的に固定する機能を持たない
+# ため、この仕組みの上にどう工夫を重ねても「下部に固定」は実現できない。
+#
+# 仮の判断(対策・第2弾、根本対応): `patch_stdout()`をやめ、対話モードの
+# 画面全体を`prompt_toolkit`のフルスクリーンApplication(`full_screen=
+# True`)として組み直した。ログ欄・ステータス欄・入力欄を`HSplit`で
+# 明示的に分割し、印字されたテキストは(素のターミナルへ直接書くのでは
+# なく)ログ欄専用の`Buffer`(`_CHAT_LOG_BUFFER`)へ追記して
+# `Application.invalidate()`で再描画を促す方式にした(`_ChatOutputRouter`)。
+# フルスクリーンモードでは各`Window`が画面上の決まった行範囲を占有し、
+# ログ欄の内容はそのWindow内でのみスクロールするため、ステータス欄は
+# 物理的に同じ行に固定され続ける。疑似端末で同じ0.15秒おきの撮影を
+# 行い、400行のログフラッド中もステータス欄の画面上の行番号が一切
+# 変化しないことを確認した(詳細は`_attach_full_screen_chat_ui`・
+# `_ChatOutputRouter`のコメント、およびDEVELOPMENT_LOG.mdを参照)。
+#
+# 仮の判断(この対策が既存の同期的な単発質問・Ctrl+C割り込みに与える
+# 影響について): `full_screen=True`にしたのは`session.prompt()`が実際に
+# 動いている間(=入力待ち・協業モード等のバックグラウンドジョブの出力が
+# 流れている間)だけであり、`_run_repl_client`の全体構造(1メッセージ
+# ごとに`_read_multiline_input`→`session.prompt()`を呼び、戻ってきたら
+# 単発質問等を同期的に処理する、という既存のループ構造)自体は一切
+# 変更していない。単発質問の同期処理(`_ask_organization`等)は
+# 従来通り`session.prompt()`の外側(=フルスクリーンApplicationが
+# 動いていない期間)で行われるため、その間のCtrl+Cが実際のOSレベルの
+# SIGINT(`KeyboardInterrupt`)として届く既存の仕組み・
+# `_DoubleInterruptGuard`・`_handle_repl_command_interrupt`は無改修の
+# ままそのまま機能する(`prompt_toolkit`のraw mode、ひいてはこの割り込み
+# 機構は`session.prompt()`の呼び出し単位でのみ有効になるため)。
 #
 # 状態は`_DeviceStatusBoard`という、ラベル(デバイス名)ごとに1件の
 # (状態種別, 詳細テキスト, 開始時刻)を保持するスレッドセーフな辞書で
@@ -7455,29 +7494,154 @@ def _make_repl_key_bindings() -> KeyBindings:
     return bindings
 
 
-def _attach_status_panel(session: PromptSession) -> None:
-    """`session`の画面を「ステータス一覧(常時表示)」+「既存のレイアウト
-    (入力行・作業ログはpatch_stdout経由で別途流れる)」の2段構成に組み
-    替える。
+# 仮の判断: 作業ログ欄の内容を保持する`Buffer`。ユーザーが直接編集する
+# ものではないため`read_only=True`にし、実際の追記は`_ChatOutputRouter`
+# (`sys.stdout`/`sys.stderr`の差し替え先)が`bypass_readonly=True`で
+# 行う。テストのように同一プロセス内で`_run_repl_client`を複数回
+# 呼び出すケースに備え、`_run_repl_client`の起動のたびに内容をリセット
+# する(`_ACTIVE_STATUS_BOARD`等と同じ理由)。
+_CHAT_LOG_BUFFER = Buffer(read_only=True, multiline=True)
+
+# 仮の判断: 長時間の`--chat`セッションでログ欄の`Buffer`が際限なく
+# 肥大化してメモリを圧迫しないよう、上限を超えたら先頭側(古い方)を
+# 切り捨てる。既存の`_FILE_CONTENT_TRUNCATE_CHARS`等と同じ考え方の
+# 単純な安全策。
+_CHAT_LOG_BUFFER_MAX_CHARS = 500_000
+
+
+class _ChatOutputRouter:
+    """対話モードの`sys.stdout`/`sys.stderr`の差し替え先。
+
+    仮の判断(実機バグ修正・重要、詳細はこのセクション冒頭のコメント
+    参照): `patch_stdout()`をやめてこれに置き換えた。`patch_stdout()`は
+    「印字するたびに現在のウィジェットを消して印字し、その直後に
+    再描画する」設計のため、ステータスパネルが常にその時点の最新ログの
+    直下に印字されるだけで、次のログが来ればまた押し出されてしまい、
+    「画面下部に固定」を実現できなかった。この`_ChatOutputRouter`は
+    印字内容を素のターミナルへ直接書くのではなく、ログ欄専用の
+    `Buffer`(`_CHAT_LOG_BUFFER`)へ追記し、`Application.invalidate()`
+    で再描画を促す。フルスクリーンモード(`full_screen=True`)の
+    `Window`は画面上の決まった行範囲を占有するため、ログ欄の内容は
+    そのWindow内でのみスクロールし、ステータス欄は同じ行に留まり続ける。
+
+    仮の判断: `session.prompt()`が実際に動いている間(=対話モードの
+    フルスクリーンApplicationが起動中)は、印字内容を`_CHAT_LOG_BUFFER`
+    へ追記するだけで済む(Applicationがそのバッファを描画するため)。
+    一方、単発質問等の同期処理は`session.prompt()`の外側(Applicationが
+    動いていない期間)で行われるため、この間に印字された内容は
+    `_CHAT_LOG_BUFFER`に記録は残しつつ、その場では誰も描画してくれない
+    ので素のターミナルへも直接書き出す(この期間はまだ通常のターミナル
+    表示のままであり、そこに書けば従来通りその場で見える)。「今
+    Applicationが動いているかどうか」は、`patch_stdout`自身が使う
+    のと同じ手法(`get_app_session()`が返す`AppSession`の`.app`
+    属性)で判定する。この判定はどのスレッドから`write()`が呼ばれても
+    正しく動く(`AppSession`はセットアップ時に1回だけ取得し、以後は
+    ただの属性参照になるため)。
+    """
+
+    def __init__(self, real_output):
+        self._real_output = real_output
+        self._app_session = get_app_session()
+        # 仮の判断(実機バグ修正・重要): `AppSession.output`は遅延生成
+        # (未生成ならこの参照時に初めて作られる)で、生成時に`sys.stdout.
+        # isatty()`を見て実端末向けかどうかを判定する。ここで参照して
+        # おかないと、後で`PromptSession`が(まだ`Output`が無いために)
+        # 初めて`.output`にアクセスする時点まで生成が遅延し、その時点では
+        # 既に`sys.stdout`がこの`_ChatOutputRouter`(`isatty()`は常に
+        # `False`)に差し替わってしまっているため、実端末ではなく非対話的な
+        # 出力先だと誤判定され、画面が一切描画されなくなる(実際に疑似
+        # 端末で「1バイトも出力されない」不具合として再現・特定した)。
+        # `patch_stdout.StdoutProxy.__init__`も全く同じ理由で`sys.stdout`
+        # を差し替える前に`self._output = self.app_session.output`を
+        # 参照しており、同じ対策をここでも踏襲する。
+        self._app_session.output
+        self._lock = threading.Lock()
+
+    def write(self, text: str) -> int:
+        if not text:
+            return 0
+        with self._lock:
+            new_text = _CHAT_LOG_BUFFER.text + text
+            if len(new_text) > _CHAT_LOG_BUFFER_MAX_CHARS:
+                new_text = new_text[-_CHAT_LOG_BUFFER_MAX_CHARS:]
+            _CHAT_LOG_BUFFER.set_document(
+                Document(new_text, cursor_position=len(new_text)), bypass_readonly=True,
+            )
+        app = self._app_session.app
+        if app is not None:
+            app.invalidate()
+        else:
+            self._real_output.write(text)
+            self._real_output.flush()
+        return len(text)
+
+    def flush(self) -> None:
+        self._real_output.flush()
+
+    def isatty(self) -> bool:
+        return False
+
+
+def _reset_chat_log_buffer() -> None:
+    _CHAT_LOG_BUFFER.set_document(Document(""), bypass_readonly=True)
+
+
+@contextlib.contextmanager
+def _chat_output_context():
+    """`patch_stdout()`の代わりに対話モードの`sys.stdout`/`sys.stderr`を
+    `_ChatOutputRouter`へ差し替えるコンテキストマネージャ。詳細は
+    `_ChatOutputRouter`のコメントを参照。
+    """
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    router = _ChatOutputRouter(original_stdout)
+    sys.stdout = router
+    sys.stderr = router
+    try:
+        yield
+    finally:
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+
+
+def _attach_full_screen_chat_ui(session: PromptSession) -> None:
+    """`session`の画面を「ログ欄(常時表示、スクロール可能)」+「ステータス
+    一覧(常時表示)」+「既存のレイアウト(入力欄)」の3段構成に組み替え、
+    `full_screen=True`にする。
 
     仮の判断(実機バグ報告への対応・重要、詳細はこのセクション冒頭の
-    コメント参照): `bottom_toolbar`は使わない。`renderer_height_is_known`
-    という、端末へのカーソル位置問い合わせ(CPR)が成功して初めて`True`に
-    なる条件でガードされており、`patch_stdout()`が高頻度に`print()`を
-    処理する状況(協業モードの思考過程ストリーミング表示等)ではこの
-    問い合わせが再送されなくなり、パネルがセッション中ずっと非表示に
-    なる不具合を実機・疑似端末での再現の両方で確認した。
+    コメント参照): 単に既存レイアウトを自前のWindowでラップするだけの
+    第1弾の対策(`bottom_toolbar`をやめた際の対応)では、`patch_stdout()`
+    自体の「印字するたびに押し出される」性質のせいで、ステータス欄が
+    画面下部に固定されず、ログと一緒に上へ流れていってしまう不具合が
+    実機で再発した。今回は`patch_stdout()`自体をやめ、ログ欄を専用の
+    `Window`(`_CHAT_LOG_BUFFER`を描画する`BufferControl`、フォーカス
+    不可)として明示的にレイアウトへ組み込み、`session.app.renderer.
+    full_screen = True`にすることで、各Windowが画面上の決まった行範囲を
+    物理的に占有するようにした。
 
-    代わりに、`session`が組み立て済みの既存レイアウト全体
-    (`session.layout.container`。フレーム・検索ツールバー等を含む)を、
-    何のConditionも付けない自前の`Window`(常時表示、CPR非依存)で
-    上からラップする。既存レイアウトの中身には一切手を加えないため、
-    キー割り当て・履歴・複数行編集などの挙動には影響しない。ラップ後は
-    デフォルトバッファ(入力欄)へ明示的にフォーカスを戻す必要がある
-    (`Layout(container)`は素朴にはこの`container`内の最初のフォーカス
-    可能な要素にフォーカスするため、それが偶然にも入力欄と一致すると
-    保証できない)。
+    仮の判断: `Renderer.full_screen`はプレーンな属性で、`render()`が
+    呼ばれるたびに動的に参照される(`prompt_toolkit`のソースで確認済み)
+    ため、最初の`.prompt()`呼び出しより前にここで設定しておけば、次の
+    描画から正しくフルスクリーン(代替スクリーンバッファ)に切り替わる。
+    `PromptSession`自体には`full_screen`を指定する公式な手段が無い
+    (`__init__`にも`.prompt()`にも無い)ため、この属性を直接書き換える
+    形を取った。
+
+    仮の判断: 既存レイアウト(`session.layout.container`。フレーム・
+    検索ツールバー等を含む)の中身には一切手を加えないため、キー割り
+    当て・履歴・複数行編集などの挙動には影響しない。ラップ後はデフォルト
+    バッファ(入力欄)へ明示的にフォーカスを戻す必要がある(`Layout
+    (container)`は素朴にはこの`container`内の最初のフォーカス可能な
+    要素にフォーカスするため、それが偶然にも入力欄と一致すると保証
+    できない)。
     """
+    log_window = Window(
+        BufferControl(buffer=_CHAT_LOG_BUFFER, focusable=False),
+        wrap_lines=True,
+        height=Dimension(weight=1),
+        always_hide_cursor=True,
+    )
     status_window = Window(
         FormattedTextControl(
             lambda: _render_status_panel(_ACTIVE_STATUS_BOARD, _ACTIVE_ORG_MEMBERS.snapshot())
@@ -7485,9 +7649,10 @@ def _attach_status_panel(session: PromptSession) -> None:
         height=Dimension(min=0),
         dont_extend_height=True,
     )
-    wrapped_layout = Layout(HSplit([status_window, session.layout.container]))
+    wrapped_layout = Layout(HSplit([log_window, status_window, session.layout.container]))
     wrapped_layout.focus(session.default_buffer)
     session.app.layout = wrapped_layout
+    session.app.renderer.full_screen = True
 
 
 def _create_repl_prompt_session() -> PromptSession:
@@ -7506,13 +7671,12 @@ def _create_repl_prompt_session() -> PromptSession:
         history=InMemoryHistory(),
         key_bindings=_make_repl_key_bindings(),
         # 経過時間(例: 思考中の"(42s)")表示が実際に増えていくのが見える
-        # よう、入力が無くても定期的に再描画させる(`bottom_toolbar`は
-        # 使わないが、`refresh_interval`自体は`Application`全体の設定
-        # であり、`_attach_status_panel`が組み替えた後のレイアウトにも
-        # そのまま効く)。
+        # よう、入力が無くても定期的に再描画させる(`refresh_interval`
+        # 自体は`Application`全体の設定であり、`_attach_full_screen_
+        # chat_ui`が組み替えた後のレイアウトにもそのまま効く)。
         refresh_interval=_STATUS_PANEL_REFRESH_INTERVAL_SECONDS,
     )
-    _attach_status_panel(session)
+    _attach_full_screen_chat_ui(session)
     return session
 
 
@@ -7855,6 +8019,16 @@ def _run_job_with_conversation_log(chat_log: "_ChatLog", user_label: str, job: c
 # 用意した、信頼できる固定テキスト)は`patch_stdout()`のコンテキストに
 # 入る前に(素の`sys.stdout`へ直接)出力するようにし、LLMの応答等は
 # 引き続き安全策の効いた経路のまま維持した。
+#
+# 追記(`patch_stdout()`→`_ChatOutputRouter`への置き換え後): この置き換え
+# 後は端末への「生書き込み」自体を行わなくなり(印字内容はログ欄の
+# `Buffer`へテキストとして追記されるだけで、`prompt_toolkit`側が
+# エスケープシーケンスを端末制御として解釈することは無い)、上記の
+# 文字化け自体はそもそも起こりえなくなった。ただし、その代わりに
+# セッション開始後に色付き(ANSIエスケープシーケンス付き)のテキストを
+# 印字しても、色としては反映されず生の制御文字がそのまま(無害な形で)
+# 表示されるだけになる。案内文をこれまで通りコンテキストに入る前に
+# (素の`sys.stdout`へ直接)出力する構成は維持しているため、実害は無い。
 
 _ANSI_RESET = "\x1b[0m"
 _ANSI_BOLD = "\x1b[1m"
@@ -8018,10 +8192,10 @@ def _format_startup_banner(out_dir: str, member_count, use_color: bool) -> str:
 
 def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
     # 仮の判断(実機で報告された文字化け不具合への対応): 起動時の案内文
-    # (ロゴ等)は、`patch_stdout()`のコンテキストに入る前に、素の
+    # (ロゴ等)は、`_chat_output_context()`のコンテキストに入る前に、素の
     # `sys.stdout`へ直接print()する。理由は`_format_logo_lines`の
-    # コメントを参照。`patch_stdout()`(バックグラウンドジョブの出力を
-    # 安全に差し込むための仕組み)は、この後のセッション本体
+    # コメントを参照。`_chat_output_context()`(対話モードのフルスクリーン
+    # UIのログ欄へ出力を差し込む仕組み)は、この後のセッション本体
     # (入力ループ・LLMの応答・バックグラウンドジョブの出力)にのみ適用する。
     print()
     member_count = _count_org_members(port, org_fingerprint)
@@ -8034,28 +8208,30 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
     # されてしまうことを防ぐ)。
     _ACTIVE_STATUS_BOARD.clear()
     _ACTIVE_ORG_MEMBERS.update(set())
+    _reset_chat_log_buffer()
     # 仮の判断: ステータスパネルの行数を実際の参加台数に追従させるため、
     # `--chat`の起動中ずっと定期的に`/status`へ問い合わせ続けるスレッドを
     # ここで開始する(詳細は`_poll_org_members_forever`のコメント参照)。
     _start_org_member_poller(port, org_fingerprint)
 
-    # 仮の判断: 対話モードのセッション本体を`patch_stdout()`で包む。
-    # バックグラウンドジョブ(協業モード等)がメインスレッドの入力待ち中に
-    # print()する際、このコンテキストが無いと出力が入力中の行を破壊して
-    # しまう(prompt_toolkit公式が「別スレッドから安全にprintする」
-    # ために提供する仕組み)。
+    # 仮の判断: 対話モードのセッション本体を`_chat_output_context()`で
+    # 包む。バックグラウンドジョブ(協業モード等)がメインスレッドの入力
+    # 待ち中にprint()する際、このコンテキストが無いと出力がフルスクリーン
+    # UIのログ欄ではなく素のターミナルへ直接書き込まれてしまう(詳細は
+    # `_ChatOutputRouter`のコメントを参照)。
     #
-    # 仮の判断: `patch_stdout()`は、内部で`prompt_toolkit`の(プロセス
+    # 仮の判断: `_ChatOutputRouter`は、内部で`prompt_toolkit`の(プロセス
     # 全体で共有される)既定の`AppSession`が持つ`Output`オブジェクトへ
-    # 書き込む。既定の`AppSession`はプロセス内で使い回される単一の
-    # インスタンスであり、一度作られると(その時点の`sys.stdout`を
-    # 元に)出力先を固定してしまうため、`create_app_session()`で
-    # この呼び出し専用の新しい`AppSession`を作ってから`patch_stdout()`を
-    # 使う。これが無いと、テストのように同一プロセス内で`_run_repl_client`
-    # (や`sys.stdout`の差し替え)を複数回呼び出した場合、2回目以降の
-    # 出力が最初の呼び出し時点の(既に閉じられた)出力先に書き込まれて
-    # 消えてしまう不具合が実際に発生した。
-    with create_app_session(), patch_stdout():
+    # 書き込む(`patch_stdout()`と同じ仕組みを踏襲)。既定の`AppSession`は
+    # プロセス内で使い回される単一のインスタンスであり、一度作られると
+    # (その時点の`sys.stdout`を元に)出力先を固定してしまうため、
+    # `create_app_session()`でこの呼び出し専用の新しい`AppSession`を
+    # 作ってから`_chat_output_context()`を使う。これが無いと、テストの
+    # ように同一プロセス内で`_run_repl_client`(や`sys.stdout`の差し替え)
+    # を複数回呼び出した場合、2回目以降の出力が最初の呼び出し時点の
+    # (既に閉じられた)出力先に書き込まれて消えてしまう不具合が実際に
+    # 発生した。
+    with create_app_session(), _chat_output_context():
         # 仮の判断(依頼への対応): 会話履歴(messages)は、この起動中は
         # 単発質問・//multiだけでなく、//agree・//fix・//plan-only・
         # //parallel・//resume-allも含めたすべてのやり取りを共有・
