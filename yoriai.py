@@ -7909,6 +7909,21 @@ def _attach_full_screen_chat_ui(session: PromptSession) -> None:
     session.style = Style.from_dict({"banner-logo": "bold fg:ansicyan"})
     session.key_bindings = merge_key_bindings([session.key_bindings, _make_persistent_session_key_bindings()])
     session.default_buffer.accept_handler = _accept_and_keep_session_running
+    # 仮の判断(実機バグ報告への対応: 対話プロトコルの思考過程が大量に
+    # 高頻度で流れている間、画面が崩れる): 対話プロトコルの思考過程は
+    # チャンクが届くたびに`print()`→`app.invalidate()`が呼ばれ、1秒間に
+    # 何十回も再描画が要求されうる。一部の端末(特にWindowsの従来型
+    # コンソールホスト=`conhost.exe`。VT100/ANSIの高度なシーケンス
+    # 対応が不完全なことで知られる)では、これほど高頻度の差分描画に
+    # 追従しきれず、古い内容の断片が新しい内容に混ざって表示される
+    # 文字化けが実機で報告された。`Application.min_redraw_interval`
+    # (実際の再描画の間隔に下限を設ける、`invalidate()`自体は`prompt_
+    # toolkit`側で自動的に間引かれる)を設定し、再描画の頻度そのものを
+    # 抑えることで、対応が不完全な端末でも描画が追従しやすくする
+    # (`refresh_interval`とは別物: そちらは「入力が無くても定期的に
+    # 再描画させる」ためのタイマーで、こちらは「再描画そのものの最短
+    # 間隔」を制御する)。
+    session.app.min_redraw_interval = 0.1
 
 
 def _create_repl_prompt_session() -> PromptSession:
