@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
+import contextvars
 import datetime
 import difflib
 import json
@@ -64,6 +65,8 @@ from prompt_toolkit.key_binding import KeyBindings, merge_key_bindings
 from prompt_toolkit.layout import HSplit, Layout, Window
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.layout.processors import Processor, Transformation
+from prompt_toolkit.styles import Style
 from zeroconf import ServiceBrowser, ServiceInfo, Zeroconf, IPVersion, InterfaceChoice
 
 import config
@@ -7599,6 +7602,44 @@ _CHAT_LOG_BUFFER = Buffer(read_only=True, multiline=True)
 # 単純な安全策。
 _CHAT_LOG_BUFFER_MAX_CHARS = 500_000
 
+# 仮の判断(実機バグ修正: ロゴの色が水色から白に変わってしまった):
+# ログ欄(`_CHAT_LOG_BUFFER`)はプレーンテキストの`Buffer`であり、
+# `prompt_toolkit`はその内容に含まれるANSIエスケープシーケンスを一切
+# 解釈しない(解釈させようとして生のエスケープシーケンスをそのまま
+# 書き込むと、制御文字の断片がそのまま表示されて文字化けする)。その
+# ため、起動時案内文(ロゴ)の複製をログ欄の先頭に書き込む際は色無しの
+# プレーンテキストにせざるを得なかったが、これでは起動時に素の
+# ターミナルへ直接印字する色付き版(水色のロゴ)と見た目が食い違って
+# しまう。`_ChatLogBannerHighlightProcessor`で、ログ欄の各行番号ごとに
+# `_CHAT_LOG_BANNER_LINE_STYLES`で指定したスタイルクラスを強制適用する
+# ことで、生のエスケープシーケンスを埋め込まずに色を再現する
+# (`_format_logo_lines`のブロック体ワードマーク部分=`class:banner-logo`
+# =`bold fg:ansicyan`を`_attach_full_screen_chat_ui`で定義)。
+# `_supports_ansi_color()`が偽の環境(`NO_COLOR`・`TERM=dumb`等)では
+# `_run_repl_client`がこのリストを空のままにし、色付けを行わない。
+_CHAT_LOG_BANNER_LINE_STYLES = []
+
+
+class _ChatLogBannerHighlightProcessor(Processor):
+    """ログ欄(`_CHAT_LOG_BUFFER`)の先頭に複製された起動時案内文の
+    一部の行に、行番号に応じたスタイルを強制適用するプロセッサ。
+    詳細は`_CHAT_LOG_BANNER_LINE_STYLES`のコメントを参照。
+    """
+
+    def apply_transformation(self, transformation_input):
+        lineno = transformation_input.lineno
+        if lineno >= len(_CHAT_LOG_BANNER_LINE_STYLES):
+            return Transformation(transformation_input.fragments)
+        extra_style = _CHAT_LOG_BANNER_LINE_STYLES[lineno]
+        if not extra_style:
+            return Transformation(transformation_input.fragments)
+        new_fragments = []
+        for fragment in transformation_input.fragments:
+            style, text = fragment[0], fragment[1]
+            rest = fragment[2:]
+            new_fragments.append((f"{style} {extra_style}", text, *rest))
+        return Transformation(new_fragments)
+
 
 class _ChatOutputRouter:
     """対話モードの`sys.stdout`/`sys.stderr`の差し替え先。
@@ -7628,6 +7669,26 @@ class _ChatOutputRouter:
     属性)で判定する。この判定はどのスレッドから`write()`が呼ばれても
     正しく動く(`AppSession`はセットアップ時に1回だけ取得し、以後は
     ただの属性参照になるため)。
+
+    仮の判断(実機バグ修正・重要): `Application`が動いている間、
+    `_CHAT_LOG_BUFFER`への実際の書き込み(`set_document`)は、`write()`を
+    呼んだスレッドで直接行うのではなく、`app.loop.call_soon_threadsafe`
+    経由でApplication自身のイベントループのスレッドへ委譲する。
+    `Application._redraw`(実際の描画処理)のdocstringには"Not thread
+    safe!"と明記されており、`Renderer`は「自分が動いているスレッドから
+    しか`Buffer`の内容を読まない」という前提で動いている。以前は
+    `write()`を呼んだスレッド(単発質問等のバックグラウンドジョブの
+    スレッド、または`_read_multiline_input`のメインスレッド)から直接
+    `_CHAT_LOG_BUFFER.set_document()`していたため、ちょうどそのタイミングで
+    UIスレッドがレンダリングの途中(=ステータス欄や入力欄の高さを
+    計算した直後、実際に描画する前など)だと、書き込み前後で内容が
+    食い違う"torn read"が起こり、画面上で異なる行の内容が混ざり合う
+    (例:「Yoriai>」と「MacStudio(自分) 待機」が同じ行に混在する)
+    という文字化けが実機で再現した。疑似端末での検証で、Ctrl+C時に
+    限らず、通常のメッセージ送信でログ欄が伸びて再描画が起きるたびに
+    同様の崩れが起きることを確認した。Applicationが動いていない間
+    (`app`が`None`)は、これまで通り呼び出したスレッドで直接書き込む
+    (この間はUIスレッドの描画が走っていないため競合しない)。
     """
 
     def __init__(self, real_output):
@@ -7648,9 +7709,7 @@ class _ChatOutputRouter:
         self._app_session.output
         self._lock = threading.Lock()
 
-    def write(self, text: str) -> int:
-        if not text:
-            return 0
+    def _append_to_log_buffer(self, text: str) -> None:
         with self._lock:
             new_text = _CHAT_LOG_BUFFER.text + text
             if len(new_text) > _CHAT_LOG_BUFFER_MAX_CHARS:
@@ -7658,10 +7717,21 @@ class _ChatOutputRouter:
             _CHAT_LOG_BUFFER.set_document(
                 Document(new_text, cursor_position=len(new_text)), bypass_readonly=True,
             )
+
+    def write(self, text: str) -> int:
+        if not text:
+            return 0
         app = self._app_session.app
-        if app is not None:
+        if app is not None and app.loop is not None and not app.loop.is_closed():
+            # 仮の判断: 実際の書き込みをApplicationのイベントループの
+            # スレッドへ委譲する(`call_soon_threadsafe`はどのスレッドから
+            # 呼んでも安全)。同じスレッドへ順番に積まれるため、この直後の
+            # `app.invalidate()`による再描画は必ずこの書き込みの後に実行
+            # される。
+            app.loop.call_soon_threadsafe(self._append_to_log_buffer, text)
             app.invalidate()
         else:
+            self._append_to_log_buffer(text)
             self._real_output.write(text)
             self._real_output.flush()
         return len(text)
@@ -7812,7 +7882,10 @@ def _attach_full_screen_chat_ui(session: PromptSession) -> None:
     直接呼ぶ既存のテスト群(この関数を経由しない)には一切影響しない。
     """
     log_window = Window(
-        BufferControl(buffer=_CHAT_LOG_BUFFER, focusable=False),
+        BufferControl(
+            buffer=_CHAT_LOG_BUFFER, focusable=False,
+            input_processors=[_ChatLogBannerHighlightProcessor()],
+        ),
         wrap_lines=True,
         height=Dimension(weight=1),
         always_hide_cursor=True,
@@ -7828,8 +7901,29 @@ def _attach_full_screen_chat_ui(session: PromptSession) -> None:
     wrapped_layout.focus(session.default_buffer)
     session.app.layout = wrapped_layout
     session.app.renderer.full_screen = True
+    # 仮の判断(実機バグ修正: ロゴの色が水色から白になった): ログ欄の
+    # 先頭に複製したロゴ部分だけに`_ChatLogBannerHighlightProcessor`が
+    # `class:banner-logo`スタイルを適用するため、そのスタイル自体を
+    # ここで定義する(既定では`session.style`は未設定=`None`のため、
+    # 既存の見た目への影響はこの1クラスの追加のみ)。
+    session.style = Style.from_dict({"banner-logo": "bold fg:ansicyan"})
     session.key_bindings = merge_key_bindings([session.key_bindings, _make_persistent_session_key_bindings()])
     session.default_buffer.accept_handler = _accept_and_keep_session_running
+    # 仮の判断(実機バグ報告への対応: 対話プロトコルの思考過程が大量に
+    # 高頻度で流れている間、画面が崩れる): 対話プロトコルの思考過程は
+    # チャンクが届くたびに`print()`→`app.invalidate()`が呼ばれ、1秒間に
+    # 何十回も再描画が要求されうる。一部の端末(特にWindowsの従来型
+    # コンソールホスト=`conhost.exe`。VT100/ANSIの高度なシーケンス
+    # 対応が不完全なことで知られる)では、これほど高頻度の差分描画に
+    # 追従しきれず、古い内容の断片が新しい内容に混ざって表示される
+    # 文字化けが実機で報告された。`Application.min_redraw_interval`
+    # (実際の再描画の間隔に下限を設ける、`invalidate()`自体は`prompt_
+    # toolkit`側で自動的に間引かれる)を設定し、再描画の頻度そのものを
+    # 抑えることで、対応が不完全な端末でも描画が追従しやすくする
+    # (`refresh_interval`とは別物: そちらは「入力が無くても定期的に
+    # 再描画させる」ためのタイマーで、こちらは「再描画そのものの最短
+    # 間隔」を制御する)。
+    session.app.min_redraw_interval = 0.1
 
 
 def _create_repl_prompt_session() -> PromptSession:
@@ -8404,10 +8498,21 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
     # ようにする。ログ欄はプレーンテキストとして描画され、`prompt_
     # toolkit`側がANSIエスケープシーケンスを解釈することは無いため、
     # 色無し版(`use_color=False`)を別途組み立てて使う(色付き版を
-    # そのまま書くと、制御文字の断片がそのまま表示されてしまう)。
+    # そのまま書くと、制御文字の断片がそのまま表示されてしまう)。色は
+    # 別途`_ChatLogBannerHighlightProcessor`が行番号ごとのスタイルの
+    # 強制適用で再現する(詳細は`_CHAT_LOG_BANNER_LINE_STYLES`のコメント
+    # 参照)。`banner_use_color`が偽(`NO_COLOR`環境変数等)の場合は
+    # 空のままにし、色付けを行わない。ブロック体ワードマーク部分
+    # (`_YORIAI_LOGO_ART_LINES`)だけを色付けの対象にする(区切り線・
+    # サブタイトル・以降の案内文は素のターミナルへの直接印字でも太字
+    # 止まりで、ユーザーから報告があったのはロゴの色そのものだったため)。
+    banner_plain_text = _format_startup_banner(out_dir, member_count, use_color=False)
     _CHAT_LOG_BUFFER.set_document(
-        Document(_format_startup_banner(out_dir, member_count, use_color=False) + "\n"),
+        Document(banner_plain_text + "\n"),
         bypass_readonly=True,
+    )
+    _CHAT_LOG_BANNER_LINE_STYLES[:] = (
+        ["class:banner-logo"] * len(_YORIAI_LOGO_ART_LINES) if banner_use_color else []
     )
     # 仮の判断: ステータスパネルの行数を実際の参加台数に追従させるため、
     # `--chat`の起動中ずっと定期的に`/status`へ問い合わせ続けるスレッドを
@@ -8465,8 +8570,37 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
         # であり、このスレッドはメインスレッドではない(かつCtrl+Cの
         # 検出自体は`_make_persistent_session_key_bindings`が独自の
         # キー割り当てとして行うため、SIGINTハンドリングは不要)ため。
+        #
+        # 仮の判断(実機バグ修正・最重要): `threading.Thread`は既定では
+        # 呼び出し元スレッドの`contextvars`コンテキストを引き継がない
+        # (新しいスレッドは常にデフォルトの空コンテキストから始まる)。
+        # `prompt_toolkit`の「現在のAppSession」(`get_app_session()`が
+        # 返すもの、`with create_app_session():`で設定される)は
+        # `contextvars.ContextVar`で管理されているため、このスレッドを
+        # 素の`threading.Thread`で起動すると、`session.app.run()`が
+        # 内部で行う`set_app(self)`(`AppSession.app`への登録)が、
+        # このスレッド専用の別の(デフォルトの)`AppSession`に対して
+        # 行われてしまい、メインスレッド側の`_ChatOutputRouter`
+        # (`_chat_output_context()`で作られ、正しい方の`AppSession`を
+        # 保持している)からは`self._app_session.app`が常に`None`に
+        # 見えてしまう。この結果、対話モードでメッセージを送信する
+        # たびに(`_ChatOutputRouter.write()`が「Applicationは動いて
+        # いない」と誤判定し)ログ出力が`Application`の描画を経由せず
+        # 素のターミナルへ直接書き込まれ、`Application`自身の再描画が
+        # 直後にその上へ古い内部キャッシュに基づいて上書きすることで、
+        # 実機で報告された「Ctrl+C時に画面が崩れる」(実際にはCtrl+Cに
+        # 限らずメッセージ送信のたびに起きていた)不具合の直接の原因に
+        # なっていた。`contextvars.copy_context()`でメインスレッドの
+        # コンテキスト(正しい`AppSession`を含む)を明示的に複製し、
+        # そのコンテキストの中でこのスレッドの処理を実行することで、
+        # `ui_thread`とメインスレッドが同じ`AppSession`を共有するように
+        # した。
+        ui_thread_context = contextvars.copy_context()
         ui_thread = threading.Thread(
-            target=session.app.run, kwargs={"handle_sigint": False}, daemon=True,
+            target=ui_thread_context.run,
+            args=(session.app.run,),
+            kwargs={"handle_sigint": False},
+            daemon=True,
         )
         ui_thread.start()
         # 仮の判断: 入力編集中・組織への問い合わせ中(応答待ち)のどちらで

@@ -62,11 +62,9 @@ def _run_repl_with_keys(keystrokes: str):
     yoriai._ask_organization_multi = stub_ask_multi
     yoriai._ask_organization_collaborate = stub_ask_collaborate
 
-    buf = io.StringIO()
     out_dir = tempfile.mkdtemp(prefix="yoriai_repl_input_test_")
     try:
-        with contextlib.redirect_stdout(buf):
-            run_full_repl_client_with_keys(keystrokes, 47120, "fingerprint", out_dir)
+        output = run_full_repl_client_with_keys(keystrokes, 47120, "fingerprint", out_dir)
     finally:
         yoriai._classify_execution_mode = original_classify
         yoriai._ask_organization = original_ask
@@ -74,7 +72,7 @@ def _run_repl_with_keys(keystrokes: str):
         yoriai._ask_organization_collaborate = original_ask_collaborate
         shutil.rmtree(out_dir, ignore_errors=True)
 
-    return buf.getvalue(), calls
+    return output, calls
 
 
 def test_empty_submission_does_nothing_and_reprompts():

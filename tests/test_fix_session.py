@@ -307,10 +307,8 @@ def _run_repl_with_keys(keystrokes, out_dir, run_fix_side_effect=None,
     yoriai._ask_organization_multi = stub_ask_multi
     yoriai._ask_organization_collaborate = stub_ask_collaborate
 
-    buf = io.StringIO()
     try:
-        with contextlib.redirect_stdout(buf):
-            run_full_repl_client_with_keys(keystrokes, 47120, "fingerprint", out_dir)
+        output = run_full_repl_client_with_keys(keystrokes, 47120, "fingerprint", out_dir)
     finally:
         yoriai._create_background_job_runner = original_create_runner
 
@@ -323,7 +321,7 @@ def _run_repl_with_keys(keystrokes, out_dir, run_fix_side_effect=None,
     yoriai._ask_organization_multi = original_ask_multi
     yoriai._ask_organization_collaborate = original_ask_collaborate
 
-    return buf.getvalue(), calls, fix_calls
+    return output, calls, fix_calls
 
 
 def test_fix_command_then_plain_followup_continues_the_same_project():

@@ -260,17 +260,13 @@ def _run_repl_with_fake_tty_stdout(keystrokes: str) -> str:
     実機に忠実な形で再現する。
     """
     fake_stdout = _FakeTtyStdout()
-    original_stdout = sys.stdout
-
-    sys.stdout = fake_stdout
     out_dir = tempfile.mkdtemp(prefix="yoriai_startup_banner_test_")
     try:
-        run_full_repl_client_with_keys(keystrokes, 47120, "fingerprint", out_dir)
+        return run_full_repl_client_with_keys(
+            keystrokes, 47120, "fingerprint", out_dir, stdout=fake_stdout,
+        )
     finally:
-        sys.stdout = original_stdout
         shutil.rmtree(out_dir, ignore_errors=True)
-
-    return fake_stdout.getvalue()
 
 
 def test_run_repl_client_does_not_corrupt_ansi_codes_in_the_banner():
@@ -305,15 +301,13 @@ def test_run_repl_client_banner_has_no_escape_codes_on_non_tty_output():
     より色付けが自動的に無効化され、ANSIエスケープシーケンスが一切
     出力に含まれないことを確認する。
     """
-    buf = io.StringIO()
     out_dir = tempfile.mkdtemp(prefix="yoriai_startup_banner_test_")
     try:
-        with contextlib.redirect_stdout(buf):
-            run_full_repl_client_with_keys("exit" + _SUBMIT, 47120, "fingerprint", out_dir)
+        output = run_full_repl_client_with_keys("exit" + _SUBMIT, 47120, "fingerprint", out_dir)
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
 
-    assert "\x1b[" not in buf.getvalue()
+    assert "\x1b[" not in output
 
 
 def main():

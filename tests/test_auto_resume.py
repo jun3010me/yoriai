@@ -449,19 +449,16 @@ def test_auto_resume_runs_in_background_without_blocking_next_input():
     yoriai._create_background_job_runner = fake_create_runner
     yoriai._ask_organization_collaborate = slow_collaborate
 
-    buf = io.StringIO()
     repl_out_dir = tempfile.mkdtemp(prefix="yoriai_auto_resume_repl_test_")
     try:
-        with contextlib.redirect_stdout(buf):
-            run_full_repl_client_with_keys(
-                f"{yoriai.AGREE_COMMAND} ToDoリストを作って" + _SUBMIT + "exit" + _SUBMIT,
-                47120, "fingerprint", repl_out_dir,
-            )
+        output = run_full_repl_client_with_keys(
+            f"{yoriai.AGREE_COMMAND} ToDoリストを作って" + _SUBMIT + "exit" + _SUBMIT,
+            47120, "fingerprint", repl_out_dir,
+        )
     finally:
         yoriai._create_background_job_runner = original_create_runner
         shutil.rmtree(repl_out_dir, ignore_errors=True)
 
-    output = buf.getvalue()
     release.set()
     runner_holder["runner"].join()
     yoriai._ask_organization_collaborate = original_ask_collaborate

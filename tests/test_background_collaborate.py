@@ -188,18 +188,16 @@ def _run_repl_with_keys(keystrokes: str, ask_collaborate_side_effect=None, ask_s
     yoriai._ask_organization_parallel = stub_ask_parallel
     yoriai._run_resume_all = stub_resume_all
 
-    buf = io.StringIO()
     # 仮の判断: この関数はバックグラウンドジョブの完了(呼び出し元が
     # `runner.join()`する)を待たずに返るため、ここで一時ディレクトリを
     # 作ってもこの関数内では削除しない(ジョブが後から書き込む可能性が
     # ある)。OSが定期的に掃除する/tmp配下に作ることで、少なくとも
     # リポジトリの作業ディレクトリを汚さないようにする。
     out_dir = tempfile.mkdtemp(prefix="yoriai_background_collaborate_test_")
-    with contextlib.redirect_stdout(buf):
-        run_full_repl_client_with_keys(keystrokes, 47120, "fingerprint", out_dir)
+    output = run_full_repl_client_with_keys(keystrokes, 47120, "fingerprint", out_dir)
     yoriai._create_background_job_runner = original_create_runner
 
-    return buf.getvalue(), calls, runner_holder.get("runner"), restore_dispatch_stubs
+    return output, calls, runner_holder.get("runner"), restore_dispatch_stubs
 
 
 def test_agree_command_returns_to_prompt_before_the_job_finishes():
@@ -301,6 +299,7 @@ def test_followup_right_after_a_dialogue_pause_is_not_reclassified():
 
     out_dir = tempfile.mkdtemp(prefix="yoriai_dialogue_pause_reclassify_test_")
     buf = io.StringIO()
+    yoriai._reset_chat_log_buffer()
     try:
         with create_pipe_input() as pipe_input:
             def run_client():
@@ -323,7 +322,7 @@ def test_followup_right_after_a_dialogue_pause_is_not_reclassified():
         yoriai._ask_organization_collaborate = original_ask_collaborate
         shutil.rmtree(out_dir, ignore_errors=True)
 
-    output = buf.getvalue()
+    output = buf.getvalue() + yoriai._CHAT_LOG_BUFFER.text
     assert "対話モードを終了します。" in output, output
     assert "[💬 対話プロトコルの一時停止直後の発言のため、会話の続きとして扱います]" in output, output
     # 1回目(明示//agree)はモード判定を経由しない。2回目の「作って」を
@@ -475,6 +474,7 @@ def test_followup_right_after_a_design_dialogue_pause_resumes_instead_of_single_
 
     out_dir = tempfile.mkdtemp(prefix="yoriai_design_pause_resume_repl_test_")
     buf = io.StringIO()
+    yoriai._reset_chat_log_buffer()
     try:
         with create_pipe_input() as pipe_input:
             def run_client():
@@ -499,7 +499,7 @@ def test_followup_right_after_a_design_dialogue_pause_resumes_instead_of_single_
         yoriai._resume_organization_collaborate = original_resume_organization_collaborate
         shutil.rmtree(out_dir, ignore_errors=True)
 
-    output = buf.getvalue()
+    output = buf.getvalue() + yoriai._CHAT_LOG_BUFFER.text
     assert "対話モードを終了します。" in output, output
     assert "[💬 対話プロトコルの一時停止直後の発言のため、合意フェーズを続きから再開します]" in output, output
     assert calls["classify"] == 0, calls
@@ -603,6 +603,7 @@ def test_second_followup_during_slow_resume_still_avoids_tool_less_single_chat()
 
     out_dir = tempfile.mkdtemp(prefix="yoriai_race_followup_test_")
     buf = io.StringIO()
+    yoriai._reset_chat_log_buffer()
     try:
         with create_pipe_input() as pipe_input:
             def run_client():
@@ -626,7 +627,11 @@ def test_second_followup_during_slow_resume_still_avoids_tool_less_single_chat()
             # 追記直前で足止めされている(=messagesの末尾はまだ一時
             # 停止マーカーのまま)。この状態で3件目の発言を送る。
             pipe_input.send_text("早く終わらせて" + _SUBMIT)
-            _wait_until(lambda: "直前のプロジェクト" in buf.getvalue() or calls["ask_single"] > 0, timeout=5)
+            _wait_until(
+                lambda: "直前のプロジェクト" in (buf.getvalue() + yoriai._CHAT_LOG_BUFFER.text)
+                or calls["ask_single"] > 0,
+                timeout=5,
+            )
             release_resume_job.set()
             pipe_input.send_text("exit" + _SUBMIT)
             thread.join(timeout=5)
@@ -642,7 +647,7 @@ def test_second_followup_during_slow_resume_still_avoids_tool_less_single_chat()
         shutil.rmtree(out_dir, ignore_errors=True)
         shutil.rmtree(stale_project_dir, ignore_errors=True)
 
-    output = buf.getvalue()
+    output = buf.getvalue() + yoriai._CHAT_LOG_BUFFER.text
     assert "対話モードを終了します。" in output, output
     assert "直前のプロジェクト" in output, output
     # write_file等を持たない単発質問(_ask_organization)には落ちないはずです。
@@ -704,6 +709,7 @@ def test_followup_right_after_collaborate_completion_becomes_a_fix_session():
 
     out_dir = tempfile.mkdtemp(prefix="yoriai_completed_build_followup_test_")
     buf = io.StringIO()
+    yoriai._reset_chat_log_buffer()
     try:
         with create_pipe_input() as pipe_input:
             def run_client():
@@ -727,7 +733,7 @@ def test_followup_right_after_collaborate_completion_becomes_a_fix_session():
         yoriai._run_fix_on_project = original_run_fix_on_project
         shutil.rmtree(out_dir, ignore_errors=True)
 
-    output = buf.getvalue()
+    output = buf.getvalue() + yoriai._CHAT_LOG_BUFFER.text
     assert "対話モードを終了します。" in output, output
     assert "[🏗️" in output, output
     # write_file等を持たない単発質問(_ask_organization)には落ちないはずです
