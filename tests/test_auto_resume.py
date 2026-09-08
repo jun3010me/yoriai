@@ -20,13 +20,11 @@ import sys
 import tempfile
 import threading
 
+sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import progress  # noqa: E402
 import yoriai  # noqa: E402
-
-from prompt_toolkit import PromptSession  # noqa: E402
-from prompt_toolkit.input import create_pipe_input  # noqa: E402
-from prompt_toolkit.output import DummyOutput  # noqa: E402
+from _repl_test_support import run_full_repl_client_with_keys  # noqa: E402
 
 _SUBMIT = "\r"  # Enterキー単体(送信)
 
@@ -438,7 +436,6 @@ def test_auto_resume_runs_in_background_without_blocking_next_input():
         call_count["n"] += 1
         release.wait(timeout=5)
 
-    original_create_session = yoriai._create_repl_prompt_session
     original_create_runner = yoriai._create_background_job_runner
     original_ask_collaborate = yoriai._ask_organization_collaborate
 
@@ -449,27 +446,20 @@ def test_auto_resume_runs_in_background_without_blocking_next_input():
         runner_holder["runner"] = runner
         return runner
 
-    with create_pipe_input() as pipe_input:
-        def fake_create_session():
-            return PromptSession(
-                input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
+    yoriai._create_background_job_runner = fake_create_runner
+    yoriai._ask_organization_collaborate = slow_collaborate
+
+    buf = io.StringIO()
+    repl_out_dir = tempfile.mkdtemp(prefix="yoriai_auto_resume_repl_test_")
+    try:
+        with contextlib.redirect_stdout(buf):
+            run_full_repl_client_with_keys(
+                f"{yoriai.AGREE_COMMAND} ToDoリストを作って" + _SUBMIT + "exit" + _SUBMIT,
+                47120, "fingerprint", repl_out_dir,
             )
-
-        yoriai._create_repl_prompt_session = fake_create_session
-        yoriai._create_background_job_runner = fake_create_runner
-        yoriai._ask_organization_collaborate = slow_collaborate
-
-        pipe_input.send_text(f"{yoriai.AGREE_COMMAND} ToDoリストを作って" + _SUBMIT + "exit" + _SUBMIT)
-
-        buf = io.StringIO()
-        repl_out_dir = tempfile.mkdtemp(prefix="yoriai_auto_resume_repl_test_")
-        try:
-            with contextlib.redirect_stdout(buf):
-                yoriai._run_repl_client(47120, "fingerprint", repl_out_dir)
-        finally:
-            yoriai._create_repl_prompt_session = original_create_session
-            yoriai._create_background_job_runner = original_create_runner
-            shutil.rmtree(repl_out_dir, ignore_errors=True)
+    finally:
+        yoriai._create_background_job_runner = original_create_runner
+        shutil.rmtree(repl_out_dir, ignore_errors=True)
 
     output = buf.getvalue()
     release.set()

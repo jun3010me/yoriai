@@ -60,7 +60,7 @@ from prompt_toolkit.application import create_app_session, get_app_session
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
 from prompt_toolkit.history import InMemoryHistory
-from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.key_binding import KeyBindings, merge_key_bindings
 from prompt_toolkit.layout import HSplit, Layout, Window
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
@@ -7428,6 +7428,97 @@ def _handle_repl_command_interrupt(interrupt_guard: "_DoubleInterruptGuard") -> 
     return False
 
 
+# ---------------------------------------------------------------------------
+# 対話モードのフルスクリーンUIが常時動き続けることに伴う、Ctrl+C割り込みの
+# 配送先の切り替え(`_run_interruptibly`)
+# ---------------------------------------------------------------------------
+#
+# 仮の判断(実機バグ修正・重要): 以前は対話モードのセッション本体
+# (`session.prompt()`)が1メッセージごとに起動・終了するモデルで、単発
+# 質問等の同期処理(`_ask_organization`等)は`session.prompt()`の外側
+# (`prompt_toolkit`のraw modeが無効な期間)で実行されていた。そのため、
+# その間のCtrl+Cは実際のOSレベルのSIGINTとして届き、`KeyboardInterrupt`が
+# 実行中のコードの途中に直接送出されていた。
+#
+# ところが、実機から「フルスクリーン化してもログの表示が安定しない
+# (起動時のロゴが消える、チャット中に急に画面が切り替わる)」という
+# 報告を受け、対話モードのフルスクリーンUIをセッションの生存期間中
+# ずっと動かし続ける設計に変更した(詳細は`_run_repl_client`のコメントを
+# 参照)。`prompt_toolkit`のraw mode(ISIG無効)はUIが動いている間ずっと
+# 有効になるため、単発質問の同期処理中もCtrl+CはOSレベルのSIGINTには
+# ならず、UI自身のキー割り当てで捕捉されるキー入力になる。そのため、
+# 単発質問の待機中のCtrl+Cを、UIのキー割り当てからこの待機コードへ
+# 明示的に伝える仕組みが必要になった。
+#
+# `_run_interruptibly`は、待っている間だけCtrl+Cの配送先を一時的な
+# キューへ差し替え、そこにCtrl+Cが届いたら`KeyboardInterrupt`を送出する。
+# これにより、`_run_repl_client`側の既存の`try/except KeyboardInterrupt`
+# ブロック(2箇所)は一切変更せずに済む。
+
+_CHAT_INPUT_QUEUE = queue.Queue()  # ("text"|"eof"|"interrupt", payload)の待ち行列
+
+
+class _InterruptRelay:
+    """Ctrl+Cが押されたときにどこへ知らせるべきかを保持する、スレッド
+    セーフな差し替え可能な参照。既定では入力待ちの待ち行列
+    (`_CHAT_INPUT_QUEUE`)へ届く。`_run_interruptibly`がバックグラウンドの
+    問い合わせの完了を待っている間だけ、一時的にそちらの専用キューへ
+    差し替える。
+    """
+
+    def __init__(self, default_queue: "queue.Queue"):
+        self._lock = threading.Lock()
+        self._default_queue = default_queue
+        self._current_queue = default_queue
+
+    def redirect_to(self, q: "queue.Queue") -> None:
+        with self._lock:
+            self._current_queue = q
+
+    def restore_default(self) -> None:
+        with self._lock:
+            self._current_queue = self._default_queue
+
+    def deliver_interrupt(self) -> None:
+        with self._lock:
+            target = self._current_queue
+        target.put(("interrupt", None))
+
+
+# 仮の判断: `_ACTIVE_STATUS_BOARD`等と同じ理由でモジュール単一のインスタンス
+# として持つ(`--chat`は1プロセスにつき1セッションしか走らない前提のため)。
+_INTERRUPT_RELAY = _InterruptRelay(_CHAT_INPUT_QUEUE)
+
+
+def _run_interruptibly(fn: callable) -> None:
+    """`fn`(引数無しのcallable)を別スレッドで実行し、完了を待つ。待って
+    いる間にCtrl+Cが押されると(`_INTERRUPT_RELAY`経由でこの関数専用の
+    一時的なキューへ届く)、`fn`の完了を待たずに`KeyboardInterrupt`を
+    送出して抜ける。
+
+    仮の判断: `fn`はバックグラウンドで動き続ける(協業モード等の既存の
+    バックグラウンドジョブと同じ「打ち切らず放置する」という割り切り。
+    実際に接続を切って中断するには`fn`側の協調が必要になり、今回の
+    スコープ外と判断した)。`fn`が最終的に完了しても、この関数は既に
+    抜けた後のため、その結果(印字済みの内容を除く)は特に何もしない。
+    """
+    result_queue = queue.Queue()
+    _INTERRUPT_RELAY.redirect_to(result_queue)
+    try:
+        def runner():
+            try:
+                fn()
+            finally:
+                result_queue.put(("done", None))
+
+        threading.Thread(target=runner, daemon=True).start()
+        kind, _ = result_queue.get()
+        if kind == "interrupt":
+            raise KeyboardInterrupt
+    finally:
+        _INTERRUPT_RELAY.restore_default()
+
+
 def _repl_prompt_continuation(width, line_number, is_soft_wrap) -> str:
     """prompt_toolkitの`prompt_continuation`コールバック。
 
@@ -7604,37 +7695,121 @@ def _chat_output_context():
         sys.stderr = original_stderr
 
 
+def _make_persistent_session_key_bindings() -> KeyBindings:
+    """対話モードの永続的なフルスクリーンUI専用の追加キー割り当て。
+
+    仮の判断(実機バグ修正・重要、詳細は`_run_repl_client`のコメント
+    参照): 以前は`session.prompt()`をメッセージごとに呼び直しており、
+    Enter(`_make_repl_key_bindings`の既定の`accept_handler`経由)・
+    Ctrl+C・Ctrl+Dのいずれも`Application`を終了させ、その終了によって
+    `.prompt()`の呼び出しが結果(またはEOFError/KeyboardInterrupt)を
+    返す、という設計だった。ところがこの「メッセージごとにUIが起動・
+    終了する」モデル自体が、実機で「画面が明滅する」不具合の原因
+    だったため、対話モードの生存期間中`Application`を1つだけ動かし
+    続ける設計に変更した(詳細は`_run_repl_client`のコメント参照)。
+
+    このキー割り当ては、Ctrl+C・Ctrl+Dが`Application`を終了させない
+    ように上書きし、代わりに`_CHAT_INPUT_QUEUE`(`_read_multiline_input`
+    が待ち受ける共有の待ち行列)へ結果を伝える。`_make_repl_key_bindings`
+    (Enter/Shift+Enterの切り替え)とは別のオブジェクトにしたのは、
+    既存のテスト群(素の`PromptSession`+`_make_repl_key_bindings()`で
+    `.prompt()`を直接呼び、`EOFError`/`KeyboardInterrupt`の送出を
+    検証するテスト)に影響を与えないためで、本番の永続セッション
+    (`_attach_full_screen_chat_ui`)にのみ追加で適用する。
+
+    仮の判断: Ctrl+Cは、バッファに何か入力済みかどうかに関わらず、常に
+    その場で入力中の内容を破棄する(既存の「Ctrl+C単押しで入力を破棄」
+    という仕様をそのまま踏襲)。Ctrl+Dは、`prompt_toolkit`既定の
+    `ctrl_d_condition`(バッファが空の時だけ)と同じ条件で、EOFとして
+    `_CHAT_INPUT_QUEUE`へ伝える。
+    """
+    bindings = KeyBindings()
+
+    @bindings.add("c-c")
+    def _interrupt(event) -> None:
+        event.current_buffer.reset()
+        _INTERRUPT_RELAY.deliver_interrupt()
+
+    @bindings.add("c-d")
+    def _eof(event) -> None:
+        if event.current_buffer.text:
+            return
+        _CHAT_INPUT_QUEUE.put(("eof", None))
+
+    return bindings
+
+
+def _accept_and_keep_session_running(buffer: Buffer) -> bool:
+    """対話モードの永続セッションの入力欄の`accept_handler`。
+
+    仮の判断: `prompt_toolkit`既定の`accept_handler`は`Application`を
+    `exit(result=...)`で終了させる(`PromptSession._create_default_
+    buffer`のソースで確認済み)。この関数はその代わりに、確定した本文を
+    `_CHAT_INPUT_QUEUE`へ積むだけで`Application`を終了させない
+    (戻り値`False`により、呼び出し元の`Buffer.validate_and_handle`が
+    バッファを自動的にリセットする。履歴への追加はそれより前に
+    `validate_and_handle`自身が行う)。これにより、Enterキーを押しても
+    UIは動き続けたままメッセージだけが確定する。
+    """
+    _CHAT_INPUT_QUEUE.put(("text", buffer.document.text))
+    return False
+
+
 def _attach_full_screen_chat_ui(session: PromptSession) -> None:
     """`session`の画面を「ログ欄(常時表示、スクロール可能)」+「ステータス
     一覧(常時表示)」+「既存のレイアウト(入力欄)」の3段構成に組み替え、
-    `full_screen=True`にする。
+    `full_screen=True`にする。さらに、Enter・Ctrl+C・Ctrl+Dのいずれでも
+    `Application`自体は終了しないようにする(詳細は`_run_repl_client`の
+    コメント参照。対話モードの生存期間中、この`Application`を1つだけ
+    動かし続けるための土台)。
 
     仮の判断(実機バグ報告への対応・重要、詳細はこのセクション冒頭の
     コメント参照): 単に既存レイアウトを自前のWindowでラップするだけの
     第1弾の対策(`bottom_toolbar`をやめた際の対応)では、`patch_stdout()`
     自体の「印字するたびに押し出される」性質のせいで、ステータス欄が
     画面下部に固定されず、ログと一緒に上へ流れていってしまう不具合が
-    実機で再発した。今回は`patch_stdout()`自体をやめ、ログ欄を専用の
-    `Window`(`_CHAT_LOG_BUFFER`を描画する`BufferControl`、フォーカス
-    不可)として明示的にレイアウトへ組み込み、`session.app.renderer.
-    full_screen = True`にすることで、各Windowが画面上の決まった行範囲を
-    物理的に占有するようにした。
+    実機で再発した。第2弾として`patch_stdout()`自体をやめ、ログ欄を
+    専用の`Window`(`_CHAT_LOG_BUFFER`を描画する`BufferControl`、
+    フォーカス不可)として明示的にレイアウトへ組み込み、`session.app.
+    renderer.full_screen = True`にすることで、各Windowが画面上の決まった
+    行範囲を物理的に占有するようにした。
+
+    ところがこの第2弾でも、`session.prompt()`をメッセージごとに呼び
+    直す(=`Application`がメッセージごとに起動・終了を繰り返す)モデルの
+    ままだったため、「起動時のロゴが(フルスクリーンに切り替わった
+    瞬間に)消える」「メッセージを送信するたびに画面が一瞬フルスクリーン
+    から抜けて、また入り直す」という、明滅として知覚されるレベルの
+    表示不具合が実機で報告された。これは1メッセージごとに代替スクリーン
+    バッファへの出入りが起きることが根本原因であり、第1弾・第2弾のような
+    レイアウトやCPRまわりの改善では解決できない。そのため第3弾として、
+    `Application`をセッションの生存期間中1つだけ動かし続ける設計に変更
+    した。Enter(`accept_handler`を`_accept_and_keep_session_running`に
+    差し替え)・Ctrl+C・Ctrl+D(`_make_persistent_session_key_bindings`)の
+    いずれも`Application`を終了させず、代わりに`_CHAT_INPUT_QUEUE`へ
+    結果を積むだけにすることで実現した。
 
     仮の判断: `Renderer.full_screen`はプレーンな属性で、`render()`が
     呼ばれるたびに動的に参照される(`prompt_toolkit`のソースで確認済み)
-    ため、最初の`.prompt()`呼び出しより前にここで設定しておけば、次の
-    描画から正しくフルスクリーン(代替スクリーンバッファ)に切り替わる。
+    ため、最初に`Application`を起動するより前にここで設定しておけば、
+    最初の描画から正しくフルスクリーン(代替スクリーンバッファ)になる。
     `PromptSession`自体には`full_screen`を指定する公式な手段が無い
     (`__init__`にも`.prompt()`にも無い)ため、この属性を直接書き換える
     形を取った。
 
     仮の判断: 既存レイアウト(`session.layout.container`。フレーム・
-    検索ツールバー等を含む)の中身には一切手を加えないため、キー割り
-    当て・履歴・複数行編集などの挙動には影響しない。ラップ後はデフォルト
-    バッファ(入力欄)へ明示的にフォーカスを戻す必要がある(`Layout
-    (container)`は素朴にはこの`container`内の最初のフォーカス可能な
-    要素にフォーカスするため、それが偶然にも入力欄と一致すると保証
-    できない)。
+    検索ツールバー等を含む)の中身には一切手を加えないため、複数行編集・
+    上下矢印での行間移動・履歴呼び出しなどの挙動には影響しない。ラップ後は
+    デフォルトバッファ(入力欄)へ明示的にフォーカスを戻す必要がある
+    (`Layout(container)`は素朴にはこの`container`内の最初のフォーカス
+    可能な要素にフォーカスするため、それが偶然にも入力欄と一致すると
+    保証できない)。
+
+    仮の判断(既存テストへの影響について): `session.key_bindings`は
+    `prompt_toolkit`側で`DynamicKeyBindings(lambda: self.key_bindings)`
+    として動的に参照される(`PromptSession`のソースで確認済み)ため、
+    ここで`merge_key_bindings`により追加のキー割り当てを足しても、
+    素の`PromptSession`+`_make_repl_key_bindings()`だけで`.prompt()`を
+    直接呼ぶ既存のテスト群(この関数を経由しない)には一切影響しない。
     """
     log_window = Window(
         BufferControl(buffer=_CHAT_LOG_BUFFER, focusable=False),
@@ -7653,12 +7828,17 @@ def _attach_full_screen_chat_ui(session: PromptSession) -> None:
     wrapped_layout.focus(session.default_buffer)
     session.app.layout = wrapped_layout
     session.app.renderer.full_screen = True
+    session.key_bindings = merge_key_bindings([session.key_bindings, _make_persistent_session_key_bindings()])
+    session.default_buffer.accept_handler = _accept_and_keep_session_running
 
 
 def _create_repl_prompt_session() -> PromptSession:
     """対話モードのメッセージ入力用に、複数行編集対応のセッションを1つ
-    作る。`_run_repl_client`が起動時に1回だけ作り、以後の全メッセージ
-    入力(`_read_multiline_input`の呼び出しごと)で使い回す。
+    作る。`_run_repl_client`が起動時に1回だけ作り、`Application`
+    (`session.app`)自体もセッションの生存期間中1つだけ動かし続ける
+    (`_attach_full_screen_chat_ui`のコメント参照)。メッセージが確定
+    するたびに`_CHAT_INPUT_QUEUE`へ積まれ、`_read_multiline_input`が
+    そこから受け取る。
 
     仮の判断: セッションを使い回すことで、入力履歴(`InMemoryHistory`)が
     メッセージをまたいで蓄積される。バッファの先頭行で上矢印を押すと、
@@ -7666,8 +7846,21 @@ def _create_repl_prompt_session() -> PromptSession:
     (`Buffer.auto_up`の標準動作)。会話をまたいだ履歴の永続化(次回起動時に
     前回の入力を引き継ぐ機能)は今回のスコープ外で、プロセス終了とともに
     履歴も破棄される。
+
+    仮の判断(実機バグ修正・重要): `message`(プロンプト文字列"Yoriai> ")・
+    `multiline`・`prompt_continuation`は、以前は`session.prompt()`を
+    メッセージごとに呼び直す際の引数として渡していたが、`Application`を
+    セッションの生存期間中1つだけ動かし続ける設計(`_attach_full_screen_
+    chat_ui`参照)に変更した際、`.prompt()`自体を一切呼ばなくなったため、
+    これらを渡す場所が無くなり黙って失われていた(実機で「入力欄に
+    "Yoriai> "が一切表示されない」という、pty経由の疑似端末検証で発見した
+    不具合)。`PromptSession`のコンストラクタ引数として直接渡すことで、
+    `.prompt()`を呼ばない今の設計でも正しく反映されるようにした。
     """
     session = PromptSession(
+        message=_REPL_PROMPT,
+        multiline=True,
+        prompt_continuation=_repl_prompt_continuation,
         history=InMemoryHistory(),
         key_bindings=_make_repl_key_bindings(),
         # 経過時間(例: 思考中の"(42s)")表示が実際に増えていくのが見える
@@ -7680,27 +7873,30 @@ def _create_repl_prompt_session() -> PromptSession:
     return session
 
 
-def _read_multiline_input(session: PromptSession, interrupt_guard: "_DoubleInterruptGuard") -> tuple:
+def _read_multiline_input(interrupt_guard: "_DoubleInterruptGuard") -> tuple:
     """対話モードの1メッセージ分の入力を読み取る。
 
-    仮の判断: `prompt_toolkit`の`multiline=True`セッションを使う。
-    `_make_repl_key_bindings`で追加した独自のキー割り当てにより、
-    Enter単体で入力を確定し(送信)、Shift+Enterで改行を挿入する
+    仮の判断(実機バグ修正・重要): 以前は`session.prompt()`をメッセージ
+    ごとに1回ずつ呼び出し、その戻り値(または送出される`EOFError`/
+    `KeyboardInterrupt`)から結果を得ていた。しかし対話モードのフル
+    スクリーンUIをセッションの生存期間中ずっと動かし続ける設計に変更した
+    ことに伴い(詳細は`_run_repl_client`のコメント参照)、`session.
+    prompt()`をメッセージごとに呼び直す方式はやめた(呼び出しのたびに
+    UIが起動・終了を繰り返し、画面が明滅する不具合が実機で報告された
+    ため)。代わりに、UI(常時1つだけ動き続ける`Application`)のキー
+    割り当て側が確定した入力・EOF・Ctrl+Cを`_CHAT_INPUT_QUEUE`という
+    共有の待ち行列に積み、この関数はそこから1件受け取るまで待つだけの
+    単純な形にした(`_attach_full_screen_chat_ui`が設定する入力欄の
+    `accept_handler`・追加のキー割り当てを参照)。
+
+    仮の判断: `_make_repl_key_bindings`が追加する独自のキー割り当てに
+    より、Enter単体で入力を確定し(送信)、Shift+Enterで改行を挿入する
     (区別できない端末での既知の制約は`_make_repl_key_bindings`の
     コメントを参照)。上下矢印キーは、複数行のバッファ内でまだ移動できる
     行がある間はカーソルをその行へ移動し、バッファの端(最初/最後の行)に
     達すると入力履歴の呼び出しに切り替わる(`Buffer.auto_up`/`auto_down`の
     標準動作)。これにより、依頼の「上下矢印で自由に行き来しながら編集
     できる」という要望に、prompt_toolkit標準の挙動だけで対応できる。
-
-    仮の判断(送信キーの変遷): 「空行で送信」→「Alt+Enterで送信」→
-    「Enterで送信、Shift+Enterで改行」の順に変更してきた。複数行バッファ
-    全体を自由に編集できる以上「空行=送信」は成立しない(空行=段落区切り
-    を入れられなくなる)ため早期に廃止した。続くAlt+Enterは、実機
-    (Windows機からraspi4へのSSH接続)でSSHクライアント側のショートカット
-    に奪われ、対話モードから抜け出せなくなる不具合が報告された。この
-    対策として、Claude Code等と同様の配置(Enterで送信、Shift+Enterで
-    改行)に変更した。
 
     戻り値は`(text, terminate)`のタプル。`terminate`が`True`の場合、
     対話モード自体を終了すべきことを示す(EOF/Ctrl+D、送信内容が
@@ -7710,13 +7906,7 @@ def _read_multiline_input(session: PromptSession, interrupt_guard: "_DoubleInter
 
     仮の判断: Ctrl+Cを1回だけ押した場合は、バッファに何か入力済みかどうかに
     関わらず、常にそのメッセージ全体を破棄して新しい入力待ちに戻る
-    (対話モード自体は終了しない)。以前は「何も入力していない状態での
-    Ctrl+Cは対話モード自体を終了する」という、入力済みかどうかで挙動が
-    変わる仕様だったが、prompt_toolkitの`session.prompt()`はCtrl+Cが
-    押された時点のバッファの状態を呼び出し元に伝えずに一様に
-    `KeyboardInterrupt`を送出するため、この区別を維持しようとすると
-    別途バッファの状態を監視する仕組みが必要になり、複雑さに見合わない
-    と判断した。
+    (対話モード自体は終了しない、既存の仕様をそのまま踏襲)。
 
     仮の判断(実機で報告された「非常口」不具合への対応): 送信キーが
     SSH経由の接続などで一切機能しない状況では、"exit"/"quit"すら送信
@@ -7725,18 +7915,14 @@ def _read_multiline_input(session: PromptSession, interrupt_guard: "_DoubleInter
     ため、`interrupt_guard`(`_DoubleInterruptGuard`)で直前のCtrl+Cから
     `_REPL_DOUBLE_CTRL_C_WINDOW_SEC`秒以内に連続してCtrl+Cが押された
     ことを検出した場合は、送信キーの状態に一切関係なく対話モード自体を
-    終了する(`terminate=True`を返す)。Ctrl+C(SIGINT)はSSH接続を含む
-    どのような端末経由でも標準的に転送される割り込みであり、送信キーが
-    ターミナルアプリ側に奪われるような状況でも確実に届くため、「非常口」
-    として機能する。
+    終了する(`terminate=True`を返す)。
     """
     while True:
-        try:
-            raw = session.prompt(_REPL_PROMPT, multiline=True, prompt_continuation=_repl_prompt_continuation)
-        except EOFError:
+        kind, payload = _CHAT_INPUT_QUEUE.get()
+        if kind == "eof":
             print()
             return "", True
-        except KeyboardInterrupt:
+        if kind == "interrupt":
             print()
             if interrupt_guard.note_interrupt():
                 print("[⚠️ Ctrl+Cが2回連続で押されたため、対話モードを終了します]")
@@ -7744,7 +7930,7 @@ def _read_multiline_input(session: PromptSession, interrupt_guard: "_DoubleInter
             print("(入力を破棄しました。2秒以内にもう一度Ctrl+Cを押すと、対話モードを終了できます)")
             continue
 
-        text = raw.strip()
+        text = payload.strip()
         if not text:
             # 何も入力していない状態(または空白のみ)での確定は、
             # 何もせず次の入力を待つ(従来通りの挙動)。
@@ -8193,13 +8379,13 @@ def _format_startup_banner(out_dir: str, member_count, use_color: bool) -> str:
 def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
     # 仮の判断(実機で報告された文字化け不具合への対応): 起動時の案内文
     # (ロゴ等)は、`_chat_output_context()`のコンテキストに入る前に、素の
-    # `sys.stdout`へ直接print()する。理由は`_format_logo_lines`の
-    # コメントを参照。`_chat_output_context()`(対話モードのフルスクリーン
-    # UIのログ欄へ出力を差し込む仕組み)は、この後のセッション本体
-    # (入力ループ・LLMの応答・バックグラウンドジョブの出力)にのみ適用する。
+    # `sys.stdout`へ直接print()する(色付きのANSIエスケープシーケンスを
+    # そのまま端末に出せる、まだフルスクリーンUIに切り替わる前の唯一の
+    # タイミングであるため)。
     print()
     member_count = _count_org_members(port, org_fingerprint)
-    print(_format_startup_banner(out_dir, member_count, _supports_ansi_color()))
+    banner_use_color = _supports_ansi_color()
+    print(_format_startup_banner(out_dir, member_count, banner_use_color))
     print()
 
     # 仮の判断: テストのように同一プロセス内で`_run_repl_client`を複数回
@@ -8208,7 +8394,21 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
     # されてしまうことを防ぐ)。
     _ACTIVE_STATUS_BOARD.clear()
     _ACTIVE_ORG_MEMBERS.update(set())
-    _reset_chat_log_buffer()
+    # 仮の判断(実機バグ報告への対応: 「起動時のロゴが消える」): フル
+    # スクリーンUIは代替スクリーンバッファに切り替わるため、素の
+    # ターミナルへ直接print()した上記の案内文はUIが起動した瞬間に画面
+    # から見えなくなる(代替スクリーンバッファは通常のスクリーン
+    # バッファとは別物で、内容を引き継がない)。そこで、ログ欄
+    # (`_CHAT_LOG_BUFFER`)の最初の内容として案内文の複製を書いておき、
+    # フルスクリーンUIに切り替わった直後もログ欄の先頭に表示され続ける
+    # ようにする。ログ欄はプレーンテキストとして描画され、`prompt_
+    # toolkit`側がANSIエスケープシーケンスを解釈することは無いため、
+    # 色無し版(`use_color=False`)を別途組み立てて使う(色付き版を
+    # そのまま書くと、制御文字の断片がそのまま表示されてしまう)。
+    _CHAT_LOG_BUFFER.set_document(
+        Document(_format_startup_banner(out_dir, member_count, use_color=False) + "\n"),
+        bypass_readonly=True,
+    )
     # 仮の判断: ステータスパネルの行数を実際の参加台数に追従させるため、
     # `--chat`の起動中ずっと定期的に`/status`へ問い合わせ続けるスレッドを
     # ここで開始する(詳細は`_poll_org_members_forever`のコメント参照)。
@@ -8242,7 +8442,33 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
         # 見返せば、別のセッションでも過去の会話内容を確認できる)。
         chat_log = _create_chat_log(out_dir)
         messages = chat_log
+        # 仮の判断: テストのように同一プロセス内で`_run_repl_client`を
+        # 複数回呼び出すケースに備え、前回起動時の残骸(前回セッションの
+        # 入力・EOF・Ctrl+Cが積まれたまま残っている可能性)を捨てておく。
+        while not _CHAT_INPUT_QUEUE.empty():
+            try:
+                _CHAT_INPUT_QUEUE.get_nowait()
+            except queue.Empty:
+                break
         session = _create_repl_prompt_session()
+        # 仮の判断(実機バグ修正・重要): フルスクリーンUIの`Application`
+        # (`session.app`)を、対話モードの生存期間中1つだけ動かし続ける
+        # 専用スレッドで起動する(詳細は`_attach_full_screen_chat_ui`の
+        # コメント参照)。以前は`session.prompt()`をメッセージごとに
+        # 呼び直しており、そのたびに代替スクリーンバッファへの出入りが
+        # 発生し、「起動時のロゴが消える」「メッセージ送信のたびに画面が
+        # 一瞬フルスクリーンから抜けてまた入り直す」という、明滅として
+        # 知覚されるレベルの表示不具合が実機で報告された。この専用
+        # スレッドは`session.app.exit()`が呼ばれるまで終了しない。
+        # `handle_sigint=False`にしているのは、SIGINTのハンドリングは
+        # メインスレッドでのみ有効(`Application.run`のドキュメント参照)
+        # であり、このスレッドはメインスレッドではない(かつCtrl+Cの
+        # 検出自体は`_make_persistent_session_key_bindings`が独自の
+        # キー割り当てとして行うため、SIGINTハンドリングは不要)ため。
+        ui_thread = threading.Thread(
+            target=session.app.run, kwargs={"handle_sigint": False}, daemon=True,
+        )
+        ui_thread.start()
         # 仮の判断: 入力編集中・組織への問い合わせ中(応答待ち)のどちらで
         # Ctrl+Cが発生しても「2回連続」を正しく検出できるよう、対話モードの
         # セッションを通じて1つのインスタンスを使い回す(_DoubleInterruptGuard
@@ -8271,7 +8497,7 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
         # `_FixSession`として引き継ぐ(詳細は`_CompletedBuildBox`参照)。
         completed_build_box = _CompletedBuildBox()
         while True:
-            text, terminate = _read_multiline_input(session, interrupt_guard)
+            text, terminate = _read_multiline_input(interrupt_guard)
             if terminate:
                 break
 
@@ -8297,7 +8523,7 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
 
             if text.startswith(RESUME_ALL_COMMAND):
                 job_runner.submit(
-                    lambda: _run_job_with_conversation_log(
+                    lambda text=text: _run_job_with_conversation_log(
                         messages, text, lambda: _run_resume_all(port, org_fingerprint, out_dir),
                     ),
                     queued_notice=_BACKGROUND_QUEUED_NOTICE,
@@ -8318,7 +8544,7 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                     )
                     fix_session = None
                 job_runner.submit(
-                    lambda request=request: _run_job_with_conversation_log(
+                    lambda request=request, text=text: _run_job_with_conversation_log(
                         messages, text,
                         lambda: _ask_organization_collaborate(
                             port, org_fingerprint, request, out_dir, enable_dialogue=True,
@@ -8335,7 +8561,7 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                     print(f"使い方: {PLAN_ONLY_COMMAND} <検討したい依頼>  (例: {PLAN_ONLY_COMMAND} ToDoリストのCLIツールを作って)")
                     continue
                 job_runner.submit(
-                    lambda plan_request=plan_request: _run_job_with_conversation_log(
+                    lambda plan_request=plan_request, text=text: _run_job_with_conversation_log(
                         messages, text,
                         lambda: _ask_organization_plan_only(port, org_fingerprint, plan_request, out_dir),
                     ),
@@ -8359,7 +8585,7 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
             if text.startswith(PARALLEL_QUERY_COMMAND):
                 command_text = text[len(PARALLEL_QUERY_COMMAND):].strip()
                 job_runner.submit(
-                    lambda command_text=command_text: _run_job_with_conversation_log(
+                    lambda command_text=command_text, text=text: _run_job_with_conversation_log(
                         messages, text,
                         lambda: _ask_organization_parallel(port, org_fingerprint, command_text, out_dir),
                     ),
@@ -8374,7 +8600,7 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                     continue
                 messages.append({"role": "user", "content": question})
                 try:
-                    _ask_organization_multi(port, org_fingerprint, messages)
+                    _run_interruptibly(lambda: _ask_organization_multi(port, org_fingerprint, messages))
                 except KeyboardInterrupt:
                     if _handle_repl_command_interrupt(interrupt_guard):
                         break
@@ -8506,14 +8732,28 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
             messages.append({"role": "user", "content": text})
             try:
                 if mode == EXECUTION_MODE_COMPARE:
-                    _ask_organization_multi(port, org_fingerprint, messages)
+                    _run_interruptibly(lambda: _ask_organization_multi(port, org_fingerprint, messages))
                 else:
-                    _ask_organization(port, org_fingerprint, messages, disable_web_search=post_pause_single_fallback)
+                    _run_interruptibly(
+                        lambda: _ask_organization(
+                            port, org_fingerprint, messages, disable_web_search=post_pause_single_fallback,
+                        )
+                    )
             except KeyboardInterrupt:
                 if _handle_repl_command_interrupt(interrupt_guard):
                     break
                 continue
 
+        # 仮の判断(実機バグ修正・重要): フルスクリーンUIをセッションの
+        # 生存期間中1つだけ動かし続ける設計にしたため(詳細は本関数冒頭の
+        # コメント参照)、終了時にここで明示的に`Application`を終了させ、
+        # UIスレッドの終了を待つ必要がある。これを待たずに「対話モードを
+        # 終了します。」を印字すると、その時点ではまだ代替スクリーン
+        # バッファ側にいる可能性があり(`_ChatOutputRouter`はUIが動いて
+        # いる間ログ欄バッファへ書くだけで、実際の端末には描画されない)、
+        # 最後の挨拶が画面に表示されないまま対話モードが終了してしまう。
+        session.app.exit()
+        ui_thread.join(timeout=5.0)
         print("対話モードを終了します。")
 
 

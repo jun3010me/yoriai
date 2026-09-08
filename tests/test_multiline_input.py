@@ -16,23 +16,18 @@ Enter/Shift+Enterのキー割り当てそのものの検証はtests/test_enter_t
 で行う。このファイルでは、`_read_multiline_input`が返す`(text, terminate)`
 の契約(送信内容・終了判定)を検証する。
 
-`prompt_toolkit.input.create_pipe_input`で仮想的なキー入力を送り込み、
-`prompt_toolkit.output.DummyOutput`で実際の画面描画を行わないように
-した`PromptSession`を使う(prompt_toolkit公式のテスト手法。実際の
-擬似端末を使わずに済む)。セッションは本番と同じ`yoriai._make_repl_key_bindings()`
-のキー割り当てで作る(本番のEnter/Shift+Enterの挙動を実際に検証するため)。
+`_repl_test_support.run_repl_session_with_keys`(本番と同じ`_create_repl_
+prompt_session()`ベースの永続セッションを、仮想端末経由で実際に動かす
+共通ヘルパー)を使う(prompt_toolkit公式のテスト手法である`create_pipe_
+input`/`DummyOutput`をラップしたもの。実際の擬似端末を使わずに済む)。
 
 使い方: python3 tests/test_multiline_input.py
 """
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import yoriai  # noqa: E402
-
-from prompt_toolkit import PromptSession  # noqa: E402
-from prompt_toolkit.input import create_pipe_input  # noqa: E402
-from prompt_toolkit.output import DummyOutput  # noqa: E402
+sys.path.insert(0, os.path.dirname(__file__))
+from _repl_test_support import run_repl_session_with_keys  # noqa: E402
 
 # Enterキー単体(送信)を送信する際のバイト列。
 _SUBMIT = "\r"
@@ -43,16 +38,10 @@ _NEWLINE = "\x1b[27;2;13~"
 
 
 def _read_with_keys(keystrokes: str):
-    """指定したキー入力(複数回分の`_read_multiline_input`呼び出しを
-    またいでよい)を仮想端末に送り込み、1回分の`_read_multiline_input`の
-    戻り値を返す。
+    """指定したキー入力を仮想端末に送り込み、1回分の`_read_multiline_
+    input`の戻り値を返す。
     """
-    with create_pipe_input() as pipe_input:
-        session = PromptSession(
-            input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
-        )
-        pipe_input.send_text(keystrokes)
-        return yoriai._read_multiline_input(session, yoriai._DoubleInterruptGuard())
+    return run_repl_session_with_keys(keystrokes, message_count=1)[0]
 
 
 def test_single_line_then_submit_key_sends_as_one_message():

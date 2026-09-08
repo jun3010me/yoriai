@@ -36,12 +36,8 @@ import shutil
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import yoriai  # noqa: E402
-
-from prompt_toolkit import PromptSession  # noqa: E402
-from prompt_toolkit.input import create_pipe_input  # noqa: E402
-from prompt_toolkit.output import DummyOutput  # noqa: E402
+sys.path.insert(0, os.path.dirname(__file__))
+from _repl_test_support import run_full_repl_client_with_keys, run_repl_session_with_keys  # noqa: E402
 
 _SUBMIT = "\r"  # Enterキー単体
 _SHIFT_ENTER = "\x1b[27;2;13~"  # 一部の端末がShift+Enterに対して送るバイト列
@@ -49,12 +45,7 @@ _OLD_SUBMIT_KEY_ALT_ENTER = "\x1b\r"  # 旧・送信キー(Alt+Enter)
 
 
 def _read_with_keys(keystrokes: str):
-    with create_pipe_input() as pipe_input:
-        session = PromptSession(
-            input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
-        )
-        pipe_input.send_text(keystrokes)
-        return yoriai._read_multiline_input(session, yoriai._DoubleInterruptGuard())
+    return run_repl_session_with_keys(keystrokes, message_count=1)[0]
 
 
 def test_enter_submits_a_single_line_message():
@@ -84,13 +75,9 @@ def test_terminal_that_cannot_distinguish_shift_enter_degrades_to_submit():
     確定・送信され、2回目の`_read_multiline_input`呼び出しで「2行目」が
     別のメッセージとして送信される(1つの複数行メッセージにはならない)。
     """
-    with create_pipe_input() as pipe_input:
-        session = PromptSession(
-            input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
-        )
-        pipe_input.send_text("1行目" + _SUBMIT + "2行目" + _SUBMIT)
-        first_text, first_terminate = yoriai._read_multiline_input(session, yoriai._DoubleInterruptGuard())
-        second_text, second_terminate = yoriai._read_multiline_input(session, yoriai._DoubleInterruptGuard())
+    (first_text, first_terminate), (second_text, second_terminate) = run_repl_session_with_keys(
+        "1行目" + _SUBMIT + "2行目" + _SUBMIT, message_count=2,
+    )
     assert first_terminate is False
     assert first_text == "1行目", repr(first_text)
     assert second_terminate is False
@@ -117,12 +104,9 @@ def test_double_ctrl_c_emergency_exit_still_works_after_the_key_change():
     tests/test_double_ctrl_c_emergency_exit.pyで行っている。ここでは
     今回の変更による回帰が無いことをこのファイル内でも確認する)。
     """
-    with create_pipe_input() as pipe_input:
-        session = PromptSession(
-            input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
-        )
-        pipe_input.send_text("送信キーが効かない状況を想定した入力\x03\x03")
-        text, terminate = yoriai._read_multiline_input(session, yoriai._DoubleInterruptGuard())
+    text, terminate = run_repl_session_with_keys(
+        "送信キーが効かない状況を想定した入力\x03\x03", message_count=1,
+    )[0]
     assert terminate is True
     assert text == ""
 
@@ -148,23 +132,13 @@ def test_banner_documents_the_new_keys_prominently():
     """依頼の要件5: 起動時の案内文が新しいキー割り当て(Enterで送信、
     Shift+Enterで改行)に合わせて更新されていることを確認する。
     """
-    with create_pipe_input() as pipe_input:
-        def fake_create_session():
-            return PromptSession(
-                input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
-            )
-
-        original_create_session = yoriai._create_repl_prompt_session
-        yoriai._create_repl_prompt_session = fake_create_session
-        out_dir = tempfile.mkdtemp(prefix="yoriai_enter_to_submit_test_")
-        try:
-            pipe_input.send_text("\x04")
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                yoriai._run_repl_client(47120, "fingerprint", out_dir)
-        finally:
-            yoriai._create_repl_prompt_session = original_create_session
-            shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir = tempfile.mkdtemp(prefix="yoriai_enter_to_submit_test_")
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            run_full_repl_client_with_keys("\x04", 47120, "fingerprint", out_dir)
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
 
     output = buf.getvalue()
     assert "Enterで送信" in output, output

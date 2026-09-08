@@ -6286,3 +6286,158 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   (旧`patch_stdout()`方式では同条件で1秒足らずのうちに2行目まで押し
   上げられていた)。フラッド終了後の`Ctrl+D`によるフルスクリーン終了・
   「対話モードを終了します。」の表示も正常に動作することを確認した。
+
+### 対話モードのApplicationをセッションの生存期間中1つだけ動かし続ける設計へ全面変更(実機バグ修正・第3弾)+ pty検証で発見した2件の重大な取りこぼし
+
+- **背景**: 前回(`patch_stdout()`→フルスクリーンApplication化)の修正を
+  実機に取り込んだ利用者から、スクリーンショット付きで「最初のタイトル
+  ロゴが一切見えず、ずっとステータスパネル+入力欄だけの画面のまま。
+  `hello`と打つと一瞬フルロゴ+応答が表示され、応答後にまた元の(ロゴが
+  無い)画面に戻る。人間が知覚できるレベルのバグだ。こういうつぎはぎ
+  ではなく、根本的な修正をしてほしい」という明確な要求を受けた。
+- **根本原因**: `_run_repl_client`のメインループは、1メッセージごとに
+  `_read_multiline_input`経由で`session.prompt()`を呼び直していた。
+  `session.prompt()`は呼び出しのたびに新しい`Application.run()`サイクル
+  であり、開始時に代替スクリーンバッファへ入り、終了時に抜ける
+  (`enter_alternate_screen`/`quit_alternate_screen`)。つまり1メッセージ
+  処理するたびに「フルスクリーンUIを一度終了→通常のスクリーンバッファ
+  (起動時にprint()した素のロゴがまだ残っている)が一瞬見える→次の
+  `.prompt()`呼び出しで再びフルスクリーンUIへ戻る(ログ欄はまだ空)」が
+  起きていた。これが「ロゴが見えない」「メッセージ送信のたびに明滅する」
+  という報告の両方の直接の原因であり、レイアウトやCPRまわりの改善
+  (第1弾・第2弾)では原理的に解決できない設計上の問題だった。
+- **実装(方針転換)**: `Application`を対話モードの生存期間中1つだけ
+  起動し続け、メッセージのやり取りのたびに終了・再起動しない設計に
+  変更した。
+  - `_CHAT_INPUT_QUEUE`(`("text"|"eof"|"interrupt", payload)`を運ぶ
+    共有の待ち行列)を新設。`_read_multiline_input(interrupt_guard)`は
+    `session`引数を廃止し、この待ち行列から1件受け取るだけの単純な形に
+    書き換えた。
+  - `_make_persistent_session_key_bindings()`: Ctrl+C・Ctrl+Dを
+    `Application`終了ではなく`_CHAT_INPUT_QUEUE`への通知に置き換える、
+    永続セッション専用の追加キー割り当て。既存の`_make_repl_key_
+    bindings()`(素の`PromptSession`を直接使う既存テスト群向け)とは
+    別物にして、既存テストへの影響をゼロにした。
+  - `_accept_and_keep_session_running`: 入力欄の`accept_handler`を
+    差し替え、確定した入力を`_CHAT_INPUT_QUEUE`へ積んだうえで`False`を
+    返す(`Application`を終了させない)。
+  - `_InterruptRelay`/`_run_interruptibly`: 対話モードの`Application`が
+    セッション全体を通して常駐し続ける(=raw modeが常に有効)ため、
+    「組織への問い合わせ中(応答待ち)のCtrl+C」がもはやOSレベルの
+    SIGINT/`KeyboardInterrupt`としては届かなくなる(第2弾までは
+    `session.prompt()`の呼び出し単位でしかraw modeが有効にならなかった
+    ため、その外側の同期処理中はOSのSIGINTがそのまま素通りしていた)。
+    そこで、単発質問等の同期的な問い合わせを一時的に別スレッドで実行し
+    (`_run_interruptibly`)、その間だけCtrl+Cキー割り当ての配送先を
+    一時的な`queue.Queue`へ切り替える(`_InterruptRelay.redirect_to`)
+    ことで、既存の`_DoubleInterruptGuard`・「応答待ち中のCtrl+C」という
+    挙動をOSのSIGINTに頼らず再現した。
+  - `_attach_full_screen_chat_ui`: `session.key_bindings`を`merge_key_
+    bindings`で追加差し替え、`session.default_buffer.accept_handler`を
+    `_accept_and_keep_session_running`に差し替える処理を追加。
+  - `_run_repl_client`: 起動時の案内文(ロゴ)は素の`sys.stdout`へ直接
+    print()した後、`_CHAT_LOG_BUFFER`の最初の内容としても複製を書き込む
+    ようにした(代替スクリーンバッファは通常のスクリーンバッファの内容を
+    引き継がないため、フルスクリーンUI起動後もログ欄の先頭にロゴが
+    表示され続けるようにするため)。セッション構築後は`session.app.run
+    (handle_sigint=False)`を専用の常駐スレッドで起動し、メインループは
+    `_CHAT_INPUT_QUEUE`から受け取るだけになった。終了時は`session.app.
+    exit()`→スレッドの`join()`を待ってから「対話モードを終了します。」を
+    表示する(先に表示すると、まだ代替スクリーンバッファ側にいる間は
+    実端末に描画されない)。
+- **既存テストの土台からの作り直し**: `_read_multiline_input`の
+  シグネチャ変更(`session`引数の廃止)、および素の`PromptSession`+
+  `_create_repl_prompt_session`の差し替えでは動かなくなったテスト
+  (`_run_repl_client`内部がこの新しい永続セッション・待ち行列を前提と
+  するようになったため)に対応するため、共通ハーネス`tests/_repl_test_
+  support.py`を新設した。`run_repl_session_with_keys`(本番と同じ
+  `_create_repl_prompt_session()`を使い、`_read_multiline_input`の戻り値を
+  検証する用途)・`run_full_repl_client_with_keys`(`_run_repl_client`
+  全体を検証する用途。`_create_repl_prompt_session`自体はもう差し替え
+  不要になった)の2関数を提供し、影響を受けた10ファイル(`test_status_
+  panel.py`・`test_multiline_input.py`・`test_enter_to_submit.py`・
+  `test_repl_line_editing.py`・`test_double_ctrl_c_emergency_exit.py`・
+  `test_repl_input_handling.py`・`test_startup_banner.py`・`test_auto_
+  resume.py`・`test_background_collaborate.py`・`test_chat_conversation_
+  log.py`・`test_fix_session.py`)すべてをこのハーネス経由に書き換えた。
+- **この作業中に新たに発見・修正した重大な不具合(1): バックグラウンド
+  ジョブのクロージャがループ変数を参照で捕まえていた**: テストの書き
+  換え中、`test_repl_agree_command_writes_conversation_to_log_file`が
+  「会話ログの記録内容(ユーザー発言)が空になる」形で失敗することに
+  気づいた。原因は`_run_repl_client`内の`job_runner.submit(lambda: ...)`
+  系の呼び出しのうち、`//agree`・`//plan-only`・`//parallel`・
+  `//resume-all`の4箇所が、`_run_job_with_conversation_log(messages, text,
+  ...)`の`text`をラムダのデフォルト引数として捕まえておらず、外側の
+  ループ変数`text`をクロージャ経由で(参照として)見ていた。以前の
+  アーキテクチャ(メッセージごとに`Application`を起動・終了する、遅い
+  処理)では、バックグラウンドジョブが実際に`text`を読む前にメインループ
+  が次のメッセージへ進んで`text`を上書きすることは稀だったため顕在化
+  しなかったが、今回の高速化(明滅対策で処理間のオーバーヘッドが
+  ほぼ無くなった)により、メインループがバックグラウンドジョブの実行
+  より先に次のメッセージ(典型的には`exit`)を処理し切ってしまう競合が
+  ほぼ毎回再現するようになった。4箇所すべて`lambda text=text: ...`の
+  形でデフォルト引数として明示的に捕まえるよう修正した(`request`・
+  `plan_request`・`command_text`は元々デフォルト引数で捕まえられていた
+  ため無事だった)。
+- **この作業中に新たに発見・修正した重大な不具合(2、最重要): `message`・
+  `multiline`・`prompt_continuation`の設定がまるごと失われていた**:
+  上記のテスト書き換えがすべて完了し、`python3 -m pytest tests/`が
+  全件パスした後、依頼者の「根本的な修正をしてほしい」という要求に
+  応えるため、実際に疑似端末(pty)+生バイト列で「起動直後にロゴが
+  見えるか」「メッセージを連続送信しても代替スクリーンバッファの
+  出入りが起きないか」を検証したところ、**入力欄のプロンプト文字列
+  "Yoriai> "が画面に一切描画されていない**ことが発覚した(この不具合は
+  `DummyOutput`ベースの既存テスト群では検出できない。バッファの
+  accept_handler・キー割り当てといった「機能」は正しく動いていたため、
+  それらを検証するテストはすべてパスしたまま、純粋に「見た目」だけが
+  壊れていた)。原因の切り分けに、`prompt_toolkit`のレイアウト高さ計算
+  アルゴリズム(`HSplit._divide_heights`・`Window._merge_dimensions`)を
+  ソースまで遡って調査し、最小再現コード(`PromptSession`を素で構築し
+  同じ`HSplit`でラップするだけの数十行のスクリプト)でも同じ現象が
+  再現することを確認した。真因は、`PromptSession`の`message`
+  ("Yoriai> "というプロンプト文字列)・`multiline`・`prompt_continuation`
+  という3つの設定が、**`_create_repl_prompt_session()`のコンストラクタ
+  呼び出しに一切渡されていなかった**ことだった。第3弾のこの回で
+  `session.prompt()`自体を呼ばなくなった(`Application`を常駐させる
+  設計に変更した)際、以前は`session.prompt(message=_REPL_PROMPT,
+  multiline=True, prompt_continuation=_repl_prompt_continuation, ...)`の
+  ように毎回の`.prompt()`呼び出しの引数として渡していたはずのこれらの
+  設定を、コンストラクタ側へ移し替える作業が抜け落ちていた
+  (`PromptSession.__init__`の既定値`message=""`・`multiline=False`が
+  そのまま使われてしまっていた)。`_REPL_PROMPT`定数・
+  `_repl_prompt_continuation`関数はコード上に残っていたが、実際には
+  どこからも参照されていない「死んだ設定」になっていた。
+  `_create_repl_prompt_session()`の`PromptSession(...)`呼び出しに
+  `message=_REPL_PROMPT`・`multiline=True`・`prompt_continuation=
+  _repl_prompt_continuation`を明示的に追加して解決した。
+- **教訓**: `DummyOutput`ベースの単体テストは「入力の受理・キー割り当て・
+  会話履歴への記録」といった機能的な正しさは検証できるが、「実際に
+  画面に何が描画されるか」という見た目の正しさは一切検証できない。
+  今回のように機能テストが626件全件パスしている状態でも、ユーザーに
+  とって最も重要な「見た目」がまるごと壊れていることがあり得る。
+  疑似端末(pty)+生バイト列での検証を、レイアウト・描画に関わる変更の
+  最終確認として必ず行う必要があることを改めて確認した。
+- **テスト**: `tests/test_status_panel.py`に、`_create_repl_prompt_
+  session()`が`message`・`multiline`・`prompt_continuation`を正しく
+  設定していることを直接確認する`test_create_repl_prompt_session_still_
+  configures_prompt_and_multiline`(上記不具合(2)の直接の回帰検知)を
+  追加した。既存の`test_create_repl_prompt_session_still_accepts_input_
+  after_layout_wrap`は新しい共通ハーネス経由に書き換えたうえでそのまま
+  パスすることを確認した。
+- **動作確認**: `tests/`配下の全47ファイルをそれぞれ独立実行し(標準
+  ライブラリのみのstandalone pytest形式、`_repl_test_support.py`を除く)、
+  複数回繰り返して全件パスすることを確認した(既知のフレーキーテスト
+  `test_background_collaborate.py::test_followup_right_after_a_dialogue_
+  pause_is_not_reclassified`は、今回の高速化で顕在化しやすくなった別の
+  競合(バックグラウンドジョブの完了と2件目の発言の読み取りの間)が
+  原因だったため、他の類似テストと同じ`threading.Event`による決定的な
+  同期方式に書き換えて解消した)。加えて、疑似端末(pty)+生バイト列で
+  実際の`_run_repl_client`を(ネットワーク呼び出しのみスタブ化して)
+  実行し、(1)起動直後、フルスクリーンUIへ切り替わる前の素の画面に
+  ロゴ・案内文が表示されること、(2)フルスクリーンUI切り替え後、
+  入力プロンプト"Yoriai> "・ステータスパネルが実際に描画されること、
+  (3)3件のメッセージを連続で送信しても代替スクリーンバッファへの
+  出入り(`\x1b[?1049h`/`\x1b[?1049l`)が最初の1回だけで、メッセージ
+  ごとの明滅が一切発生しないこと、(4)`exit`で正しく代替スクリーン
+  バッファから退出し「対話モードを終了します。」が表示されること、を
+  すべて確認した。

@@ -23,12 +23,10 @@ import shutil
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import yoriai  # noqa: E402
-
-from prompt_toolkit import PromptSession  # noqa: E402
-from prompt_toolkit.input import create_pipe_input  # noqa: E402
-from prompt_toolkit.output import DummyOutput  # noqa: E402
+from _repl_test_support import run_full_repl_client_with_keys  # noqa: E402
 
 # Enterキー単体(送信)を送信する際のバイト列。
 _SUBMIT = "\r"
@@ -41,7 +39,6 @@ def _run_repl_with_keys(keystrokes: str):
     """
     calls = {"classify": 0, "ask_single": 0, "ask_multi": 0, "ask_collaborate": 0}
 
-    original_create_session = yoriai._create_repl_prompt_session
     original_classify = yoriai._classify_execution_mode
     original_ask = yoriai._ask_organization
     original_ask_multi = yoriai._ask_organization_multi
@@ -60,32 +57,22 @@ def _run_repl_with_keys(keystrokes: str):
     def stub_ask_collaborate(*args, **kwargs):
         calls["ask_collaborate"] += 1
 
-    with create_pipe_input() as pipe_input:
-        def fake_create_session():
-            return PromptSession(
-                input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
-            )
+    yoriai._classify_execution_mode = spy_classify
+    yoriai._ask_organization = stub_ask
+    yoriai._ask_organization_multi = stub_ask_multi
+    yoriai._ask_organization_collaborate = stub_ask_collaborate
 
-        yoriai._create_repl_prompt_session = fake_create_session
-        yoriai._classify_execution_mode = spy_classify
-        yoriai._ask_organization = stub_ask
-        yoriai._ask_organization_multi = stub_ask_multi
-        yoriai._ask_organization_collaborate = stub_ask_collaborate
-
-        pipe_input.send_text(keystrokes)
-
-        buf = io.StringIO()
-        out_dir = tempfile.mkdtemp(prefix="yoriai_repl_input_test_")
-        try:
-            with contextlib.redirect_stdout(buf):
-                yoriai._run_repl_client(47120, "fingerprint", out_dir)
-        finally:
-            yoriai._create_repl_prompt_session = original_create_session
-            yoriai._classify_execution_mode = original_classify
-            yoriai._ask_organization = original_ask
-            yoriai._ask_organization_multi = original_ask_multi
-            yoriai._ask_organization_collaborate = original_ask_collaborate
-            shutil.rmtree(out_dir, ignore_errors=True)
+    buf = io.StringIO()
+    out_dir = tempfile.mkdtemp(prefix="yoriai_repl_input_test_")
+    try:
+        with contextlib.redirect_stdout(buf):
+            run_full_repl_client_with_keys(keystrokes, 47120, "fingerprint", out_dir)
+    finally:
+        yoriai._classify_execution_mode = original_classify
+        yoriai._ask_organization = original_ask
+        yoriai._ask_organization_multi = original_ask_multi
+        yoriai._ask_organization_collaborate = original_ask_collaborate
+        shutil.rmtree(out_dir, ignore_errors=True)
 
     return buf.getvalue(), calls
 

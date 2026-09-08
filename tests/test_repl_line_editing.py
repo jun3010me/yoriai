@@ -31,12 +31,10 @@ tests/test_enter_to_submit.pyで行う。
 import os
 import sys
 
+sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import yoriai  # noqa: E402
-
-from prompt_toolkit import PromptSession  # noqa: E402
-from prompt_toolkit.input import create_pipe_input  # noqa: E402
-from prompt_toolkit.output import DummyOutput  # noqa: E402
+from _repl_test_support import run_repl_session_with_keys  # noqa: E402
 
 _SUBMIT = "\r"  # Enterキー単体(送信)
 # Shift+Enter(改行を挿入)を送る際のバイト列。詳細は
@@ -45,12 +43,7 @@ _NEWLINE = "\x1b[27;2;13~"
 
 
 def _read_with_keys(keystrokes: str):
-    with create_pipe_input() as pipe_input:
-        session = PromptSession(
-            input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
-        )
-        pipe_input.send_text(keystrokes)
-        return yoriai._read_multiline_input(session, yoriai._DoubleInterruptGuard())
+    return run_repl_session_with_keys(keystrokes, message_count=1)[0]
 
 
 def test_continuation_lines_have_no_prefix():

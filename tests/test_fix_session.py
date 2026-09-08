@@ -24,12 +24,10 @@ import sys
 import tempfile
 import time
 
+sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import yoriai  # noqa: E402
-
-from prompt_toolkit import PromptSession  # noqa: E402
-from prompt_toolkit.input import create_pipe_input  # noqa: E402
-from prompt_toolkit.output import DummyOutput  # noqa: E402
+from _repl_test_support import run_full_repl_client_with_keys  # noqa: E402
 
 _SUBMIT = "\r"
 
@@ -271,7 +269,6 @@ def _run_repl_with_keys(keystrokes, out_dir, run_fix_side_effect=None,
     calls = {"run_fix": 0, "ask_collaborate": 0, "ask_multi": 0, "ask_single": 0}
     fix_calls = []
 
-    original_create_session = yoriai._create_repl_prompt_session
     original_create_runner = yoriai._create_background_job_runner
     original_run_fix = yoriai._run_fix_on_project
     original_ask = yoriai._ask_organization
@@ -304,28 +301,18 @@ def _run_repl_with_keys(keystrokes, out_dir, run_fix_side_effect=None,
         runner_holder["runner"] = runner
         return runner
 
-    with create_pipe_input() as pipe_input:
-        def fake_create_session():
-            return PromptSession(
-                input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
-            )
+    yoriai._create_background_job_runner = fake_create_runner
+    yoriai._run_fix_on_project = stub_run_fix
+    yoriai._ask_organization = stub_ask
+    yoriai._ask_organization_multi = stub_ask_multi
+    yoriai._ask_organization_collaborate = stub_ask_collaborate
 
-        yoriai._create_repl_prompt_session = fake_create_session
-        yoriai._create_background_job_runner = fake_create_runner
-        yoriai._run_fix_on_project = stub_run_fix
-        yoriai._ask_organization = stub_ask
-        yoriai._ask_organization_multi = stub_ask_multi
-        yoriai._ask_organization_collaborate = stub_ask_collaborate
-
-        pipe_input.send_text(keystrokes)
-
-        buf = io.StringIO()
-        try:
-            with contextlib.redirect_stdout(buf):
-                yoriai._run_repl_client(47120, "fingerprint", out_dir)
-        finally:
-            yoriai._create_repl_prompt_session = original_create_session
-            yoriai._create_background_job_runner = original_create_runner
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            run_full_repl_client_with_keys(keystrokes, 47120, "fingerprint", out_dir)
+    finally:
+        yoriai._create_background_job_runner = original_create_runner
 
     runner = runner_holder.get("runner")
     if runner is not None:
