@@ -22,12 +22,10 @@ import shutil
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import yoriai  # noqa: E402
-
-from prompt_toolkit import PromptSession  # noqa: E402
-from prompt_toolkit.input import create_pipe_input  # noqa: E402
-from prompt_toolkit.output import DummyOutput  # noqa: E402
+from _repl_test_support import run_full_repl_client_with_keys  # noqa: E402
 
 _SUBMIT = "\r"
 
@@ -291,7 +289,6 @@ def test_single_query_after_agree_job_receives_prior_conversation_as_context():
 # ---------------------------------------------------------------------------
 
 def test_repl_agree_command_writes_conversation_to_log_file():
-    original_create_session = yoriai._create_repl_prompt_session
     original_create_runner = yoriai._create_background_job_runner
     original_ask_collaborate = yoriai._ask_organization_collaborate
 
@@ -306,25 +303,18 @@ def test_repl_agree_command_writes_conversation_to_log_file():
         runner_holder["runner"] = runner
         return runner
 
+    yoriai._create_background_job_runner = fake_create_runner
+    yoriai._ask_organization_collaborate = stub_ask_collaborate
+
     out_dir = tempfile.mkdtemp(prefix="yoriai_chat_log_repl_test_")
     try:
-        with create_pipe_input() as pipe_input:
-            def fake_create_session():
-                return PromptSession(
-                    input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
-                )
-
-            yoriai._create_repl_prompt_session = fake_create_session
-            yoriai._create_background_job_runner = fake_create_runner
-            yoriai._ask_organization_collaborate = stub_ask_collaborate
-
-            pipe_input.send_text(f"{yoriai.AGREE_COMMAND} ToDoリストを作って" + _SUBMIT + "exit" + _SUBMIT)
-
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                yoriai._run_repl_client(47120, "fingerprint", out_dir)
-            yoriai._create_repl_prompt_session = original_create_session
-            yoriai._create_background_job_runner = original_create_runner
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            run_full_repl_client_with_keys(
+                f"{yoriai.AGREE_COMMAND} ToDoリストを作って" + _SUBMIT + "exit" + _SUBMIT,
+                47120, "fingerprint", out_dir,
+            )
+        yoriai._create_background_job_runner = original_create_runner
 
         runner_holder["runner"].join()
         yoriai._ask_organization_collaborate = original_ask_collaborate

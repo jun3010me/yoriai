@@ -18,9 +18,11 @@ Claude Code等のツールのように「処理はバックグラウンドで進
 (`yoriai._BackgroundJobRunner`のクラスdocstring参照)。
 
 `prompt_toolkit.input.create_pipe_input`で仮想的なキー入力を送り込み、
-`yoriai._create_repl_prompt_session`・`yoriai._create_background_job_runner`を
-差し替えて`_run_repl_client`全体を実際に動かして検証する(既存のREPL
-テストファイル群と同じ手法)。
+`_run_repl_client`全体を実際に動かして検証する(既存のREPLテスト
+ファイル群と同じ手法。`_create_repl_prompt_session`自体はもう差し替え
+不要になった。詳細は`tests/_repl_test_support.py`のモジュールdocstring
+参照)。`yoriai._create_background_job_runner`は、テスト側がバック
+グラウンドジョブの完了を`.join()`で待つために引き続き差し替える。
 
 使い方: python3 tests/test_background_collaborate.py
 """
@@ -33,10 +35,12 @@ import tempfile
 import threading
 import time
 
+sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import yoriai  # noqa: E402
+from _repl_test_support import run_full_repl_client_with_keys  # noqa: E402
 
-from prompt_toolkit import PromptSession  # noqa: E402
+from prompt_toolkit.application import create_app_session  # noqa: E402
 from prompt_toolkit.input import create_pipe_input  # noqa: E402
 from prompt_toolkit.output import DummyOutput  # noqa: E402
 
@@ -130,7 +134,6 @@ def _run_repl_with_keys(keystrokes: str, ask_collaborate_side_effect=None, ask_s
     """
     calls = {"classify": 0, "ask_single": 0, "ask_multi": 0, "ask_collaborate": 0, "ask_parallel": 0, "resume_all": 0}
 
-    original_create_session = yoriai._create_repl_prompt_session
     original_create_runner = yoriai._create_background_job_runner
     original_classify = yoriai._classify_execution_mode
     original_ask = yoriai._ask_organization
@@ -177,34 +180,24 @@ def _run_repl_with_keys(keystrokes: str, ask_collaborate_side_effect=None, ask_s
         runner_holder["runner"] = runner
         return runner
 
-    with create_pipe_input() as pipe_input:
-        def fake_create_session():
-            return PromptSession(
-                input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
-            )
+    yoriai._create_background_job_runner = fake_create_runner
+    yoriai._classify_execution_mode = spy_classify
+    yoriai._ask_organization = stub_ask
+    yoriai._ask_organization_multi = stub_ask_multi
+    yoriai._ask_organization_collaborate = stub_ask_collaborate
+    yoriai._ask_organization_parallel = stub_ask_parallel
+    yoriai._run_resume_all = stub_resume_all
 
-        yoriai._create_repl_prompt_session = fake_create_session
-        yoriai._create_background_job_runner = fake_create_runner
-        yoriai._classify_execution_mode = spy_classify
-        yoriai._ask_organization = stub_ask
-        yoriai._ask_organization_multi = stub_ask_multi
-        yoriai._ask_organization_collaborate = stub_ask_collaborate
-        yoriai._ask_organization_parallel = stub_ask_parallel
-        yoriai._run_resume_all = stub_resume_all
-
-        pipe_input.send_text(keystrokes)
-
-        buf = io.StringIO()
-        # 仮の判断: この関数はバックグラウンドジョブの完了(呼び出し元が
-        # `runner.join()`する)を待たずに返るため、ここで一時ディレクトリを
-        # 作ってもこの関数内では削除しない(ジョブが後から書き込む可能性が
-        # ある)。OSが定期的に掃除する/tmp配下に作ることで、少なくとも
-        # リポジトリの作業ディレクトリを汚さないようにする。
-        out_dir = tempfile.mkdtemp(prefix="yoriai_background_collaborate_test_")
-        with contextlib.redirect_stdout(buf):
-            yoriai._run_repl_client(47120, "fingerprint", out_dir)
-        yoriai._create_repl_prompt_session = original_create_session
-        yoriai._create_background_job_runner = original_create_runner
+    buf = io.StringIO()
+    # 仮の判断: この関数はバックグラウンドジョブの完了(呼び出し元が
+    # `runner.join()`する)を待たずに返るため、ここで一時ディレクトリを
+    # 作ってもこの関数内では削除しない(ジョブが後から書き込む可能性が
+    # ある)。OSが定期的に掃除する/tmp配下に作ることで、少なくとも
+    # リポジトリの作業ディレクトリを汚さないようにする。
+    out_dir = tempfile.mkdtemp(prefix="yoriai_background_collaborate_test_")
+    with contextlib.redirect_stdout(buf):
+        run_full_repl_client_with_keys(keystrokes, 47120, "fingerprint", out_dir)
+    yoriai._create_background_job_runner = original_create_runner
 
     return buf.getvalue(), calls, runner_holder.get("runner"), restore_dispatch_stubs
 
@@ -262,18 +255,75 @@ def test_followup_right_after_a_dialogue_pause_is_not_reclassified():
     直後に、たとえ協業モードのキーワード(「作って」)を含む発言を送っても、
     新規の自動判定にはかけず「今の会話の続き」の単発質問として扱う
     ことを確認する。
-    """
-    def paused_collaborate():
-        print(yoriai._DIALOGUE_PAUSE_HUMAN_JUDGEMENT_MARKER)
 
-    output, calls, runner, restore = _run_repl_with_keys(
-        f"{yoriai.AGREE_COMMAND} ToDoリストを作って" + _SUBMIT
-        + "やっぱり別のアプリを作って" + _SUBMIT
-        + "exit" + _SUBMIT,
-        ask_collaborate_side_effect=paused_collaborate,
-    )
-    runner.join()
-    restore()
+    仮の判断: 他の類似テスト(`test_followup_right_after_a_design_
+    dialogue_pause_resumes_instead_of_single_question`等)と同じ理由
+    (一時停止を知らせるバックグラウンドジョブの完了と2件目の発言の
+    読み取りの間の競合)により、全キーストロークを起動前に一括で
+    パイプへ送り込む`_run_repl_with_keys`ではなく、`_run_repl_client`を
+    別スレッドで動かし、1件目のジョブが完了した(`paused_ready`が立った)
+    ことを確認してから2件目のキー入力を送り込むことで、競合を避けて
+    決定的にする(フルスクリーンUI常駐化により、以前よりメッセージ間の
+    処理が高速になり、この競合が顕在化しやすくなったため)。
+    """
+    calls = {"classify": 0, "ask_single": 0, "ask_collaborate": 0}
+    paused_ready = threading.Event()
+
+    original_classify = yoriai._classify_execution_mode
+    original_ask = yoriai._ask_organization
+    original_ask_collaborate = yoriai._ask_organization_collaborate
+    original_create_runner = yoriai._create_background_job_runner
+
+    def spy_classify(text, out_dir=None):
+        calls["classify"] += 1
+        return original_classify(text, out_dir)
+
+    def stub_ask(*args, **kwargs):
+        calls["ask_single"] += 1
+
+    def stub_ask_collaborate(*args, **kwargs):
+        calls["ask_collaborate"] += 1
+        print(yoriai._DIALOGUE_PAUSE_HUMAN_JUDGEMENT_MARKER)
+        paused_ready.set()
+
+    yoriai._classify_execution_mode = spy_classify
+    yoriai._ask_organization = stub_ask
+    yoriai._ask_organization_collaborate = stub_ask_collaborate
+
+    runner_holder = {}
+
+    def fake_create_runner():
+        runner = original_create_runner()
+        runner_holder["runner"] = runner
+        return runner
+
+    yoriai._create_background_job_runner = fake_create_runner
+
+    out_dir = tempfile.mkdtemp(prefix="yoriai_dialogue_pause_reclassify_test_")
+    buf = io.StringIO()
+    try:
+        with create_pipe_input() as pipe_input:
+            def run_client():
+                with contextlib.redirect_stdout(buf):
+                    with create_app_session(input=pipe_input, output=DummyOutput()):
+                        yoriai._run_repl_client(47120, "fingerprint", out_dir)
+
+            thread = threading.Thread(target=run_client)
+            thread.start()
+            pipe_input.send_text(f"{yoriai.AGREE_COMMAND} ToDoリストを作って" + _SUBMIT)
+            assert paused_ready.wait(timeout=5), "合意フェーズの一時停止(バックグラウンドジョブ)がタイムアウトしました"
+            runner_holder["runner"].join()
+            pipe_input.send_text("やっぱり別のアプリを作って" + _SUBMIT + "exit" + _SUBMIT)
+            thread.join(timeout=5)
+            assert not thread.is_alive(), "対話モードがexitで終了しませんでした"
+    finally:
+        yoriai._create_background_job_runner = original_create_runner
+        yoriai._classify_execution_mode = original_classify
+        yoriai._ask_organization = original_ask
+        yoriai._ask_organization_collaborate = original_ask_collaborate
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+    output = buf.getvalue()
     assert "対話モードを終了します。" in output, output
     assert "[💬 対話プロトコルの一時停止直後の発言のため、会話の続きとして扱います]" in output, output
     # 1回目(明示//agree)はモード判定を経由しない。2回目の「作って」を
@@ -300,7 +350,6 @@ def test_followup_right_after_a_dialogue_pause_fallback_disables_web_search():
     ask_single_kwargs_calls = []
     paused_ready = threading.Event()
 
-    original_create_session = yoriai._create_repl_prompt_session
     original_create_runner = yoriai._create_background_job_runner
     original_ask = yoriai._ask_organization
     original_ask_collaborate = yoriai._ask_organization_collaborate
@@ -322,36 +371,28 @@ def test_followup_right_after_a_dialogue_pause_fallback_disables_web_search():
         runner_holder["runner"] = runner
         return runner
 
+    yoriai._create_background_job_runner = fake_create_runner
+
     out_dir = tempfile.mkdtemp(prefix="yoriai_dialogue_pause_no_web_search_test_")
     buf = io.StringIO()
     try:
         with create_pipe_input() as pipe_input:
-            def fake_create_session():
-                return PromptSession(
-                    input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
-                )
-
-            yoriai._create_repl_prompt_session = fake_create_session
-            yoriai._create_background_job_runner = fake_create_runner
-
             def run_client():
                 with contextlib.redirect_stdout(buf):
-                    yoriai._run_repl_client(47120, "fingerprint", out_dir)
+                    with create_app_session(input=pipe_input, output=DummyOutput()):
+                        yoriai._run_repl_client(47120, "fingerprint", out_dir)
 
             thread = threading.Thread(target=run_client)
             thread.start()
-            try:
-                pipe_input.send_text("富士山の標高は?" + _SUBMIT)
-                pipe_input.send_text(f"{yoriai.AGREE_COMMAND} ToDoリストを作って" + _SUBMIT)
-                assert paused_ready.wait(timeout=5), "合意フェーズの一時停止(バックグラウンドジョブ)がタイムアウトしました"
-                runner_holder["runner"].join()
-                pipe_input.send_text("やっぱり別のアプリを作って" + _SUBMIT + "exit" + _SUBMIT)
-                thread.join(timeout=5)
-                assert not thread.is_alive(), "対話モードがexitで終了しませんでした"
-            finally:
-                yoriai._create_repl_prompt_session = original_create_session
-                yoriai._create_background_job_runner = original_create_runner
+            pipe_input.send_text("富士山の標高は?" + _SUBMIT)
+            pipe_input.send_text(f"{yoriai.AGREE_COMMAND} ToDoリストを作って" + _SUBMIT)
+            assert paused_ready.wait(timeout=5), "合意フェーズの一時停止(バックグラウンドジョブ)がタイムアウトしました"
+            runner_holder["runner"].join()
+            pipe_input.send_text("やっぱり別のアプリを作って" + _SUBMIT + "exit" + _SUBMIT)
+            thread.join(timeout=5)
+            assert not thread.is_alive(), "対話モードがexitで終了しませんでした"
     finally:
+        yoriai._create_background_job_runner = original_create_runner
         yoriai._ask_organization = original_ask
         yoriai._ask_organization_collaborate = original_ask_collaborate
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -387,7 +428,6 @@ def test_followup_right_after_a_design_dialogue_pause_resumes_instead_of_single_
     calls = {"classify": 0, "ask_single": 0, "ask_collaborate": 0, "resume_organization_collaborate": 0}
     paused_ready = threading.Event()
 
-    original_create_session = yoriai._create_repl_prompt_session
     original_create_runner = yoriai._create_background_job_runner
     original_classify = yoriai._classify_execution_mode
     original_ask = yoriai._ask_organization
@@ -431,36 +471,28 @@ def test_followup_right_after_a_design_dialogue_pause_resumes_instead_of_single_
         runner_holder["runner"] = runner
         return runner
 
+    yoriai._create_background_job_runner = fake_create_runner
+
     out_dir = tempfile.mkdtemp(prefix="yoriai_design_pause_resume_repl_test_")
     buf = io.StringIO()
     try:
         with create_pipe_input() as pipe_input:
-            def fake_create_session():
-                return PromptSession(
-                    input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
-                )
-
-            yoriai._create_repl_prompt_session = fake_create_session
-            yoriai._create_background_job_runner = fake_create_runner
-
             def run_client():
                 with contextlib.redirect_stdout(buf):
-                    yoriai._run_repl_client(47120, "fingerprint", out_dir)
+                    with create_app_session(input=pipe_input, output=DummyOutput()):
+                        yoriai._run_repl_client(47120, "fingerprint", out_dir)
 
             thread = threading.Thread(target=run_client)
             thread.start()
-            try:
-                pipe_input.send_text(f"{yoriai.AGREE_COMMAND} ToDoリストを作って" + _SUBMIT)
-                assert paused_ready.wait(timeout=5), "合意フェーズの一時停止(バックグラウンドジョブ)がタイムアウトしました"
-                runner_holder["runner"].join()
-                pipe_input.send_text("方向性はAでお願いします" + _SUBMIT + "exit" + _SUBMIT)
-                thread.join(timeout=5)
-                assert not thread.is_alive(), "対話モードがexitで終了しませんでした"
-                runner_holder["runner"].join()
-            finally:
-                yoriai._create_repl_prompt_session = original_create_session
-                yoriai._create_background_job_runner = original_create_runner
+            pipe_input.send_text(f"{yoriai.AGREE_COMMAND} ToDoリストを作って" + _SUBMIT)
+            assert paused_ready.wait(timeout=5), "合意フェーズの一時停止(バックグラウンドジョブ)がタイムアウトしました"
+            runner_holder["runner"].join()
+            pipe_input.send_text("方向性はAでお願いします" + _SUBMIT + "exit" + _SUBMIT)
+            thread.join(timeout=5)
+            assert not thread.is_alive(), "対話モードがexitで終了しませんでした"
+            runner_holder["runner"].join()
     finally:
+        yoriai._create_background_job_runner = original_create_runner
         yoriai._classify_execution_mode = original_classify
         yoriai._ask_organization = original_ask
         yoriai._ask_organization_collaborate = original_ask_collaborate
@@ -515,7 +547,6 @@ def test_second_followup_during_slow_resume_still_avoids_tool_less_single_chat()
     original_resume_organization_collaborate = yoriai._resume_organization_collaborate
     original_run_fix_on_project = yoriai._run_fix_on_project
     original_run_job_with_conversation_log = yoriai._run_job_with_conversation_log
-    original_create_session = yoriai._create_repl_prompt_session
     original_create_runner = yoriai._create_background_job_runner
 
     stale_project_dir = tempfile.mkdtemp(prefix="yoriai_stale_paused_project_")
@@ -568,49 +599,41 @@ def test_second_followup_during_slow_resume_still_avoids_tool_less_single_chat()
         runner_holder["runner"] = runner
         return runner
 
+    yoriai._create_background_job_runner = fake_create_runner
+
     out_dir = tempfile.mkdtemp(prefix="yoriai_race_followup_test_")
     buf = io.StringIO()
     try:
         with create_pipe_input() as pipe_input:
-            def fake_create_session():
-                return PromptSession(
-                    input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
-                )
-
-            yoriai._create_repl_prompt_session = fake_create_session
-            yoriai._create_background_job_runner = fake_create_runner
-
             def run_client():
                 with contextlib.redirect_stdout(buf):
-                    yoriai._run_repl_client(47120, "fingerprint", out_dir)
+                    with create_app_session(input=pipe_input, output=DummyOutput()):
+                        yoriai._run_repl_client(47120, "fingerprint", out_dir)
 
             thread = threading.Thread(target=run_client)
             thread.start()
-            try:
-                pipe_input.send_text(f"{yoriai.AGREE_COMMAND} ToDoリストを作って" + _SUBMIT)
-                assert paused_ready.wait(timeout=5), "合意フェーズの一時停止(バックグラウンドジョブ)がタイムアウトしました"
-                # 一時停止ジョブは(このスタブでは)ブロックせずすぐ完了する
-                # ため、まずキューが空になる(=マーカーがmessagesに記録
-                # される)のを待つ。
-                runner_holder["runner"].join()
-                pipe_input.send_text("続けて" + _SUBMIT)
-                assert resume_job_dequeued.wait(timeout=5), (
-                    "「続けて」ジョブがバックグラウンドワーカーに着手されませんでした"
-                )
-                # ここでpending_boxは既に空、かつ再開ジョブはmessagesへの
-                # 追記直前で足止めされている(=messagesの末尾はまだ一時
-                # 停止マーカーのまま)。この状態で3件目の発言を送る。
-                pipe_input.send_text("早く終わらせて" + _SUBMIT)
-                _wait_until(lambda: "直前のプロジェクト" in buf.getvalue() or calls["ask_single"] > 0, timeout=5)
-                release_resume_job.set()
-                pipe_input.send_text("exit" + _SUBMIT)
-                thread.join(timeout=5)
-                assert not thread.is_alive(), "対話モードがexitで終了しませんでした"
-                runner_holder["runner"].join()
-            finally:
-                yoriai._create_repl_prompt_session = original_create_session
-                yoriai._create_background_job_runner = original_create_runner
+            pipe_input.send_text(f"{yoriai.AGREE_COMMAND} ToDoリストを作って" + _SUBMIT)
+            assert paused_ready.wait(timeout=5), "合意フェーズの一時停止(バックグラウンドジョブ)がタイムアウトしました"
+            # 一時停止ジョブは(このスタブでは)ブロックせずすぐ完了する
+            # ため、まずキューが空になる(=マーカーがmessagesに記録
+            # される)のを待つ。
+            runner_holder["runner"].join()
+            pipe_input.send_text("続けて" + _SUBMIT)
+            assert resume_job_dequeued.wait(timeout=5), (
+                "「続けて」ジョブがバックグラウンドワーカーに着手されませんでした"
+            )
+            # ここでpending_boxは既に空、かつ再開ジョブはmessagesへの
+            # 追記直前で足止めされている(=messagesの末尾はまだ一時
+            # 停止マーカーのまま)。この状態で3件目の発言を送る。
+            pipe_input.send_text("早く終わらせて" + _SUBMIT)
+            _wait_until(lambda: "直前のプロジェクト" in buf.getvalue() or calls["ask_single"] > 0, timeout=5)
+            release_resume_job.set()
+            pipe_input.send_text("exit" + _SUBMIT)
+            thread.join(timeout=5)
+            assert not thread.is_alive(), "対話モードがexitで終了しませんでした"
+            runner_holder["runner"].join()
     finally:
+        yoriai._create_background_job_runner = original_create_runner
         yoriai._ask_organization = original_ask
         yoriai._ask_organization_collaborate = original_ask_collaborate
         yoriai._resume_organization_collaborate = original_resume_organization_collaborate
@@ -649,7 +672,6 @@ def test_followup_right_after_collaborate_completion_becomes_a_fix_session():
     original_ask = yoriai._ask_organization
     original_ask_collaborate = yoriai._ask_organization_collaborate
     original_run_fix_on_project = yoriai._run_fix_on_project
-    original_create_session = yoriai._create_repl_prompt_session
     original_create_runner = yoriai._create_background_job_runner
 
     def stub_ask(*args, **kwargs):
@@ -678,36 +700,28 @@ def test_followup_right_after_collaborate_completion_becomes_a_fix_session():
         runner_holder["runner"] = runner
         return runner
 
+    yoriai._create_background_job_runner = fake_create_runner
+
     out_dir = tempfile.mkdtemp(prefix="yoriai_completed_build_followup_test_")
     buf = io.StringIO()
     try:
         with create_pipe_input() as pipe_input:
-            def fake_create_session():
-                return PromptSession(
-                    input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
-                )
-
-            yoriai._create_repl_prompt_session = fake_create_session
-            yoriai._create_background_job_runner = fake_create_runner
-
             def run_client():
                 with contextlib.redirect_stdout(buf):
-                    yoriai._run_repl_client(47120, "fingerprint", out_dir)
+                    with create_app_session(input=pipe_input, output=DummyOutput()):
+                        yoriai._run_repl_client(47120, "fingerprint", out_dir)
 
             thread = threading.Thread(target=run_client)
             thread.start()
-            try:
-                pipe_input.send_text("ObsidianのPKMサイトを作って" + _SUBMIT)
-                assert completed_ready.wait(timeout=5), "協業モードの実装フェーズ完了(バックグラウンドジョブ)がタイムアウトしました"
-                runner_holder["runner"].join()
-                pipe_input.send_text("Webで調べながらコンテンツを書いて" + _SUBMIT + "exit" + _SUBMIT)
-                thread.join(timeout=5)
-                assert not thread.is_alive(), "対話モードがexitで終了しませんでした"
-                runner_holder["runner"].join()
-            finally:
-                yoriai._create_repl_prompt_session = original_create_session
-                yoriai._create_background_job_runner = original_create_runner
+            pipe_input.send_text("ObsidianのPKMサイトを作って" + _SUBMIT)
+            assert completed_ready.wait(timeout=5), "協業モードの実装フェーズ完了(バックグラウンドジョブ)がタイムアウトしました"
+            runner_holder["runner"].join()
+            pipe_input.send_text("Webで調べながらコンテンツを書いて" + _SUBMIT + "exit" + _SUBMIT)
+            thread.join(timeout=5)
+            assert not thread.is_alive(), "対話モードがexitで終了しませんでした"
+            runner_holder["runner"].join()
     finally:
+        yoriai._create_background_job_runner = original_create_runner
         yoriai._ask_organization = original_ask
         yoriai._ask_organization_collaborate = original_ask_collaborate
         yoriai._run_fix_on_project = original_run_fix_on_project

@@ -17,12 +17,10 @@ import shutil
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import yoriai  # noqa: E402
-
-from prompt_toolkit import PromptSession  # noqa: E402
-from prompt_toolkit.input import create_pipe_input  # noqa: E402
-from prompt_toolkit.output import DummyOutput  # noqa: E402
+from _repl_test_support import run_full_repl_client_with_keys  # noqa: E402
 
 _SUBMIT = "\r"  # Enterキー単体(送信)
 
@@ -263,25 +261,14 @@ def _run_repl_with_fake_tty_stdout(keystrokes: str) -> str:
     """
     fake_stdout = _FakeTtyStdout()
     original_stdout = sys.stdout
-    original_create_session = yoriai._create_repl_prompt_session
 
-    with create_pipe_input() as pipe_input:
-        def fake_create_session():
-            return PromptSession(
-                input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
-            )
-
-        yoriai._create_repl_prompt_session = fake_create_session
-        pipe_input.send_text(keystrokes)
-
-        sys.stdout = fake_stdout
-        out_dir = tempfile.mkdtemp(prefix="yoriai_startup_banner_test_")
-        try:
-            yoriai._run_repl_client(47120, "fingerprint", out_dir)
-        finally:
-            sys.stdout = original_stdout
-            yoriai._create_repl_prompt_session = original_create_session
-            shutil.rmtree(out_dir, ignore_errors=True)
+    sys.stdout = fake_stdout
+    out_dir = tempfile.mkdtemp(prefix="yoriai_startup_banner_test_")
+    try:
+        run_full_repl_client_with_keys(keystrokes, 47120, "fingerprint", out_dir)
+    finally:
+        sys.stdout = original_stdout
+        shutil.rmtree(out_dir, ignore_errors=True)
 
     return fake_stdout.getvalue()
 
@@ -318,27 +305,13 @@ def test_run_repl_client_banner_has_no_escape_codes_on_non_tty_output():
     より色付けが自動的に無効化され、ANSIエスケープシーケンスが一切
     出力に含まれないことを確認する。
     """
-    original_create_session = yoriai._create_repl_prompt_session
-    original_create_runner = yoriai._create_background_job_runner
-
-    with create_pipe_input() as pipe_input:
-        def fake_create_session():
-            return PromptSession(
-                input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
-            )
-
-        yoriai._create_repl_prompt_session = fake_create_session
-        pipe_input.send_text("exit" + _SUBMIT)
-
-        buf = io.StringIO()
-        out_dir = tempfile.mkdtemp(prefix="yoriai_startup_banner_test_")
-        try:
-            with contextlib.redirect_stdout(buf):
-                yoriai._run_repl_client(47120, "fingerprint", out_dir)
-        finally:
-            yoriai._create_repl_prompt_session = original_create_session
-            yoriai._create_background_job_runner = original_create_runner
-            shutil.rmtree(out_dir, ignore_errors=True)
+    buf = io.StringIO()
+    out_dir = tempfile.mkdtemp(prefix="yoriai_startup_banner_test_")
+    try:
+        with contextlib.redirect_stdout(buf):
+            run_full_repl_client_with_keys("exit" + _SUBMIT, 47120, "fingerprint", out_dir)
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
 
     assert "\x1b[" not in buf.getvalue()
 

@@ -26,12 +26,10 @@ import shutil
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import yoriai  # noqa: E402
-
-from prompt_toolkit import PromptSession  # noqa: E402
-from prompt_toolkit.input import create_pipe_input  # noqa: E402
-from prompt_toolkit.output import DummyOutput  # noqa: E402
+from _repl_test_support import run_full_repl_client_with_keys, run_repl_session_with_keys  # noqa: E402
 
 # Enterキー単体(送信)を送信する際のバイト列。
 _SUBMIT = "\r"
@@ -89,12 +87,7 @@ def test_read_multiline_input_terminates_on_double_ctrl_c():
     """入力編集中に(送信キーを一切使わず)Ctrl+Cを2回連続で押すだけで、
     `_read_multiline_input`が終了を示す`("", True)`を返すことを確認する。
     """
-    with create_pipe_input() as pipe_input:
-        session = PromptSession(
-            input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
-        )
-        pipe_input.send_text("\x03\x03")
-        text, terminate = yoriai._read_multiline_input(session, yoriai._DoubleInterruptGuard())
+    text, terminate = run_repl_session_with_keys("\x03\x03", message_count=1)[0]
     assert terminate is True
     assert text == ""
 
@@ -104,12 +97,7 @@ def test_read_multiline_input_single_ctrl_c_does_not_terminate():
     モードは終了しないことを確認する(依頼の動作確認: 既存の中断挙動が
     壊れていないこと)。
     """
-    with create_pipe_input() as pipe_input:
-        session = PromptSession(
-            input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
-        )
-        pipe_input.send_text("\x03こんにちは" + _SUBMIT)
-        text, terminate = yoriai._read_multiline_input(session, yoriai._DoubleInterruptGuard())
+    text, terminate = run_repl_session_with_keys("\x03こんにちは" + _SUBMIT, message_count=1)[0]
     assert terminate is False
     assert text == "こんにちは", repr(text)
 
@@ -123,7 +111,6 @@ def _run_repl_with_keys(keystrokes: str, ask_single_side_effect=None):
     """
     calls = {"classify": 0, "ask_single": 0, "ask_multi": 0, "ask_collaborate": 0}
 
-    original_create_session = yoriai._create_repl_prompt_session
     original_classify = yoriai._classify_execution_mode
     original_ask = yoriai._ask_organization
     original_ask_multi = yoriai._ask_organization_multi
@@ -144,32 +131,22 @@ def _run_repl_with_keys(keystrokes: str, ask_single_side_effect=None):
     def stub_ask_collaborate(*args, **kwargs):
         calls["ask_collaborate"] += 1
 
-    with create_pipe_input() as pipe_input:
-        def fake_create_session():
-            return PromptSession(
-                input=pipe_input, output=DummyOutput(), key_bindings=yoriai._make_repl_key_bindings()
-            )
+    yoriai._classify_execution_mode = spy_classify
+    yoriai._ask_organization = stub_ask
+    yoriai._ask_organization_multi = stub_ask_multi
+    yoriai._ask_organization_collaborate = stub_ask_collaborate
 
-        yoriai._create_repl_prompt_session = fake_create_session
-        yoriai._classify_execution_mode = spy_classify
-        yoriai._ask_organization = stub_ask
-        yoriai._ask_organization_multi = stub_ask_multi
-        yoriai._ask_organization_collaborate = stub_ask_collaborate
-
-        pipe_input.send_text(keystrokes)
-
-        buf = io.StringIO()
-        out_dir = tempfile.mkdtemp(prefix="yoriai_double_ctrl_c_test_")
-        try:
-            with contextlib.redirect_stdout(buf):
-                yoriai._run_repl_client(47120, "fingerprint", out_dir)
-        finally:
-            yoriai._create_repl_prompt_session = original_create_session
-            yoriai._classify_execution_mode = original_classify
-            yoriai._ask_organization = original_ask
-            yoriai._ask_organization_multi = original_ask_multi
-            yoriai._ask_organization_collaborate = original_ask_collaborate
-            shutil.rmtree(out_dir, ignore_errors=True)
+    buf = io.StringIO()
+    out_dir = tempfile.mkdtemp(prefix="yoriai_double_ctrl_c_test_")
+    try:
+        with contextlib.redirect_stdout(buf):
+            run_full_repl_client_with_keys(keystrokes, 47120, "fingerprint", out_dir)
+    finally:
+        yoriai._classify_execution_mode = original_classify
+        yoriai._ask_organization = original_ask
+        yoriai._ask_organization_multi = original_ask_multi
+        yoriai._ask_organization_collaborate = original_ask_collaborate
+        shutil.rmtree(out_dir, ignore_errors=True)
 
     return buf.getvalue(), calls
 
@@ -193,7 +170,7 @@ def test_repl_terminates_on_double_ctrl_c_spanning_response_wait_and_input():
     (中断後に戻ってきた)次の入力プロンプトで発生させる。
     """
     def raise_interrupt_once():
-        raise KeyboardInterrupt
+        yoriai._INTERRUPT_RELAY.deliver_interrupt()
 
     output, calls = _run_repl_with_keys(
         "富士山の標高は?" + _SUBMIT + "\x03",

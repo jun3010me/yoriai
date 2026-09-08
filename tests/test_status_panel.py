@@ -41,8 +41,10 @@ import tempfile
 import threading
 import time
 
+sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import yoriai  # noqa: E402
+from _repl_test_support import run_repl_session_with_keys  # noqa: E402
 
 from prompt_toolkit.application import create_app_session  # noqa: E402
 from prompt_toolkit.input import create_pipe_input  # noqa: E402
@@ -439,12 +441,30 @@ def test_create_repl_prompt_session_still_accepts_input_after_layout_wrap():
     土台を作り変えるたびに既存の入力機能への回帰が無いことを検証する)。
     """
     yoriai._ACTIVE_ORG_MEMBERS.update(set())
-    with create_pipe_input() as pipe_input, create_app_session(input=pipe_input, output=DummyOutput()):
-        session = yoriai._create_repl_prompt_session()
-        pipe_input.send_text("こんにちは\r")
-        text, terminate = yoriai._read_multiline_input(session, yoriai._DoubleInterruptGuard())
+    text, terminate = run_repl_session_with_keys("こんにちは\r", message_count=1)[0]
     assert terminate is False
     assert text == "こんにちは", repr(text)
+
+
+def test_create_repl_prompt_session_still_configures_prompt_and_multiline():
+    """実機バグの再発防止(pty経由の疑似端末検証で発見): `Application`を
+    セッションの生存期間中1つだけ動かし続ける設計に変更した際、以前は
+    `session.prompt(message=..., multiline=True, ...)`の引数として渡して
+    いた`message`("Yoriai> ")・`multiline`・`prompt_continuation`が、
+    `.prompt()`自体を呼ばなくなったことで渡す場所を失い、黙って既定値
+    (`message=""`・`multiline=False`)に戻ってしまっていた。この結果、
+    入力プロンプト"Yoriai> "が実機の画面に一切表示されなくなる不具合が
+    発生したが、`DummyOutput`を使う既存のテスト群(実際の描画内容を
+    見ない)では検出できず、pty(疑似端末)+生バイト列の検証で初めて
+    発見できた。`_create_repl_prompt_session()`がこれらを正しく
+    コンストラクタ引数として設定していることを直接確認する(実際の
+    描画までは検証しないが、設定漏れの再発は確実に検知できる)。
+    """
+    with create_pipe_input() as pipe_input, create_app_session(input=pipe_input, output=DummyOutput()):
+        session = yoriai._create_repl_prompt_session()
+        assert session.message == yoriai._REPL_PROMPT, session.message
+        assert session.multiline is True, session.multiline
+        assert session.prompt_continuation is yoriai._repl_prompt_continuation
 
 
 # ---------------------------------------------------------------------------
@@ -584,6 +604,7 @@ def main():
         test_panel_known_labels_defaults_to_board_only_for_backward_compatibility,
         test_panel_union_shows_board_only_labels_even_if_poll_has_not_caught_up,
         test_create_repl_prompt_session_still_accepts_input_after_layout_wrap,
+        test_create_repl_prompt_session_still_configures_prompt_and_multiline,
         test_chat_output_router_forces_output_creation_before_swapping_stdout,
         test_chat_output_router_writes_to_log_buffer_and_invalidates_when_app_running,
         test_chat_output_router_writes_to_real_output_when_app_not_running,
