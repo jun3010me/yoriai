@@ -6610,3 +6610,32 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   上記3点の回答を確認してから、`prompt_toolkit`の文字幅計算箇所
   (`prompt_toolkit.layout.screen`・`get_cwidth`等)と`_display_width`の
   計算基準が食い違っていないかを疑うとよい。
+
+- **解決確認**: 利用者はもともとWindows Terminalを使用しており、上記
+  2件のコミット(contextvars修正+`min_redraw_interval`緩和)を反映した
+  ところ、画面崩れが解消したことを確認できた。当初の実機報告が
+  「conhost.exeの互換性問題」ではなく、上記2件の修正(特にcontextvars
+  不伝播の根本修正)そのもので解決したことが確定した。
+
+### ステータスパネルの経過時間表示を、秒だけでなく分・時間の単位にも対応させた
+
+- **依頼**: 思考中のデバイスに表示される経過時間が秒数だけ(例:
+  "(542s)")で増え続けると読みにくいため、分・時間の単位も使うように
+  してほしいという要望。「時分秒と増えるごとに単位を調整してほしい」
+  という指定どおり、1分未満は秒のみ、1分を超えたら分+秒、1時間を
+  超えたら時+分+秒、という段階的な単位切り替えにした。
+- **実装**: `_format_elapsed_duration(elapsed_seconds: int) -> str`を
+  新設し、`_format_device_status_line`の経過時間表示箇所をこの関数
+  経由に変更した。1時間未満は秒だけ(例: "42s"、以前の表示・既存
+  テストとそのまま互換)、1分を超えたら"1m05s"のように分+秒(2桁
+  ゼロ埋め)、1時間を超えたら"1h02m05s"のように時+分+秒にする。
+  分・秒を2桁に揃えるのは、上位の桁が変わっても常に同じ幅で読み取れる
+  ようにするため。
+- **テスト**: `tests/test_status_panel.py`に、`_format_elapsed_duration`
+  が0秒・59秒・60秒・1時間ちょうど・2時間超などの境界で正しく単位を
+  切り替えることを確認する`test_format_elapsed_duration_switches_units_
+  as_it_grows`と、`_format_device_status_line`が1分を超える経過時間で
+  実際に分単位の表記("1m05s")を使うことを確認する`test_status_line_
+  uses_minute_unit_once_thinking_exceeds_a_minute`を追加した。既存の
+  `test_status_icons_and_text_per_kind`等(60秒未満の値のみ使用)は
+  無改修でそのままパスすることを確認した。
