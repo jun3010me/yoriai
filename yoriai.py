@@ -25,6 +25,7 @@ import contextlib
 import contextvars
 import datetime
 import difflib
+import itertools
 import json
 import locale
 import logging
@@ -5285,15 +5286,36 @@ class _DeviceStatusBoard:
     """バックグラウンドジョブ(協業モード等)に参加しているデバイスごとの
     「今何をしているか」を保持する、スレッドセーフな共有レジストリ。
 
-    ラベル(デバイス名)をキーに`(状態種別, 詳細テキスト, 開始時刻)`を
-    1件だけ保持する単純な辞書のラッパー。複数のワーカースレッドから
-    同時に`set`/`remove`が呼ばれても壊れないよう、すべての読み書きを
-    1つの`threading.Lock`で保護する。
+    `set`/`remove`は、ラベル(デバイス名)をキーに`(状態種別, 詳細テキスト,
+    開始時刻)`を1件だけ保持する単純な辞書として扱う(このデバイス自身の
+    ワーカースレッドが、自分の担当キューを処理する間に順番に書き換えていく
+    「基本状態」)。複数のワーカースレッドから同時に呼ばれても壊れないよう、
+    すべての読み書きを1つの`threading.Lock`で保護する。
+
+    仮の判断(実機バグ報告への対応・重要): タスクキュー方式では、あるデバイス
+    (reviewer)が自分の担当タスクとは無関係に、別のワーカースレッドから
+    レビュー依頼として一時的に「借用」されることがある(`pick_reviewer`が
+    実装担当以外の候補を選ぶ設計上、複数の実装担当スレッドが同時に同じ
+    reviewerを選ぶことも起こりうる)。この借用は`set`/`remove`と同じ
+    「最後に書いた者勝ち」の1件だけの状態で表現すると、あるスレッドが
+    自分の借用を終えて「待機」に戻した瞬間に、まだ別のスレッドがその
+    デバイスを借用中(例: read_fileツールでファイルを読んでいる最中)でも
+    パネル上は「待機」と表示されてしまう不具合があった(ステータスパネルと
+    実際の動作が食い違って見える、との実機報告)。そのため借用は`set`/
+    `remove`とは別に`begin_borrow`/`end_borrow`で参照カウント方式にし、
+    同じラベルに対する借用が複数同時に走っていても、最後の1件が
+    `end_borrow`されるまでは「借用中」の表示を維持するようにした。
+    借用が1件でも進行中のラベルは、そのデバイス自身の基本状態
+    (`set`で書かれた内容)より借用側の表示を優先する(借用=レビュー中の
+    ような「今まさに動いている」処理の方が、基本状態(担当タスクの完了を
+    ただ待っているだけ、等)より実態を反映するため)。
     """
 
     def __init__(self):
         self._lock = threading.Lock()
         self._entries = {}  # label -> (status_kind, detail, started_at(monotonic))
+        self._borrows = {}  # label -> {token: (status_kind, detail, started_at(monotonic))}
+        self._next_borrow_token = itertools.count(1)
 
     def set(self, label: str, status_kind: str, detail: str = "") -> None:
         with self._lock:
@@ -5301,8 +5323,14 @@ class _DeviceStatusBoard:
 
     def remove(self, label: str) -> None:
         """`label`のデバイスがこのジョブでの作業を終えた(離脱した)ことを
-        表す。一覧から該当行を消す。存在しないラベルを渡しても何もしない
-        (複数箇所からの防御的な呼び出しを許容するため)。
+        表す。基本状態の一覧から該当行を消す。存在しないラベルを渡しても
+        何もしない(複数箇所からの防御的な呼び出しを許容するため)。
+
+        仮の判断: 進行中の借用(`begin_borrow`)がまだ残っている場合は
+        消さない。基本状態としては離脱していても、他スレッドから見れば
+        まだそのデバイスを使って作業中であり、ここで借用ごと消してしまうと
+        `begin_borrow`/`end_borrow`の参照カウントが目的としている
+        「借用が終わるまで表示を保つ」効果が損なわれてしまうため。
         """
         with self._lock:
             self._entries.pop(label, None)
@@ -5310,20 +5338,63 @@ class _DeviceStatusBoard:
     def clear(self) -> None:
         """全件消去する。1つのバックグラウンドジョブ(タスクキュー等)が
         完了した後の後始末、および対話モードの起動時の初期化に使う。
+        進行中の借用も含めて完全にリセットする。
         """
         with self._lock:
             self._entries.clear()
+            self._borrows.clear()
+
+    def begin_borrow(self, label: str, status_kind: str, detail: str = "") -> int:
+        """他スレッドが`label`のデバイスを一時的に借用して使うことを表す。
+        参照カウント方式で管理され、同じラベルへの借用が複数同時に走って
+        いても、最後の1件が`end_borrow`されるまでこの借用の表示が保たれる
+        (クラスの仮の判断コメント参照)。戻り値のトークンは、対応する
+        `end_borrow`呼び出しにそのまま渡すこと。呼び出し元は借用中に例外が
+        発生しても必ず`end_borrow`できるよう、`try`/`finally`で対にして
+        使うことを想定している。
+        """
+        with self._lock:
+            token = next(self._next_borrow_token)
+            self._borrows.setdefault(label, {})[token] = (status_kind, detail, time.monotonic())
+            return token
+
+    def end_borrow(self, label: str, token: int) -> None:
+        """`begin_borrow`が返したトークンに対応する借用を終える。存在しない
+        (既に終わっている)トークンを渡しても何もしない(防御的な呼び出しを
+        許容するため)。同じラベルへの他の借用がまだ残っている場合は、
+        その借用の表示が引き続き優先される。
+        """
+        with self._lock:
+            borrows_for_label = self._borrows.get(label)
+            if borrows_for_label is None:
+                return
+            borrows_for_label.pop(token, None)
+            if not borrows_for_label:
+                self._borrows.pop(label, None)
 
     def snapshot(self) -> list:
         """`[(label, status_kind, detail, started_at), ...]`を返す。
         ロック保持中に値をコピーして返すことで、呼び出し元(描画処理)が
         ロックを持たずに安全に読める。
+
+        進行中の借用(`begin_borrow`)があるラベルは、その借用の内容を
+        基本状態より優先して返す(クラスの仮の判断コメント参照)。同じ
+        ラベルへの借用が複数同時に進行中の場合は、最後に始まった(=最も
+        新しい)ものを代表として使う。
         """
         with self._lock:
-            return [
-                (label, status_kind, detail, started_at)
-                for label, (status_kind, detail, started_at) in self._entries.items()
-            ]
+            labels = set(self._entries) | set(self._borrows)
+            result = []
+            for label in labels:
+                borrows_for_label = self._borrows.get(label)
+                if borrows_for_label:
+                    _token, (status_kind, detail, started_at) = max(
+                        borrows_for_label.items(), key=lambda item: item[1][2],
+                    )
+                else:
+                    status_kind, detail, started_at = self._entries[label]
+                result.append((label, status_kind, detail, started_at))
+            return result
 
 
 # 仮の判断: `--chat`のセッションはプロセスにつき1つしか走らない前提のため、
@@ -5612,24 +5683,36 @@ def _run_collaborative_task_queue(
             # ため「今動いているのは誰か」という観点では、reviewer側を
             # 「実装中(詳細はレビュー中)」、実装担当側は「待機」として
             # 表示するのが実態に近い。
-            _ACTIVE_STATUS_BOARD.set(reviewer["label"], _DEVICE_STATUS_WORKING, f"{filename} をレビュー中")
+            #
+            # 仮の判断(実機報告への対応): `pick_reviewer`は実装担当以外の
+            # 候補を選ぶだけなので、メンバーが3台以上いる場合は複数の実装
+            # 担当スレッドが同時に同じreviewerを選ぶことが起こりうる
+            # (`_DeviceStatusBoard`クラスの仮の判断コメント参照)。そのため
+            # reviewer側の状態は`set`ではなく`begin_borrow`/`end_borrow`
+            # (参照カウント方式)で管理し、自分より後に始まった別スレッドの
+            # 借用がまだ終わっていない場合に「待機」で上書きしてしまわない
+            # ようにする。
+            review_borrow_token = _ACTIVE_STATUS_BOARD.begin_borrow(
+                reviewer["label"], _DEVICE_STATUS_WORKING, f"{filename} をレビュー中",
+            )
             _ACTIVE_STATUS_BOARD.set(candidate["label"], _DEVICE_STATUS_WAITING)
             if on_update:
                 on_update()
-            ok, feedback = _review_and_fix_one_file(
-                filename=filename, owner=candidate, code=code,
-                reviewer=reviewer, reviewer_own_filename=reviewer_own_filename, reviewer_own_code=reviewer_own_code,
-                full_plan=full_plan, org_fingerprint=org_fingerprint, out_dir=project_dir, print_lock=print_lock,
-                # 対話プロトコルの「レビュー用途での再利用」(依頼2.3): タスク
-                # キュー方式による実装・レビューでは、実装担当に設計判断を
-                # 短く説明させ、レビュー担当が疑問点をぶつける自己説明対話を
-                # 常に行う。
-                enable_self_explanation=True,
-            )
-            # レビューが終わった時点で、reviewer側の行を一旦「待機」に
-            # 戻す。reviewer自身のワーカースレッドが自分のタスクを持って
-            # いれば、そちらの`set`がすぐ上書きするため実害は無い。
-            _ACTIVE_STATUS_BOARD.set(reviewer["label"], _DEVICE_STATUS_WAITING)
+            try:
+                ok, feedback = _review_and_fix_one_file(
+                    filename=filename, owner=candidate, code=code,
+                    reviewer=reviewer, reviewer_own_filename=reviewer_own_filename, reviewer_own_code=reviewer_own_code,
+                    full_plan=full_plan, org_fingerprint=org_fingerprint, out_dir=project_dir, print_lock=print_lock,
+                    # 対話プロトコルの「レビュー用途での再利用」(依頼2.3): タスク
+                    # キュー方式による実装・レビューでは、実装担当に設計判断を
+                    # 短く説明させ、レビュー担当が疑問点をぶつける自己説明対話を
+                    # 常に行う。
+                    enable_self_explanation=True,
+                )
+            finally:
+                # この借用を終える。同じreviewerへの他の借用がまだ進行中
+                # なら、そちらの表示が引き続き優先される(参照カウント方式)。
+                _ACTIVE_STATUS_BOARD.end_borrow(reviewer["label"], review_borrow_token)
             if ok:
                 _set_task_status(checklist, filename, "review", _TASK_STATUS_COMPLETED)
             if review_feedback is not None:
@@ -6752,17 +6835,25 @@ def _run_fix_task_queue(
             # 参照): レビューの実処理はreviewer側で行われるが、呼び出し
             # 自体は実装担当のスレッドが同期的にブロックして待つため、
             # reviewer側を「実装中(詳細はレビュー中)」、実装担当側は
-            # 「待機」として表示する。
-            _ACTIVE_STATUS_BOARD.set(reviewer["label"], _DEVICE_STATUS_WORKING, f"{task_key}をレビュー中")
+            # 「待機」として表示する。同じ理由(実機報告への対応)で、
+            # reviewer側の状態は`set`ではなく`begin_borrow`/`end_borrow`
+            # (参照カウント方式)で管理し、複数の実装担当スレッドが同時に
+            # 同じreviewerを選んだ場合でも、他スレッドの借用が終わるまで
+            # 「待機」で上書きしてしまわないようにする。
+            review_borrow_token = _ACTIVE_STATUS_BOARD.begin_borrow(
+                reviewer["label"], _DEVICE_STATUS_WORKING, f"{task_key}をレビュー中",
+            )
             _ACTIVE_STATUS_BOARD.set(candidate["label"], _DEVICE_STATUS_WAITING)
-            review_prompt = _build_fix_subtask_review_prompt(
-                subtask, full_plan, language, list(dict.fromkeys(modified)),
-            )
-            review_summary, review_error, review_truncated, review_modified = _collect_answer_with_project_tools(
-                reviewer, org_fingerprint, [{"role": "user", "content": review_prompt}], project_dir,
-                print_lock=print_lock, tag=task_key,
-            )
-            _ACTIVE_STATUS_BOARD.set(reviewer["label"], _DEVICE_STATUS_WAITING)
+            try:
+                review_prompt = _build_fix_subtask_review_prompt(
+                    subtask, full_plan, language, list(dict.fromkeys(modified)),
+                )
+                review_summary, review_error, review_truncated, review_modified = _collect_answer_with_project_tools(
+                    reviewer, org_fingerprint, [{"role": "user", "content": review_prompt}], project_dir,
+                    print_lock=print_lock, tag=task_key,
+                )
+            finally:
+                _ACTIVE_STATUS_BOARD.end_borrow(reviewer["label"], review_borrow_token)
             record_modified(review_modified)
             review_preview = [f"--- {task_key} のレビュー ← {reviewer['label']} (モデル: {reviewer['model']}) ---"]
             if review_error:

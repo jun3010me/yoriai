@@ -24,6 +24,10 @@
 - デバイスが離脱した場合(`remove`)、一覧から正しく消えること
 - 複数のバックグラウンドスレッドから同時に更新しても壊れないこと
   (スレッドセーフ性)
+- 複数のスレッドが同じデバイスを同時に借用している場合(`begin_borrow`/
+  `end_borrow`)、一方の借用が終わっても、まだ他方の借用が進行中であれば
+  パネルの表示が「待機」に戻ってしまわないこと(実機報告のあった、パネル
+  表示と実際の動作が食い違って見える不具合の回帰検知)
 - ジョブに参加していない(が組織には接続している)デバイスも、待機中の
   1行としてパネルに表示され続けること(参加台数のリアルタイム増減対応)
 に加え、実際のタスクキュー方式(`_run_collaborative_task_queue`)を
@@ -171,6 +175,145 @@ def test_remove_of_unknown_label_is_a_no_op():
     board.set("MacStudio", yoriai._DEVICE_STATUS_WAITING)
     board.remove("no-such-device")
     assert "MacStudio" in yoriai._render_status_panel(board)
+
+
+# ---------------------------------------------------------------------------
+# begin_borrow/end_borrow(参照カウント方式の一時借用)
+# ---------------------------------------------------------------------------
+#
+# 実機報告への対応: あるデバイス(reviewer)が複数のワーカースレッドから
+# 同時にレビュー依頼として借用されている場合、一方の借用が終わって
+# `set(..., 待機)`しても、まだ別の借用が進行中ならパネル上「待機」に
+# 戻ってはいけない(以前の実装は「最後に書いた者勝ち」だったため、この
+# ケースでパネルと実際の動作が食い違って見える不具合があった)。
+
+def test_borrowed_status_takes_priority_over_own_baseline_status():
+    """`begin_borrow`で書き込んだ状態は、`set`で書かれた基本状態より
+    優先して表示されることを確認する(レビューとして借用中のデバイスは、
+    自分自身の基本状態(待機など)より「レビュー中」を優先して見せる、
+    という設計の検証)。
+    """
+    board = yoriai._DeviceStatusBoard()
+    board.set("MacStudio", yoriai._DEVICE_STATUS_WAITING)
+    token = board.begin_borrow("MacStudio", yoriai._DEVICE_STATUS_WORKING, "app.py をレビュー中")
+    panel = yoriai._render_status_panel(board)
+    assert panel == "💻 MacStudio が app.py をレビュー中", panel
+
+    board.end_borrow("MacStudio", token)
+    panel = yoriai._render_status_panel(board)
+    assert panel == "⏳ MacStudio 待機", panel
+
+
+def test_borrowed_status_survives_unrelated_set_to_waiting():
+    """実機報告のあった食い違いの回帰検知: あるデバイスが借用中(例:
+    レビューでread_fileを実行中)に、`set(..., 待機)`が呼ばれても、
+    借用が終わるまではパネル上「待機」に戻ってしまわないことを確認する。
+    """
+    board = yoriai._DeviceStatusBoard()
+    token = board.begin_borrow("MacStudio", yoriai._DEVICE_STATUS_WORKING, "test_verify.py をレビュー中")
+
+    # 以前の実装では、同じラベルへの`set`が借用中の状態を問答無用で
+    # 上書きしてしまっていた。
+    board.set("MacStudio", yoriai._DEVICE_STATUS_WAITING)
+
+    panel = yoriai._render_status_panel(board)
+    assert "待機" not in panel, panel
+    assert "test_verify.py をレビュー中" in panel, panel
+
+    board.end_borrow("MacStudio", token)
+    panel = yoriai._render_status_panel(board)
+    assert panel == "⏳ MacStudio 待機", panel
+
+
+def test_concurrent_borrows_on_same_label_do_not_clobber_each_other():
+    """複数のスレッドが同じデバイスを同時に借用している場合(`pick_reviewer`
+    が同じreviewerを複数の実装担当スレッドに選んでしまうケースを想定)、
+    一方が`end_borrow`しても、まだ他方の借用が進行中であればパネルの表示は
+    「借用中」のまま保たれることを確認する。
+    """
+    board = yoriai._DeviceStatusBoard()
+    token_a = board.begin_borrow("MacStudio", yoriai._DEVICE_STATUS_WORKING, "a.py をレビュー中")
+    token_b = board.begin_borrow("MacStudio", yoriai._DEVICE_STATUS_WORKING, "b.py をレビュー中")
+
+    board.end_borrow("MacStudio", token_a)
+    panel = yoriai._render_status_panel(board)
+    assert "待機" not in panel, panel
+    assert "MacStudio" in panel, panel
+
+    # 残っていたb.py側の借用も終われば、行そのものが消える(このラベルには
+    # `set`による基本状態が一度も書かれていないため)。
+    board.end_borrow("MacStudio", token_b)
+    assert yoriai._render_status_panel(board) == ""
+
+
+def test_end_borrow_of_unknown_token_is_a_no_op():
+    board = yoriai._DeviceStatusBoard()
+    token = board.begin_borrow("MacStudio", yoriai._DEVICE_STATUS_WORKING, "app.py をレビュー中")
+    board.end_borrow("MacStudio", token + 999)  # 存在しないトークン
+    panel = yoriai._render_status_panel(board)
+    assert "app.py をレビュー中" in panel, panel
+
+    board.end_borrow("MacStudio", token)
+    assert yoriai._render_status_panel(board) == ""
+
+
+def test_remove_of_own_baseline_does_not_cancel_in_progress_borrow():
+    """`remove`(=自分のジョブからの離脱)を呼んでも、進行中の借用
+    (=他スレッドがまだこのデバイスを使っている)があれば、その行は
+    消えずに借用中の表示を保つことを確認する。
+    """
+    board = yoriai._DeviceStatusBoard()
+    board.set("MacStudio", yoriai._DEVICE_STATUS_WORKING, "自分のタスクを実装中")
+    token = board.begin_borrow("MacStudio", yoriai._DEVICE_STATUS_WORKING, "他ファイルをレビュー中")
+
+    board.remove("MacStudio")
+    panel = yoriai._render_status_panel(board)
+    assert "他ファイルをレビュー中" in panel, panel
+
+    board.end_borrow("MacStudio", token)
+    assert yoriai._render_status_panel(board) == ""
+
+
+def test_clear_also_cancels_in_progress_borrows():
+    board = yoriai._DeviceStatusBoard()
+    board.begin_borrow("MacStudio", yoriai._DEVICE_STATUS_WORKING, "app.py をレビュー中")
+    board.clear()
+    assert yoriai._render_status_panel(board) == ""
+
+
+def test_concurrent_borrows_from_real_threads_reflect_overlap_accurately():
+    """`_DeviceStatusBoard`の参照カウントが、実際に複数スレッドから同時に
+    呼ばれても正しく機能する(スレッドセーフ性)ことを確認する。
+    `threading.Barrier`/`Event`で、2つの借用が実際に重なっている瞬間の
+    パネル表示を確定的に検証する。
+    """
+    board = yoriai._DeviceStatusBoard()
+    both_started = threading.Barrier(2)
+    release_first = threading.Event()
+    mid_overlap_panel = {}
+
+    def borrower_a():
+        token = board.begin_borrow("MacStudio", yoriai._DEVICE_STATUS_WORKING, "a.py をレビュー中")
+        both_started.wait(timeout=5)
+        release_first.wait(timeout=5)
+        board.end_borrow("MacStudio", token)
+
+    def borrower_b():
+        token = board.begin_borrow("MacStudio", yoriai._DEVICE_STATUS_WORKING, "b.py をレビュー中")
+        both_started.wait(timeout=5)
+        mid_overlap_panel["panel"] = yoriai._render_status_panel(board)
+        release_first.set()
+        board.end_borrow("MacStudio", token)
+
+    threads = [threading.Thread(target=borrower_a), threading.Thread(target=borrower_b)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert "待機" not in mid_overlap_panel["panel"], mid_overlap_panel["panel"]
+    assert "MacStudio" in mid_overlap_panel["panel"], mid_overlap_panel["panel"]
+    assert yoriai._render_status_panel(board) == ""
 
 
 def test_clear_removes_all_devices():
@@ -637,6 +780,13 @@ def main():
         test_elapsed_seconds_reflect_render_time,
         test_device_removed_from_panel_when_it_leaves,
         test_remove_of_unknown_label_is_a_no_op,
+        test_borrowed_status_takes_priority_over_own_baseline_status,
+        test_borrowed_status_survives_unrelated_set_to_waiting,
+        test_concurrent_borrows_on_same_label_do_not_clobber_each_other,
+        test_end_borrow_of_unknown_token_is_a_no_op,
+        test_remove_of_own_baseline_does_not_cancel_in_progress_borrow,
+        test_clear_also_cancels_in_progress_borrows,
+        test_concurrent_borrows_from_real_threads_reflect_overlap_accurately,
         test_clear_removes_all_devices,
         test_concurrent_updates_from_many_threads_do_not_corrupt_state,
         test_task_queue_clears_status_board_after_completion,
