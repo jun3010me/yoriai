@@ -134,13 +134,10 @@ def test_banner_documents_the_new_keys_prominently():
     """
     out_dir = tempfile.mkdtemp(prefix="yoriai_enter_to_submit_test_")
     try:
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            run_full_repl_client_with_keys("\x04", 47120, "fingerprint", out_dir)
+        output = run_full_repl_client_with_keys("\x04", 47120, "fingerprint", out_dir)
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
 
-    output = buf.getvalue()
     assert "Enterで送信" in output, output
     assert "Shift+Enterで改行" in output, output
     assert "Ctrl+Cを2秒以内に2回連続で押す" in output, output

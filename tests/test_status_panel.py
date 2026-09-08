@@ -503,7 +503,16 @@ def test_chat_output_router_writes_to_log_buffer_and_invalidates_when_app_runnin
     yoriai._reset_chat_log_buffer()
     invalidated = {"count": 0}
 
+    class _FakeLoop:
+        def is_closed(self):
+            return False
+
+        def call_soon_threadsafe(self, fn, *args):
+            fn(*args)
+
     class _FakeApp:
+        loop = _FakeLoop()
+
         def invalidate(self):
             invalidated["count"] += 1
 
@@ -562,7 +571,16 @@ def test_chat_log_buffer_caps_size_by_dropping_oldest_content():
     """
     yoriai._reset_chat_log_buffer()
 
+    class _FakeLoop:
+        def is_closed(self):
+            return False
+
+        def call_soon_threadsafe(self, fn, *args):
+            fn(*args)
+
     class _FakeApp:
+        loop = _FakeLoop()
+
         def invalidate(self):
             pass
 
