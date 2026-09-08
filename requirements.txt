@@ -1,3 +1,13 @@
 zeroconf>=0.132.0
 requests>=2.31.0
 prompt_toolkit>=3.0.36
+
+# 以下はオプション: `check_html`ツール、および`browser_frontend`に分類
+# された`//agree`の完了ゲート(Gate 2: 実ブラウザでの読み込み確認、
+# `browser_verification.verify_browser_load`)で使う。未インストールでも
+# Yoriaiの他の機能には影響しない(該当チェックがスキップされるだけ)。
+# 有効にするには次を実行してください(Yoriaiが自動でインストールする
+# ことはありません)。
+#   pip install playwright
+#   playwright install chromium
+# playwright>=1.56.0

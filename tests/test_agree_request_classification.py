@@ -156,6 +156,55 @@ def test_build_design_dialogue_output_instruction_defaults_to_software_behavior(
     assert "関数のシグネチャ" in instruction, instruction
 
 
+# ---------------------------------------------------------------------------
+# ブラウザ向け成果物の完了ゲート追加: browser_frontendへの分類
+# ---------------------------------------------------------------------------
+
+def test_browser_frontend_keywords_are_classified_as_browser_frontend():
+    """「ブラウザ」「チャットボット」「フロントエンド」という語、または
+    `.html`ファイルへの明示的な言及を含む依頼はBROWSER_FRONTENDに
+    分類される。
+    """
+    requests = [
+        "ブラウザで直接開けるチャットボットを作って",
+        "index.htmlをダブルクリックして開けるツールを作って",
+        "簡単なフロントエンドのゲームを作って",
+        "掲示板アプリのチャットボット機能をHTML+JSで作って",
+    ]
+    for request in requests:
+        assert yoriai._classify_agree_request_type(request) == yoriai.AGREE_REQUEST_TYPE_BROWSER_FRONTEND, request
+
+
+def test_browser_frontend_classification_takes_priority_over_other_types():
+    """browser_frontendのキーワードは、ソフトウェア実装・明示的な
+    リサーチ指示のキーワードよりも優先して判定される(実機のブラウザ
+    でしか検証できない構造的な不具合を防ぐための完了ゲートを確実に
+    通すため)。
+    """
+    request_with_software_keyword = "ブラウザで動くToDoリストアプリを作って"
+    assert (
+        yoriai._classify_agree_request_type(request_with_software_keyword)
+        == yoriai.AGREE_REQUEST_TYPE_BROWSER_FRONTEND
+    ), request_with_software_keyword
+
+    request_with_research_keyword = "生成AIの最新動向について調査して、結果をブラウザで見られるチャットボットにまとめて"
+    assert (
+        yoriai._classify_agree_request_type(request_with_research_keyword)
+        == yoriai.AGREE_REQUEST_TYPE_BROWSER_FRONTEND
+    ), request_with_research_keyword
+
+
+def test_plain_webpage_content_request_stays_content_not_browser_frontend():
+    """「Webページ」という語だけでは(「ブラウザ」「チャットボット」
+    「フロントエンド」・`.html`への言及が無い限り)browser_frontendには
+    分類されず、従来通りコンテンツ生成として扱われることを確認する
+    (既存の`test_content_keywords_are_classified_as_content`との
+    整合性の回帰確認)。
+    """
+    request = "ObsidianでPKMを構築するための知識をまとめたWebページを作って"
+    assert yoriai._classify_agree_request_type(request) == yoriai.AGREE_REQUEST_TYPE_CONTENT, request
+
+
 def main():
     tests = [
         test_content_keywords_are_classified_as_content,
@@ -163,6 +212,9 @@ def main():
         test_ambiguous_or_unmatched_requests_default_to_software,
         test_explicit_research_instruction_overrides_keyword_classification,
         test_research_and_investigate_phrasings_are_classified_as_content,
+        test_browser_frontend_keywords_are_classified_as_browser_frontend,
+        test_browser_frontend_classification_takes_priority_over_other_types,
+        test_plain_webpage_content_request_stays_content_not_browser_frontend,
         test_build_module_breakdown_prompt_uses_content_template_and_embeds_research_notes,
         test_build_module_breakdown_prompt_still_uses_software_template_for_software_requests,
         test_build_design_dialogue_output_instruction_embeds_research_notes_for_content,

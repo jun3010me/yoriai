@@ -6639,3 +6639,104 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   uses_minute_unit_once_thinking_exceeds_a_minute`を追加した。既存の
   `test_status_icons_and_text_per_kind`等(60秒未満の値のみ使用)は
   無改修でそのままパスすることを確認した。
+
+### ブラウザ向け成果物(HTML+JS)の完了ゲート追加
+
+- **背景**: 「ブラウザで直接開くHTML+JS」を作らせるタスクで、
+  `chatbot.js`が`export function ...`(ESモジュール構文)で書かれている
+  のに`index.html`側は`<script src="chatbot.js"></script>`
+  (非モジュール指定)で読み込んでおり、実機のブラウザでは
+  `Unexpected token 'export'`という構文エラーになって動作しなかった。
+  自動検証(検証コマンドとして生成された`node test_verify.js`の実行)は
+  成功していたが、これはNode.js(v22系)がESモジュール構文を自動検出して
+  寛容に解釈してしまうためで、「ロジックが正しいか」は検証できても
+  「実際のブラウザで(非モジュールとして)読み込めるか」は一度も検証
+  されていなかった。個別のバグではなく、検証環境(Node.js)と実行環境
+  (ダブルクリックで直接開くブラウザ)が一致していないと完了ゲートが
+  機能しないという構造的な問題として対応した。
+- **タスク分類の拡張**: `_classify_agree_request_type`が返す種別に
+  `AGREE_REQUEST_TYPE_BROWSER_FRONTEND`(`"browser_frontend"`)を追加
+  した。依頼文中に「ブラウザ」「チャットボット」「フロントエンド」の
+  いずれかの語、または`.html`ファイルへの明示的な言及があれば、他の
+  判定より優先してこの種別にする。既存の`_CONTENT_REQUEST_KEYWORDS`に
+  含まれる「Webページ」「ウェブページ」は、あえてbrowser_frontend側の
+  キーワードには含めていない。「ObsidianでPKMを構築するための知識を
+  まとめたWebページを作って」のような、書き起こしただけの静的な
+  コンテンツ依頼(既存のテストで`AGREE_REQUEST_TYPE_CONTENT`と確認
+  済み)まで巻き込むと誤判定になるため。`request_type`は既存コードの
+  多くが`== AGREE_REQUEST_TYPE_CONTENT`かどうかだけで分岐している
+  (それ以外は暗黙にソフトウェア実装用の挙動)ため、新種別を追加しても
+  `_build_module_breakdown_prompt`等の既存分岐には手を入れていない
+  (browser_frontendは自動的に従来のソフトウェア実装用テンプレートの
+  まま扱われる)。
+- **Gate 1(静的モジュール整合性チェック)**: 新設の`static_checks.py`に
+  `check_script_module_mismatch(html_path: str) -> list[str]`を実装
+  した。HTML中の`type="module"`が付いていない`<script src="...">`
+  タグを抽出し、読み込み先のJSファイルの各行(インデントを除く行頭)が
+  `export `/`import `で始まっていないかを正規表現で検査する。該当が
+  あれば`"<JSファイル名>:<行番号>: '<export|import>' はモジュール外の
+  scriptタグから読み込むファイルでは使用できません"`という形式の
+  文字列で列挙する(該当なしなら空リスト)。属性の並び順に依存しない
+  よう、まずタグ全体の属性文字列を取り出してから`src`・
+  `type="module"`の有無を個別に判定している。CDN等の外部URL
+  (`https://...`・`//...`)は対象外。
+- **Gate 2(実ブラウザ読み込み確認)**: 新設の`browser_verification.py`に
+  `verify_browser_load(html_path: str) -> list[str]`を実装した。
+  依頼者(ジュンさん)が実際に行う「HTMLファイルをダブルクリックして
+  直接開く」使い方をそのまま再現するため、
+  `page.goto(f"file://{絶対パス}")`でファイルを直接開き(ローカル
+  サーバー経由ではない)、`console.error`メッセージと未捕捉の例外
+  (`pageerror`)を収集する。非同期の初期化処理に備え、読み込み後3秒
+  待機してから結果を返す。Playwright自体が実機に無い・ブラウザの
+  起動に失敗した場合は、検出エラー0件(問題無し)と混同しないよう
+  `BrowserVerificationUnavailable`を送出する(呼び出し元がこれを
+  捕捉してGate 2をスキップした旨を表示し、無条件に成功扱いにはしない)。
+  `tools._check_html_with_playwright`(モデルが`check_html`ツールを
+  自発的に呼んだ場合にのみ動く任意の検証)とは別に新設したのは、
+  こちらは`browser_frontend`タスクの完了ゲートとしてオーケストレー
+  ション層から強制的に呼ばれる点が異なるため(モデルの判断に委ねると
+  検証自体がサボられうる)。
+- **完了ゲートへの統合**: `_run_collaborative_project`に、統合検証・
+  内容量チェックと同じ並びで`browser_frontend`専用のブロックを追加
+  した。未完了タスクが残っている場合は他のチェックと同様スキップする。
+  `_check_browser_frontend(project_dir, tasks)`が`tasks`から`.html`
+  ファイルを見つけ、各ファイルにGate 1→Gate 2の順で適用する。Gate 1で
+  検出があったファイルは、Playwrightの起動コストをかけずそのファイルの
+  Gate 2をスキップする(fail-fast)。`_run_browser_frontend_
+  verification`は`_run_content_volume_verification`と同じ「実行して
+  失敗したら担当メンバー1名に修正を依頼し、再実行する」ループの構造を
+  流用し、最大2回まで修正を試みる。修正依頼プロンプト
+  (`_build_browser_frontend_fix_prompt`)には、Gate 1/Gate 2が返した
+  ファイル名・行番号・エラーメッセージをそのまま(要約せず)埋め込み、
+  ボイラープレートな指摘に丸めて情報を失わないようにした。
+- **依存関係**: Playwrightは`requirements.txt`に必須依存としては追加
+  していない(既存の`check_html`ツールと同じく、未インストールでも
+  Yoriaiの他の機能に影響しないようにするため、`README.md`にも
+  「YoriaiがPlaywrightを自動でインストールすることはありません」と
+  明記済み)。代わりに`requirements.txt`にコメントとして、有効化に
+  必要な`pip install playwright`・`playwright install chromium`の
+  手順を明記した。
+- **テスト**: `tests/test_static_checks.py`(Gate 1: exportを含むJSを
+  非moduleタグから読み込む場合の検出・`type="module"`タグでの非検出・
+  export/importを含まない通常のJSでの非検出・1ファイル内の複数該当の
+  列挙・外部URLの除外・HTML不在時の空リスト)、
+  `tests/test_browser_verification.py`(Gate 2: 意図的な`console.error`
+  の検出・意図的な未定義関数呼び出し(未捕捉例外)の検出・正常なページ
+  での非検出・存在しないファイルでの`BrowserVerificationUnavailable`)
+  をそれぞれ新設した。`tests/test_agree_request_classification.py`にも
+  `browser_frontend`への分類(キーワード・`.html`言及)・他の種別より
+  優先されること・「Webページ」単体では従来通りCONTENTのままである
+  ことの回帰確認を追加した。開発中はこの環境に一時的に
+  `pip install playwright==1.56.0 && playwright install chromium`
+  相当(実機にプリインストールされていたChromiumのリビジョンに合わせた
+  バージョン)を入れて、Gate 2が実際のヘッドレスブラウザで
+  `console.error`・未捕捉例外の両方を正しく検出し、正常なページでは
+  誤検知しないことを実機相当の環境で確認した後、確認用に入れた
+  Playwrightは元の状態(未インストール)に戻した。
+- **動作確認**: `python3 -m pytest tests/`で649件全てパス(Playwright
+  未インストール環境、`tests/test_browser_verification.py`のGate 2
+  依存テストは既存の`tests/test_run_command.py`のgcc/node/Playwright
+  不在時の扱いと同じ方針でスキップ表示のうえ成功扱い)。Playwrightを
+  一時的にインストールした状態でも同様に全件パスし、かつGate 2依存
+  テストが実際にスキップされず本体を実行してパスすることを確認した。
+  無改修でそのままパスすることを確認した。

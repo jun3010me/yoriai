@@ -118,6 +118,8 @@ from tools import (
     _write_project_file,
     web_search,
 )
+from static_checks import check_script_module_mismatch
+from browser_verification import BrowserVerificationUnavailable, verify_browser_load
 from network import (
     PeerRegistry,
     YoriaiListener,
@@ -2586,6 +2588,21 @@ AGREE_COMMAND = "//agree"
 AGREE_REQUEST_TYPE_CONTENT = "content"
 AGREE_REQUEST_TYPE_SOFTWARE = "software"
 
+# 仮の判断(ブラウザ向け成果物の完了ゲート追加): `chatbot.js`が`export
+# function ...`(ESモジュール構文)で書かれているのに`index.html`側は
+# `<script src="chatbot.js"></script>`(非モジュール)で読み込んでおり、
+# 実機のブラウザでは`Unexpected token 'export'`の構文エラーになって
+# 動作しなかった不具合への対応。自動検証(検証コマンドの実行)は
+# Node.js(v22系)がESモジュール構文を自動検出して寛容に解釈するため
+# 成功してしまい、「ロジックが正しいか」は検証できても「実際のブラウザで
+# 読み込めるか」は一度も検証されていなかった。検証環境(Node.js)と実行
+# 環境(ブラウザで直接開く)が一致していないと完了ゲートが機能しないという
+# 構造的な問題として、`AGREE_REQUEST_TYPE_SOFTWARE`から独立した種別を
+# 新設し、この種別だけ`_run_browser_frontend_verification`(Gate 1:
+# `static_checks.check_script_module_mismatch`→Gate 2:
+# `browser_verification.verify_browser_load`)を完了ゲートに追加する。
+AGREE_REQUEST_TYPE_BROWSER_FRONTEND = "browser_frontend"
+
 # コンテンツ生成を示すキーワード(簡易なキーワードベース判定でよく、
 # 厳密な自然言語理解までは求めない)。
 _CONTENT_REQUEST_KEYWORDS = (
@@ -2614,13 +2631,43 @@ _EXPLICIT_RESEARCH_INSTRUCTION_KEYWORDS = (
     "Web検索して", "ウェブ検索して", "調査して", "リサーチして", "調べて",
 )
 
+# ブラウザで直接動作するフロントエンド(HTML+JS)成果物を示すキーワード。
+#
+# 仮の判断: 「Webページ」「ウェブページ」は`_CONTENT_REQUEST_KEYWORDS`
+# と重複する語で、「ObsidianでPKMを構築するための知識をまとめたWeb
+# ページを作って」のような、書き起こしただけの静的なコンテンツ依頼
+# (既存の分類テストで`AGREE_REQUEST_TYPE_CONTENT`と確認済み)まで
+# 巻き込むと誤判定になるため、ここでは含めない。「ブラウザ」
+# 「チャットボット」「フロントエンド」のように、ページを実際に動かす
+# (JSで対話する)ことを明示する語だけを使う。
+_BROWSER_FRONTEND_REQUEST_KEYWORDS = ("ブラウザ", "チャットボット", "フロントエンド")
+
+# 成果物として.htmlファイルの生成が明示的に要求されている場合も、
+# キーワードの有無に関わらずbrowser_frontendとして扱う。
+#
+# 仮の判断: `\bhtml\b`のような単語境界(`\b`)は、Python3の`re`が
+# デフォルトでUnicode対応のため、「index.htmlをダブルクリックして」の
+# ように直後に日本語(ひらがな等、Unicode上は`\w`扱い)が続くと「lと
+# を」の間に境界が無いと判定され、意図せずマッチしなくなる。ここでは
+# 直後にASCIIの英数字・アンダースコアが続かない(拡張子がそこで
+# 終わっている)ことだけを否定先読みで確認する。
+_HTML_FILE_MENTION_PATTERN = re.compile(r"\.html(?![A-Za-z0-9_])", re.IGNORECASE)
+
 
 def _classify_agree_request_type(request: str) -> str:
-    """`//agree`への依頼が「コンテンツ生成」か「ソフトウェア実装」かを
-    簡易なキーワードベースで分類する。依頼文に「Web検索して」「調査して」
-    「リサーチして」「調べて」という明示的な指示があれば、キーワード分類の
-    結果に関わらず`AGREE_REQUEST_TYPE_CONTENT`を優先する(ユーザーの明示的な
-    意図を最優先する)。
+    """`//agree`への依頼を「ブラウザ向けフロントエンド」「コンテンツ生成」
+    「ソフトウェア実装」のいずれかに簡易なキーワードベースで分類する。
+
+    依頼文中に「ブラウザ」「チャットボット」「フロントエンド」という
+    語、または`.html`ファイルへの明示的な言及があれば、他の判定より
+    優先して`AGREE_REQUEST_TYPE_BROWSER_FRONTEND`とする(実機の
+    ブラウザでしか検証できない構造的な不具合を防ぐための完了ゲートを
+    確実に通すため、最優先で判定する)。
+
+    それ以外で、依頼文に「Web検索して」「調査して」「リサーチして」
+    「調べて」という明示的な指示があれば、キーワード分類の結果に関わらず
+    `AGREE_REQUEST_TYPE_CONTENT`を優先する(ユーザーの明示的な意図を
+    最優先する)。
 
     それ以外は、コンテンツ生成キーワードのみに該当する場合だけ
     `AGREE_REQUEST_TYPE_CONTENT`とし、両方に該当する・どちらにも
@@ -2629,6 +2676,11 @@ def _classify_agree_request_type(request: str) -> str:
     ソフトウェア開発フローを壊すことを避けるため、後方互換性を優先する。
     """
     text = request or ""
+    if _HTML_FILE_MENTION_PATTERN.search(text) or any(
+        keyword in text for keyword in _BROWSER_FRONTEND_REQUEST_KEYWORDS
+    ):
+        return AGREE_REQUEST_TYPE_BROWSER_FRONTEND
+
     for keyword in _EXPLICIT_RESEARCH_INSTRUCTION_KEYWORDS:
         if keyword in text:
             return AGREE_REQUEST_TYPE_CONTENT
@@ -4297,6 +4349,127 @@ def _run_content_volume_verification(
     return result
 
 
+# 仮の判断(ブラウザ向け成果物の完了ゲート追加): `_run_content_volume_
+# verification`と同じ「実行して失敗したら担当メンバー1名に修正を依頼し、
+# 再実行する」ループの構造を、`browser_frontend`に分類された`//agree`の
+# 完了ゲートに適用する。
+#
+# Gate 1(`check_script_module_mismatch`、静的なモジュール整合性チェック)
+# → Gate 2(`verify_browser_load`、実際にヘッドレスブラウザで開いて
+# コンソールエラー・未捕捉例外を確認)の順に実行し、Gate 1で検出があれば
+# Playwrightの起動コストをかけずGate 2をスキップして即座に修正ループへ
+# 戻す(fail-fast)。
+MAX_BROWSER_FRONTEND_FIX_ATTEMPTS = 2
+
+_BROWSER_FRONTEND_FIX_PROMPT_TEMPLATE = """あなたはこのプロジェクトの改修担当です。全タスクの実装完了後のブラウザ動作検証で、以下の問題が見つかりました。
+
+【このプロジェクトの構成案全体】
+{full_plan}
+
+【検出された問題】
+{issues}
+
+上記はブラウザで実際にファイルを開いて検出された問題です。「検証コマンド(Node.js等)では成功するのに実際のブラウザでは動かない」という食い違いが起きる主な原因は、ESモジュール構文(export/import)を使ったJSファイルを、type="module"の付いていない<script src="...">タグから読み込んでいることです。この場合は、(1) 該当のscriptタグにtype="module"属性を追加する、または (2) JSファイル側のexport/importを削除して通常のグローバル関数として書き直す、のいずれかで修正してください。それ以外の問題(コンソールエラー・実行時エラー)は、内容を読んで原因を直してください。
+
+read_file・search_in_fileで現在の内容を確認してから、edit_file・write_fileで直してください。{edit_over_write_guidance}
+
+修正が完了したら、最後にツールを呼び出さずに、何を直したかを簡潔な日本語の文章で報告してください。
+"""
+
+
+def _build_browser_frontend_fix_prompt(full_plan: str, issues: list) -> str:
+    return _BROWSER_FRONTEND_FIX_PROMPT_TEMPLATE.format(
+        full_plan=full_plan,
+        issues="\n".join(f"- {issue}" for issue in issues),
+        edit_over_write_guidance=f" {_EDIT_OVER_WRITE_GUIDANCE}",
+    )
+
+
+def _check_browser_frontend(project_dir: str, tasks: list) -> dict:
+    """`tasks`から`.html`ファイルを見つけ、各ファイルにGate 1
+    (`check_script_module_mismatch`)→Gate 2(`verify_browser_load`)を
+    順に適用する。戻り値は`{"ok": bool, "warnings": list}`(`warnings`は
+    検出内容をファイル名・行番号・メッセージ付きでそのまま列挙したもの)。
+
+    Gate 1で検出があったHTMLファイルは、Playwrightの起動コストをかけず
+    そのファイルのGate 2をスキップする(fail-fast)。
+
+    プロジェクト内に`.html`ファイルが無い場合(分類の誤検知等)は、
+    チェック対象が無いため`{"ok": True, "warnings": []}`を返す。
+
+    Playwright自体が実機に無い・ブラウザの起動に失敗した場合は、その
+    HTMLファイルのGate 2をスキップした旨を標準出力に表示するにとどめ、
+    `warnings`(`ok`の判定基準)には含めない(ツール不在は成果物側の
+    不具合として扱わない、既存の`tools._check_html_with_playwright`と
+    同じ方針)。
+    """
+    html_filenames = [filename for filename, _description in tasks if filename.lower().endswith(".html")]
+    warnings = []
+    for filename in html_filenames:
+        safe_path, error = _resolve_safe_project_path(project_dir, filename)
+        if error or not os.path.isfile(safe_path):
+            continue
+
+        gate1_issues = check_script_module_mismatch(safe_path)
+        if gate1_issues:
+            warnings.extend(gate1_issues)
+            continue
+
+        try:
+            gate2_issues = verify_browser_load(safe_path)
+        except BrowserVerificationUnavailable as exc:
+            print(f"[⏭️ ブラウザ動作検証({filename}): {exc}]")
+            continue
+        warnings.extend(gate2_issues)
+
+    return {"ok": not warnings, "warnings": warnings}
+
+
+def _run_browser_frontend_verification(
+    candidates: list, org_fingerprint: str, project_dir: str, tasks: list,
+    max_attempts: int = MAX_BROWSER_FRONTEND_FIX_ATTEMPTS,
+) -> dict:
+    """`browser_frontend`に分類された`//agree`が生成した`.html`ファイルを
+    `_check_browser_frontend`(Gate 1→Gate 2)でチェックし、問題があれば
+    担当メンバー1名に修正を依頼して再チェックする、を最大`max_attempts`回
+    まで繰り返す。`_run_content_volume_verification`と同じループ構造。
+
+    批評フィードバックがボイラープレートな指摘に丸められて失われることを
+    避けるため、`check_script_module_mismatch`・`verify_browser_load`が
+    返したファイル名・行番号・エラーメッセージをそのまま(要約せず)修正
+    依頼プロンプトに埋め込む。
+
+    戻り値は`_check_browser_frontend`と同じ形式(`{"ok": bool, "warnings":
+    list}`)に、実際に試行した回数`attempts`を加えたもの。`max_attempts`回
+    試みても解消しない場合は、最後のチェック結果(`ok: False`)をそのまま
+    返す(誤検知でユーザーの成果物を握りつぶすことを避けるため、それ以上
+    リトライせず生成物はそのまま維持する)。
+    """
+    fixer = candidates[0]
+    full_plan = "\n".join(f"{fn}: {content}" for fn, content in tasks)
+
+    result = _check_browser_frontend(project_dir, tasks)
+    for attempt in range(1, max_attempts + 1):
+        if result["ok"]:
+            result["attempts"] = attempt
+            return result
+        if attempt >= max_attempts:
+            break
+        print(f"[⚠️ ブラウザ動作検証で問題があります。修正を依頼します ({attempt}回目/{max_attempts}回)]")
+        for warning in result["warnings"]:
+            print(f"  - {warning}")
+        print(f"[🔧 {fixer['label']} (モデル: {fixer['model']}) が修正しています...]")
+        fix_prompt = _build_browser_frontend_fix_prompt(full_plan, result["warnings"])
+        _collect_answer_with_project_tools(
+            fixer, org_fingerprint, [{"role": "user", "content": fix_prompt}], project_dir,
+        )
+        print("[🔍 ブラウザ動作検証を再実行します]")
+        result = _check_browser_frontend(project_dir, tasks)
+
+    result["attempts"] = max_attempts
+    return result
+
+
 def _run_collaborative_project(
     request: str, tasks: list, checklist: list, candidates: list, org_fingerprint: str,
     project_dir: str, tasks_to_queue: list, auto_resume_count: int = 0, changelog: list = None,
@@ -4418,6 +4591,21 @@ def _run_collaborative_project(
                 print(f"  - {warning}")
         else:
             print(f"[✅ 内容量チェックに成功しました ({content_volume_result['attempts']}回目の試行)]")
+
+    # 仮の判断(ブラウザ向け成果物の完了ゲート追加): `browser_frontend`に
+    # 分類された依頼は、検証コマンド(Node.js等)が成功していても実際の
+    # ブラウザで動作するとは限らない(構造的な問題、詳細は
+    # `AGREE_REQUEST_TYPE_BROWSER_FRONTEND`定義部のコメントを参照)。
+    # 未完了タスクが残っている場合はファイルが揃っていない可能性が高い
+    # ため、他のチェックと同様スキップする。
+    if request_type == AGREE_REQUEST_TYPE_BROWSER_FRONTEND and not incomplete_labels:
+        browser_frontend_result = _run_browser_frontend_verification(candidates, org_fingerprint, project_dir, tasks)
+        if not browser_frontend_result["ok"]:
+            print("[⚠️ ブラウザ動作検証で警告が残っています(生成物はそのまま維持されます)]")
+            for warning in browser_frontend_result["warnings"]:
+                print(f"  - {warning}")
+        else:
+            print(f"[✅ ブラウザ動作検証に成功しました ({browser_frontend_result['attempts']}回目の試行)]")
 
     # 【最重要】組織自身が立てた計画のうち、1つでも未完了のタスクが残って
     # いる場合は「✅ レビュー完了」を名乗らず、何が終わっていないかを
