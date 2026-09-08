@@ -113,6 +113,32 @@ def test_elapsed_time_is_shown_only_for_thinking():
     assert "(7s)" not in waiting_line, waiting_line
 
 
+def test_format_elapsed_duration_switches_units_as_it_grows():
+    """依頼への対応: 経過時間の表示が秒だけで増え続けると読みにくいため、
+    1分を超えたら分+秒、1時間を超えたら時+分+秒へと、値が増えるごとに
+    単位を追加した表記に切り替わることを確認する。
+    """
+    assert yoriai._format_elapsed_duration(0) == "0s"
+    assert yoriai._format_elapsed_duration(42) == "42s"
+    assert yoriai._format_elapsed_duration(59) == "59s"
+    assert yoriai._format_elapsed_duration(60) == "1m00s"
+    assert yoriai._format_elapsed_duration(125) == "2m05s"
+    assert yoriai._format_elapsed_duration(3599) == "59m59s"
+    assert yoriai._format_elapsed_duration(3600) == "1h00m00s"
+    assert yoriai._format_elapsed_duration(7325) == "2h02m05s"
+
+
+def test_status_line_uses_minute_unit_once_thinking_exceeds_a_minute():
+    """`_format_device_status_line`が経過時間の表記に`_format_elapsed_
+    duration`を使っており、1分を超える思考時間では"(1m05s)"のように
+    分単位を含む表記になることを確認する(回帰検知)。
+    """
+    line = yoriai._format_device_status_line(
+        "MacStudio", yoriai._DEVICE_STATUS_THINKING, "", elapsed_seconds=65,
+    )
+    assert line == "🧠 MacStudio が 処理中... (1m05s)", line
+
+
 def test_elapsed_seconds_reflect_render_time():
     """`_render_status_panel`が実際の経過時間(呼び出し時点との差分)を
     計算して埋め込むことを確認する。
@@ -606,6 +632,8 @@ def main():
         test_panel_line_count_scales_with_participant_count,
         test_status_icons_and_text_per_kind,
         test_elapsed_time_is_shown_only_for_thinking,
+        test_format_elapsed_duration_switches_units_as_it_grows,
+        test_status_line_uses_minute_unit_once_thinking_exceeds_a_minute,
         test_elapsed_seconds_reflect_render_time,
         test_device_removed_from_panel_when_it_leaves,
         test_remove_of_unknown_label_is_a_no_op,

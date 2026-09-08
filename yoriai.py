@@ -5331,6 +5331,25 @@ class _DeviceStatusBoard:
 _ACTIVE_STATUS_BOARD = _DeviceStatusBoard()
 
 
+def _format_elapsed_duration(elapsed_seconds: int) -> str:
+    """経過時間を、値が増えるごとに秒→分→時と単位を追加した表記に
+    変換する(依頼: 長時間の思考中に秒数だけが増え続けるのは読みにくい
+    ため、分・時間の単位も使ってほしいとの要望への対応)。1時間未満は
+    秒だけ(例: "42s")のまま(既存の表示・テストとの後方互換性)、
+    1分を超えたら分+秒(例: "1m05s")、1時間を超えたら時+分+秒
+    (例: "1h02m05s")にする。分・秒の桁を2桁に揃えるのは、上位の桁が
+    増えても常に同じ幅で読み取れるようにするため。
+    """
+    elapsed_seconds = max(0, int(elapsed_seconds))
+    hours, remainder = divmod(elapsed_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours}h{minutes:02d}m{seconds:02d}s"
+    if minutes > 0:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{seconds}s"
+
+
 def _format_device_status_line(label: str, status_kind: str, detail: str, elapsed_seconds: int) -> str:
     """ステータスパネルの1デバイス分の表示行を組み立てる。"""
     icon = _DEVICE_STATUS_ICONS.get(status_kind, "❔")
@@ -5338,7 +5357,7 @@ def _format_device_status_line(label: str, status_kind: str, detail: str, elapse
         return f"{icon} {label} 待機"
     text = detail if detail else "処理中..."
     if _DEVICE_STATUS_SHOWS_ELAPSED.get(status_kind, False):
-        return f"{icon} {label} が {text} ({elapsed_seconds}s)"
+        return f"{icon} {label} が {text} ({_format_elapsed_duration(elapsed_seconds)})"
     return f"{icon} {label} が {text}"
 
 
