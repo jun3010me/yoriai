@@ -67,6 +67,22 @@ def _with_stream(fake_stream, fn, *args, **kwargs):
         yoriai._stream_chat_from_candidate = original
 
 
+def _with_no_web_search(fn, *args, **kwargs):
+    """`enable_dialogue=True`かつ全タスク完了まで進むテストでは、Gap批評
+    エージェント(`_run_gap_critique_phase`)が実際のSearXNGインスタンスへ
+    `web_search`を呼びに行ってしまい、実機に接続できないテスト環境では
+    接続タイムアウト分だけ無駄に遅くなる。このファイルは対話プロトコル
+    自体の検証が目的でweb_searchの挙動は無関係なため、即座に空リストを
+    返すよう差し替える。
+    """
+    original = yoriai.web_search
+    yoriai.web_search = lambda query, max_results=5: []
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        yoriai.web_search = original
+
+
 def _with_collect_answer(fake_collect, fn, *args, **kwargs):
     """`_collect_answer_from_candidate`自体を差し替えて`speak()`の
     表示分岐(`error`/`answer`/`truncated`の組み合わせ)を直接検証する
@@ -734,8 +750,8 @@ def test_ask_organization_collaborate_with_dialogue_reaches_consensus_and_implem
     try:
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            _with_stream(
-                fake_stream, yoriai._ask_organization_collaborate,
+            _with_no_web_search(
+                _with_stream, fake_stream, yoriai._ask_organization_collaborate,
                 47120, "fingerprint", "ToDoリストのCLIツールを作って", out_dir, enable_dialogue=True,
             )
         output = buf.getvalue()
@@ -813,8 +829,8 @@ def test_ask_organization_collaborate_with_dialogue_finalizes_solo_and_implement
     try:
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            _with_stream(
-                fake_stream, yoriai._ask_organization_collaborate,
+            _with_no_web_search(
+                _with_stream, fake_stream, yoriai._ask_organization_collaborate,
                 47120, "fingerprint", "ToDoリストのCLIツールを作って", out_dir, enable_dialogue=True,
             )
         output = buf.getvalue()
@@ -941,8 +957,8 @@ def test_resume_organization_collaborate_continues_dialogue_and_implements():
 
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            _with_stream(
-                fake_stream_resume, yoriai._resume_organization_collaborate, pending, "自由に決めてください",
+            _with_no_web_search(
+                _with_stream, fake_stream_resume, yoriai._resume_organization_collaborate, pending, "自由に決めてください",
             )
         output = buf.getvalue()
 
@@ -1012,8 +1028,9 @@ def test_resume_organization_collaborate_falls_back_to_single_node_plan_when_sti
 
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            _with_stream(
-                fake_stream_resume_stuck, yoriai._resume_organization_collaborate, pending, "自由に決めてください",
+            _with_no_web_search(
+                _with_stream, fake_stream_resume_stuck, yoriai._resume_organization_collaborate,
+                pending, "自由に決めてください",
             )
         output = buf.getvalue()
 

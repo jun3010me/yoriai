@@ -132,6 +132,7 @@ from progress import (
     _TASK_STATUS_COMPLETED,
     _TASK_STATUS_IN_PROGRESS,
     _build_task_checklist,
+    _extract_progress_section,
     _find_incomplete_projects,
     _find_repeated_review_feedback,
     _format_task_checklist,
@@ -2588,6 +2589,14 @@ AGREE_COMMAND = "//agree"
 AGREE_REQUEST_TYPE_CONTENT = "content"
 AGREE_REQUEST_TYPE_SOFTWARE = "software"
 
+# 仮の判断(実行検証グラウンディングループへの対応): タスクキュー方式に
+# 渡す粒度オプション。`_run_collaborative_project`(このすぐ後で定義)の
+# デフォルト引数から参照されるため、実際の使用箇所(`_run_task_grounding_
+# verification`まわり、後方のタスクキュー方式のセクションを参照)より
+# 前のこの位置で定義する。
+TASK_GRANULARITY_FILE = "file"
+TASK_GRANULARITY_FUNCTION = "function"
+
 # 仮の判断(ブラウザ向け成果物の完了ゲート追加): `chatbot.js`が`export
 # function ...`(ESモジュール構文)で書かれているのに`index.html`側は
 # `<script src="chatbot.js"></script>`(非モジュール)で読み込んでおり、
@@ -3082,7 +3091,8 @@ def _resume_organization_collaborate(
         return
     _run_collaborate_implementation_phase(
         pending.request, answer, pending.candidates, pending.org_fingerprint, pending.project_dir, pending.port,
-        completed_box=completed_box, request_type=pending.request_type,
+        completed_box=completed_box, request_type=pending.request_type, task_granularity=pending.task_granularity,
+        enable_gap_critique=pending.enable_gap_critique,
     )
 
 
@@ -3512,6 +3522,7 @@ class _PendingDesignDialogue:
     def __init__(
         self, port: int, org_fingerprint: str, request: str, candidates: list, project_dir: str, result: dict,
         request_type: str = AGREE_REQUEST_TYPE_SOFTWARE, research_notes: str = "",
+        task_granularity: str = TASK_GRANULARITY_FILE, enable_gap_critique: bool = False,
     ):
         self.port = port
         self.org_fingerprint = org_fingerprint
@@ -3526,6 +3537,15 @@ class _PendingDesignDialogue:
         # 後方互換性のため。
         self.request_type = request_type
         self.research_notes = research_notes
+        # 仮の判断(実行検証グラウンディングループへの対応): タスク粒度
+        # オプション(依頼文の`--fine-grained`フラグ)も、一時停止前に
+        # `_ask_organization_collaborate`が解釈した結果を再開時
+        # (`_resume_organization_collaborate`)まで引き継ぐ。
+        self.task_granularity = task_granularity
+        # 仮の判断(Gap批評エージェントへの対応): `enable_gap_critique`
+        # (対話モードのREPLから実際に呼ばれた場合のみ`True`)も同様に、
+        # 一時停止・再開をまたいで引き継ぐ。
+        self.enable_gap_critique = enable_gap_critique
 
 
 class _PendingDesignDialogueBox:
@@ -3617,6 +3637,7 @@ class _CompletedBuildBox:
 def _run_collaborate_implementation_phase(
     request: str, answer: str, candidates: list, org_fingerprint: str, project_dir: str, port: int,
     completed_box: "_CompletedBuildBox" = None, request_type: str = AGREE_REQUEST_TYPE_SOFTWARE,
+    task_granularity: str = TASK_GRANULARITY_FILE, enable_gap_critique: bool = False,
 ) -> None:
     """合意フェーズ(対話プロトコルによる複数ラウンドの議論・設計担当1名への
     1回きりの相談・一時停止後に人間の回答を踏まえて再開した議論、のいずれ
@@ -3682,7 +3703,7 @@ def _run_collaborate_implementation_phase(
 
     _run_collaborative_project(
         request, tasks, checklist, candidates, org_fingerprint, project_dir, tasks, language=language,
-        verify_command=verify_command, request_type=request_type,
+        verify_command=verify_command, request_type=request_type, task_granularity=task_granularity,
     )
 
     # 仮の判断: 自動再開(有限の上限付き)は、この「新規の協業モード実行」
@@ -3690,6 +3711,22 @@ def _run_collaborate_implementation_phase(
     # 呼ばない(依頼の要件5: 手動実行はこの試行回数カウンタと無関係に
     # 何度でもできるようにする、という区別を素直に実装するため)。
     _maybe_auto_resume(project_dir, port, org_fingerprint)
+
+    # 仮の判断(Gap批評エージェントへの対応): `enable_gap_critique`の既定は
+    # `False`(既存の呼び出し元・テストとの後方互換性のため。この関数を
+    # 直接呼ぶ既存テストの多くは生成物一覧・出力文言を厳密に比較しており、
+    # 新たにBACKLOG.mdが生成されたり、モック未対応のweb_search/LLM問い
+    # 合わせが余分に発生したりすると壊れてしまう)。`True`は、対話モードの
+    # REPLから実際に`//agree`・自動判定で呼ばれる場合にのみ渡す。「実装
+    # 完了ごとに」起動するため、自動再開後のディスク上の最新状態
+    # (`_maybe_auto_resume`がタスクを完遂させた可能性がある)を正として、
+    # 全タスク(実装・レビュー)が完了している場合にのみ実行する(未完了の
+    # まま振り返りを行っても、まだ存在しないファイルについて批評すること
+    # になり無意味なため)。
+    if enable_gap_critique:
+        parsed_after_completion = _parse_progress_markdown(os.path.join(project_dir, PROGRESS_FILENAME))
+        if parsed_after_completion is not None and not _progress_checklist_is_incomplete(parsed_after_completion["checklist"]):
+            _run_gap_critique_phase(request, tasks, candidates, org_fingerprint, project_dir, language=language)
 
     # 仮の判断: 自動再開でタスクが完遂したかどうかに関わらず、この時点で
     # `project_dir`にはPROGRESS.mdを含む実在のプロジェクトが出来ている
@@ -3930,6 +3967,546 @@ def _run_research_phase(researcher: dict, org_fingerprint: str, request: str, pr
     return notes
 
 
+# ---------------------------------------------------------------------------
+# 事前調査付きVisionエージェント(実現可能性を問わない要件洗い出し)
+# ---------------------------------------------------------------------------
+#
+# 依頼への対応: 新しいツール/コンテンツの計画は、外部の参照点なしに
+# 「ゼロから」立てられており、結果として実現可能性を無意識に織り込んだ
+# 小さい計画になりやすい。計画を立てる前に類似の既存プロジェクトを調査し、
+# 規模感のアンカーを与えることで、より発展的な計画を立てられるようにする。
+# 既存の`_classify_agree_request_type`のような実装寄りの分類ロジックとは
+# 完全に切り離す(Vision agentの出力はこの分類の結果によってフィルタ
+# されない)。実現可能性を問わず要件を洗い出すことに専念させるため、
+# `//vision`という独立したコマンドとして実装する(既存の`//agree`・
+# `//plan-only`とは別物で、実装フェーズへは一切進まない)。出力
+# (バックログ)は`VISION_BACKLOG.md`として保存し、人間がそのまま(または
+# 取捨選択したうえで)`//agree`への依頼文に含めて使うことを想定する。
+
+VISION_COMMAND = "//vision"
+
+_VISION_AGENT_REQUIRED_CATEGORIES = (
+    "コア機能", "エラーハンドリング", "設定管理", "ログ", "CLI/UI", "ドキュメント", "テスト",
+)
+
+VISION_BACKLOG_FILENAME = "VISION_BACKLOG.md"
+
+
+def _build_vision_agent_search_queries(request: str) -> list:
+    """依頼内容から、類似OSSプロジェクト・関連GitHubリポジトリを探すための
+    検索クエリを組み立てる。厳密な自然言語理解は行わず、依頼文をそのまま
+    キーワードとして使う簡易的な組み立て(`_extract_research_keywords`の
+    コメントと同じ「厳密な意味理解までは求めない」という方針)。
+    """
+    return [f"{request} 類似 OSS プロジェクト", f"{request} GitHub リポジトリ"]
+
+
+def _format_external_references_for_prompt(search_results_by_query: dict) -> str:
+    """`{検索クエリ: web_searchの結果のリスト}`の辞書を、Vision agentへの
+    プロンプトに埋め込む1つのテキストにまとめる。
+
+    仮の判断: いずれのクエリでも結果が1件も得られなかった場合、空文字列
+    ではなく明示的にその旨を書く(`_RESEARCH_NO_RESULTS_MESSAGE`と同じ
+    考え方: Vision agent側が「検索していない」と誤読して規模感の参考なしに
+    要件を洗い出してしまうことを避け、代わりに一般的な知識で判断するよう
+    明示的に促す)。
+    """
+    lines = []
+    any_results = False
+    for query, results in search_results_by_query.items():
+        lines.append(f"### 検索クエリ: {query}")
+        if not results:
+            lines.append("(検索結果は得られませんでした)")
+        else:
+            any_results = True
+            for r in results:
+                lines.append(f"- {r.get('title', '')} ({r.get('url', '')})")
+                snippet = r.get("snippet", "")
+                if snippet:
+                    lines.append(f"  {snippet}")
+        lines.append("")
+    if not any_results:
+        lines.append(
+            "(いずれのクエリでも類似プロジェクトの検索結果は得られませんでした。"
+            "一般的な知識に基づいて規模感を判断してください)"
+        )
+    return "\n".join(lines).strip()
+
+
+def _run_external_reference_search(request: str) -> str:
+    """`_build_vision_agent_search_queries`が組み立てたクエリで
+    `web_search`(SearXNG経由)を呼び出し、Vision agentへのプロンプトに
+    埋め込める形式のテキストにまとめて返す。`web_search`自体が検索失敗を
+    例外にせず空リストで返す設計のため、この関数も例外を投げない。
+    """
+    queries = _build_vision_agent_search_queries(request)
+    search_results_by_query = {query: web_search(query) for query in queries}
+    return _format_external_references_for_prompt(search_results_by_query)
+
+
+_VISION_AGENT_PROMPT_TEMPLATE = """あなたは「Vision agent」として、これから作るものの要件を、実現できるかどうかを一切気にせず洗い出す役割です。実装の難易度・工数・チームの人数といった実現可能性は考慮せず、「本当にあるべき機能は何か」だけを基準に検討してください。
+
+【依頼内容】
+{request}
+
+【類似する既存プロジェクトの調査結果(規模感の参考にしてください)】
+{external_references}
+
+上記の調査結果にある類似プロジェクトが実際に持っている機能・構成の広さを参考に、この依頼が「本来はどれくらいの規模になるべきか」のアンカーとしてください。調査結果が乏しい場合でも、一般的な同種のソフトウェア/コンテンツが備えるべき水準で構いません。
+
+以下の7つの観点それぞれについて、見出し(### 観点名)を立てたうえで、必要と考えられる要件を箇条書き(- で始める1行)で網羅的に列挙してください。該当する要件が無いと判断した観点であっても、見出し自体は省略せず「(該当なし)」とだけ書いてください:
+
+### コア機能
+### エラーハンドリング
+### 設定管理
+### ログ
+### CLI/UI
+### ドキュメント
+### テスト
+
+出力は上記7つの見出しとその箇条書きのみとし、前置き・後書きの説明文は含めないでください。
+"""
+
+
+def _build_vision_agent_prompt(request: str, external_references: str) -> str:
+    return _VISION_AGENT_PROMPT_TEMPLATE.format(request=request, external_references=external_references)
+
+
+def _run_vision_agent(visionary: dict, org_fingerprint: str, request: str) -> str:
+    """`request`(依頼内容)について、事前に類似OSSプロジェクトを調査した
+    うえで、実現可能性を問わない要件のバックログを`visionary`に洗い出させる。
+    戻り値は`### 観点名`+箇条書きの生テキスト(バックログ、失敗時は空文字列)。
+
+    仮の判断: 外部検索(`_run_external_reference_search`)はYoriai側が
+    `web_search`を直接呼び出して行い、Vision agent自身にはツールを一切
+    オファーしない(`_collect_answer_from_candidate`は既定でCHAT_TOOLS
+    (web_search)をオファーするため、`speak`・モジュール分割案の相談と
+    同じ理由で明示的に`disable_web_search=True`を渡す)。検索クエリの
+    組み立てと実行自体を決定的なロジックに固定することで、Vision agentの
+    役割を「与えられた調査結果を踏まえて要件を洗い出すこと」に限定し、
+    テスト時にはモデルの応答だけを差し替えれば検証できるようにする。
+    """
+    external_references = _run_external_reference_search(request)
+    prompt = _build_vision_agent_prompt(request, external_references)
+    answer, error, truncated = _collect_answer_from_candidate(
+        visionary, org_fingerprint, [{"role": "user", "content": prompt}], disable_web_search=True,
+    )
+    if error:
+        print(f"[⚠️ Vision agentへの問い合わせに失敗しました: {error}]")
+        return ""
+    if not answer:
+        print("[⚠️ Vision agentから応答が得られませんでした]")
+        return ""
+    if truncated:
+        print(f"[⚠️ Vision agentの応答が長すぎたため、{CHAT_MAX_OUTPUT_TOKENS}トークンで打ち切られました]")
+    return answer
+
+
+def _vision_agent_backlog_missing_categories(text: str) -> list:
+    """Vision agentの出力(`text`)に、要求した7つの観点の見出しが含まれて
+    いるかどうかを、`_looks_like_process_narration`と同じキーワードベース
+    の簡易判定(厳密な意味理解までは求めない)で確認する。含まれていない
+    観点名の一覧を返す(空リストなら全観点を網羅している)。
+    """
+    text = text or ""
+    return [category for category in _VISION_AGENT_REQUIRED_CATEGORIES if category not in text]
+
+
+def _ask_organization_vision(port: int, org_fingerprint: str, request: str, out_dir: str) -> None:
+    """`//vision <依頼文>`: 実装には一切進まず、事前調査付きVisionエージェント
+    に実現可能性を問わない要件のバックログを洗い出させ、
+    `VISION_BACKLOG.md`として保存する単体モード。このバックログをそのまま
+    (または人間が取捨選択したうえで)`//agree`への依頼文に含めて使うことを
+    想定する(計画自体を膨らませるという依頼の趣旨のため、実装フェーズへの
+    自動的な橋渡しはあえて行わず、人間が出力内容を見てから次の一手を
+    選べるようにする)。
+    """
+    data = _fetch_org_snapshot(port, org_fingerprint)
+    if data is None:
+        return
+
+    candidates = _select_chat_candidates(data.get("self", {}), data.get("peers", []), port, TASK_TYPE_CODING)
+    if not candidates:
+        print("組織内にロード済みモデルを持つメンバーがいません。")
+        return
+
+    visionary = candidates[0]
+    projects_root = os.path.join(out_dir, PROJECTS_SUBDIR_NAME)
+    project_name = _project_name_with_date_prefix(request, suffix="-vision")
+    project_dir = _resolve_project_dir(projects_root, project_name)
+
+    print(
+        f"[🔭 Visionエージェント開始: {visionary['label']}さんが類似プロジェクトを調査したうえで、"
+        "実現可能性を問わず要件を洗い出しています...]"
+    )
+    backlog = _run_vision_agent(visionary, org_fingerprint, request)
+    if not backlog:
+        return
+
+    missing_categories = _vision_agent_backlog_missing_categories(backlog)
+    if missing_categories:
+        print(f"[⚠️ 以下の観点の見出しが出力に含まれていません: {', '.join(missing_categories)}]")
+
+    _write_project_file(project_dir, VISION_BACKLOG_FILENAME, backlog)
+    print(f"[🔭 {visionary['label']} が洗い出したバックログ(そのまま表示、{VISION_BACKLOG_FILENAME}として保存します)]")
+    print(backlog)
+
+
+# ---------------------------------------------------------------------------
+# Gap批評エージェント(成長するバックログ、収束判定つき)
+# ---------------------------------------------------------------------------
+#
+# 依頼への対応: 一通り完成した後、「もっと良くするには何が必要か」を
+# 問い直す振り返り工程が存在しない。実装完了ごとに「Gap批評エージェント」を
+# 起動し、実際にできあがった成果物を見た上で改善提案を洗い出す。
+#
+# 重要(依頼の注意書きへの対応): この工程はタスク単位の実行検証
+# グラウンディングループ(`_run_task_grounding_verification`、正しく動くかの
+# 判定)とは目的が異なる。同じエージェント人格・同じプロンプトに両方を
+# やらせないよう、プロンプトテンプレート・関数を完全に分離し、Gap批評の
+# プロンプトでは「実際に動くかどうかの検証はあなたの役割ではない」ことを
+# 明示する(`tests/test_gap_critique.py`の分離テストで、両者のソース同士が
+# 互いを呼んでいないことも確認する)。
+#
+# 「もっと」を無限に続けさせないため、固定回数ではなく収束判定(新規性の
+# ある指摘が出なくなったら終了)を基準にする。既存の「レビューフェーズは
+# 最大2回まで」という暴走防止設計と同じ発想で、収束しなかった場合の保険
+# として固定回数の上限も別途持たせる。
+
+MAX_GAP_CRITIQUE_CYCLES = 5
+
+# 仮の判断: 依頼の「複数回(デフォルト2〜3回)」の下限側(2回)を既定値と
+# する。新規性のある指摘がこの回数連続で出なければ「十分」と判定する。
+GAP_CRITIQUE_CONVERGENCE_STREAK = 2
+
+# 仮の判断(依頼の「実装N件ごとに1回、のような間引き設定」への対応):
+# PR2のVision agent・リサーチフェーズが既にこのプロジェクトを調査済み
+# (`research_notes.md`が存在する)場合、Gap批評の呼び出しがこの回数に
+# 達するたびにだけ外部比較を新規に検索し直す(それ以外の回は既存の
+# 調査結果をそのまま再利用する)。調査済みでない場合は毎回検索する。
+GAP_CRITIQUE_EXTERNAL_REFERENCE_REFRESH_INTERVAL = 3
+
+GAP_BACKLOG_FILENAME = "BACKLOG.md"
+_GAP_BACKLOG_SECTION_VALUABLE = "## 価値あり(実装エージェントに戻し済み)"
+_GAP_BACKLOG_SECTION_MARGINAL = "## 限界的(記録のみ)"
+
+_GAP_CRITIQUE_PROMPT_TEMPLATE = """あなたは「Gap批評エージェント」として、既に完成した成果物を見て、もっと良くするには何が必要かを考える役割です。
+
+重要: あなたの役割は、この成果物が実際に動くかどうか(構文エラー・実行時エラー・テストの成否)を検証することではありません。それは既に別の担当(実行検証)が行っています。あなたは動作の正しさではなく、機能・完成度としての「もっと」だけを考えてください。
+
+【依頼内容】
+{request}
+
+【完成した成果物】
+{artifact_text}
+
+【類似する既存プロジェクトとの比較(規模感の参考にしてください)】
+{external_reference}
+
+【これまでに挙がった指摘(これらと実質的に同じ内容は繰り返さないでください)】
+{known_suggestions}
+
+上記を踏まえて、この成果物を見た今、もっと良くするには何が必要かを箇条書きで具体的に列挙してください。
+
+出力の各行は、次のいずれかの形式にしてください:
+- [価値あり] <実装する価値がある具体的な改善提案>
+- [限界的] <記録には値するが、今実装するほどではない提案>
+
+新規の指摘が無い場合は、他に何も書かず「追加の指摘はありません」とだけ出力してください。
+"""
+
+
+def _build_gap_critique_prompt(request: str, artifact_text: str, external_reference: str, known_suggestions: list) -> str:
+    return _GAP_CRITIQUE_PROMPT_TEMPLATE.format(
+        request=request, artifact_text=artifact_text,
+        external_reference=external_reference or "(比較材料はありません。一般的な知識に基づいて判断してください)",
+        known_suggestions="\n".join(f"- {s}" for s in known_suggestions) if known_suggestions else "(まだありません)",
+    )
+
+
+_GAP_SUGGESTION_LINE_PATTERN = re.compile(r"^-\s*\[(価値あり|限界的)\]\s*(.+)$")
+
+
+def _parse_gap_critique_suggestions(text: str) -> list:
+    """Gap批評エージェントの出力から、`[価値あり]`/`[限界的]`のタグ付き
+    指摘を`(判定, 指摘内容)`のタプルのリストとして抽出する。タグが付いて
+    いない行(前置き・後書きの説明文、「追加の指摘はありません」等)は
+    無視する。
+    """
+    suggestions = []
+    for line in (text or "").splitlines():
+        match = _GAP_SUGGESTION_LINE_PATTERN.match(line.strip())
+        if match:
+            verdict, suggestion = match.groups()
+            suggestion = suggestion.strip()
+            if suggestion:
+                suggestions.append((verdict, suggestion))
+    return suggestions
+
+
+def _normalize_gap_suggestion_text(text: str) -> str:
+    """指摘文言の比較用正規化(空白の違いを無視する)。既存のレビュー
+    往復の早期エスカレーション(`_find_repeated_review_feedback`)と同じ
+    「文言の一字一句比較」ベースの単純な判定にする(厳密な意味理解までは
+    求めない)。
+    """
+    return re.sub(r"\s+", "", text or "")
+
+
+def _filter_novel_gap_suggestions(suggestions: list, known_suggestion_texts: set) -> list:
+    """`suggestions`(`_parse_gap_critique_suggestions`の戻り値)のうち、
+    `known_suggestion_texts`(正規化済みの、既存のバックログ・過去の批評
+    結果に含まれる指摘文言の集合)と実質的に重複しないものだけを返す。
+    """
+    novel = []
+    for verdict, suggestion in suggestions:
+        normalized = _normalize_gap_suggestion_text(suggestion)
+        if normalized and normalized not in known_suggestion_texts:
+            novel.append((verdict, suggestion))
+    return novel
+
+
+def _run_gap_critique_loop(
+    critic: dict, org_fingerprint: str, request: str, artifact_text: str, external_reference: str = "",
+    initial_known_suggestions: list = None, max_cycles: int = MAX_GAP_CRITIQUE_CYCLES,
+    convergence_streak: int = GAP_CRITIQUE_CONVERGENCE_STREAK,
+) -> dict:
+    """Gap批評エージェント(`critic`)に、完成した成果物(`artifact_text`)を
+    見せて「もっと良くするには何が必要か」を複数サイクル問い直し、新規性の
+    ある指摘が`convergence_streak`回連続で出なくなった時点で収束と判定して
+    打ち切る。収束判定が機能しなかった場合の保険として、`max_cycles`回に
+    達したら(収束していなくても)必ず打ち切る(暴走防止)。
+
+    `initial_known_suggestions`(既存のバックログ・過去の批評結果の指摘
+    文言のリスト)を渡すと、それらと実質的に重複する指摘は新規性なしとして
+    扱われる(依頼の「既存のバックログや過去の批評結果と重複しない提案」の
+    判定)。
+
+    戻り値は`{"converged": bool, "cycles": int, "valuable_tasks": list,
+    "marginal_notes": list}`。`valuable_tasks`は「価値あり」と判定された
+    新規の指摘(実装エージェントに戻すべきタスク)、`marginal_notes`は
+    「限界的」と判定された新規の指摘(記録のみ)。
+
+    仮の判断: 問い合わせ自体が失敗した場合(`error`またはモデルからの
+    応答なし)は、それ以上の批評サイクルを継続する意味が無いため、
+    その時点で(収束していなくても)打ち切る。Gap批評は`//agree`の完了
+    条件ではなく、あくまで任意の振り返り工程のため、統合検証等とは異なり
+    修正を試みたり再試行したりはしない。
+    """
+    known_display = list(initial_known_suggestions or [])
+    known_texts = {_normalize_gap_suggestion_text(s) for s in known_display}
+    valuable_tasks = []
+    marginal_notes = []
+    no_novelty_streak = 0
+    cycles_run = 0
+
+    for cycle in range(1, max_cycles + 1):
+        cycles_run = cycle
+        prompt = _build_gap_critique_prompt(request, artifact_text, external_reference, known_display)
+        answer, error, _truncated = _collect_answer_from_candidate(
+            critic, org_fingerprint, [{"role": "user", "content": prompt}], disable_web_search=True,
+        )
+        if error or not answer:
+            break
+
+        novel = _filter_novel_gap_suggestions(_parse_gap_critique_suggestions(answer), known_texts)
+        if not novel:
+            no_novelty_streak += 1
+            if no_novelty_streak >= convergence_streak:
+                return {
+                    "converged": True, "cycles": cycles_run,
+                    "valuable_tasks": valuable_tasks, "marginal_notes": marginal_notes,
+                }
+            continue
+
+        no_novelty_streak = 0
+        for verdict, suggestion in novel:
+            known_texts.add(_normalize_gap_suggestion_text(suggestion))
+            known_display.append(suggestion)
+            if verdict == "価値あり":
+                valuable_tasks.append(suggestion)
+            else:
+                marginal_notes.append(suggestion)
+
+    return {
+        "converged": False, "cycles": cycles_run,
+        "valuable_tasks": valuable_tasks, "marginal_notes": marginal_notes,
+    }
+
+
+def _read_gap_backlog(project_dir: str) -> dict:
+    """`project_dir`直下の`BACKLOG.md`(存在すれば)を読み込み、
+    `{"valuable": [...], "marginal": [...]}`として返す。存在しない・
+    読み込めない場合は両方とも空リスト。
+    """
+    path = os.path.join(project_dir, GAP_BACKLOG_FILENAME)
+    if not os.path.exists(path):
+        return {"valuable": [], "marginal": []}
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return {"valuable": [], "marginal": []}
+    return {
+        "valuable": _parse_bullet_lines(_extract_progress_section(text, _GAP_BACKLOG_SECTION_VALUABLE)),
+        "marginal": _parse_bullet_lines(_extract_progress_section(text, _GAP_BACKLOG_SECTION_MARGINAL)),
+    }
+
+
+def _format_gap_backlog_markdown(valuable: list, marginal: list) -> str:
+    lines = ["# 成長するバックログ(Gap批評エージェント)", "", _GAP_BACKLOG_SECTION_VALUABLE, ""]
+    lines.extend(f"- {item}" for item in valuable) if valuable else lines.append("(なし)")
+    lines.append("")
+    lines.append(_GAP_BACKLOG_SECTION_MARGINAL)
+    lines.append("")
+    lines.extend(f"- {item}" for item in marginal) if marginal else lines.append("(なし)")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _write_gap_backlog_md(project_dir: str, result: dict) -> None:
+    """Gap批評エージェントの結果(`_run_gap_critique_loop`の戻り値)を
+    `BACKLOG.md`に記録する。依頼の「成長するバックログ」に対応するため、
+    既存の`BACKLOG.md`(前回までの実行分)があれば読み込み、新規の指摘を
+    追記して書き戻す(上書きではなく蓄積)。
+    """
+    existing = _read_gap_backlog(project_dir)
+    valuable = existing["valuable"] + result["valuable_tasks"]
+    marginal = existing["marginal"] + result["marginal_notes"]
+    _write_project_file(project_dir, GAP_BACKLOG_FILENAME, _format_gap_backlog_markdown(valuable, marginal))
+
+
+def _gap_critique_should_refresh_external_reference(
+    implementation_count: int, has_prior_research: bool,
+    refresh_interval: int = GAP_CRITIQUE_EXTERNAL_REFERENCE_REFRESH_INTERVAL,
+) -> bool:
+    """依頼の「PR2のVision agentで既に調査済みの場合は、この工程の実行
+    頻度を下げる設定(例: 実装N件ごとに1回)」への対応。事前の調査結果が
+    無い場合は、比較材料が無いと批評の質が下がるため毎回検索する。事前の
+    調査結果がある場合は、`implementation_count`が`refresh_interval`の
+    倍数になったときだけ検索し直す(それ以外は既存の調査結果を再利用する
+    ことでコストを抑える)。
+    """
+    if not has_prior_research:
+        return True
+    return implementation_count % refresh_interval == 0
+
+
+def _read_all_task_files_for_critique(project_dir: str, tasks: list) -> str:
+    """完成した成果物を、Gap批評エージェントへのプロンプトに埋め込める
+    1つのテキストにまとめる(`_check_content_volume`と同じ、ファイル名で
+    見出しを立てて連結する簡易的な方式)。読み込めなかったファイルは
+    スキップする。
+    """
+    blocks = []
+    for filename, _content_desc in tasks:
+        safe_path, error = _resolve_safe_project_path(project_dir, filename)
+        if error:
+            continue
+        try:
+            with open(safe_path, encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            continue
+        blocks.append(f"--- {filename} ---\n{text}")
+    return "\n\n".join(blocks)
+
+
+# 仮の判断: プロセス生存期間内でのGap批評の呼び出し回数を数えるだけの
+# 単純なカウンタ(`_gap_critique_should_refresh_external_reference`の
+# `implementation_count`用)。永続化はしない(プロセス再起動で0に戻る)。
+# 複数プロジェクトを跨いだ正確な回数よりも、「毎回は検索し直さない」という
+# 間引きの目的を満たせれば十分なため、この単純さで割り切る。
+_GAP_CRITIQUE_INVOCATION_COUNTER = [0]
+
+
+def _run_gap_critique_phase(
+    request: str, tasks: list, candidates: list, org_fingerprint: str, project_dir: str, language: str = "",
+    max_cycles: int = MAX_GAP_CRITIQUE_CYCLES, convergence_streak: int = GAP_CRITIQUE_CONVERGENCE_STREAK,
+) -> dict:
+    """実装完了ごとに呼び出す、Gap批評エージェントの入口。既存のバックログ・
+    過去の批評結果を読み込んで重複除外の材料にしたうえで`_run_gap_critique_
+    loop`を実行し、結果を`BACKLOG.md`に記録する。「価値がある」と判定
+    された指摘は、既存の`//fix`のタスク分割(`_run_fix_task_queue`)に
+    そのまま渡して実装エージェントに戻す(車輪の再発明をせず、実績のある
+    既存の修正パイプラインを再利用する)。「限界的」と判定された指摘は
+    `BACKLOG.md`への記録のみで完了扱いとする(再実装はしない)。
+    """
+    _GAP_CRITIQUE_INVOCATION_COUNTER[0] += 1
+    implementation_count = _GAP_CRITIQUE_INVOCATION_COUNTER[0]
+
+    critic = candidates[0]
+    full_plan = "\n".join(f"{fn}: {content}" for fn, content in tasks)
+    artifact_text = _read_all_task_files_for_critique(project_dir, tasks)
+    known_backlog = _read_gap_backlog(project_dir)
+    known_suggestions = known_backlog["valuable"] + known_backlog["marginal"]
+
+    research_notes_path = os.path.join(project_dir, "research_notes.md")
+    has_prior_research = os.path.exists(research_notes_path)
+    if _gap_critique_should_refresh_external_reference(implementation_count, has_prior_research):
+        external_reference = _run_external_reference_search(request)
+    else:
+        try:
+            with open(research_notes_path, encoding="utf-8") as f:
+                external_reference = f.read()
+        except OSError:
+            external_reference = ""
+
+    print(f"[🔭 Gap批評エージェント開始: {critic['label']}さんが成果物を見て改善点を洗い出しています...]")
+    result = _run_gap_critique_loop(
+        critic, org_fingerprint, request, artifact_text, external_reference,
+        initial_known_suggestions=known_suggestions, max_cycles=max_cycles, convergence_streak=convergence_streak,
+    )
+    _write_gap_backlog_md(project_dir, result)
+
+    if result["converged"]:
+        print(f"[🔭 Gap批評: {result['cycles']}サイクルで収束しました]")
+    else:
+        print(f"[🔭 Gap批評: 上限の{max_cycles}サイクルに達したため打ち切りました]")
+    print(
+        f"[🔭 Gap批評: 価値ありと判定された指摘 {len(result['valuable_tasks'])}件、"
+        f"限界的と判定された指摘 {len(result['marginal_notes'])}件 ({GAP_BACKLOG_FILENAME}に記録しました)]"
+    )
+
+    if result["valuable_tasks"]:
+        print(f"[🔭 Gap批評: 価値ありと判定された{len(result['valuable_tasks'])}件を実装エージェントに戻します]")
+        file_list = _list_project_files(project_dir)
+        parsed = {
+            "request": request, "tasks": tasks, "checklist": _build_task_checklist(tasks),
+            "language": language, "auto_resume_count": 0, "changelog": [],
+        }
+        _run_fix_task_queue(
+            result["valuable_tasks"], candidates, org_fingerprint, project_dir, request, parsed, full_plan,
+            file_list, language,
+        )
+
+    return result
+
+
+# 仮の判断(実行検証グラウンディングループへの対応・タスク粒度オプション):
+# `//agree`の依頼文の末尾にこのフラグを付けると、タスクキュー方式の
+# 実行検証グラウンディングループ(`_run_task_grounding_verification`)が
+# ファイル単位ではなく、テストファイル内の`test_...`関数単位まで
+# 細分化して実行する(依頼の「タスク粒度を「1関数・1テストケース」単位
+# まで細分化できるオプション」への対応)。既存のタスクキュー方式
+# (`_run_collaborative_task_queue`)の`task_granularity`引数として
+# 実装しているため、CLI側はこのフラグの有無を解釈するだけの薄い層になる。
+_TASK_GRANULARITY_FUNCTION_FLAG = "--fine-grained"
+
+
+def _extract_task_granularity_flag(request: str) -> tuple:
+    """依頼文の末尾の空白を除いた部分が`_TASK_GRANULARITY_FUNCTION_FLAG`で
+    終わっていれば取り除き、`(task_granularity, フラグを取り除いた依頼文)`
+    を返す。フラグが無ければ`(TASK_GRANULARITY_FILE, request)`(依頼文は
+    変更しない)。
+    """
+    stripped = request.rstrip()
+    if stripped == _TASK_GRANULARITY_FUNCTION_FLAG or stripped.endswith(f" {_TASK_GRANULARITY_FUNCTION_FLAG}"):
+        cleaned = stripped[: -len(_TASK_GRANULARITY_FUNCTION_FLAG)].rstrip()
+        return TASK_GRANULARITY_FUNCTION, cleaned
+    return TASK_GRANULARITY_FILE, request
+
+
 def _ask_organization_collaborate(
     port: int, org_fingerprint: str, request: str, out_dir: str, enable_dialogue: bool = False,
     pending_box: "_PendingDesignDialogueBox" = None, completed_box: "_CompletedBuildBox" = None,
@@ -3966,7 +4543,25 @@ def _ask_organization_collaborate(
     implementation_phase`に橋渡しするだけ(詳細は`_CompletedBuildBox`
     参照)。対話プロトコルが一時停止して`return`する場合(実装フェーズに
     到達しない)は、この時点では何も格納しない。
+
+    依頼文の末尾に`_TASK_GRANULARITY_FUNCTION_FLAG`(`--fine-grained`)が
+    付いている場合、それを取り除いたうえで、実行検証グラウンディング
+    ループを関数単位まで細分化する(`_extract_task_granularity_flag`
+    参照)。プロジェクト名・設計担当への依頼文には、取り除いた後の
+    (フラグを含まない)依頼文を使う。
+
+    仮の判断(Gap批評エージェントへの対応): この関数自身は
+    `enable_gap_critique`という独立した引数を持たない。`_ask_organization_
+    collaborate`をテスト側で丸ごと差し替える既存テストが多数あり
+    (`tests/test_background_collaborate.py`等)、固定シグネチャの
+    スタブ関数に呼び出し側から新しいキーワード引数を渡すと`TypeError`に
+    なってしまうため。代わりに、既存の`enable_dialogue`(対話モードの
+    REPLから実際に呼ばれる場合のみ`True`、直接呼び出す既存テストの多くは
+    既定の`False`のまま)をそのままGap批評の有効/無効の判定に流用する
+    (`_run_collaborate_implementation_phase`への橋渡し時、および
+    `_PendingDesignDialogue`への格納時)。
     """
+    task_granularity, request = _extract_task_granularity_flag(request)
     data = _fetch_org_snapshot(port, org_fingerprint)
     if data is None:
         return
@@ -4016,7 +4611,7 @@ def _ask_organization_collaborate(
             ):
                 pending_box.set(_PendingDesignDialogue(
                     port, org_fingerprint, request, candidates, project_dir, dialogue_result,
-                    request_type, research_notes,
+                    request_type, research_notes, task_granularity, enable_dialogue,
                 ))
             return
     else:
@@ -4047,7 +4642,7 @@ def _ask_organization_collaborate(
 
     _run_collaborate_implementation_phase(
         request, answer, candidates, org_fingerprint, project_dir, port, completed_box=completed_box,
-        request_type=request_type,
+        request_type=request_type, task_granularity=task_granularity, enable_gap_critique=enable_dialogue,
     )
 
 
@@ -4474,6 +5069,7 @@ def _run_collaborative_project(
     request: str, tasks: list, checklist: list, candidates: list, org_fingerprint: str,
     project_dir: str, tasks_to_queue: list, auto_resume_count: int = 0, changelog: list = None,
     language: str = "", verify_command: str = "", request_type: str = AGREE_REQUEST_TYPE_SOFTWARE,
+    task_granularity: str = TASK_GRANULARITY_FILE,
 ) -> None:
     """タスクキュー方式による実装・レビューを実行し、その間PROGRESS.mdを
     更新し続ける。新規プロジェクト(`_ask_organization_collaborate`)・
@@ -4506,6 +5102,11 @@ def _run_collaborative_project(
     """
     changelog = list(changelog) if changelog else []
     review_feedback = {}
+    # 仮の判断(実行検証グラウンディングループへの対応): レビュー完了直後の
+    # タスク単位の実行検証(`_run_task_grounding_verification`)で、最大
+    # 試行回数まで解消しなかったファイルの最後の実行結果を記録する。
+    # `review_feedback`と同じ「ミュータブルな辞書をそのまま更新する」設計。
+    grounding_results = {}
     # 仮の判断: 統合検証の結果はクロージャ内(write_progress)から参照する
     # 必要があるが、Pythonの関数はネストしたスコープの単純な代入
     # (verification = ...)ができない(nonlocal宣言が要る)ため、書き換え
@@ -4519,6 +5120,7 @@ def _run_collaborative_project(
             _write_progress_md(
                 project_dir, request, tasks, checklist, review_feedback, auto_resume_count, changelog, language,
                 verify_command=verify_command, verification=verification_holder["result"],
+                grounding_results=grounding_results,
             )
 
     write_progress()
@@ -4529,7 +5131,8 @@ def _run_collaborative_project(
         # 最終的に実装されるようにした。詳しくは同関数のコメントを参照。
         _run_collaborative_task_queue(
             tasks_to_queue, candidates, org_fingerprint, project_dir, checklist,
-            on_update=write_progress, review_feedback=review_feedback,
+            on_update=write_progress, review_feedback=review_feedback, verify_command=verify_command,
+            task_granularity=task_granularity, grounding_results=grounding_results,
         )
 
     # 仮の判断: 統合検証は、未完了タスクが1件でも残っている場合はスキップ
@@ -4621,6 +5224,8 @@ def _run_collaborative_project(
             print(f"[🔍 統合検証: 成功 ({verification_result['attempts']}回目の試行)]")
         else:
             print(f"[🔍 統合検証: 失敗 ({verification_result['attempts']}回試行)]")
+    if grounding_results:
+        print(f"[⚠️ 実行検証(グラウンディング)で解消しなかったタスクがあります: {', '.join(sorted(grounding_results))}]")
     if incomplete_labels:
         print(f"[⚠️ 未完了のタスクが残っています: {', '.join(incomplete_labels)}]")
     elif verification_result is not None and not verification_result["success"]:
@@ -4630,6 +5235,11 @@ def _run_collaborative_project(
         # 判明しているものを完了扱いにすると、依頼の「品質保証の実効性」
         # という趣旨に反するため)。両者を区別できる専用の表示にする。
         print(f"[⚠️ 実装は完了しましたが、統合検証に失敗しています (保存先: {project_dir})]")
+    elif grounding_results:
+        # 仮の判断: 上記と同じ理由(モデルの自己申告・レビューの「合意」
+        # ではなく実行結果を正とする)で、タスク単位の実行検証が最後まで
+        # 解消しなかった場合も「✅ 全タスク完了」を名乗らない。
+        print(f"[⚠️ 実装は完了しましたが、実行検証(グラウンディング)に失敗しているタスクがあります (保存先: {project_dir})]")
     else:
         print(f"[✅ 全タスク完了 (保存先: {project_dir})]")
     write_progress()
@@ -5692,9 +6302,186 @@ def _estimate_task_weight(content: str) -> int:
     return len(content)
 
 
+# ---------------------------------------------------------------------------
+# タスク単位の実行検証グラウンディングループ
+# ---------------------------------------------------------------------------
+#
+# 依頼への対応: `//agree`のタスクキュー方式は、内容レビュー(最大2回、
+# 読むだけで実行はしない)が「問題なし」と判定した時点でそのタスクを
+# 完了扱いにしていた。しかしローカルLLM同士のレビューの「合意」は
+# 実際に動くかどうかとは無関係に、もっともらしい無難な判定に収束
+# しがちである。判定基準を「モデルの合意・自己申告」から「実際の
+# 実行結果(終了コード)」に置き換えるため、レビューが完了した直後に
+# そのタスクの担当ファイルを実際に実行し、失敗すれば生のエラー内容
+# (要約や言い換えではない)をそのまま担当メンバーに渡して修正させ、
+# 再実行する。既存の`_run_integration_verification`(プロジェクト全体・
+# 全タスク完了後に1回だけ)とは責務が異なり、こちらはタスク単位で
+# レビュー完了の直後に行う。
+#
+# 仮の判断: 検証コマンド(`verify_command`)が絞り込み可能な形
+# (`pytest`呼び出し)であり、かつ対象がテストファイルである場合にのみ
+# 意味のある「そのタスクだけ」の実行ができる。それ以外の組み合わせ
+# (検証コマンドが無い・pytest以外・非テストファイル)では、このタスク
+# 単体を安全に切り出して実行する方法が無い(他の未完了ファイルへの
+# 依存で必ず失敗する、あるいはそもそも実行可能な単位に絞り込めない)
+# ため、タスク単位のグラウンディングはスキップし、既存のプロジェクト
+# 全体の統合検証にまかせる。
+#
+# `TASK_GRANULARITY_FILE`・`TASK_GRANULARITY_FUNCTION`は、この関数群より
+# 前の位置(`AGREE_REQUEST_TYPE_SOFTWARE`の定義直後)で定義済み
+# (`_run_collaborative_project`のデフォルト引数から参照されるため)。
+
+# 仮の判断: 既存の「レビューフェーズは最大2回まで」という暴走防止設計
+# (`_review_and_fix_one_file`のクラスコメント参照)、および同じ発想を
+# 踏襲した`MAX_CONTENT_VOLUME_FIX_ATTEMPTS`・`MAX_BROWSER_FRONTEND_FIX_
+# ATTEMPTS`と同じデフォルト値(2回)に合わせる。
+MAX_TASK_GROUNDING_ATTEMPTS = 2
+
+_TEST_FILE_PATTERN = re.compile(r"(^|[\\/])(test_[^\\/]+\.py|[^\\/]+_test\.py)$")
+
+
+def _is_test_file(filename: str) -> bool:
+    return bool(_TEST_FILE_PATTERN.search(filename))
+
+
+_TEST_FUNCTION_NAME_PATTERN = re.compile(r"^def\s+(test_\w+)\s*\(", re.MULTILINE)
+
+
+def _extract_test_function_names(code: str) -> list:
+    """テストファイルのコードから`def test_...(`形式のテスト関数名を、
+    登場順・重複無しで抽出する(「1関数・1テストケース」単位への
+    細分化オプション用)。
+    """
+    seen = set()
+    names = []
+    for name in _TEST_FUNCTION_NAME_PATTERN.findall(code):
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+_PYTEST_INVOCATION_PATTERN = re.compile(r"^(.*?\bpytest\b)")
+
+
+def _pytest_invocation_prefix(verify_command: str):
+    """検証コマンドの先頭が(`pytest`単体・`python3 -m pytest`のように)
+    pytestの呼び出しであれば、その呼び出し部分(パス等の引数を除く)を
+    返す。pytest呼び出しでなければ`None`を返す(絞り込み不可能なため、
+    タスク単位のグラウンディングはスキップする)。
+    """
+    match = _PYTEST_INVOCATION_PATTERN.match((verify_command or "").strip())
+    return match.group(1) if match else None
+
+
+def _build_task_grounding_commands(verify_command: str, filename: str, code: str, task_granularity: str) -> list:
+    """このタスク(1ファイル)を対象に実行すべき検証コマンドの一覧を返す。
+    絞り込めない場合は空リストを返す(呼び出し元はスキップと解釈する)。
+
+    `task_granularity`が`TASK_GRANULARITY_FUNCTION`の場合、テストファイル内の
+    各`test_...`関数を個別のpytestノードID(`ファイル::関数名`)として
+    1件ずつ返す(依頼の「1関数・1テストケース単位まで細分化できる
+    オプション」への対応)。関数が1つも見つからない場合はファイル単位に
+    フォールバックする。
+    """
+    if not _has_verify_command(verify_command) or not _is_test_file(filename):
+        return []
+    prefix = _pytest_invocation_prefix(verify_command)
+    if prefix is None:
+        return []
+    if task_granularity == TASK_GRANULARITY_FUNCTION:
+        function_names = _extract_test_function_names(code)
+        if function_names:
+            return [f"{prefix} {filename}::{name}" for name in function_names]
+    return [f"{prefix} {filename}"]
+
+
+_TASK_GROUNDING_FIX_PROMPT_TEMPLATE = """あなたはこのタスクの実装担当です。あなたが実装した{filename}を実際に実行(テスト)したところ、以下のコマンドが失敗しました。
+
+【実装計画全体】
+{full_plan}
+
+【実行したコマンド】
+{command}
+
+【終了コード】
+{returncode}
+
+【出力(要約や言い換えではない、実際のエラーメッセージ・スタックトレース)】
+{output}
+
+「これで動くはずです」のような自己申告ではなく、この実行結果そのものを踏まえて直してください。read_file・search_in_fileで現在の内容を確認してから、edit_file・write_fileで修正してください。{edit_over_write_guidance}
+
+修正が完了したら、最後にツールを呼び出さずに、何が原因で何を直したかを簡潔な日本語の文章で報告してください。
+"""
+
+
+def _build_task_grounding_fix_prompt(filename: str, full_plan: str, command: str, run_result: dict) -> str:
+    output = run_result.get("output")
+    if output is None:
+        output = run_result.get("message", "(出力はありません)")
+    return _TASK_GROUNDING_FIX_PROMPT_TEMPLATE.format(
+        filename=filename, full_plan=full_plan, command=command, returncode=run_result.get("returncode", "不明"),
+        output=output, edit_over_write_guidance=f" {_EDIT_OVER_WRITE_GUIDANCE}",
+    )
+
+
+def _run_task_grounding_verification(
+    filename: str, code: str, full_plan: str, verify_command: str, owner: dict, org_fingerprint: str,
+    project_dir: str, print_lock: threading.Lock = None, task_granularity: str = TASK_GRANULARITY_FILE,
+    max_attempts: int = MAX_TASK_GROUNDING_ATTEMPTS,
+) -> tuple:
+    """このタスク(1ファイル)を実際に実行して検証する。モデルの
+    自己申告やレビューの「合意」ではなく、実行結果(終了コード)だけで
+    機械的に成否を判定する。失敗した場合は生のエラー出力をそのまま
+    担当メンバー(`owner`)への修正依頼に含め、再実行する。既存の
+    レビュー往復・内容量チェック等と同じ「実行して失敗したら直す」
+    ループの構造を踏襲し、暴走防止のため`max_attempts`回で打ち切る。
+
+    `(検証を実施したか, 成功したか(未実施の場合はTrue扱い), 最後の
+    出力(成功/未実施の場合は空文字列), 試行回数(未実施の場合は0))`
+    を返す。
+    """
+    commands = _build_task_grounding_commands(verify_command, filename, code, task_granularity)
+    if not commands:
+        return False, True, "", 0
+
+    last_output = ""
+    for attempt in range(1, max_attempts + 1):
+        failed_command, failed_result = None, None
+        for command in commands:
+            run_result = json.loads(_run_project_command(project_dir, command))
+            if not run_result.get("ok"):
+                failed_command, failed_result = command, run_result
+                break  # fail-fast: 最初に失敗したコマンド(関数)の生の出力だけを使う
+
+        if failed_command is None:
+            return True, True, "", attempt
+
+        last_output = failed_result.get("output")
+        if last_output is None:
+            last_output = failed_result.get("message", "")
+        if attempt >= max_attempts:
+            break
+
+        _print_tagged(
+            print_lock, filename,
+            f"[❌ {filename}: `{failed_command}` が終了コード{failed_result.get('returncode', '?')}で"
+            f"失敗しました。{owner['label']}に修正を依頼します ({attempt}回目/{max_attempts}回)]",
+        )
+        fix_prompt = _build_task_grounding_fix_prompt(filename, full_plan, failed_command, failed_result)
+        _collect_answer_with_project_tools(
+            owner, org_fingerprint, [{"role": "user", "content": fix_prompt}], project_dir,
+        )
+        _print_tagged(print_lock, filename, f"[🔍 {filename}: `{failed_command}` を再実行します]")
+
+    return True, False, last_output, max_attempts
+
+
 def _run_collaborative_task_queue(
     tasks: list, candidates: list, org_fingerprint: str, project_dir: str, checklist: list,
-    on_update: callable = None, review_feedback: dict = None,
+    on_update: callable = None, review_feedback: dict = None, verify_command: str = "",
+    task_granularity: str = TASK_GRANULARITY_FILE, grounding_results: dict = None,
 ) -> None:
     """合意フェーズで確定した全タスクを待ち行列(キュー)として扱い、
     メンバーの実装+レビューが完了するたびに次のタスクを割り当てながら
@@ -5741,6 +6528,19 @@ def _run_collaborative_task_queue(
     存在しないため`research_notes`は空文字列のままで、既存の挙動は変わらない
     (`_build_collaborative_implementation_request`は空文字列の場合セクション
     ごと省略する)。
+
+    実行検証グラウンディングループへの対応: `verify_command`を渡すと、
+    レビューが完了する(合否によらず)たびに`_run_task_grounding_
+    verification`でそのタスクを実際に実行して検証する(絞り込めない
+    組み合わせの場合は自動的にスキップされる。詳細は同関数のコメント
+    参照)。`task_granularity`(既定`TASK_GRANULARITY_FILE`)に
+    `TASK_GRANULARITY_FUNCTION`を渡すと、テストファイル内の関数
+    単位まで細分化して実行する。`grounding_results`(dict、
+    `{filename: {"output":, "attempts":}}`)を渡すと、最大試行回数まで
+    解消しなかったファイルの最後の実行結果がそこに記録され、解消すれば
+    そのファイルのエントリは削除される(`review_feedback`と同じ設計)。
+    どちらも既定値(空文字列・`None`)の場合は、既存の呼び出し元・
+    テストとの後方互換性のため何もしない(=このループは動かない)。
     """
     full_plan = "\n".join(f"{fn}: {content}" for fn, content in tasks)
     remaining = sorted(tasks, key=lambda t: _estimate_task_weight(t[1]), reverse=True)
@@ -5909,6 +6709,34 @@ def _run_collaborative_task_queue(
                         review_feedback.pop(filename, None)
                     else:
                         review_feedback[filename] = feedback
+            if on_update:
+                on_update()
+
+            # 実行検証グラウンディングループ: レビューの合否によらず、
+            # 「実際に動くか」はレビュー(読むだけ)とは独立の観点なので
+            # ここで必ず行う。レビューによる修正があれば`dest_path`には
+            # 既に最新のコードが書き込まれている(`_request_fix`参照)ため、
+            # ディスクから読み直して最新の内容を使う。
+            grounding_ran, grounding_ok, grounding_output, grounding_attempts = False, True, "", 0
+            if _has_verify_command(verify_command):
+                try:
+                    with open(dest_path, encoding="utf-8") as f:
+                        current_code = f.read()
+                except OSError:
+                    current_code = code
+                _ACTIVE_STATUS_BOARD.set(candidate["label"], _DEVICE_STATUS_WORKING, f"{filename} を実行検証中")
+                grounding_ran, grounding_ok, grounding_output, grounding_attempts = _run_task_grounding_verification(
+                    filename=filename, code=current_code, full_plan=full_plan, verify_command=verify_command,
+                    owner=candidate, org_fingerprint=org_fingerprint, project_dir=project_dir,
+                    print_lock=print_lock, task_granularity=task_granularity,
+                )
+                _ACTIVE_STATUS_BOARD.set(candidate["label"], _DEVICE_STATUS_WAITING)
+            if grounding_ran and grounding_results is not None:
+                with queue_lock:
+                    if grounding_ok:
+                        grounding_results.pop(filename, None)
+                    else:
+                        grounding_results[filename] = {"output": grounding_output, "attempts": grounding_attempts}
             if on_update:
                 on_update()
 
@@ -8754,6 +9582,8 @@ def _format_startup_banner(out_dir: str, member_count, use_color: bool) -> str:
         f"  {MULTI_QUERY_COMMAND} <質問文>: 空きリソース上位{MULTI_QUERY_TARGET_COUNT}台に同時に質問",
         f"  {AGREE_COMMAND} <制作依頼>: 対話プロトコルによる事前すり合わせを経て協業モードで実装",
         f"  {PLAN_ONLY_COMMAND} <依頼>: 対話プロトコルで計画のみ議論し、実装せず計画書を出力",
+        f"  {VISION_COMMAND} <依頼>: 類似OSSを調査し、実現可能性を問わず要件を洗い出す",
+        f"    (実装は行わず{VISION_BACKLOG_FILENAME}として出力します)",
         f"  {FIX_PROJECT_COMMAND} <修正依頼>: 完成済みプロジェクトの一部を修正(プロジェクト名を",
         f"    先頭に付けて{FIX_PROJECT_COMMAND} <プロジェクト名>: <修正依頼>のように明示指定も可能)",
         f"    ({FIX_PROJECT_COMMAND}後は修正セッションが始まり、続けてコマンド無しで話しかけても",
@@ -8949,6 +9779,7 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                 text.startswith(RESUME_ALL_COMMAND) or text.startswith(AGREE_COMMAND)
                 or text.startswith(PLAN_ONLY_COMMAND) or text.startswith(FIX_PROJECT_COMMAND)
                 or text.startswith(PARALLEL_QUERY_COMMAND) or text.startswith(MULTI_QUERY_COMMAND)
+                or text.startswith(VISION_COMMAND)
             ):
                 pending_design_box.take()
                 print("[🧭 新しいコマンドが入力されたため、一時停止中だった合意フェーズの再開待ちを終了しました]")
@@ -8996,6 +9827,20 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                     lambda plan_request=plan_request, text=text: _run_job_with_conversation_log(
                         messages, text,
                         lambda: _ask_organization_plan_only(port, org_fingerprint, plan_request, out_dir),
+                    ),
+                    queued_notice=_BACKGROUND_QUEUED_NOTICE,
+                )
+                continue
+
+            if text.startswith(VISION_COMMAND):
+                vision_request = text[len(VISION_COMMAND):].strip()
+                if not vision_request:
+                    print(f"使い方: {VISION_COMMAND} <検討したい依頼>  (例: {VISION_COMMAND} ToDoリストのCLIツールを作って)")
+                    continue
+                job_runner.submit(
+                    lambda vision_request=vision_request, text=text: _run_job_with_conversation_log(
+                        messages, text,
+                        lambda: _ask_organization_vision(port, org_fingerprint, vision_request, out_dir),
                     ),
                     queued_notice=_BACKGROUND_QUEUED_NOTICE,
                 )
