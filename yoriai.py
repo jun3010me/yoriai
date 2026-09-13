@@ -132,6 +132,7 @@ from progress import (
     _TASK_STATUS_COMPLETED,
     _TASK_STATUS_IN_PROGRESS,
     _build_task_checklist,
+    _extract_progress_section,
     _find_incomplete_projects,
     _find_repeated_review_feedback,
     _format_task_checklist,
@@ -3091,6 +3092,7 @@ def _resume_organization_collaborate(
     _run_collaborate_implementation_phase(
         pending.request, answer, pending.candidates, pending.org_fingerprint, pending.project_dir, pending.port,
         completed_box=completed_box, request_type=pending.request_type, task_granularity=pending.task_granularity,
+        enable_gap_critique=pending.enable_gap_critique,
     )
 
 
@@ -3520,7 +3522,7 @@ class _PendingDesignDialogue:
     def __init__(
         self, port: int, org_fingerprint: str, request: str, candidates: list, project_dir: str, result: dict,
         request_type: str = AGREE_REQUEST_TYPE_SOFTWARE, research_notes: str = "",
-        task_granularity: str = TASK_GRANULARITY_FILE,
+        task_granularity: str = TASK_GRANULARITY_FILE, enable_gap_critique: bool = False,
     ):
         self.port = port
         self.org_fingerprint = org_fingerprint
@@ -3540,6 +3542,10 @@ class _PendingDesignDialogue:
         # `_ask_organization_collaborate`が解釈した結果を再開時
         # (`_resume_organization_collaborate`)まで引き継ぐ。
         self.task_granularity = task_granularity
+        # 仮の判断(Gap批評エージェントへの対応): `enable_gap_critique`
+        # (対話モードのREPLから実際に呼ばれた場合のみ`True`)も同様に、
+        # 一時停止・再開をまたいで引き継ぐ。
+        self.enable_gap_critique = enable_gap_critique
 
 
 class _PendingDesignDialogueBox:
@@ -3631,7 +3637,7 @@ class _CompletedBuildBox:
 def _run_collaborate_implementation_phase(
     request: str, answer: str, candidates: list, org_fingerprint: str, project_dir: str, port: int,
     completed_box: "_CompletedBuildBox" = None, request_type: str = AGREE_REQUEST_TYPE_SOFTWARE,
-    task_granularity: str = TASK_GRANULARITY_FILE,
+    task_granularity: str = TASK_GRANULARITY_FILE, enable_gap_critique: bool = False,
 ) -> None:
     """合意フェーズ(対話プロトコルによる複数ラウンドの議論・設計担当1名への
     1回きりの相談・一時停止後に人間の回答を踏まえて再開した議論、のいずれ
@@ -3705,6 +3711,22 @@ def _run_collaborate_implementation_phase(
     # 呼ばない(依頼の要件5: 手動実行はこの試行回数カウンタと無関係に
     # 何度でもできるようにする、という区別を素直に実装するため)。
     _maybe_auto_resume(project_dir, port, org_fingerprint)
+
+    # 仮の判断(Gap批評エージェントへの対応): `enable_gap_critique`の既定は
+    # `False`(既存の呼び出し元・テストとの後方互換性のため。この関数を
+    # 直接呼ぶ既存テストの多くは生成物一覧・出力文言を厳密に比較しており、
+    # 新たにBACKLOG.mdが生成されたり、モック未対応のweb_search/LLM問い
+    # 合わせが余分に発生したりすると壊れてしまう)。`True`は、対話モードの
+    # REPLから実際に`//agree`・自動判定で呼ばれる場合にのみ渡す。「実装
+    # 完了ごとに」起動するため、自動再開後のディスク上の最新状態
+    # (`_maybe_auto_resume`がタスクを完遂させた可能性がある)を正として、
+    # 全タスク(実装・レビュー)が完了している場合にのみ実行する(未完了の
+    # まま振り返りを行っても、まだ存在しないファイルについて批評すること
+    # になり無意味なため)。
+    if enable_gap_critique:
+        parsed_after_completion = _parse_progress_markdown(os.path.join(project_dir, PROGRESS_FILENAME))
+        if parsed_after_completion is not None and not _progress_checklist_is_incomplete(parsed_after_completion["checklist"]):
+            _run_gap_critique_phase(request, tasks, candidates, org_fingerprint, project_dir, language=language)
 
     # 仮の判断: 自動再開でタスクが完遂したかどうかに関わらず、この時点で
     # `project_dir`にはPROGRESS.mdを含む実在のプロジェクトが出来ている
@@ -4130,6 +4152,337 @@ def _ask_organization_vision(port: int, org_fingerprint: str, request: str, out_
     print(backlog)
 
 
+# ---------------------------------------------------------------------------
+# Gap批評エージェント(成長するバックログ、収束判定つき)
+# ---------------------------------------------------------------------------
+#
+# 依頼への対応: 一通り完成した後、「もっと良くするには何が必要か」を
+# 問い直す振り返り工程が存在しない。実装完了ごとに「Gap批評エージェント」を
+# 起動し、実際にできあがった成果物を見た上で改善提案を洗い出す。
+#
+# 重要(依頼の注意書きへの対応): この工程はタスク単位の実行検証
+# グラウンディングループ(`_run_task_grounding_verification`、正しく動くかの
+# 判定)とは目的が異なる。同じエージェント人格・同じプロンプトに両方を
+# やらせないよう、プロンプトテンプレート・関数を完全に分離し、Gap批評の
+# プロンプトでは「実際に動くかどうかの検証はあなたの役割ではない」ことを
+# 明示する(`tests/test_gap_critique.py`の分離テストで、両者のソース同士が
+# 互いを呼んでいないことも確認する)。
+#
+# 「もっと」を無限に続けさせないため、固定回数ではなく収束判定(新規性の
+# ある指摘が出なくなったら終了)を基準にする。既存の「レビューフェーズは
+# 最大2回まで」という暴走防止設計と同じ発想で、収束しなかった場合の保険
+# として固定回数の上限も別途持たせる。
+
+MAX_GAP_CRITIQUE_CYCLES = 5
+
+# 仮の判断: 依頼の「複数回(デフォルト2〜3回)」の下限側(2回)を既定値と
+# する。新規性のある指摘がこの回数連続で出なければ「十分」と判定する。
+GAP_CRITIQUE_CONVERGENCE_STREAK = 2
+
+# 仮の判断(依頼の「実装N件ごとに1回、のような間引き設定」への対応):
+# PR2のVision agent・リサーチフェーズが既にこのプロジェクトを調査済み
+# (`research_notes.md`が存在する)場合、Gap批評の呼び出しがこの回数に
+# 達するたびにだけ外部比較を新規に検索し直す(それ以外の回は既存の
+# 調査結果をそのまま再利用する)。調査済みでない場合は毎回検索する。
+GAP_CRITIQUE_EXTERNAL_REFERENCE_REFRESH_INTERVAL = 3
+
+GAP_BACKLOG_FILENAME = "BACKLOG.md"
+_GAP_BACKLOG_SECTION_VALUABLE = "## 価値あり(実装エージェントに戻し済み)"
+_GAP_BACKLOG_SECTION_MARGINAL = "## 限界的(記録のみ)"
+
+_GAP_CRITIQUE_PROMPT_TEMPLATE = """あなたは「Gap批評エージェント」として、既に完成した成果物を見て、もっと良くするには何が必要かを考える役割です。
+
+重要: あなたの役割は、この成果物が実際に動くかどうか(構文エラー・実行時エラー・テストの成否)を検証することではありません。それは既に別の担当(実行検証)が行っています。あなたは動作の正しさではなく、機能・完成度としての「もっと」だけを考えてください。
+
+【依頼内容】
+{request}
+
+【完成した成果物】
+{artifact_text}
+
+【類似する既存プロジェクトとの比較(規模感の参考にしてください)】
+{external_reference}
+
+【これまでに挙がった指摘(これらと実質的に同じ内容は繰り返さないでください)】
+{known_suggestions}
+
+上記を踏まえて、この成果物を見た今、もっと良くするには何が必要かを箇条書きで具体的に列挙してください。
+
+出力の各行は、次のいずれかの形式にしてください:
+- [価値あり] <実装する価値がある具体的な改善提案>
+- [限界的] <記録には値するが、今実装するほどではない提案>
+
+新規の指摘が無い場合は、他に何も書かず「追加の指摘はありません」とだけ出力してください。
+"""
+
+
+def _build_gap_critique_prompt(request: str, artifact_text: str, external_reference: str, known_suggestions: list) -> str:
+    return _GAP_CRITIQUE_PROMPT_TEMPLATE.format(
+        request=request, artifact_text=artifact_text,
+        external_reference=external_reference or "(比較材料はありません。一般的な知識に基づいて判断してください)",
+        known_suggestions="\n".join(f"- {s}" for s in known_suggestions) if known_suggestions else "(まだありません)",
+    )
+
+
+_GAP_SUGGESTION_LINE_PATTERN = re.compile(r"^-\s*\[(価値あり|限界的)\]\s*(.+)$")
+
+
+def _parse_gap_critique_suggestions(text: str) -> list:
+    """Gap批評エージェントの出力から、`[価値あり]`/`[限界的]`のタグ付き
+    指摘を`(判定, 指摘内容)`のタプルのリストとして抽出する。タグが付いて
+    いない行(前置き・後書きの説明文、「追加の指摘はありません」等)は
+    無視する。
+    """
+    suggestions = []
+    for line in (text or "").splitlines():
+        match = _GAP_SUGGESTION_LINE_PATTERN.match(line.strip())
+        if match:
+            verdict, suggestion = match.groups()
+            suggestion = suggestion.strip()
+            if suggestion:
+                suggestions.append((verdict, suggestion))
+    return suggestions
+
+
+def _normalize_gap_suggestion_text(text: str) -> str:
+    """指摘文言の比較用正規化(空白の違いを無視する)。既存のレビュー
+    往復の早期エスカレーション(`_find_repeated_review_feedback`)と同じ
+    「文言の一字一句比較」ベースの単純な判定にする(厳密な意味理解までは
+    求めない)。
+    """
+    return re.sub(r"\s+", "", text or "")
+
+
+def _filter_novel_gap_suggestions(suggestions: list, known_suggestion_texts: set) -> list:
+    """`suggestions`(`_parse_gap_critique_suggestions`の戻り値)のうち、
+    `known_suggestion_texts`(正規化済みの、既存のバックログ・過去の批評
+    結果に含まれる指摘文言の集合)と実質的に重複しないものだけを返す。
+    """
+    novel = []
+    for verdict, suggestion in suggestions:
+        normalized = _normalize_gap_suggestion_text(suggestion)
+        if normalized and normalized not in known_suggestion_texts:
+            novel.append((verdict, suggestion))
+    return novel
+
+
+def _run_gap_critique_loop(
+    critic: dict, org_fingerprint: str, request: str, artifact_text: str, external_reference: str = "",
+    initial_known_suggestions: list = None, max_cycles: int = MAX_GAP_CRITIQUE_CYCLES,
+    convergence_streak: int = GAP_CRITIQUE_CONVERGENCE_STREAK,
+) -> dict:
+    """Gap批評エージェント(`critic`)に、完成した成果物(`artifact_text`)を
+    見せて「もっと良くするには何が必要か」を複数サイクル問い直し、新規性の
+    ある指摘が`convergence_streak`回連続で出なくなった時点で収束と判定して
+    打ち切る。収束判定が機能しなかった場合の保険として、`max_cycles`回に
+    達したら(収束していなくても)必ず打ち切る(暴走防止)。
+
+    `initial_known_suggestions`(既存のバックログ・過去の批評結果の指摘
+    文言のリスト)を渡すと、それらと実質的に重複する指摘は新規性なしとして
+    扱われる(依頼の「既存のバックログや過去の批評結果と重複しない提案」の
+    判定)。
+
+    戻り値は`{"converged": bool, "cycles": int, "valuable_tasks": list,
+    "marginal_notes": list}`。`valuable_tasks`は「価値あり」と判定された
+    新規の指摘(実装エージェントに戻すべきタスク)、`marginal_notes`は
+    「限界的」と判定された新規の指摘(記録のみ)。
+
+    仮の判断: 問い合わせ自体が失敗した場合(`error`またはモデルからの
+    応答なし)は、それ以上の批評サイクルを継続する意味が無いため、
+    その時点で(収束していなくても)打ち切る。Gap批評は`//agree`の完了
+    条件ではなく、あくまで任意の振り返り工程のため、統合検証等とは異なり
+    修正を試みたり再試行したりはしない。
+    """
+    known_display = list(initial_known_suggestions or [])
+    known_texts = {_normalize_gap_suggestion_text(s) for s in known_display}
+    valuable_tasks = []
+    marginal_notes = []
+    no_novelty_streak = 0
+    cycles_run = 0
+
+    for cycle in range(1, max_cycles + 1):
+        cycles_run = cycle
+        prompt = _build_gap_critique_prompt(request, artifact_text, external_reference, known_display)
+        answer, error, _truncated = _collect_answer_from_candidate(
+            critic, org_fingerprint, [{"role": "user", "content": prompt}], disable_web_search=True,
+        )
+        if error or not answer:
+            break
+
+        novel = _filter_novel_gap_suggestions(_parse_gap_critique_suggestions(answer), known_texts)
+        if not novel:
+            no_novelty_streak += 1
+            if no_novelty_streak >= convergence_streak:
+                return {
+                    "converged": True, "cycles": cycles_run,
+                    "valuable_tasks": valuable_tasks, "marginal_notes": marginal_notes,
+                }
+            continue
+
+        no_novelty_streak = 0
+        for verdict, suggestion in novel:
+            known_texts.add(_normalize_gap_suggestion_text(suggestion))
+            known_display.append(suggestion)
+            if verdict == "価値あり":
+                valuable_tasks.append(suggestion)
+            else:
+                marginal_notes.append(suggestion)
+
+    return {
+        "converged": False, "cycles": cycles_run,
+        "valuable_tasks": valuable_tasks, "marginal_notes": marginal_notes,
+    }
+
+
+def _read_gap_backlog(project_dir: str) -> dict:
+    """`project_dir`直下の`BACKLOG.md`(存在すれば)を読み込み、
+    `{"valuable": [...], "marginal": [...]}`として返す。存在しない・
+    読み込めない場合は両方とも空リスト。
+    """
+    path = os.path.join(project_dir, GAP_BACKLOG_FILENAME)
+    if not os.path.exists(path):
+        return {"valuable": [], "marginal": []}
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return {"valuable": [], "marginal": []}
+    return {
+        "valuable": _parse_bullet_lines(_extract_progress_section(text, _GAP_BACKLOG_SECTION_VALUABLE)),
+        "marginal": _parse_bullet_lines(_extract_progress_section(text, _GAP_BACKLOG_SECTION_MARGINAL)),
+    }
+
+
+def _format_gap_backlog_markdown(valuable: list, marginal: list) -> str:
+    lines = ["# 成長するバックログ(Gap批評エージェント)", "", _GAP_BACKLOG_SECTION_VALUABLE, ""]
+    lines.extend(f"- {item}" for item in valuable) if valuable else lines.append("(なし)")
+    lines.append("")
+    lines.append(_GAP_BACKLOG_SECTION_MARGINAL)
+    lines.append("")
+    lines.extend(f"- {item}" for item in marginal) if marginal else lines.append("(なし)")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _write_gap_backlog_md(project_dir: str, result: dict) -> None:
+    """Gap批評エージェントの結果(`_run_gap_critique_loop`の戻り値)を
+    `BACKLOG.md`に記録する。依頼の「成長するバックログ」に対応するため、
+    既存の`BACKLOG.md`(前回までの実行分)があれば読み込み、新規の指摘を
+    追記して書き戻す(上書きではなく蓄積)。
+    """
+    existing = _read_gap_backlog(project_dir)
+    valuable = existing["valuable"] + result["valuable_tasks"]
+    marginal = existing["marginal"] + result["marginal_notes"]
+    _write_project_file(project_dir, GAP_BACKLOG_FILENAME, _format_gap_backlog_markdown(valuable, marginal))
+
+
+def _gap_critique_should_refresh_external_reference(
+    implementation_count: int, has_prior_research: bool,
+    refresh_interval: int = GAP_CRITIQUE_EXTERNAL_REFERENCE_REFRESH_INTERVAL,
+) -> bool:
+    """依頼の「PR2のVision agentで既に調査済みの場合は、この工程の実行
+    頻度を下げる設定(例: 実装N件ごとに1回)」への対応。事前の調査結果が
+    無い場合は、比較材料が無いと批評の質が下がるため毎回検索する。事前の
+    調査結果がある場合は、`implementation_count`が`refresh_interval`の
+    倍数になったときだけ検索し直す(それ以外は既存の調査結果を再利用する
+    ことでコストを抑える)。
+    """
+    if not has_prior_research:
+        return True
+    return implementation_count % refresh_interval == 0
+
+
+def _read_all_task_files_for_critique(project_dir: str, tasks: list) -> str:
+    """完成した成果物を、Gap批評エージェントへのプロンプトに埋め込める
+    1つのテキストにまとめる(`_check_content_volume`と同じ、ファイル名で
+    見出しを立てて連結する簡易的な方式)。読み込めなかったファイルは
+    スキップする。
+    """
+    blocks = []
+    for filename, _content_desc in tasks:
+        safe_path, error = _resolve_safe_project_path(project_dir, filename)
+        if error:
+            continue
+        try:
+            with open(safe_path, encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            continue
+        blocks.append(f"--- {filename} ---\n{text}")
+    return "\n\n".join(blocks)
+
+
+# 仮の判断: プロセス生存期間内でのGap批評の呼び出し回数を数えるだけの
+# 単純なカウンタ(`_gap_critique_should_refresh_external_reference`の
+# `implementation_count`用)。永続化はしない(プロセス再起動で0に戻る)。
+# 複数プロジェクトを跨いだ正確な回数よりも、「毎回は検索し直さない」という
+# 間引きの目的を満たせれば十分なため、この単純さで割り切る。
+_GAP_CRITIQUE_INVOCATION_COUNTER = [0]
+
+
+def _run_gap_critique_phase(
+    request: str, tasks: list, candidates: list, org_fingerprint: str, project_dir: str, language: str = "",
+    max_cycles: int = MAX_GAP_CRITIQUE_CYCLES, convergence_streak: int = GAP_CRITIQUE_CONVERGENCE_STREAK,
+) -> dict:
+    """実装完了ごとに呼び出す、Gap批評エージェントの入口。既存のバックログ・
+    過去の批評結果を読み込んで重複除外の材料にしたうえで`_run_gap_critique_
+    loop`を実行し、結果を`BACKLOG.md`に記録する。「価値がある」と判定
+    された指摘は、既存の`//fix`のタスク分割(`_run_fix_task_queue`)に
+    そのまま渡して実装エージェントに戻す(車輪の再発明をせず、実績のある
+    既存の修正パイプラインを再利用する)。「限界的」と判定された指摘は
+    `BACKLOG.md`への記録のみで完了扱いとする(再実装はしない)。
+    """
+    _GAP_CRITIQUE_INVOCATION_COUNTER[0] += 1
+    implementation_count = _GAP_CRITIQUE_INVOCATION_COUNTER[0]
+
+    critic = candidates[0]
+    full_plan = "\n".join(f"{fn}: {content}" for fn, content in tasks)
+    artifact_text = _read_all_task_files_for_critique(project_dir, tasks)
+    known_backlog = _read_gap_backlog(project_dir)
+    known_suggestions = known_backlog["valuable"] + known_backlog["marginal"]
+
+    research_notes_path = os.path.join(project_dir, "research_notes.md")
+    has_prior_research = os.path.exists(research_notes_path)
+    if _gap_critique_should_refresh_external_reference(implementation_count, has_prior_research):
+        external_reference = _run_external_reference_search(request)
+    else:
+        try:
+            with open(research_notes_path, encoding="utf-8") as f:
+                external_reference = f.read()
+        except OSError:
+            external_reference = ""
+
+    print(f"[🔭 Gap批評エージェント開始: {critic['label']}さんが成果物を見て改善点を洗い出しています...]")
+    result = _run_gap_critique_loop(
+        critic, org_fingerprint, request, artifact_text, external_reference,
+        initial_known_suggestions=known_suggestions, max_cycles=max_cycles, convergence_streak=convergence_streak,
+    )
+    _write_gap_backlog_md(project_dir, result)
+
+    if result["converged"]:
+        print(f"[🔭 Gap批評: {result['cycles']}サイクルで収束しました]")
+    else:
+        print(f"[🔭 Gap批評: 上限の{max_cycles}サイクルに達したため打ち切りました]")
+    print(
+        f"[🔭 Gap批評: 価値ありと判定された指摘 {len(result['valuable_tasks'])}件、"
+        f"限界的と判定された指摘 {len(result['marginal_notes'])}件 ({GAP_BACKLOG_FILENAME}に記録しました)]"
+    )
+
+    if result["valuable_tasks"]:
+        print(f"[🔭 Gap批評: 価値ありと判定された{len(result['valuable_tasks'])}件を実装エージェントに戻します]")
+        file_list = _list_project_files(project_dir)
+        parsed = {
+            "request": request, "tasks": tasks, "checklist": _build_task_checklist(tasks),
+            "language": language, "auto_resume_count": 0, "changelog": [],
+        }
+        _run_fix_task_queue(
+            result["valuable_tasks"], candidates, org_fingerprint, project_dir, request, parsed, full_plan,
+            file_list, language,
+        )
+
+    return result
+
+
 # 仮の判断(実行検証グラウンディングループへの対応・タスク粒度オプション):
 # `//agree`の依頼文の末尾にこのフラグを付けると、タスクキュー方式の
 # 実行検証グラウンディングループ(`_run_task_grounding_verification`)が
@@ -4196,6 +4549,17 @@ def _ask_organization_collaborate(
     ループを関数単位まで細分化する(`_extract_task_granularity_flag`
     参照)。プロジェクト名・設計担当への依頼文には、取り除いた後の
     (フラグを含まない)依頼文を使う。
+
+    仮の判断(Gap批評エージェントへの対応): この関数自身は
+    `enable_gap_critique`という独立した引数を持たない。`_ask_organization_
+    collaborate`をテスト側で丸ごと差し替える既存テストが多数あり
+    (`tests/test_background_collaborate.py`等)、固定シグネチャの
+    スタブ関数に呼び出し側から新しいキーワード引数を渡すと`TypeError`に
+    なってしまうため。代わりに、既存の`enable_dialogue`(対話モードの
+    REPLから実際に呼ばれる場合のみ`True`、直接呼び出す既存テストの多くは
+    既定の`False`のまま)をそのままGap批評の有効/無効の判定に流用する
+    (`_run_collaborate_implementation_phase`への橋渡し時、および
+    `_PendingDesignDialogue`への格納時)。
     """
     task_granularity, request = _extract_task_granularity_flag(request)
     data = _fetch_org_snapshot(port, org_fingerprint)
@@ -4247,7 +4611,7 @@ def _ask_organization_collaborate(
             ):
                 pending_box.set(_PendingDesignDialogue(
                     port, org_fingerprint, request, candidates, project_dir, dialogue_result,
-                    request_type, research_notes, task_granularity,
+                    request_type, research_notes, task_granularity, enable_dialogue,
                 ))
             return
     else:
@@ -4278,7 +4642,7 @@ def _ask_organization_collaborate(
 
     _run_collaborate_implementation_phase(
         request, answer, candidates, org_fingerprint, project_dir, port, completed_box=completed_box,
-        request_type=request_type, task_granularity=task_granularity,
+        request_type=request_type, task_granularity=task_granularity, enable_gap_critique=enable_dialogue,
     )
 
 
