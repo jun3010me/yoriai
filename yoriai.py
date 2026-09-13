@@ -3945,6 +3945,191 @@ def _run_research_phase(researcher: dict, org_fingerprint: str, request: str, pr
     return notes
 
 
+# ---------------------------------------------------------------------------
+# 事前調査付きVisionエージェント(実現可能性を問わない要件洗い出し)
+# ---------------------------------------------------------------------------
+#
+# 依頼への対応: 新しいツール/コンテンツの計画は、外部の参照点なしに
+# 「ゼロから」立てられており、結果として実現可能性を無意識に織り込んだ
+# 小さい計画になりやすい。計画を立てる前に類似の既存プロジェクトを調査し、
+# 規模感のアンカーを与えることで、より発展的な計画を立てられるようにする。
+# 既存の`_classify_agree_request_type`のような実装寄りの分類ロジックとは
+# 完全に切り離す(Vision agentの出力はこの分類の結果によってフィルタ
+# されない)。実現可能性を問わず要件を洗い出すことに専念させるため、
+# `//vision`という独立したコマンドとして実装する(既存の`//agree`・
+# `//plan-only`とは別物で、実装フェーズへは一切進まない)。出力
+# (バックログ)は`VISION_BACKLOG.md`として保存し、人間がそのまま(または
+# 取捨選択したうえで)`//agree`への依頼文に含めて使うことを想定する。
+
+VISION_COMMAND = "//vision"
+
+_VISION_AGENT_REQUIRED_CATEGORIES = (
+    "コア機能", "エラーハンドリング", "設定管理", "ログ", "CLI/UI", "ドキュメント", "テスト",
+)
+
+VISION_BACKLOG_FILENAME = "VISION_BACKLOG.md"
+
+
+def _build_vision_agent_search_queries(request: str) -> list:
+    """依頼内容から、類似OSSプロジェクト・関連GitHubリポジトリを探すための
+    検索クエリを組み立てる。厳密な自然言語理解は行わず、依頼文をそのまま
+    キーワードとして使う簡易的な組み立て(`_extract_research_keywords`の
+    コメントと同じ「厳密な意味理解までは求めない」という方針)。
+    """
+    return [f"{request} 類似 OSS プロジェクト", f"{request} GitHub リポジトリ"]
+
+
+def _format_external_references_for_prompt(search_results_by_query: dict) -> str:
+    """`{検索クエリ: web_searchの結果のリスト}`の辞書を、Vision agentへの
+    プロンプトに埋め込む1つのテキストにまとめる。
+
+    仮の判断: いずれのクエリでも結果が1件も得られなかった場合、空文字列
+    ではなく明示的にその旨を書く(`_RESEARCH_NO_RESULTS_MESSAGE`と同じ
+    考え方: Vision agent側が「検索していない」と誤読して規模感の参考なしに
+    要件を洗い出してしまうことを避け、代わりに一般的な知識で判断するよう
+    明示的に促す)。
+    """
+    lines = []
+    any_results = False
+    for query, results in search_results_by_query.items():
+        lines.append(f"### 検索クエリ: {query}")
+        if not results:
+            lines.append("(検索結果は得られませんでした)")
+        else:
+            any_results = True
+            for r in results:
+                lines.append(f"- {r.get('title', '')} ({r.get('url', '')})")
+                snippet = r.get("snippet", "")
+                if snippet:
+                    lines.append(f"  {snippet}")
+        lines.append("")
+    if not any_results:
+        lines.append(
+            "(いずれのクエリでも類似プロジェクトの検索結果は得られませんでした。"
+            "一般的な知識に基づいて規模感を判断してください)"
+        )
+    return "\n".join(lines).strip()
+
+
+def _run_external_reference_search(request: str) -> str:
+    """`_build_vision_agent_search_queries`が組み立てたクエリで
+    `web_search`(SearXNG経由)を呼び出し、Vision agentへのプロンプトに
+    埋め込める形式のテキストにまとめて返す。`web_search`自体が検索失敗を
+    例外にせず空リストで返す設計のため、この関数も例外を投げない。
+    """
+    queries = _build_vision_agent_search_queries(request)
+    search_results_by_query = {query: web_search(query) for query in queries}
+    return _format_external_references_for_prompt(search_results_by_query)
+
+
+_VISION_AGENT_PROMPT_TEMPLATE = """あなたは「Vision agent」として、これから作るものの要件を、実現できるかどうかを一切気にせず洗い出す役割です。実装の難易度・工数・チームの人数といった実現可能性は考慮せず、「本当にあるべき機能は何か」だけを基準に検討してください。
+
+【依頼内容】
+{request}
+
+【類似する既存プロジェクトの調査結果(規模感の参考にしてください)】
+{external_references}
+
+上記の調査結果にある類似プロジェクトが実際に持っている機能・構成の広さを参考に、この依頼が「本来はどれくらいの規模になるべきか」のアンカーとしてください。調査結果が乏しい場合でも、一般的な同種のソフトウェア/コンテンツが備えるべき水準で構いません。
+
+以下の7つの観点それぞれについて、見出し(### 観点名)を立てたうえで、必要と考えられる要件を箇条書き(- で始める1行)で網羅的に列挙してください。該当する要件が無いと判断した観点であっても、見出し自体は省略せず「(該当なし)」とだけ書いてください:
+
+### コア機能
+### エラーハンドリング
+### 設定管理
+### ログ
+### CLI/UI
+### ドキュメント
+### テスト
+
+出力は上記7つの見出しとその箇条書きのみとし、前置き・後書きの説明文は含めないでください。
+"""
+
+
+def _build_vision_agent_prompt(request: str, external_references: str) -> str:
+    return _VISION_AGENT_PROMPT_TEMPLATE.format(request=request, external_references=external_references)
+
+
+def _run_vision_agent(visionary: dict, org_fingerprint: str, request: str) -> str:
+    """`request`(依頼内容)について、事前に類似OSSプロジェクトを調査した
+    うえで、実現可能性を問わない要件のバックログを`visionary`に洗い出させる。
+    戻り値は`### 観点名`+箇条書きの生テキスト(バックログ、失敗時は空文字列)。
+
+    仮の判断: 外部検索(`_run_external_reference_search`)はYoriai側が
+    `web_search`を直接呼び出して行い、Vision agent自身にはツールを一切
+    オファーしない(`_collect_answer_from_candidate`は既定でCHAT_TOOLS
+    (web_search)をオファーするため、`speak`・モジュール分割案の相談と
+    同じ理由で明示的に`disable_web_search=True`を渡す)。検索クエリの
+    組み立てと実行自体を決定的なロジックに固定することで、Vision agentの
+    役割を「与えられた調査結果を踏まえて要件を洗い出すこと」に限定し、
+    テスト時にはモデルの応答だけを差し替えれば検証できるようにする。
+    """
+    external_references = _run_external_reference_search(request)
+    prompt = _build_vision_agent_prompt(request, external_references)
+    answer, error, truncated = _collect_answer_from_candidate(
+        visionary, org_fingerprint, [{"role": "user", "content": prompt}], disable_web_search=True,
+    )
+    if error:
+        print(f"[⚠️ Vision agentへの問い合わせに失敗しました: {error}]")
+        return ""
+    if not answer:
+        print("[⚠️ Vision agentから応答が得られませんでした]")
+        return ""
+    if truncated:
+        print(f"[⚠️ Vision agentの応答が長すぎたため、{CHAT_MAX_OUTPUT_TOKENS}トークンで打ち切られました]")
+    return answer
+
+
+def _vision_agent_backlog_missing_categories(text: str) -> list:
+    """Vision agentの出力(`text`)に、要求した7つの観点の見出しが含まれて
+    いるかどうかを、`_looks_like_process_narration`と同じキーワードベース
+    の簡易判定(厳密な意味理解までは求めない)で確認する。含まれていない
+    観点名の一覧を返す(空リストなら全観点を網羅している)。
+    """
+    text = text or ""
+    return [category for category in _VISION_AGENT_REQUIRED_CATEGORIES if category not in text]
+
+
+def _ask_organization_vision(port: int, org_fingerprint: str, request: str, out_dir: str) -> None:
+    """`//vision <依頼文>`: 実装には一切進まず、事前調査付きVisionエージェント
+    に実現可能性を問わない要件のバックログを洗い出させ、
+    `VISION_BACKLOG.md`として保存する単体モード。このバックログをそのまま
+    (または人間が取捨選択したうえで)`//agree`への依頼文に含めて使うことを
+    想定する(計画自体を膨らませるという依頼の趣旨のため、実装フェーズへの
+    自動的な橋渡しはあえて行わず、人間が出力内容を見てから次の一手を
+    選べるようにする)。
+    """
+    data = _fetch_org_snapshot(port, org_fingerprint)
+    if data is None:
+        return
+
+    candidates = _select_chat_candidates(data.get("self", {}), data.get("peers", []), port, TASK_TYPE_CODING)
+    if not candidates:
+        print("組織内にロード済みモデルを持つメンバーがいません。")
+        return
+
+    visionary = candidates[0]
+    projects_root = os.path.join(out_dir, PROJECTS_SUBDIR_NAME)
+    project_name = _project_name_with_date_prefix(request, suffix="-vision")
+    project_dir = _resolve_project_dir(projects_root, project_name)
+
+    print(
+        f"[🔭 Visionエージェント開始: {visionary['label']}さんが類似プロジェクトを調査したうえで、"
+        "実現可能性を問わず要件を洗い出しています...]"
+    )
+    backlog = _run_vision_agent(visionary, org_fingerprint, request)
+    if not backlog:
+        return
+
+    missing_categories = _vision_agent_backlog_missing_categories(backlog)
+    if missing_categories:
+        print(f"[⚠️ 以下の観点の見出しが出力に含まれていません: {', '.join(missing_categories)}]")
+
+    _write_project_file(project_dir, VISION_BACKLOG_FILENAME, backlog)
+    print(f"[🔭 {visionary['label']} が洗い出したバックログ(そのまま表示、{VISION_BACKLOG_FILENAME}として保存します)]")
+    print(backlog)
+
+
 # 仮の判断(実行検証グラウンディングループへの対応・タスク粒度オプション):
 # `//agree`の依頼文の末尾にこのフラグを付けると、タスクキュー方式の
 # 実行検証グラウンディングループ(`_run_task_grounding_verification`)が
@@ -9033,6 +9218,8 @@ def _format_startup_banner(out_dir: str, member_count, use_color: bool) -> str:
         f"  {MULTI_QUERY_COMMAND} <質問文>: 空きリソース上位{MULTI_QUERY_TARGET_COUNT}台に同時に質問",
         f"  {AGREE_COMMAND} <制作依頼>: 対話プロトコルによる事前すり合わせを経て協業モードで実装",
         f"  {PLAN_ONLY_COMMAND} <依頼>: 対話プロトコルで計画のみ議論し、実装せず計画書を出力",
+        f"  {VISION_COMMAND} <依頼>: 類似OSSを調査し、実現可能性を問わず要件を洗い出す",
+        f"    (実装は行わず{VISION_BACKLOG_FILENAME}として出力します)",
         f"  {FIX_PROJECT_COMMAND} <修正依頼>: 完成済みプロジェクトの一部を修正(プロジェクト名を",
         f"    先頭に付けて{FIX_PROJECT_COMMAND} <プロジェクト名>: <修正依頼>のように明示指定も可能)",
         f"    ({FIX_PROJECT_COMMAND}後は修正セッションが始まり、続けてコマンド無しで話しかけても",
@@ -9228,6 +9415,7 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                 text.startswith(RESUME_ALL_COMMAND) or text.startswith(AGREE_COMMAND)
                 or text.startswith(PLAN_ONLY_COMMAND) or text.startswith(FIX_PROJECT_COMMAND)
                 or text.startswith(PARALLEL_QUERY_COMMAND) or text.startswith(MULTI_QUERY_COMMAND)
+                or text.startswith(VISION_COMMAND)
             ):
                 pending_design_box.take()
                 print("[🧭 新しいコマンドが入力されたため、一時停止中だった合意フェーズの再開待ちを終了しました]")
@@ -9275,6 +9463,20 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
                     lambda plan_request=plan_request, text=text: _run_job_with_conversation_log(
                         messages, text,
                         lambda: _ask_organization_plan_only(port, org_fingerprint, plan_request, out_dir),
+                    ),
+                    queued_notice=_BACKGROUND_QUEUED_NOTICE,
+                )
+                continue
+
+            if text.startswith(VISION_COMMAND):
+                vision_request = text[len(VISION_COMMAND):].strip()
+                if not vision_request:
+                    print(f"使い方: {VISION_COMMAND} <検討したい依頼>  (例: {VISION_COMMAND} ToDoリストのCLIツールを作って)")
+                    continue
+                job_runner.submit(
+                    lambda vision_request=vision_request, text=text: _run_job_with_conversation_log(
+                        messages, text,
+                        lambda: _ask_organization_vision(port, org_fingerprint, vision_request, out_dir),
                     ),
                     queued_notice=_BACKGROUND_QUEUED_NOTICE,
                 )
