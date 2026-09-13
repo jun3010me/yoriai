@@ -205,6 +205,139 @@ def test_on_thinking_display_does_not_lose_or_reorder_content():
     assert len(thinking_texts) >= 2, thinking_texts
 
 
+# ---------------------------------------------------------------------------
+# タスクキュー方式のレビュー担当(read_fileツール付き、
+# `_collect_review_answer_with_read_file`)側の同じバグの回帰検知
+# ---------------------------------------------------------------------------
+#
+# 実機報告: `speak()`と全く同じ「SSEのdeltaチャンクが届くたびに
+# `_print_tagged`を呼んでしまい、単語1つごとに改行される」不具合が、
+# タスクキュー方式のレビュー担当がread_fileツールを使う経路
+# (`_collect_review_answer_with_read_file`)にも別途残っていた
+# (`_run_dialogue`側の修正だけでは直っていなかった)。こちらは
+# `_stream_chat_from_candidate`を直接消費するループのため、
+# `tests/test_reviewer_read_file_tool.py`と同じ方式(`_stream_chat_from_
+# candidate`自体を差し替える)で検証する。
+
+def _run_review_with_thinking(fake_stream):
+    printed = []
+
+    def fake_print_tagged(print_lock, tag, text):
+        printed.append(text)
+
+    original_stream = yoriai._stream_chat_from_candidate
+    original_print_tagged = yoriai._print_tagged
+    yoriai._stream_chat_from_candidate = fake_stream
+    yoriai._print_tagged = fake_print_tagged
+    try:
+        answer, error, truncated = yoriai._collect_review_answer_with_read_file(
+            _candidate("MacStudio", "m1"), "fingerprint",
+            [{"role": "user", "content": "test_storage.pyをレビューしてください"}], "/tmp/fake-project-dir",
+            tag="test_storage.py",
+        )
+    finally:
+        yoriai._stream_chat_from_candidate = original_stream
+        yoriai._print_tagged = original_print_tagged
+
+    assert error is None, error
+    return printed, answer
+
+
+def test_review_with_read_file_buffers_short_thinking_chunks_until_threshold():
+    chunks = ["use", " temp", "_dir", " ", "\"", "entries", ".json", "\""]
+
+    def fake_stream(candidate, org_fingerprint, messages, offer_read_file_tool=False, **_kwargs):
+        for chunk in chunks:
+            yield {"thinking": chunk}
+        yield {"content": "問題なし"}
+        yield {"done": True}
+
+    combined = "".join(chunks)
+    assert len(combined) < 40, "このテストの前提(40文字未満)が崩れています"
+
+    printed, answer = _run_review_with_thinking(fake_stream)
+    thinking_texts = [text for text in printed if text.startswith("[🤔 思考中]")]
+
+    # 実機報告の再現条件: チャンクの数(8個)ぶん改行されるのではなく、
+    # 40文字未満・文末記号無しなのでこのラウンドの終わりに1回だけ
+    # まとめて出力されるはず。
+    assert len(thinking_texts) == 1, thinking_texts
+    assert thinking_texts[0] == f"[🤔 思考中] {combined}", thinking_texts
+    assert answer == "問題なし", answer
+
+
+def test_review_with_read_file_does_not_flush_mid_stream_below_threshold():
+    """閾値到達前は、チャンクが届くたびに`_print_tagged`が呼ばれていない
+    ことを、ジェネレータがまだチャンクを送り続けている最中(呼び出しが
+    完了する前)に直接確認する。
+    """
+    printed_snapshot_after_first_chunk = []
+
+    def fake_stream(candidate, org_fingerprint, messages, offer_read_file_tool=False, **_kwargs):
+        yield {"thinking": "短い"}
+        printed_snapshot_after_first_chunk.append(list(printed))
+        yield {"thinking": "チャンク"}
+        printed_snapshot_after_first_chunk.append(list(printed))
+        yield {"content": "問題なし"}
+        yield {"done": True}
+
+    printed = []
+
+    def fake_print_tagged(print_lock, tag, text):
+        printed.append(text)
+
+    original_stream = yoriai._stream_chat_from_candidate
+    original_print_tagged = yoriai._print_tagged
+    yoriai._stream_chat_from_candidate = fake_stream
+    yoriai._print_tagged = fake_print_tagged
+    try:
+        yoriai._collect_review_answer_with_read_file(
+            _candidate("MacStudio", "m1"), "fingerprint",
+            [{"role": "user", "content": "test_storage.pyをレビューしてください"}], "/tmp/fake-project-dir",
+            tag="test_storage.py",
+        )
+    finally:
+        yoriai._stream_chat_from_candidate = original_stream
+        yoriai._print_tagged = original_print_tagged
+
+    assert printed_snapshot_after_first_chunk[0] == [], "1チャンク目でフラッシュされてしまっています"
+    assert printed_snapshot_after_first_chunk[1] == [], "2チャンク目でフラッシュされてしまっています"
+
+
+def test_review_with_read_file_flushes_on_sentence_ending_punctuation():
+    def fake_stream(candidate, org_fingerprint, messages, offer_read_file_tool=False, **_kwargs):
+        yield {"thinking": "ok."}  # 半角ピリオドで終わる → 即座にフラッシュされるはず
+        yield {"thinking": "残り"}  # 続く端数(ラウンド終了時に最終フラッシュ)
+        yield {"content": "問題なし"}
+        yield {"done": True}
+
+    printed, _answer = _run_review_with_thinking(fake_stream)
+    thinking_texts = [text for text in printed if text.startswith("[🤔 思考中]")]
+    assert thinking_texts == ["[🤔 思考中] ok.", "[🤔 思考中] 残り"], thinking_texts
+
+
+def test_review_with_read_file_does_not_lose_or_reorder_thinking_content():
+    chunks = [
+        "First", " we", " consider", " the", " requirements", " carefully", " and", " thoroughly",
+        " before", " moving", " on.",  # ここで文末記号によりフラッシュ
+        "次に", "日本語で", "検討します", "。",  # ここでも文末記号によりフラッシュ
+        "最後に", "端数が残る",  # 閾値・文末記号どちらにも達しない端数
+    ]
+
+    def fake_stream(candidate, org_fingerprint, messages, offer_read_file_tool=False, **_kwargs):
+        for chunk in chunks:
+            yield {"thinking": chunk}
+        yield {"content": "問題なし"}
+        yield {"done": True}
+
+    printed, _answer = _run_review_with_thinking(fake_stream)
+    thinking_texts = [text for text in printed if text.startswith("[🤔 思考中]")]
+
+    reconstructed = "".join(text[len("[🤔 思考中] "):] for text in thinking_texts)
+    assert reconstructed == "".join(chunks), (reconstructed, "".join(chunks))
+    assert len(thinking_texts) >= 2, thinking_texts
+
+
 def main():
     tests = [
         test_on_thinking_buffers_short_chunks_until_threshold,
@@ -213,6 +346,10 @@ def main():
         test_on_thinking_flushes_on_full_width_sentence_ending_punctuation,
         test_on_thinking_flushes_remaining_buffer_after_answer_completes,
         test_on_thinking_display_does_not_lose_or_reorder_content,
+        test_review_with_read_file_buffers_short_thinking_chunks_until_threshold,
+        test_review_with_read_file_does_not_flush_mid_stream_below_threshold,
+        test_review_with_read_file_flushes_on_sentence_ending_punctuation,
+        test_review_with_read_file_does_not_lose_or_reorder_thinking_content,
     ]
     failures = 0
     for test in tests:

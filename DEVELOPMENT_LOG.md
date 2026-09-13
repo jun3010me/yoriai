@@ -6955,3 +6955,38 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   即座に空リストへ差し替えるヘルパーを追加し接続タイムアウトを回避した。
   既存の全テスト(pytest実行、688件)を実行し、リグレッションが無い
   ことを確認した(追加分と合わせて計709件パス)。
+
+### タスクキュー方式のレビュー担当(read_fileツール付き)で、思考過程が1トークンずつ改行表示される不具合の修正
+
+上記3PRの実機検証中、Mac miniの思考モデルがtest_storage.pyをレビュー
+している最中、`[test_storage.py] [🤔 思考中]`というプレフィックス付きで
+1単語ごとに改行される非常に読みにくい表示になる不具合が報告された。
+これは今回追加した3機能とは無関係の、既存の別の不具合だった。
+
+原因は、対話プロトコル`_run_dialogue`の`speak()`では既に修正済み(SSEの
+deltaチャンクが届くたびに`_print_tagged`を呼ばず、一定量たまるか文末
+記号で終わるまでバッファする方式に変更済み、`_THINKING_DISPLAY_BUFFER_
+FLUSH_CHARS`定義部のコメント参照)だったのと全く同じ不具合が、タスク
+キュー方式のレビュー担当がread_fileツールを使う経路
+(`_collect_review_answer_with_read_file`)には別途残っていたこと。この
+関数は`_stream_chat_from_candidate`を直接消費する独自ループのため、
+`speak()`側の修正が及んでいなかった。
+
+対応: `_collect_review_answer_with_read_file`内のラウンド処理ループに、
+`speak()`の`_on_thinking`/`_flush_pending_display`と同じ「チャンクを
+`pending_display`に貯め、40文字以上たまるか文末記号(半角`.!?`・全角
+`。！？`)で終わったらまとめて1回だけ`_print_tagged`を呼ぶ」バッファ
+リングを追加した(定数`_THINKING_DISPLAY_BUFFER_FLUSH_CHARS`・
+`_THINKING_DISPLAY_SENTENCE_END_CHARS`は`speak()`と共通のものを再利用)。
+1ラウンド(1回の`_stream_chat_from_candidate`呼び出し)の終わりには、
+端数が残っていないか必ず1回フラッシュを呼び、取りこぼしを防ぐ。
+
+テスト: `tests/test_thinking_display_buffering.py`に、
+`_collect_review_answer_with_read_file`(`_stream_chat_from_candidate`を
+差し替えて検証、`tests/test_reviewer_read_file_tool.py`と同じ手法)向けの
+回帰テストを4件追加した((1)閾値未満のチャンクはラウンド終了時に1回だけ
+まとめて出力される、(2)ストリーミング中は`_print_tagged`が呼ばれない、
+(3)文末記号で即座にフラッシュされる、(4)表示の間引きによって内容が
+欠けたり順序が入れ替わったりしない)。既存の全テスト(pytest実行、
+709件)を実行し、リグレッションが無いことを確認した(追加分と合わせて
+計713件パス)。

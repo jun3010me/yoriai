@@ -1440,6 +1440,25 @@ def _collect_review_answer_with_read_file(
         pending_tool_calls = None
         error = None
         truncated = False
+
+        # 仮の判断(実機バグ報告への対応: `_run_dialogue`の`speak()`
+        # (`_THINKING_DISPLAY_BUFFER_FLUSH_CHARS`定義部のコメント参照)と
+        # 全く同じ不具合がこのループにも残っていた。SSEのdeltaチャンク
+        # (数文字〜1単語程度)が届くたびに`_print_tagged`を呼んでいたため、
+        # 単語1つごとにプレフィックス([🤔 思考中])付きで改行される非常に
+        # 読みにくい表示になっていた(タスクキュー方式のレビュー担当が
+        # read_fileツールを使う経路で報告された)。`speak()`と同じ、一定量
+        # たまるか文末記号で終わるまでは`_print_tagged`を呼ばないバッファ
+        # リング方式に変更する(定数は`speak()`と共通のものを再利用する)。
+        pending_display = []
+
+        def _flush_pending_display() -> None:
+            if not pending_display:
+                return
+            buffered = "".join(pending_display)
+            pending_display.clear()
+            _print_tagged(print_lock, tag or candidate["label"], f"[🤔 思考中] {buffered}")
+
         for event in _stream_chat_from_candidate(candidate, org_fingerprint, messages, offer_read_file_tool=True):
             if "error" in event:
                 error = event["error"]
@@ -1450,12 +1469,17 @@ def _collect_review_answer_with_read_file(
             thinking = event.get("thinking")
             if thinking:
                 # 仮の判断: このループはタスクキュー方式で複数ワーカー
-                # スレッドから並行に呼ばれうるため、1チャンクごとに
-                # `_print_tagged`(ロック保護・タグ付き)で1行として出力する
-                # (このループ自身は`content`をその場で表示しない設計のため、
+                # スレッドから並行に呼ばれうるため、まとめて出す1回分も
+                # `_print_tagged`(ロック保護・タグ付き)で出力する(この
+                # ループ自身は`content`をその場で表示しない設計のため、
                 # 思考過程だけをこの場で見せることで「まだ動いている」ことを
                 # 可視化する)。
-                _print_tagged(print_lock, tag or candidate["label"], f"[🤔 思考中] {thinking}")
+                pending_display.append(thinking)
+                buffered_tail = "".join(pending_display)
+                if len(buffered_tail) >= _THINKING_DISPLAY_BUFFER_FLUSH_CHARS or (
+                    buffered_tail and buffered_tail[-1] in _THINKING_DISPLAY_SENTENCE_END_CHARS
+                ):
+                    _flush_pending_display()
                 continue
             content = event.get("content")
             if content:
@@ -1463,6 +1487,10 @@ def _collect_review_answer_with_read_file(
             if event.get("done"):
                 truncated = bool(event.get("truncated"))
                 break
+        # 閾値にも文末記号にも達しないまま端数がバッファに残っている
+        # 可能性があるため、このラウンドの終わりに必ず1回出し切る
+        # (`speak()`と同じ、取りこぼし防止のための最終フラッシュ)。
+        _flush_pending_display()
 
         if error:
             return "", error, False
