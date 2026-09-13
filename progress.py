@@ -116,6 +116,11 @@ _PROGRESS_SECTION_AUTO_RESUME_COUNT = "## 自動再開の試行回数"
 # ディスク上の状態を正として扱う既存方針をそのまま踏襲する。
 _PROGRESS_SECTION_VERIFICATION = "## 統合検証"
 _PROGRESS_SECTION_REVIEW = "## 直近のレビュー指摘"
+# 仮の判断(実行検証グラウンディングループへの対応): タスク単位で実際に
+# 実行して検証した結果のうち、最大試行回数まで解消しなかったものを、
+# 「直近のレビュー指摘」と同じ`### {filename}`区切りの形式で記録する。
+# レビュー(読むだけ)とは独立した観点のため節を分ける。
+_PROGRESS_SECTION_GROUNDING = "## 実行検証(グラウンディング)"
 _PROGRESS_SECTION_CHANGELOG = "## 更新履歴"
 # 仮の判断(バグ報告への対応): //fixのタスク分割(_run_fix_task_queue)が
 # ツール呼び出しの往復回数の上限等で一部のサブタスクを完了させられずに
@@ -175,7 +180,7 @@ def _format_progress_markdown(
     request: str, tasks: list, checklist: list, review_feedback: dict, auto_resume_count: int = 0,
     changelog: list = None, language: str = "",
     pending_fix_request: str = "", pending_fix_subtasks: list = None,
-    verify_command: str = "", verification: dict = None,
+    verify_command: str = "", verification: dict = None, grounding_results: dict = None,
 ) -> str:
     """PROGRESS.mdの内容を組み立てる。
 
@@ -247,6 +252,16 @@ def _format_progress_markdown(
             lines.append("")
             lines.append(feedback)
             lines.append("")
+    if grounding_results:
+        lines.append(_PROGRESS_SECTION_GROUNDING)
+        lines.append("")
+        for filename, info in grounding_results.items():
+            lines.append(f"### {filename}")
+            lines.append("")
+            lines.append(f"{info['attempts']}回試行")
+            lines.append("")
+            lines.append(info.get("output", ""))
+            lines.append("")
     if changelog:
         lines.append(_PROGRESS_SECTION_CHANGELOG)
         lines.append("")
@@ -268,12 +283,12 @@ def _write_progress_md(
     project_dir: str, request: str, tasks: list, checklist: list, review_feedback: dict, auto_resume_count: int = 0,
     changelog: list = None, language: str = "",
     pending_fix_request: str = "", pending_fix_subtasks: list = None,
-    verify_command: str = "", verification: dict = None,
+    verify_command: str = "", verification: dict = None, grounding_results: dict = None,
 ) -> None:
     os.makedirs(project_dir, exist_ok=True)
     content = _format_progress_markdown(
         request, tasks, checklist, review_feedback, auto_resume_count, changelog, language,
-        pending_fix_request, pending_fix_subtasks, verify_command, verification,
+        pending_fix_request, pending_fix_subtasks, verify_command, verification, grounding_results,
     )
     with open(os.path.join(project_dir, PROGRESS_FILENAME), "w", encoding="utf-8") as f:
         f.write(content)
@@ -367,6 +382,49 @@ def _parse_review_feedback_markdown(text: str) -> dict:
     return review_feedback
 
 
+_GROUNDING_ATTEMPTS_PATTERN = re.compile(r"^(\d+)回試行$")
+
+
+def _parse_grounding_results_markdown(text: str) -> dict:
+    """PROGRESS.md全体(`text`)から「## 実行検証(グラウンディング)」
+    セクション(`_PROGRESS_SECTION_GROUNDING`)を取り出し、
+    `_format_progress_markdown`が`### {filename}`見出しで区切って
+    書き出した内容を`{filename: {"attempts": int, "output": str}}`の
+    辞書として読み戻す。`_parse_review_feedback_markdown`と同じ
+    「見出しで区切って本文を集める」ロジックを踏襲する。セクション自体が
+    無い場合は空の辞書を返す。
+    """
+    section = _extract_progress_section(text, _PROGRESS_SECTION_GROUNDING)
+    if not section:
+        return {}
+    grounding_results = {}
+    filename = None
+    body_lines = []
+
+    def _flush():
+        if filename is None:
+            return
+        lines = "\n".join(body_lines).strip("\n").splitlines()
+        attempts = 0
+        output_lines = lines
+        if lines:
+            match = _GROUNDING_ATTEMPTS_PATTERN.match(lines[0].strip())
+            if match:
+                attempts = int(match.group(1))
+                output_lines = lines[1:]
+        grounding_results[filename] = {"attempts": attempts, "output": "\n".join(output_lines).strip("\n")}
+
+    for line in section.splitlines():
+        if line.startswith("### "):
+            _flush()
+            filename = line[len("### "):].strip()
+            body_lines = []
+        else:
+            body_lines.append(line)
+    _flush()
+    return grounding_results
+
+
 def _find_repeated_review_feedback(previous: dict, current: dict, checklist: list) -> list:
     """直近の自動再開の前後(`previous`→`current`、いずれも
     `{filename: feedback}`の辞書)を比較し、`checklist`上でまだ完了して
@@ -430,9 +488,13 @@ def _parse_progress_markdown(path: str):
     """PROGRESS.mdを読み込み、`{"request":, "language":, "tasks":,
     "checklist":, "auto_resume_count":, "changelog":, "pending_fix_request":,
     "pending_fix_subtasks":, "verify_command":, "verification":,
-    "review_feedback":}`の辞書として返す。ファイルが存在しない・想定した
-    形式で解析できない場合は`None`を返す(呼び出し元は、そのプロジェクトの
-    再開をスキップすべきというシグナルとして扱う)。
+    "review_feedback":, "grounding_results":}`の辞書として返す。ファイルが
+    存在しない・想定した形式で解析できない場合は`None`を返す(呼び出し元は、
+    そのプロジェクトの再開をスキップすべきというシグナルとして扱う)。
+
+    仮の判断: `grounding_results`(この節が無ければ空の辞書)も同じ
+    後方互換の方針。実行検証グラウンディングループより前に作られた
+    PROGRESS.mdでは単に「グラウンディング指摘は無い」として扱われる。
 
     仮の判断(繰り返しレビュー指摘の早期検知への対応): `review_feedback`
     (この節が無ければ空の辞書)も同じ後方互換の方針。従来この節は
@@ -479,6 +541,7 @@ def _parse_progress_markdown(path: str):
         "verify_command": _extract_progress_section(text, _PROGRESS_SECTION_VERIFY_COMMAND).strip(),
         "verification": _parse_verification_result(_extract_progress_section(text, _PROGRESS_SECTION_VERIFICATION)),
         "review_feedback": _parse_review_feedback_markdown(text),
+        "grounding_results": _parse_grounding_results_markdown(text),
     }
 
 

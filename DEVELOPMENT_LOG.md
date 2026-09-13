@@ -6740,3 +6740,81 @@ README.mdの動作環境は当初から「Python 3.9以降」と明記されて�
   一時的にインストールした状態でも同様に全件パスし、かつGate 2依存
   テストが実際にスキップされず本体を実行してパスすることを確認した。
   無改修でそのままパスすることを確認した。
+
+### 実行検証グラウンディングループ(タスク単位で実際に動かして、落ちたら直す)の実装
+
+`//agree`のタスクキュー方式は、内容レビュー(最大2回、読むだけで実行は
+しない)が「問題なし」と判定した時点でそのタスクを完了扱いにしていた。
+しかしローカルLLM同士のレビューの「合意」は、実際に動くかどうかとは
+無関係に、もっともらしい無難な判定に収束しがちである。既存の統合検証
+(`_run_integration_verification`)は全タスク完了後にプロジェクト全体へ
+1回だけ実行するもので、個々のタスクがレビュー完了直後にどれだけ実行に
+耐えるかは見ていなかった。判定基準を「モデルの合意・自己申告」から
+「実際の実行結果(終了コード)」に置き換えるため、レビュー完了直後に
+そのタスクを実際に実行し、失敗すれば生のエラー内容(要約や言い換えでは
+ない)をそのまま担当メンバーに渡して修正させ、再実行するループを追加した。
+
+対応:
+
+- **`_run_task_grounding_verification()`を新設**し、既存の
+  `_run_integration_verification`・`_run_content_volume_verification`と
+  同じ「実行して失敗したら担当メンバーに修正を依頼し、再実行する」構造を
+  タスク単位に適用した。成否は`_run_project_command`の実行結果(`ok`/
+  終了コード)のみで機械的に判定し、モデルの自己申告(「これで動くはず
+  です」等)では判定しない。暴走防止のため、既存の「レビューフェーズは
+  最大2回まで」・`MAX_CONTENT_VOLUME_FIX_ATTEMPTS`・`MAX_BROWSER_
+  FRONTEND_FIX_ATTEMPTS`と同じデフォルト値(2回)の`MAX_TASK_GROUNDING_
+  ATTEMPTS`で打ち切る。
+- **タスク単位への絞り込み**: 検証コマンド(`verify_command`)は通常
+  プロジェクト全体に対するコマンドのため、他の未完了ファイルへの依存で
+  必ず失敗する・そもそも実行可能な単位に絞り込めない、という問題がある。
+  `_pytest_invocation_prefix()`で検証コマンドがpytest呼び出しかどうかを
+  判定し、`_is_test_file()`で対象がテストファイル(`test_*.py`・
+  `*_test.py`)かどうかを判定したうえで、両方を満たす場合のみ
+  `pytest <ファイル名>`のようにそのファイルだけに絞り込んだコマンドを
+  組み立てる(`_build_task_grounding_commands`)。絞り込めない組み合わせ
+  (検証コマンドが無い・pytest以外・非テストファイル)ではタスク単位の
+  グラウンディングを自動的にスキップし、既存のプロジェクト全体の統合
+  検証にまかせる。
+- **「1関数・1テストケース」単位までの細分化オプション**: `task_
+  granularity`引数(`TASK_GRANULARITY_FILE`(既定)/`TASK_GRANULARITY_
+  FUNCTION`)を`_run_collaborative_task_queue`・`_run_collaborative_
+  project`・`_run_collaborate_implementation_phase`・`_ask_organization_
+  collaborate`まで貫通させた。`TASK_GRANULARITY_FUNCTION`の場合、
+  `_extract_test_function_names()`でテストファイル内の`def test_...(`を
+  検出し、`pytest <ファイル名>::<関数名>`という1関数ごとのpytestノード
+  IDを個別に実行する(関数が見つからない場合はファイル単位にフォール
+  バック)。`//agree <依頼文> --fine-grained`のように依頼文の末尾に
+  フラグを付けると、`_extract_task_granularity_flag()`がこれを解釈して
+  取り除き(プロジェクト名・設計担当への依頼文にはフラグを含まない
+  依頼文を使う)、対話プロトコルの一時停止・再開(`_PendingDesignDialogue`)
+  をまたいでも設定を保持する。
+- **`_run_collaborative_task_queue`への統合**: レビューの合否によらず
+  (実行できるかどうかはレビュー(読むだけ)とは独立の観点のため)、
+  レビュー完了直後に必ずグラウンディングを行う。レビューによる修正が
+  あった場合はディスク上の最新のコードを読み直してから実行する。
+  `grounding_results`(dict、`{filename: {"output":, "attempts":}}`、
+  既存の`review_feedback`と同じミュータブルな辞書を書き換える設計)を
+  渡すと、最大試行回数まで解消しなかったファイルの最後の実行結果が
+  記録され、解消すればそのファイルのエントリは削除される。
+- **PROGRESS.mdへの永続化**: 新設の`## 実行検証(グラウンディング)`
+  節を`_format_progress_markdown`/`_write_progress_md`に追加し、
+  既存の`## 直近のレビュー指摘`と同じ`### {filename}`区切りの形式で
+  書き出す。`_parse_progress_markdown`で`grounding_results`として
+  読み戻せるようにした(値が無ければ節ごと省略・空の辞書を返す、
+  既存の後方互換方針を踏襲)。
+- **`_run_collaborative_project`での完了判定への反映**: 統合検証と
+  同じ考え方で、`grounding_results`が空でない場合は「✅ 全タスク完了」を
+  名乗らず、`[⚠️ 実装は完了しましたが、実行検証(グラウンディング)に
+  失敗しているタスクがあります]`と区別して報告する。
+- **テスト**: `tests/test_task_grounding.py`を新設し、(1)絞り込み判定
+  (`_is_test_file`・`_pytest_invocation_prefix`・`_build_task_grounding_
+  commands`、ファイル/関数の両粒度)、(2)`_run_task_grounding_
+  verification`の試行回数の挙動(実行結果のみで機械的に成否判定、
+  失敗時は生のエラーがそのまま次ラウンドのプロンプトに含まれること、
+  失敗時は同じタスクに留まること、上限回数で安全に打ち切られ暴走
+  しないこと)、(3)`_run_collaborative_task_queue`への組み込み
+  (レビュー完了後に実行され`grounding_results`に記録・解消されること)、
+  (4)`--fine-grained`フラグの解釈、(5)PROGRESS.mdへの記録の往復、を
+  確認した(27件追加)。既存の全テスト(pytest実行、649件)を実行し、
+  リグレッションが無いことを確認した(追加分と合わせて計676件パス)。

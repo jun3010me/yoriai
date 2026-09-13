@@ -2588,6 +2588,14 @@ AGREE_COMMAND = "//agree"
 AGREE_REQUEST_TYPE_CONTENT = "content"
 AGREE_REQUEST_TYPE_SOFTWARE = "software"
 
+# 仮の判断(実行検証グラウンディングループへの対応): タスクキュー方式に
+# 渡す粒度オプション。`_run_collaborative_project`(このすぐ後で定義)の
+# デフォルト引数から参照されるため、実際の使用箇所(`_run_task_grounding_
+# verification`まわり、後方のタスクキュー方式のセクションを参照)より
+# 前のこの位置で定義する。
+TASK_GRANULARITY_FILE = "file"
+TASK_GRANULARITY_FUNCTION = "function"
+
 # 仮の判断(ブラウザ向け成果物の完了ゲート追加): `chatbot.js`が`export
 # function ...`(ESモジュール構文)で書かれているのに`index.html`側は
 # `<script src="chatbot.js"></script>`(非モジュール)で読み込んでおり、
@@ -3082,7 +3090,7 @@ def _resume_organization_collaborate(
         return
     _run_collaborate_implementation_phase(
         pending.request, answer, pending.candidates, pending.org_fingerprint, pending.project_dir, pending.port,
-        completed_box=completed_box, request_type=pending.request_type,
+        completed_box=completed_box, request_type=pending.request_type, task_granularity=pending.task_granularity,
     )
 
 
@@ -3512,6 +3520,7 @@ class _PendingDesignDialogue:
     def __init__(
         self, port: int, org_fingerprint: str, request: str, candidates: list, project_dir: str, result: dict,
         request_type: str = AGREE_REQUEST_TYPE_SOFTWARE, research_notes: str = "",
+        task_granularity: str = TASK_GRANULARITY_FILE,
     ):
         self.port = port
         self.org_fingerprint = org_fingerprint
@@ -3526,6 +3535,11 @@ class _PendingDesignDialogue:
         # 後方互換性のため。
         self.request_type = request_type
         self.research_notes = research_notes
+        # 仮の判断(実行検証グラウンディングループへの対応): タスク粒度
+        # オプション(依頼文の`--fine-grained`フラグ)も、一時停止前に
+        # `_ask_organization_collaborate`が解釈した結果を再開時
+        # (`_resume_organization_collaborate`)まで引き継ぐ。
+        self.task_granularity = task_granularity
 
 
 class _PendingDesignDialogueBox:
@@ -3617,6 +3631,7 @@ class _CompletedBuildBox:
 def _run_collaborate_implementation_phase(
     request: str, answer: str, candidates: list, org_fingerprint: str, project_dir: str, port: int,
     completed_box: "_CompletedBuildBox" = None, request_type: str = AGREE_REQUEST_TYPE_SOFTWARE,
+    task_granularity: str = TASK_GRANULARITY_FILE,
 ) -> None:
     """合意フェーズ(対話プロトコルによる複数ラウンドの議論・設計担当1名への
     1回きりの相談・一時停止後に人間の回答を踏まえて再開した議論、のいずれ
@@ -3682,7 +3697,7 @@ def _run_collaborate_implementation_phase(
 
     _run_collaborative_project(
         request, tasks, checklist, candidates, org_fingerprint, project_dir, tasks, language=language,
-        verify_command=verify_command, request_type=request_type,
+        verify_command=verify_command, request_type=request_type, task_granularity=task_granularity,
     )
 
     # 仮の判断: 自動再開(有限の上限付き)は、この「新規の協業モード実行」
@@ -3930,6 +3945,30 @@ def _run_research_phase(researcher: dict, org_fingerprint: str, request: str, pr
     return notes
 
 
+# 仮の判断(実行検証グラウンディングループへの対応・タスク粒度オプション):
+# `//agree`の依頼文の末尾にこのフラグを付けると、タスクキュー方式の
+# 実行検証グラウンディングループ(`_run_task_grounding_verification`)が
+# ファイル単位ではなく、テストファイル内の`test_...`関数単位まで
+# 細分化して実行する(依頼の「タスク粒度を「1関数・1テストケース」単位
+# まで細分化できるオプション」への対応)。既存のタスクキュー方式
+# (`_run_collaborative_task_queue`)の`task_granularity`引数として
+# 実装しているため、CLI側はこのフラグの有無を解釈するだけの薄い層になる。
+_TASK_GRANULARITY_FUNCTION_FLAG = "--fine-grained"
+
+
+def _extract_task_granularity_flag(request: str) -> tuple:
+    """依頼文の末尾の空白を除いた部分が`_TASK_GRANULARITY_FUNCTION_FLAG`で
+    終わっていれば取り除き、`(task_granularity, フラグを取り除いた依頼文)`
+    を返す。フラグが無ければ`(TASK_GRANULARITY_FILE, request)`(依頼文は
+    変更しない)。
+    """
+    stripped = request.rstrip()
+    if stripped == _TASK_GRANULARITY_FUNCTION_FLAG or stripped.endswith(f" {_TASK_GRANULARITY_FUNCTION_FLAG}"):
+        cleaned = stripped[: -len(_TASK_GRANULARITY_FUNCTION_FLAG)].rstrip()
+        return TASK_GRANULARITY_FUNCTION, cleaned
+    return TASK_GRANULARITY_FILE, request
+
+
 def _ask_organization_collaborate(
     port: int, org_fingerprint: str, request: str, out_dir: str, enable_dialogue: bool = False,
     pending_box: "_PendingDesignDialogueBox" = None, completed_box: "_CompletedBuildBox" = None,
@@ -3966,7 +4005,14 @@ def _ask_organization_collaborate(
     implementation_phase`に橋渡しするだけ(詳細は`_CompletedBuildBox`
     参照)。対話プロトコルが一時停止して`return`する場合(実装フェーズに
     到達しない)は、この時点では何も格納しない。
+
+    依頼文の末尾に`_TASK_GRANULARITY_FUNCTION_FLAG`(`--fine-grained`)が
+    付いている場合、それを取り除いたうえで、実行検証グラウンディング
+    ループを関数単位まで細分化する(`_extract_task_granularity_flag`
+    参照)。プロジェクト名・設計担当への依頼文には、取り除いた後の
+    (フラグを含まない)依頼文を使う。
     """
+    task_granularity, request = _extract_task_granularity_flag(request)
     data = _fetch_org_snapshot(port, org_fingerprint)
     if data is None:
         return
@@ -4016,7 +4062,7 @@ def _ask_organization_collaborate(
             ):
                 pending_box.set(_PendingDesignDialogue(
                     port, org_fingerprint, request, candidates, project_dir, dialogue_result,
-                    request_type, research_notes,
+                    request_type, research_notes, task_granularity,
                 ))
             return
     else:
@@ -4047,7 +4093,7 @@ def _ask_organization_collaborate(
 
     _run_collaborate_implementation_phase(
         request, answer, candidates, org_fingerprint, project_dir, port, completed_box=completed_box,
-        request_type=request_type,
+        request_type=request_type, task_granularity=task_granularity,
     )
 
 
@@ -4474,6 +4520,7 @@ def _run_collaborative_project(
     request: str, tasks: list, checklist: list, candidates: list, org_fingerprint: str,
     project_dir: str, tasks_to_queue: list, auto_resume_count: int = 0, changelog: list = None,
     language: str = "", verify_command: str = "", request_type: str = AGREE_REQUEST_TYPE_SOFTWARE,
+    task_granularity: str = TASK_GRANULARITY_FILE,
 ) -> None:
     """タスクキュー方式による実装・レビューを実行し、その間PROGRESS.mdを
     更新し続ける。新規プロジェクト(`_ask_organization_collaborate`)・
@@ -4506,6 +4553,11 @@ def _run_collaborative_project(
     """
     changelog = list(changelog) if changelog else []
     review_feedback = {}
+    # 仮の判断(実行検証グラウンディングループへの対応): レビュー完了直後の
+    # タスク単位の実行検証(`_run_task_grounding_verification`)で、最大
+    # 試行回数まで解消しなかったファイルの最後の実行結果を記録する。
+    # `review_feedback`と同じ「ミュータブルな辞書をそのまま更新する」設計。
+    grounding_results = {}
     # 仮の判断: 統合検証の結果はクロージャ内(write_progress)から参照する
     # 必要があるが、Pythonの関数はネストしたスコープの単純な代入
     # (verification = ...)ができない(nonlocal宣言が要る)ため、書き換え
@@ -4519,6 +4571,7 @@ def _run_collaborative_project(
             _write_progress_md(
                 project_dir, request, tasks, checklist, review_feedback, auto_resume_count, changelog, language,
                 verify_command=verify_command, verification=verification_holder["result"],
+                grounding_results=grounding_results,
             )
 
     write_progress()
@@ -4529,7 +4582,8 @@ def _run_collaborative_project(
         # 最終的に実装されるようにした。詳しくは同関数のコメントを参照。
         _run_collaborative_task_queue(
             tasks_to_queue, candidates, org_fingerprint, project_dir, checklist,
-            on_update=write_progress, review_feedback=review_feedback,
+            on_update=write_progress, review_feedback=review_feedback, verify_command=verify_command,
+            task_granularity=task_granularity, grounding_results=grounding_results,
         )
 
     # 仮の判断: 統合検証は、未完了タスクが1件でも残っている場合はスキップ
@@ -4621,6 +4675,8 @@ def _run_collaborative_project(
             print(f"[🔍 統合検証: 成功 ({verification_result['attempts']}回目の試行)]")
         else:
             print(f"[🔍 統合検証: 失敗 ({verification_result['attempts']}回試行)]")
+    if grounding_results:
+        print(f"[⚠️ 実行検証(グラウンディング)で解消しなかったタスクがあります: {', '.join(sorted(grounding_results))}]")
     if incomplete_labels:
         print(f"[⚠️ 未完了のタスクが残っています: {', '.join(incomplete_labels)}]")
     elif verification_result is not None and not verification_result["success"]:
@@ -4630,6 +4686,11 @@ def _run_collaborative_project(
         # 判明しているものを完了扱いにすると、依頼の「品質保証の実効性」
         # という趣旨に反するため)。両者を区別できる専用の表示にする。
         print(f"[⚠️ 実装は完了しましたが、統合検証に失敗しています (保存先: {project_dir})]")
+    elif grounding_results:
+        # 仮の判断: 上記と同じ理由(モデルの自己申告・レビューの「合意」
+        # ではなく実行結果を正とする)で、タスク単位の実行検証が最後まで
+        # 解消しなかった場合も「✅ 全タスク完了」を名乗らない。
+        print(f"[⚠️ 実装は完了しましたが、実行検証(グラウンディング)に失敗しているタスクがあります (保存先: {project_dir})]")
     else:
         print(f"[✅ 全タスク完了 (保存先: {project_dir})]")
     write_progress()
@@ -5692,9 +5753,186 @@ def _estimate_task_weight(content: str) -> int:
     return len(content)
 
 
+# ---------------------------------------------------------------------------
+# タスク単位の実行検証グラウンディングループ
+# ---------------------------------------------------------------------------
+#
+# 依頼への対応: `//agree`のタスクキュー方式は、内容レビュー(最大2回、
+# 読むだけで実行はしない)が「問題なし」と判定した時点でそのタスクを
+# 完了扱いにしていた。しかしローカルLLM同士のレビューの「合意」は
+# 実際に動くかどうかとは無関係に、もっともらしい無難な判定に収束
+# しがちである。判定基準を「モデルの合意・自己申告」から「実際の
+# 実行結果(終了コード)」に置き換えるため、レビューが完了した直後に
+# そのタスクの担当ファイルを実際に実行し、失敗すれば生のエラー内容
+# (要約や言い換えではない)をそのまま担当メンバーに渡して修正させ、
+# 再実行する。既存の`_run_integration_verification`(プロジェクト全体・
+# 全タスク完了後に1回だけ)とは責務が異なり、こちらはタスク単位で
+# レビュー完了の直後に行う。
+#
+# 仮の判断: 検証コマンド(`verify_command`)が絞り込み可能な形
+# (`pytest`呼び出し)であり、かつ対象がテストファイルである場合にのみ
+# 意味のある「そのタスクだけ」の実行ができる。それ以外の組み合わせ
+# (検証コマンドが無い・pytest以外・非テストファイル)では、このタスク
+# 単体を安全に切り出して実行する方法が無い(他の未完了ファイルへの
+# 依存で必ず失敗する、あるいはそもそも実行可能な単位に絞り込めない)
+# ため、タスク単位のグラウンディングはスキップし、既存のプロジェクト
+# 全体の統合検証にまかせる。
+#
+# `TASK_GRANULARITY_FILE`・`TASK_GRANULARITY_FUNCTION`は、この関数群より
+# 前の位置(`AGREE_REQUEST_TYPE_SOFTWARE`の定義直後)で定義済み
+# (`_run_collaborative_project`のデフォルト引数から参照されるため)。
+
+# 仮の判断: 既存の「レビューフェーズは最大2回まで」という暴走防止設計
+# (`_review_and_fix_one_file`のクラスコメント参照)、および同じ発想を
+# 踏襲した`MAX_CONTENT_VOLUME_FIX_ATTEMPTS`・`MAX_BROWSER_FRONTEND_FIX_
+# ATTEMPTS`と同じデフォルト値(2回)に合わせる。
+MAX_TASK_GROUNDING_ATTEMPTS = 2
+
+_TEST_FILE_PATTERN = re.compile(r"(^|[\\/])(test_[^\\/]+\.py|[^\\/]+_test\.py)$")
+
+
+def _is_test_file(filename: str) -> bool:
+    return bool(_TEST_FILE_PATTERN.search(filename))
+
+
+_TEST_FUNCTION_NAME_PATTERN = re.compile(r"^def\s+(test_\w+)\s*\(", re.MULTILINE)
+
+
+def _extract_test_function_names(code: str) -> list:
+    """テストファイルのコードから`def test_...(`形式のテスト関数名を、
+    登場順・重複無しで抽出する(「1関数・1テストケース」単位への
+    細分化オプション用)。
+    """
+    seen = set()
+    names = []
+    for name in _TEST_FUNCTION_NAME_PATTERN.findall(code):
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+_PYTEST_INVOCATION_PATTERN = re.compile(r"^(.*?\bpytest\b)")
+
+
+def _pytest_invocation_prefix(verify_command: str):
+    """検証コマンドの先頭が(`pytest`単体・`python3 -m pytest`のように)
+    pytestの呼び出しであれば、その呼び出し部分(パス等の引数を除く)を
+    返す。pytest呼び出しでなければ`None`を返す(絞り込み不可能なため、
+    タスク単位のグラウンディングはスキップする)。
+    """
+    match = _PYTEST_INVOCATION_PATTERN.match((verify_command or "").strip())
+    return match.group(1) if match else None
+
+
+def _build_task_grounding_commands(verify_command: str, filename: str, code: str, task_granularity: str) -> list:
+    """このタスク(1ファイル)を対象に実行すべき検証コマンドの一覧を返す。
+    絞り込めない場合は空リストを返す(呼び出し元はスキップと解釈する)。
+
+    `task_granularity`が`TASK_GRANULARITY_FUNCTION`の場合、テストファイル内の
+    各`test_...`関数を個別のpytestノードID(`ファイル::関数名`)として
+    1件ずつ返す(依頼の「1関数・1テストケース単位まで細分化できる
+    オプション」への対応)。関数が1つも見つからない場合はファイル単位に
+    フォールバックする。
+    """
+    if not _has_verify_command(verify_command) or not _is_test_file(filename):
+        return []
+    prefix = _pytest_invocation_prefix(verify_command)
+    if prefix is None:
+        return []
+    if task_granularity == TASK_GRANULARITY_FUNCTION:
+        function_names = _extract_test_function_names(code)
+        if function_names:
+            return [f"{prefix} {filename}::{name}" for name in function_names]
+    return [f"{prefix} {filename}"]
+
+
+_TASK_GROUNDING_FIX_PROMPT_TEMPLATE = """あなたはこのタスクの実装担当です。あなたが実装した{filename}を実際に実行(テスト)したところ、以下のコマンドが失敗しました。
+
+【実装計画全体】
+{full_plan}
+
+【実行したコマンド】
+{command}
+
+【終了コード】
+{returncode}
+
+【出力(要約や言い換えではない、実際のエラーメッセージ・スタックトレース)】
+{output}
+
+「これで動くはずです」のような自己申告ではなく、この実行結果そのものを踏まえて直してください。read_file・search_in_fileで現在の内容を確認してから、edit_file・write_fileで修正してください。{edit_over_write_guidance}
+
+修正が完了したら、最後にツールを呼び出さずに、何が原因で何を直したかを簡潔な日本語の文章で報告してください。
+"""
+
+
+def _build_task_grounding_fix_prompt(filename: str, full_plan: str, command: str, run_result: dict) -> str:
+    output = run_result.get("output")
+    if output is None:
+        output = run_result.get("message", "(出力はありません)")
+    return _TASK_GROUNDING_FIX_PROMPT_TEMPLATE.format(
+        filename=filename, full_plan=full_plan, command=command, returncode=run_result.get("returncode", "不明"),
+        output=output, edit_over_write_guidance=f" {_EDIT_OVER_WRITE_GUIDANCE}",
+    )
+
+
+def _run_task_grounding_verification(
+    filename: str, code: str, full_plan: str, verify_command: str, owner: dict, org_fingerprint: str,
+    project_dir: str, print_lock: threading.Lock = None, task_granularity: str = TASK_GRANULARITY_FILE,
+    max_attempts: int = MAX_TASK_GROUNDING_ATTEMPTS,
+) -> tuple:
+    """このタスク(1ファイル)を実際に実行して検証する。モデルの
+    自己申告やレビューの「合意」ではなく、実行結果(終了コード)だけで
+    機械的に成否を判定する。失敗した場合は生のエラー出力をそのまま
+    担当メンバー(`owner`)への修正依頼に含め、再実行する。既存の
+    レビュー往復・内容量チェック等と同じ「実行して失敗したら直す」
+    ループの構造を踏襲し、暴走防止のため`max_attempts`回で打ち切る。
+
+    `(検証を実施したか, 成功したか(未実施の場合はTrue扱い), 最後の
+    出力(成功/未実施の場合は空文字列), 試行回数(未実施の場合は0))`
+    を返す。
+    """
+    commands = _build_task_grounding_commands(verify_command, filename, code, task_granularity)
+    if not commands:
+        return False, True, "", 0
+
+    last_output = ""
+    for attempt in range(1, max_attempts + 1):
+        failed_command, failed_result = None, None
+        for command in commands:
+            run_result = json.loads(_run_project_command(project_dir, command))
+            if not run_result.get("ok"):
+                failed_command, failed_result = command, run_result
+                break  # fail-fast: 最初に失敗したコマンド(関数)の生の出力だけを使う
+
+        if failed_command is None:
+            return True, True, "", attempt
+
+        last_output = failed_result.get("output")
+        if last_output is None:
+            last_output = failed_result.get("message", "")
+        if attempt >= max_attempts:
+            break
+
+        _print_tagged(
+            print_lock, filename,
+            f"[❌ {filename}: `{failed_command}` が終了コード{failed_result.get('returncode', '?')}で"
+            f"失敗しました。{owner['label']}に修正を依頼します ({attempt}回目/{max_attempts}回)]",
+        )
+        fix_prompt = _build_task_grounding_fix_prompt(filename, full_plan, failed_command, failed_result)
+        _collect_answer_with_project_tools(
+            owner, org_fingerprint, [{"role": "user", "content": fix_prompt}], project_dir,
+        )
+        _print_tagged(print_lock, filename, f"[🔍 {filename}: `{failed_command}` を再実行します]")
+
+    return True, False, last_output, max_attempts
+
+
 def _run_collaborative_task_queue(
     tasks: list, candidates: list, org_fingerprint: str, project_dir: str, checklist: list,
-    on_update: callable = None, review_feedback: dict = None,
+    on_update: callable = None, review_feedback: dict = None, verify_command: str = "",
+    task_granularity: str = TASK_GRANULARITY_FILE, grounding_results: dict = None,
 ) -> None:
     """合意フェーズで確定した全タスクを待ち行列(キュー)として扱い、
     メンバーの実装+レビューが完了するたびに次のタスクを割り当てながら
@@ -5741,6 +5979,19 @@ def _run_collaborative_task_queue(
     存在しないため`research_notes`は空文字列のままで、既存の挙動は変わらない
     (`_build_collaborative_implementation_request`は空文字列の場合セクション
     ごと省略する)。
+
+    実行検証グラウンディングループへの対応: `verify_command`を渡すと、
+    レビューが完了する(合否によらず)たびに`_run_task_grounding_
+    verification`でそのタスクを実際に実行して検証する(絞り込めない
+    組み合わせの場合は自動的にスキップされる。詳細は同関数のコメント
+    参照)。`task_granularity`(既定`TASK_GRANULARITY_FILE`)に
+    `TASK_GRANULARITY_FUNCTION`を渡すと、テストファイル内の関数
+    単位まで細分化して実行する。`grounding_results`(dict、
+    `{filename: {"output":, "attempts":}}`)を渡すと、最大試行回数まで
+    解消しなかったファイルの最後の実行結果がそこに記録され、解消すれば
+    そのファイルのエントリは削除される(`review_feedback`と同じ設計)。
+    どちらも既定値(空文字列・`None`)の場合は、既存の呼び出し元・
+    テストとの後方互換性のため何もしない(=このループは動かない)。
     """
     full_plan = "\n".join(f"{fn}: {content}" for fn, content in tasks)
     remaining = sorted(tasks, key=lambda t: _estimate_task_weight(t[1]), reverse=True)
@@ -5909,6 +6160,34 @@ def _run_collaborative_task_queue(
                         review_feedback.pop(filename, None)
                     else:
                         review_feedback[filename] = feedback
+            if on_update:
+                on_update()
+
+            # 実行検証グラウンディングループ: レビューの合否によらず、
+            # 「実際に動くか」はレビュー(読むだけ)とは独立の観点なので
+            # ここで必ず行う。レビューによる修正があれば`dest_path`には
+            # 既に最新のコードが書き込まれている(`_request_fix`参照)ため、
+            # ディスクから読み直して最新の内容を使う。
+            grounding_ran, grounding_ok, grounding_output, grounding_attempts = False, True, "", 0
+            if _has_verify_command(verify_command):
+                try:
+                    with open(dest_path, encoding="utf-8") as f:
+                        current_code = f.read()
+                except OSError:
+                    current_code = code
+                _ACTIVE_STATUS_BOARD.set(candidate["label"], _DEVICE_STATUS_WORKING, f"{filename} を実行検証中")
+                grounding_ran, grounding_ok, grounding_output, grounding_attempts = _run_task_grounding_verification(
+                    filename=filename, code=current_code, full_plan=full_plan, verify_command=verify_command,
+                    owner=candidate, org_fingerprint=org_fingerprint, project_dir=project_dir,
+                    print_lock=print_lock, task_granularity=task_granularity,
+                )
+                _ACTIVE_STATUS_BOARD.set(candidate["label"], _DEVICE_STATUS_WAITING)
+            if grounding_ran and grounding_results is not None:
+                with queue_lock:
+                    if grounding_ok:
+                        grounding_results.pop(filename, None)
+                    else:
+                        grounding_results[filename] = {"output": grounding_output, "attempts": grounding_attempts}
             if on_update:
                 on_update()
 
