@@ -239,7 +239,10 @@ def test_collaborate_dispatches_exactly_two_files_when_architect_uses_nested_for
         # 保存される(プロジェクト名は依頼文から自動生成されるため、実際の
         # 生成ロジックを呼んで期待値を求める)。
         project_dir = os.path.join(out_dir, yoriai.PROJECTS_SUBDIR_NAME, yoriai._project_name_with_date_prefix("ToDoリストのCLIツールを作って"))
-        assert set(os.listdir(project_dir)) == {"storage.py", "cli.py", "PROGRESS.md"}, (
+        # 仮の判断(チェックポイント運用への対応): `.git`はタスク完了のたびに
+        # コミットするチェックポイント用のリポジトリであり、生成物の一部
+        # ではないため比較対象から除外する。
+        assert set(os.listdir(project_dir)) - {".git"} == {"storage.py", "cli.py", "PROGRESS.md"}, (
             f"storage.py/cli.py/PROGRESS.mdの3件だけが保存されるはずです: {os.listdir(project_dir)}"
         )
     finally:

@@ -125,7 +125,9 @@ def test_collaborate_saves_generated_files_under_projects_subdir_only():
             assert "Yoriai本体" in f.read(), "本体のconfig.pyが上書きされています"
 
         project_dir = os.path.join(out_dir, "projects", yoriai._project_name_with_date_prefix("ToDoリストのCLIツールを作って"))
-        assert set(os.listdir(project_dir)) == {"storage.py", "cli.py", "PROGRESS.md"}, os.listdir(project_dir)
+        # 仮の判断(チェックポイント運用への対応): `.git`はチェックポイント用の
+        # リポジトリであり、生成物の一部ではないため比較対象から除外する。
+        assert set(os.listdir(project_dir)) - {".git"} == {"storage.py", "cli.py", "PROGRESS.md"}, os.listdir(project_dir)
     finally:
         yoriai._fetch_org_snapshot = original_snapshot
         yoriai._stream_chat_from_candidate = original_stream
@@ -149,9 +151,15 @@ def test_collaborate_does_not_overwrite_existing_project_on_rerun():
 
         base_name = yoriai._project_name_with_date_prefix("ToDoリストのCLIツールを作って")
         projects_root = os.path.join(out_dir, "projects")
+        # 仮の判断(チェックポイント運用への対応): `.git`はチェックポイント用の
+        # リポジトリであり、生成物の一部ではないため比較対象から除外する。
+        # なお、この2回目の実行は1回目が既に完了済み(未完了プロジェクトが
+        # 無い)ため、チェックポイントからの再開ではなく従来通り連番の新規
+        # プロジェクトとして保存される(`test_checkpoint_resume.py`で、
+        # 未完了プロジェクトが残っている場合にのみ再開されることを別途確認する)。
         assert set(os.listdir(projects_root)) == {base_name, f"{base_name}-2"}, os.listdir(projects_root)
-        assert set(os.listdir(os.path.join(projects_root, base_name))) == {"storage.py", "cli.py", "PROGRESS.md"}
-        assert set(os.listdir(os.path.join(projects_root, f"{base_name}-2"))) == {"storage.py", "cli.py", "PROGRESS.md"}
+        assert set(os.listdir(os.path.join(projects_root, base_name))) - {".git"} == {"storage.py", "cli.py", "PROGRESS.md"}
+        assert set(os.listdir(os.path.join(projects_root, f"{base_name}-2"))) - {".git"} == {"storage.py", "cli.py", "PROGRESS.md"}
     finally:
         yoriai._fetch_org_snapshot = original_snapshot
         yoriai._stream_chat_from_candidate = original_stream
