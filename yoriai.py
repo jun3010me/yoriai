@@ -134,6 +134,7 @@ from progress import (
     _build_task_checklist,
     _extract_progress_section,
     _find_incomplete_projects,
+    _find_matching_incomplete_project,
     _find_repeated_review_feedback,
     _format_task_checklist,
     _incomplete_task_labels,
@@ -4562,6 +4563,28 @@ def _ask_organization_collaborate(
     `_PendingDesignDialogue`への格納時)。
     """
     task_granularity, request = _extract_task_granularity_flag(request)
+
+    # チェックポイント運用によるセッション再開(依頼: ネットワーク障害等で
+    # セッションが中断した後、同じ依頼文が新しい試行として再投入されても、
+    # 新規プロジェクトとしてゼロから始めるのではなく、既存の未完了
+    # プロジェクトの続きから再開する。この判定を怠ると、`_resolve_project_
+    # dir`が常に未使用のディレクトリ名(`<name>-2`、`<name>-3`、...)を
+    # 新たに割り当ててしまい、元の依頼文をまるごと再実行することになる
+    # (実際の運用ログで、同一の依頼が3回丸ごと再実行され2日を消費した
+    # 不具合への対応)。判定はPROGRESS.mdに記録されている依頼文の完全一致
+    # (`_find_matching_incomplete_project`)で行う。見つかった場合、設計
+    # フェーズ(合意フェーズ)はやり直さず、既存の`_resume_project`
+    # (`//resume-all`・自動再開と同じ経路)にそのまま委ねる。
+    existing_project_dir = _find_matching_incomplete_project(out_dir, request)
+    if existing_project_dir is not None:
+        print(
+            f"[🔁 {existing_project_dir} に、同一の依頼文で中断した未完了プロジェクトが"
+            "見つかりました。新規プロジェクトとしてではなく、チェックポイントから再開します]"
+        )
+        if _resume_project(existing_project_dir, port, org_fingerprint):
+            _maybe_auto_resume(existing_project_dir, port, org_fingerprint)
+        return
+
     data = _fetch_org_snapshot(port, org_fingerprint)
     if data is None:
         return
@@ -5065,6 +5088,112 @@ def _run_browser_frontend_verification(
     return result
 
 
+# ---------------------------------------------------------------------------
+# チェックポイント運用によるセッション再開(依頼: ネットワーク障害等で
+# セッションが中断しても、元の依頼文をまるごと再投入して最初からやり直す
+# のではなく、進捗を保持したまま続きから再開できるようにする)
+# ---------------------------------------------------------------------------
+#
+# 仮の判断: `project_dir`自体をgitリポジトリとして初期化し、検証済み
+# (グラウンディング・統合検証を通過した)タスク単位でコミットする。
+# セッションが中断しても、次回の再開(`_resume_project`・`_maybe_auto_
+# resume`)は最新のコミット以降の未完了タスクだけをPROGRESS.mdの
+# チェックリストから拾い直せば良く、`git`自体が失われていなければ生成物も
+# 一緒に残る。git操作(init/add/commit)が失敗しても(gitが未インストール・
+# ディスク容量不足等)、チェックポイントを作れないだけでこれまでの
+# 実行自体は継続できるべきなので、例外は投げずログに警告するだけにとどめる。
+#
+# 仮の判断: タスクキュー方式は複数メンバーのワーカースレッドが並行に
+# 動くため、同じ`project_dir`(同じ`.git`)へ複数スレッドが同時に`git
+# commit`を実行すると、git自身のref lock(`cannot lock ref 'HEAD'`)で
+# 失敗することが実際に確認された。git操作全体をプロセス全体で単一の
+# ロックで直列化する(コミット自体は軽い処理であり、プロジェクトを
+# またいでも直列化して問題ない粒度のため、プロジェクト単位のロックを
+# 個別に管理する複雑さを避けた)。
+_CHECKPOINT_GIT_LOCK = threading.Lock()
+
+
+def _ensure_project_git_repo(project_dir: str) -> None:
+    """`project_dir`がまだgitリポジトリとして初期化されていなければ
+    初期化する(依頼の実装前調査: 「プロジェクトディレクトリが既に
+    gitリポジトリとして初期化されているか確認する」への対応)。既に
+    `.git`があれば何もしない。
+    """
+    if os.path.isdir(os.path.join(project_dir, ".git")):
+        return
+    os.makedirs(project_dir, exist_ok=True)
+    subprocess.run(["git", "init"], cwd=project_dir, capture_output=True, text=True)
+    # 仮の判断: CIやheadlessな実行環境ではグローバルなuser.name/user.email
+    # が設定されていないことが多く、その場合`git commit`自体が失敗する。
+    # チェックポイント用の内部コミットに人間の身元は不要なため、
+    # リポジトリローカルの設定として固定値を入れておく(依頼者の実際の
+    # git設定を書き換えないよう、`--global`は使わない)。
+    subprocess.run(["git", "config", "user.email", "yoriai@localhost"], cwd=project_dir, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.name", "yoriai"], cwd=project_dir, capture_output=True, text=True)
+
+
+def _git_commit_checkpoint(project_dir: str, message: str, paths: list = None) -> bool:
+    """`project_dir`内の現時点の変更を、検証済みのチェックポイントとして
+    コミットする。コミット対象の変更が無い場合(既にコミット済みの内容と
+    同じ)は何もせず`True`を返す。git自体が使えない・コミットに失敗した
+    場合は`False`を返すが、例外は送出しない(呼び出し元の処理は継続する)。
+
+    `paths`(既定`None`)を渡すと、`git add -A`(作業ツリー全体)ではなく
+    指定したパスだけを`git add`する。
+
+    仮の判断(実機報告への対応): タスクキュー方式は複数メンバーのワーカー
+    スレッドが並行に動くため、`git add -A`で作業ツリー全体をステージすると、
+    他のワーカーが先にコミットした変更まで巻き取ってしまい、後から呼ばれた
+    ワーカー自身のタスク(例: storage.py)については「差分なし」の
+    空振りになって、そのタスク名を含むコミットメッセージが一切残らない
+    という実害が確認された。タスク単位のチェックポイント
+    (`_commit_task_checkpoint`)では、そのタスク自身が変更したパスだけを
+    明示的に渡すことで、他のワーカーの変更と競合せず、必ずそのタスクの
+    ファイル名を含むコミットが独立して残るようにする。プロジェクト全体の
+    チェックポイント(統合検証成功時)では、`paths`を渡さず従来通り作業
+    ツリー全体をコミットする。
+    """
+    try:
+        with _CHECKPOINT_GIT_LOCK:
+            _ensure_project_git_repo(project_dir)
+            if paths:
+                subprocess.run(["git", "add", "--"] + list(paths), cwd=project_dir, capture_output=True, text=True)
+            else:
+                subprocess.run(["git", "add", "-A"], cwd=project_dir, capture_output=True, text=True)
+            diff_check = subprocess.run(
+                ["git", "diff", "--cached", "--quiet"], cwd=project_dir, capture_output=True, text=True,
+            )
+            if diff_check.returncode == 0:
+                return True  # ステージされた変更が無い(既に別のコミットに含まれている等)
+            if diff_check.returncode != 1:
+                logger.warning(
+                    "チェックポイント: %s の git diff --cached に失敗しました: %s", project_dir, diff_check.stderr,
+                )
+                return False
+            result = subprocess.run(
+                ["git", "commit", "-m", message], cwd=project_dir, capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                logger.warning("チェックポイント: %s の git commit に失敗しました: %s", project_dir, result.stderr)
+                return False
+            return True
+    except OSError as exc:
+        logger.warning("チェックポイント: %s の git 操作に失敗しました: %s", project_dir, exc)
+        return False
+
+
+def _commit_task_checkpoint(project_dir: str, filename: str, detail: str) -> None:
+    """1タスク分(1ファイル)の実装・レビュー・実行検証グラウンディングが
+    完了した直後に呼び出す、タスク単位のチェックポイントコミット。
+    そのタスク自身が変更したファイル(担当ファイル・PROGRESS.md)だけを
+    対象にする(他のワーカーのタスクと競合しないように、`_git_commit_
+    checkpoint`のクラスコメントを参照)。
+    """
+    _git_commit_checkpoint(
+        project_dir, f"checkpoint: {filename} ({detail})", paths=[filename, PROGRESS_FILENAME],
+    )
+
+
 def _run_collaborative_project(
     request: str, tasks: list, checklist: list, candidates: list, org_fingerprint: str,
     project_dir: str, tasks_to_queue: list, auto_resume_count: int = 0, changelog: list = None,
@@ -5173,6 +5302,10 @@ def _run_collaborative_project(
         verification_holder["result"] = {"success": success, "attempts": attempts, "output": last_output}
         if success:
             print(f"[✅ 統合検証に成功しました ({attempts}回目の試行)]")
+            # チェックポイント(PR0): プロジェクト全体の検証コマンド(フル
+            # スイート)がgreenになった時点で、プロジェクト単位のチェック
+            # ポイントをコミットする。
+            _git_commit_checkpoint(project_dir, f"checkpoint: 統合検証成功 ({attempts}回目の試行)")
         else:
             print(f"[❌ 統合検証に失敗しました({attempts}回試行)]")
         write_progress()
@@ -6653,6 +6786,10 @@ def _run_collaborative_task_queue(
                     print_lock, filename,
                     f"[⚠️ {filename} のレビュー担当者がいません(メンバーが1台のみのため、レビューはスキップされます)]",
                 )
+                # チェックポイント(PR0): レビュー担当がおらずこれ以上この
+                # タスクに手を加える余地が無い時点で、実装済みの内容を
+                # コミットしておく(セッション中断時の続きからの再開用)。
+                _commit_task_checkpoint(project_dir, filename, "レビュー担当なし(実装のみ)")
                 continue
 
             with queue_lock:
@@ -6739,6 +6876,17 @@ def _run_collaborative_task_queue(
                         grounding_results[filename] = {"output": grounding_output, "attempts": grounding_attempts}
             if on_update:
                 on_update()
+
+            # チェックポイント(PR0): このタスク(1ファイル)の実装・レビュー・
+            # 実行検証グラウンディングの往復がここで一区切りつく(成功・
+            # 失敗いずれの場合も、それまでの変更を確実にディスク+gitへ
+            # 残しておく。失敗のまま打ち切られた場合でも、セッション再開時に
+            # 同じ作業をゼロからやり直さずに済むようにするため)。
+            if grounding_ran:
+                checkpoint_detail = f"実行検証OK({grounding_attempts}回目)" if grounding_ok else f"実行検証{grounding_attempts}回失敗"
+            else:
+                checkpoint_detail = "レビューOK" if ok else "レビュー未解決"
+            _commit_task_checkpoint(project_dir, filename, checkpoint_detail)
 
             with queue_lock:
                 latest_completed[candidate["label"]] = (filename, code)
@@ -7168,7 +7316,12 @@ def _list_project_files(project_dir: str) -> list:
     if not os.path.isdir(project_dir):
         return []
     files = []
-    for root, _dirs, filenames in os.walk(project_dir):
+    for root, dirs, filenames in os.walk(project_dir):
+        # 仮の判断(チェックポイント運用への対応): `.git`はタスク完了の
+        # たびにコミットするチェックポイント用のリポジトリの内部データ
+        # であり、生成物でもモデルが編集すべきファイルでもないため、
+        # 一覧・構文チェック・list_dirツールのいずれからも除外する。
+        dirs[:] = [d for d in dirs if d != ".git"]
         for name in filenames:
             if name == PROGRESS_FILENAME:
                 continue

@@ -131,7 +131,9 @@ def test_two_members_four_tasks_queue_completes_all_files_via_reassignment():
 
     output, out_dir, checklist = _run_queue(tasks, candidates)
     try:
-        saved_files = set(os.listdir(out_dir))
+        # 仮の判断(チェックポイント運用への対応): `.git`はチェックポイント用の
+        # リポジトリであり、生成物の一部ではないため比較対象から除外する。
+        saved_files = set(os.listdir(out_dir)) - {".git"}
         assert saved_files == {"storage.py", "cli.py", "utils.py", "config.py"}, (
             f"2台構成でも、キューにより4ファイルすべてが実装されるはずです: {saved_files}"
         )

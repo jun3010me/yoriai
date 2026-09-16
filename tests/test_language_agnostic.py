@@ -443,7 +443,9 @@ def test_collaborate_still_defaults_python_regression():
         )
         parsed = yoriai._parse_progress_markdown(os.path.join(project_dir, yoriai.PROGRESS_FILENAME))
         assert parsed["language"] == "Python", parsed
-        assert set(os.listdir(project_dir)) == {"storage.py", "cli.py", "PROGRESS.md"}
+        # 仮の判断(チェックポイント運用への対応): `.git`はチェックポイント用の
+        # リポジトリであり、生成物の一部ではないため比較対象から除外する。
+        assert set(os.listdir(project_dir)) - {".git"} == {"storage.py", "cli.py", "PROGRESS.md"}
     finally:
         yoriai._fetch_org_snapshot = original_snapshot
         yoriai._stream_chat_from_candidate = original_stream

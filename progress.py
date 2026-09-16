@@ -616,3 +616,25 @@ def _find_incomplete_projects(out_dir: str) -> list:
         if parsed is not None and _project_has_pending_work(parsed):
             incomplete.append(project_dir)
     return incomplete
+
+
+def _find_matching_incomplete_project(out_dir: str, request: str):
+    """依頼: ネットワーク障害等でセッションが中断した後、元の依頼文が
+    (人間の再入力・自動再送のいずれであれ)一字一句同じ内容で再投入された
+    場合、新規プロジェクトとしてゼロから始めるのではなく、PROGRESS.mdに
+    記録済みの未完了プロジェクトをチェックポイントから続けられるように
+    するための検索。`_find_incomplete_projects`が返す未完了プロジェクトの
+    うち、記録されている依頼文(`request`)が完全一致する最初の1件の
+    ディレクトリパスを返す。見つからなければ`None`を返す。
+
+    仮の判断: 依頼文の完全一致のみを対象とする(表記ゆれ・部分一致までは
+    今回のスコープ外)。同じ依頼文で複数の未完了プロジェクトが存在する
+    ことは通常無いが、仮にあった場合は`_find_incomplete_projects`と同じ
+    順序(ディレクトリ名の昇順、つまり日付が古いもの)で最初に見つかった
+    ものを優先する。
+    """
+    for project_dir in _find_incomplete_projects(out_dir):
+        parsed = _parse_progress_markdown(os.path.join(project_dir, PROGRESS_FILENAME))
+        if parsed is not None and parsed.get("request") == request:
+            return project_dir
+    return None
