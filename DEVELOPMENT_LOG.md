@@ -7036,3 +7036,48 @@ project_dir`が常に未使用のディレクトリ名(`<name>-2`、`<name>-3`�
   厳密な比較から`.git`を除外するよう更新した。既存の全テスト(pytest実行、
   709件)を実行し、リグレッションが無いことを確認した(追加分と合わせて
   計717件パス)。
+
+### サンプリングパラメータ(temperature・repeat_penalty)の明示指定
+
+実運用ログの調査で、MacStudio(LM Studio、qwen3.8-flash-next)が`list_dir`
+ツール呼び出しを、堂々巡り検出により1度促されても繰り返す退行ループに
+陥っていることが確認された。原因調査の結果、コンテキスト長
+(`loaded_context_length: 262144`)や並列度(`PARALLEL: 4`に対し実接続2)は
+いずれも問題なく、`llm_stream.py`内のリクエスト組み立て箇所(Ollama向け
+`/api/chat`呼び出し・LM Studio/MLX-LM向け`/v1/chat/completions`呼び出しの
+両方)が`temperature`・`repeat_penalty`のいずれも明示的に指定しておらず、
+各バックエンド側のその場のデフォルト値に生成挙動を委ねてしまっていることが
+判明した。これによりノードやタイミングによって生成の一貫性が変動し、同じ
+ツール呼び出しを機械的に繰り返す退行ループを誘発しやすい状態になっていた。
+
+対応:
+
+- **`config.py`に`DEFAULT_TEMPERATURE`・`DEFAULT_REPEAT_PENALTY`・
+  `MODEL_SAMPLING_OVERRIDES`・`get_sampling_params(model)`を新設**した。
+  既定値は暫定として`temperature=0.4`(決定性寄りだが完全な貪欲法ではない
+  程度)・`repeat_penalty=1.15`(Ollama/LM Studio双方のデフォルト(概ね1.0
+  前後)より繰り返しを避ける方向に少し強めた値)とした。値そのものの根拠は
+  経験則にとどまり、実機の様子を見ながら環境変数(`YORIAI_TEMPERATURE`・
+  `YORIAI_REPEAT_PENALTY`)で全体のデフォルト値を調整できるようにした。
+  モデルによって最適値が異なりうるため、`MODEL_SAMPLING_OVERRIDES`辞書に
+  モデル名ごとの個別値(`temperature`・`repeat_penalty`の一部または両方)を
+  追記でき、指定していないパラメータはデフォルト値で補われる。
+- **`llm_stream._stream_ollama_turn()`のOllama向け`options`辞書**、
+  および**`llm_stream._stream_openai_compatible_turn()`(LM Studio・
+  MLX-LM共通)のリクエストボディ**の両方に、`config.get_sampling_params
+  (model)`で得た値を`temperature`・`repeat_penalty`として明示的に追加
+  した。LM Studio公式ドキュメント(`/v1/chat/completions`のエンドポイント
+  仕様)で、OpenAI標準パラメータに加えて`repeat_penalty`を拡張パラメータ
+  として受け付けることを確認済み。Ollama向け`options`辞書も同様に
+  `repeat_penalty`・`temperature`を受け付けることを`/api/chat`の仕様で
+  確認済み。既存の呼び出し元は引数を変更していないため後方互換性を保つ
+  (値は常に`config.get_sampling_params()`経由で解決される)。
+- **テスト**: `tests/test_sampling_params.py`を新設し、(1)LM Studio/
+  MLX-LM向けpayloadに既定の`temperature`・`repeat_penalty`が含まれる
+  こと、(2)Ollama向け`options`辞書にも既定値が含まれること、(3)
+  `MODEL_SAMPLING_OVERRIDES`でモデルごとの個別値を設定した場合、それが
+  両バックエンドのリクエストに反映されること(他モデル向けの上書きが
+  漏れないことも含む)、(4)一部のパラメータのみ上書きした場合、残りは
+  デフォルト値で補われること、を確認した(7件追加)。既存の全テスト
+  (pytest実行、717件)を実行し、リグレッションが無いことを確認した
+  (追加分と合わせて計724件パス)。

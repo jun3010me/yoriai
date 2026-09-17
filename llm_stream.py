@@ -37,6 +37,7 @@ import uuid
 
 import requests
 
+import config
 from tools import WEB_SEARCH_TOOL_SCHEMA, _execute_tool_call, _looks_like_tools_related_error
 from yoriai_types import (
     CHAT_CONNECT_TIMEOUT_SEC,
@@ -126,6 +127,11 @@ def _stream_ollama_turn(model: str, messages: list, tools: list, max_output_toke
     (_decide_num_ctxがNoneを返した場合)はキー自体を送らず、Ollama側の
     デフォルト挙動に委ねる(従来の挙動のまま)。
 
+    仮の判断(実機調査で見つかった退行ループへの対応): options.temperature・
+    options.repeat_penaltyもconfig.get_sampling_params()から取得して
+    明示的に指定する。詳細はconfig.py側のDEFAULT_TEMPERATURE・
+    DEFAULT_REPEAT_PENALTY定義部のコメントを参照。
+
     仮の判断: `max_output_tokens`は既定でCHAT_MAX_OUTPUT_TOKENSとする
     (既存の呼び出し元との後方互換性のため)。`stream_chat_completion`から
     呼ばれる場合は、モデルのコンテキスト長に応じて自動調整された値
@@ -155,7 +161,12 @@ def _stream_ollama_turn(model: str, messages: list, tools: list, max_output_toke
     """
     from yoriai import _decide_num_ctx
     num_ctx = _decide_num_ctx(model)
-    options = {"num_predict": max_output_tokens}
+    sampling = config.get_sampling_params(model)
+    options = {
+        "num_predict": max_output_tokens,
+        "temperature": sampling["temperature"],
+        "repeat_penalty": sampling["repeat_penalty"],
+    }
     if num_ctx is not None:
         options["num_ctx"] = num_ctx
         estimated_tokens = _estimate_tokens(messages)
@@ -346,13 +357,24 @@ def _stream_openai_compatible_turn(
     ようなパラメータでの思考の深さの制御、および最初の1トークンが
     出るまでのprefill待ち時間そのものへの対策は、このPRのスコープ外
     として別途扱う。
+
+    仮の判断(実機調査で見つかった退行ループへの対応): `temperature`・
+    `repeat_penalty`をconfig.get_sampling_params()から取得して明示的に
+    指定する(値を指定しないとバックエンドのその場のデフォルトに委ねられ、
+    生成の一貫性が変動していたことが実機調査で分かった)。LM Studio公式
+    ドキュメント(`/v1/chat/completions`のエンドポイント仕様)で、OpenAI
+    標準パラメータに加えて`repeat_penalty`を拡張パラメータとして受け付ける
+    ことを確認済み。
     """
+    sampling = config.get_sampling_params(model)
     try:
         resp = requests.post(
             f"{base_url}/v1/chat/completions",
             json={
                 "model": model, "messages": messages, "tools": tools, "stream": True,
                 "max_tokens": max_output_tokens,
+                "temperature": sampling["temperature"],
+                "repeat_penalty": sampling["repeat_penalty"],
             },
             stream=True,
             timeout=(CHAT_CONNECT_TIMEOUT_SEC, CHAT_READ_TIMEOUT_SEC),
