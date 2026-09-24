@@ -8062,7 +8062,70 @@ def _check_fix_subtask_satisfied(
     grounded, reason = _fix_subtask_evidence_is_grounded(project_dir, file_list, evidence)
     if not grounded:
         return False, reason
-    return True, ", ".join(f"{filename}: {identifier}" for filename, identifier in evidence)
+
+    # 2段目: 要素ごとの対応確認(詳細は`_FIX_SUBTASK_REQUIREMENT_CHECK_PROMPT`
+    # のコメント参照)。1段目の会話の続きとして問い合わせる。
+    followup_messages = [
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": answer},
+        {"role": "user", "content": _FIX_SUBTASK_REQUIREMENT_CHECK_PROMPT},
+    ]
+    followup, error, truncated = _collect_review_answer_with_read_file(
+        candidate, org_fingerprint, followup_messages, project_dir, print_lock=print_lock, tag=tag,
+    )
+    if error:
+        return False, f"要素ごとの確認の問い合わせに失敗しました: {error}"
+    if truncated:
+        return False, "要素ごとの確認の回答が途中で打ち切られました"
+    requirements = _parse_fix_subtask_requirement_lines(followup)
+    if not requirements:
+        return False, "要素ごとの対応が示されませんでした"
+    for requirement, requirement_evidence in requirements:
+        if requirement_evidence is None:
+            return False, f"要素「{requirement}」に対応する実装が示されませんでした"
+        grounded, reason = _fix_subtask_evidence_is_grounded(project_dir, file_list, [requirement_evidence])
+        if not grounded:
+            return False, f"要素「{requirement}」: {reason}"
+    return True, ", ".join(f"{filename}: {identifier}" for _req, (filename, identifier) in requirements)
+
+
+# 仮の判断(実ノードでの計測結果への対応): 1段目(判定+根拠)だけでは、
+# 「CLIとテストの整備」まで求めるサブタスクを、managerの実装だけを根拠に
+# 「実装済み」と判定してしまう誤スキップが実測で53件中1件あった。
+# 根拠の裏付けは「挙げられた識別子が実在するか」までしか見ないため、
+# 要件の網羅性は、サブタスクが求める要素を1つずつ列挙させ、要素ごとに
+# 根拠を対応させることで確かめる。根拠の無い要素・裏付けの取れない要素が
+# 1つでもあれば、従来どおり実行する側に倒す。
+_FIX_SUBTASK_REQUIREMENT_NONE = "なし"
+
+_FIX_SUBTASK_REQUIREMENT_CHECK_PROMPT = f"""念のため、要素ごとに確認してください。確認するサブタスクが求めている変更を、要素(関数・引数・オプション・エラー処理・テストの追加など)ごとに1行ずつすべて列挙し、それぞれに対応する実装を書いてください。必要ならread_file・search_in_fileで改めて確認してください。
+
+回答は次の形式の行だけで書いてください(他の説明文は不要です):
+要素: <サブタスクが求める要素> => <ファイル名>: <その要素を実装している、ファイル内に実際に書かれている関数名・引数名・オプション名などを、省略・要約せずそのまま>
+
+対応する実装が見つからない要素は、「要素: <要素> => {_FIX_SUBTASK_REQUIREMENT_NONE}」と書いてください。サブタスクがテストの追加・更新を求めている場合は、テストも1つの要素として必ず列挙してください。逆に、サブタスクの文に書かれていない要素(サブタスクが求めていないテスト等)は付け加えないでください。
+"""
+
+_FIX_SUBTASK_REQUIREMENT_LINE_PATTERN = re.compile(r"^\s*[-*]?\s*\**要素\**\s*[:：]\s*(.+?)\s*(?:=>|→|⇒)\s*(.+?)\s*$")
+
+
+def _parse_fix_subtask_requirement_lines(text: str) -> list:
+    """要素ごとの確認の回答から`[(要素, (ファイル名, 識別子) または None), ...]`
+    を取り出す。対応する実装が「なし」とされた要素・「ファイル名: 識別子」
+    の形になっていない要素は`None`とする。
+    """
+    requirements = []
+    for line in (text or "").splitlines():
+        match = _FIX_SUBTASK_REQUIREMENT_LINE_PATTERN.match(line)
+        if not match:
+            continue
+        requirement, target = match.group(1).strip(), match.group(2).strip()
+        parts = re.split(r"[:：]", target, maxsplit=1)
+        if target.strip("`* ") == _FIX_SUBTASK_REQUIREMENT_NONE or len(parts) != 2:
+            requirements.append((requirement, None))
+            continue
+        requirements.append((requirement, (parts[0].strip().strip("`"), parts[1].strip().strip("`"))))
+    return requirements
 
 
 def _short_subtask_label(subtask: str, limit: int = 60) -> str:

@@ -100,8 +100,9 @@ class _FakeOrg:
     回答」の対応表。
     """
 
-    def __init__(self, check_answers, check_error=None):
+    def __init__(self, check_answers, check_error=None, requirement_answers=None):
         self.check_answers = check_answers
+        self.requirement_answers = _REQUIREMENT_ANSWERS if requirement_answers is None else requirement_answers
         self.check_error = check_error
         self.checked_subtasks = []
         self.implemented_subtasks = []
@@ -116,7 +117,12 @@ class _FakeOrg:
             if self.check_error:
                 yield {"error": self.check_error}
                 return
-            answer = next((a for key, a in self.check_answers.items() if key in subtask), "判定: 未実装")
+            answers = self.check_answers
+            if len(messages) > 1:
+                # 2段目(要素ごとの確認)。1段目の会話の続きとして届く。
+                assert "要素ごとに確認してください" in messages[-1]["content"], messages[-1]
+                answers = self.requirement_answers
+            answer = next((a for key, a in answers.items() if key in subtask), "判定: 未実装")
             yield {"content": answer}
             yield {"done": True}
             return
@@ -159,6 +165,14 @@ def _run_resume(project_dir, fake):
 _SATISFIED_ANSWERS = {
     "on_conflict": "判定: 実装済み\n根拠: inventory_manager.py: on_conflict\n根拠: test_verify.py: on_conflict=\"skip\"",
     "ignore_missing": "判定: 実装済み\n根拠: inventory_manager.py: ignore_missing",
+}
+
+
+_REQUIREMENT_ANSWERS = {
+    "on_conflict": "要素: on_conflict引数 => inventory_manager.py: on_conflict=\"error\"\n"
+                   "要素: 検証 => test_verify.py: on_conflict=\"skip\"",
+    "ignore_missing": "要素: ignore_missing引数 => inventory_manager.py: ignore_missing=False",
+    "max_depth": "要素: 資源制限 => test_verify.py: inventory_manager",
 }
 
 
@@ -230,7 +244,9 @@ def test_resume_skips_already_implemented_subtasks_and_shrinks_queue():
         fake = _FakeOrg(_SATISFIED_ANSWERS)
         output = _run_resume(project_dir, fake)
 
-        assert sorted(fake.checked_subtasks) == sorted(_PENDING_SUBTASKS), fake.checked_subtasks
+        # 実装済みと判定された2件は、2段目(要素ごとの確認)でもう1回問い合わせる。
+        assert sorted(set(fake.checked_subtasks)) == sorted(_PENDING_SUBTASKS), fake.checked_subtasks
+        assert len(fake.checked_subtasks) == 5, fake.checked_subtasks
         # 実装済みの2件は割り当てられず、未実装の1件だけが実装される。
         assert fake.implemented_subtasks == [_SUBTASK_LIMITS], fake.implemented_subtasks
         assert "[🔎 事前確認の結果: 3件中2件を実装済みのためスキップし、残り1件をキューに入れます]" in output, output
@@ -273,6 +289,57 @@ def test_all_subtasks_satisfied_means_nothing_is_implemented_and_queue_is_cleare
 # ---------------------------------------------------------------------------
 # 不確実な場合は実行する側に倒す
 # ---------------------------------------------------------------------------
+
+def test_parse_requirement_lines():
+    requirements = yoriai._parse_fix_subtask_requirement_lines(
+        "要素: on_conflict引数 => inventory_manager.py: on_conflict\n"
+        "- 要素: テストの追加 => なし\n"
+        "要素: CLIオプション → `inventory_cli.py`: `--on-conflict`\n"
+        "要素: 形式崩れ => inventory_cli.py\n"
+        "関係ない行",
+    )
+    assert requirements == [
+        ("on_conflict引数", ("inventory_manager.py", "on_conflict")),
+        ("テストの追加", None),
+        ("CLIオプション", ("inventory_cli.py", "--on-conflict")),
+        ("形式崩れ", None),
+    ], requirements
+
+
+def test_missing_requirement_in_second_stage_is_not_skipped():
+    """1段目で「実装済み」と判定され根拠も実在していても、2段目で
+    求められている要素(例: テストの追加)に対応する実装が無ければ
+    スキップしない(実ノードでの計測で見つかった誤スキップの再現)。
+    """
+    root = tempfile.mkdtemp(prefix="yoriai_skip_test_")
+    try:
+        project_dir = _write_project_with_pending_queue(root)
+        requirement_answers = dict(_REQUIREMENT_ANSWERS)
+        requirement_answers["on_conflict"] = (
+            "要素: on_conflict引数 => inventory_manager.py: on_conflict=\"error\"\n要素: テストの追加 => なし"
+        )
+        fake = _FakeOrg(_SATISFIED_ANSWERS, requirement_answers=requirement_answers)
+        output = _run_resume(project_dir, fake)
+        assert sorted(fake.implemented_subtasks) == sorted([_SUBTASK_ON_CONFLICT, _SUBTASK_LIMITS]), fake.implemented_subtasks
+        assert "[🔎 事前確認の結果: 3件中1件を実装済みのためスキップし、残り2件をキューに入れます]" in output, output
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_ungrounded_or_missing_second_stage_answer_is_not_skipped():
+    root = tempfile.mkdtemp(prefix="yoriai_skip_test_")
+    try:
+        project_dir = _write_project_with_pending_queue(root)
+        requirement_answers = {
+            "on_conflict": "要素: CLIオプション => inventory_manager.py: --on-conflict",
+            "ignore_missing": "形式に沿っていない回答",
+        }
+        fake = _FakeOrg(_SATISFIED_ANSWERS, requirement_answers=requirement_answers)
+        _run_resume(project_dir, fake)
+        assert sorted(fake.implemented_subtasks) == sorted(_PENDING_SUBTASKS), fake.implemented_subtasks
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
 
 def test_ungrounded_evidence_is_not_skipped():
     """「実装済み」と答えても、根拠の文字列が実際のファイルに無ければ
