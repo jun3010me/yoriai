@@ -205,6 +205,62 @@ def test_on_thinking_display_does_not_lose_or_reorder_content():
     assert len(thinking_texts) >= 2, thinking_texts
 
 
+# ---------------------------------------------------------------------------
+# 読み取り専用のレビュー用ループ(`_collect_review_answer_with_read_file`)
+# ---------------------------------------------------------------------------
+#
+# 実機報告: 実装済みサブタスクの事前確認・レビューで使うこのループは、
+# `speak()`のバッファリングが適用されておらず、1チャンクごとに
+# `[事前確認6] [🤔 思考中]  Given`のような行が並んでいた。チャンクは
+# 実機ログの断片をそのまま使う。
+
+_REVIEW_LOOP_CHUNKS = [
+    ".", " Given", " no", " explicit", " tests", " for", " update", "/s", "kip", " policies",
+    " and", " search", " for", ' "', "conf", "lict", '"', " returned", " nothing", " in",
+    " test", "_verify", ".py", ",", " I", " judge", "\n", "未", "実", "装", ".", "\n",
+]
+
+
+def _run_review_loop_with_thinking(chunks):
+    import contextlib
+    import io
+
+    def fake_stream(candidate, org_fingerprint, messages, **_kwargs):
+        for chunk in chunks:
+            yield {"thinking": chunk}
+        yield {"content": "判定: 未実装"}
+        yield {"done": True}
+
+    original_stream = yoriai._stream_chat_from_candidate
+    yoriai._stream_chat_from_candidate = fake_stream
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            answer, error, _truncated = yoriai._collect_review_answer_with_read_file(
+                _candidate("MacStudio", "qwen"), "fp", [{"role": "user", "content": "x"}], ".", tag="事前確認6",
+            )
+    finally:
+        yoriai._stream_chat_from_candidate = original_stream
+    assert error is None and answer == "判定: 未実装", (answer, error)
+    return buf.getvalue().splitlines()
+
+
+def test_review_loop_buffers_thinking_chunks_instead_of_one_line_per_chunk():
+    lines = _run_review_loop_with_thinking(_REVIEW_LOOP_CHUNKS)
+    assert len(lines) < len(_REVIEW_LOOP_CHUNKS) // 4, lines
+    assert all(line.startswith("[事前確認6] [🤔 思考中] ") for line in lines), lines
+
+
+def test_review_loop_thinking_display_keeps_content_and_emits_no_blank_lines():
+    lines = _run_review_loop_with_thinking(_REVIEW_LOOP_CHUNKS)
+    prefix = "[事前確認6] [🤔 思考中] "
+    bodies = [line[len(prefix):] for line in lines]
+    assert all(body.strip() for body in bodies), lines
+    joined = "".join(bodies).replace(" ", "")
+    expected = "".join(_REVIEW_LOOP_CHUNKS).replace(" ", "").replace("\n", "")
+    assert joined == expected, (joined, expected)
+
+
 def main():
     tests = [
         test_on_thinking_buffers_short_chunks_until_threshold,
@@ -213,6 +269,8 @@ def main():
         test_on_thinking_flushes_on_full_width_sentence_ending_punctuation,
         test_on_thinking_flushes_remaining_buffer_after_answer_completes,
         test_on_thinking_display_does_not_lose_or_reorder_content,
+        test_review_loop_buffers_thinking_chunks_instead_of_one_line_per_chunk,
+        test_review_loop_thinking_display_keeps_content_and_emits_no_blank_lines,
     ]
     failures = 0
     for test in tests:

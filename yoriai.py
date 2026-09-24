@@ -1441,6 +1441,27 @@ def _collect_review_answer_with_read_file(
         pending_tool_calls = None
         error = None
         truncated = False
+        # 仮の判断: このループはタスクキュー方式で複数ワーカースレッドから
+        # 並行に呼ばれうるため、思考過程は`_print_tagged`(ロック保護・タグ
+        # 付き)で出力する(このループ自身は`content`をその場で表示しない
+        # 設計のため、思考過程だけをこの場で見せることで「まだ動いている」
+        # ことを可視化する)。
+        #
+        # 仮の判断(実機報告への対応): 以前は1チャンクごとに`_print_tagged`を
+        # 呼んでいたため、実装済みサブタスクの事前確認・レビューで単語1つ
+        # ごとに`[🤔 思考中]`付きの行が並び非常に読みにくかった。対話
+        # プロトコルの`speak()`と同じく、`_THINKING_DISPLAY_BUFFER_FLUSH_
+        # CHARS`文字たまるか文末記号で終わるまで貯めてからまとめて出す。
+        # 改行だけのチャンクで空の行が出ないよう、前後の空白は取り除き、
+        # 空になったものは出力しない。
+        pending_thinking = []
+
+        def flush_pending_thinking() -> None:
+            buffered = "".join(pending_thinking).strip()
+            pending_thinking.clear()
+            if buffered:
+                _print_tagged(print_lock, tag or candidate["label"], f"[🤔 思考中] {buffered}")
+
         for event in _stream_chat_from_candidate(candidate, org_fingerprint, messages, offer_read_file_tool=True):
             if "error" in event:
                 error = event["error"]
@@ -1450,13 +1471,12 @@ def _collect_review_answer_with_read_file(
                 break
             thinking = event.get("thinking")
             if thinking:
-                # 仮の判断: このループはタスクキュー方式で複数ワーカー
-                # スレッドから並行に呼ばれうるため、1チャンクごとに
-                # `_print_tagged`(ロック保護・タグ付き)で1行として出力する
-                # (このループ自身は`content`をその場で表示しない設計のため、
-                # 思考過程だけをこの場で見せることで「まだ動いている」ことを
-                # 可視化する)。
-                _print_tagged(print_lock, tag or candidate["label"], f"[🤔 思考中] {thinking}")
+                pending_thinking.append(thinking)
+                buffered_tail = "".join(pending_thinking)
+                if len(buffered_tail) >= _THINKING_DISPLAY_BUFFER_FLUSH_CHARS or (
+                    buffered_tail[-1] in _THINKING_DISPLAY_SENTENCE_END_CHARS
+                ):
+                    flush_pending_thinking()
                 continue
             content = event.get("content")
             if content:
@@ -1464,6 +1484,9 @@ def _collect_review_answer_with_read_file(
             if event.get("done"):
                 truncated = bool(event.get("truncated"))
                 break
+        # 閾値にも文末記号にも達しないまま残った端数を、ツール呼び出しの
+        # 進捗表示や結果の返却より前に出し切る。
+        flush_pending_thinking()
 
         if error:
             return "", error, False
