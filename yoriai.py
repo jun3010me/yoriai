@@ -7716,6 +7716,25 @@ def _build_fix_subtask_review_prompt(subtask: str, full_plan: str, language: str
     )
 
 
+def _preserved_progress_verification_fields(latest_parsed: dict) -> dict:
+    """//fix系の処理がPROGRESS.mdを書き直す際に、既に記録されている
+    「検証コマンド」「統合検証」「実行検証グラウンディング」の節を
+    そのまま引き継ぐためのキーワード引数を返す。
+
+    仮の判断(実機報告への対応): 以前は`_finalize_fix_changes`・
+    `_persist_pending_fix_subtasks`がこれらを渡さずに書き直していたため、
+    //fixが1回走るだけで検証コマンドの記録が消えていた(260917-cli-jsonで
+    `python3 test_verify.py`が消えていたのを確認)。実装済みサブタスクの
+    事前確認(`_skip_already_satisfied_fix_subtasks`)は検証コマンドを
+    前提ゲートとして使うため、記録を失わないようにする。
+    """
+    return {
+        "verify_command": latest_parsed.get("verify_command", ""),
+        "verification": latest_parsed.get("verification"),
+        "grounding_results": latest_parsed.get("grounding_results"),
+    }
+
+
 def _finalize_fix_changes(
     project_dir: str, request: str, parsed: dict, language: str, modified_files: list, error: str,
     pending_fix_request: str = "", pending_fix_subtasks: list = None,
@@ -7762,6 +7781,7 @@ def _finalize_fix_changes(
         language=latest_parsed["language"] or language,
         pending_fix_request=pending_fix_request if pending_fix_subtasks else "",
         pending_fix_subtasks=pending_fix_subtasks or [],
+        **_preserved_progress_verification_fields(latest_parsed),
     )
 
     if error:
@@ -7802,6 +7822,7 @@ def _persist_pending_fix_subtasks(
         changelog=latest_parsed["changelog"], language=latest_parsed["language"] or language,
         pending_fix_request=request if pending_fix_subtasks else "",
         pending_fix_subtasks=pending_fix_subtasks,
+        **_preserved_progress_verification_fields(latest_parsed),
     )
     if pending_fix_subtasks:
         print(
@@ -7868,6 +7889,332 @@ def _resplit_looping_fix_subtasks(
     return pending
 
 
+# ---------------------------------------------------------------------------
+# 実装済みサブタスクの事前確認(割り当て前のスキップ)
+# ---------------------------------------------------------------------------
+#
+# 実機報告(projects/260917-cli-json)への対応: 要件がすでにコードに実装
+# 済みで検証コマンドも通っているのに、キューに残った約40件のサブタスク
+# (実装+レビューで約80項目)が3台に割り当てられ、実装済みの機能を再実装
+# していた。`//resume-all`・同一依頼文の再投入による再開では、PROGRESS.md
+# に残っていた古いキューが検証されずにそのまま引き継がれていた。
+# そこで`_run_fix_task_queue`がキューを組む前に、各サブタスクが「すでに
+# 満たされているか」を確認し、満たされていれば実装せず完了扱いにする。
+#
+# 仮の判断(誤スキップより無駄な実行のほうがまし、という方針):
+# 1. 前提ゲート(既存の仕組みの再利用): 全ファイルの構文チェック
+#    (`_syntax_check_all_files`)と、PROGRESS.mdに検証コマンドが記録されて
+#    いればその実行(`_run_project_command`)。どちらかが失敗していれば
+#    このセッションでは1件もスキップしない。
+# 2. LLMによる判定: 書き込みツールを持たない読み取り専用のループ
+#    (`_collect_review_answer_with_read_file`、レビュー用の既存の仕組み)で
+#    「判定: 実装済み/未実装」と「根拠: <ファイル名>: <識別子>」を答えさせる。
+# 3. 決定的な裏付け: 根拠に挙げられたファイルが実在し、その識別子が実際に
+#    ファイル中に含まれていることを機械的に確かめる。
+# 問い合わせの失敗・応答の打ち切り・形式の崩れ・根拠の不一致など、
+# どこかで不確実になった時点で「未実装」(=従来どおり実行する)に倒す。
+
+_FIX_SUBTASK_SATISFIED_VERDICT = "実装済み"
+_FIX_SUBTASK_UNSATISFIED_VERDICT = "未実装"
+
+# 根拠の文から取り出す「コード識別子らしい語」: アンダースコアを含む語
+# (`on_conflict`・`ON_CONFLICT_ERROR`)、`--`で始まるオプション
+# (`--on-conflict`)、CamelCaseの語(`InvalidDataError`)。
+#
+# 仮の判断(実ノードでの計測結果への対応): 当初は根拠の文字列全体がファイル中に
+# そのまま含まれることを要求していたが、実際のモデルは
+# `add_product(..., on_conflict="error|update|skip")`のように省略・要約を
+# 交えて書くため、3台とも正しく「実装済み」と判定していたのに全件が裏付け
+# 失敗になった。そこで照合の単位を識別子に変え、「根拠に現れるコード識別子
+# らしい語がすべてファイルに実在し、かつ全体で1つ以上ある」ことを条件に
+# する。実在しない識別子が1つでも混じっていれば(捏造の疑い)認めない。
+# 「id」「error」のような一般的な語は、実装前から含まれていることが多く
+# 裏付けにならないため、照合の対象にも数えない。
+_FIX_SUBTASK_EVIDENCE_IDENTIFIER_PATTERN = re.compile(
+    r"--[A-Za-z][A-Za-z0-9-]+|[A-Za-z0-9]*_[A-Za-z0-9_]*[A-Za-z0-9]|[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+"
+)
+
+_FIX_SUBTASK_SATISFIED_CHECK_PROMPT_TEMPLATE = """あなたはこのプロジェクトの実装状況の確認担当です。以下のサブタスクに着手する前に、その内容が「現在のファイルにすでに実装済みかどうか」だけを確認してください。ファイルの変更は一切行わず、read_file・search_in_fileで実際のコードを確認して判断してください。
+
+【このプロジェクトの使用言語】
+{language}
+
+【現在保存されているファイル一覧】
+{file_list}
+
+【確認するサブタスク】
+{subtask}
+
+判定の基準:
+- サブタスクが求めている変更のすべて(テストの追加・更新が求められていれば、それも含む)が、現在のファイルにすでに存在する場合に限り「{satisfied}」としてください。
+- 一部でも欠けている・確認しきれなかった・自信が無い場合は、必ず「{unsatisfied}」としてください。
+
+回答は次の形式だけで書いてください(他の説明文は不要です):
+判定: {satisfied} または {unsatisfied}
+根拠: <ファイル名>: <そのファイル内に実際に書かれている関数名・引数名・オプション名などを、省略・要約せずそのまま>
+(「{satisfied}」の場合は、サブタスクが求める要素ごとに「根拠:」の行を1行ずつ書いてください)
+"""
+
+_FIX_SUBTASK_VERDICT_LINE_PATTERN = re.compile(r"^\s*[-*]?\s*\**判定\**\s*[:：]\s*(.+?)\s*$")
+_FIX_SUBTASK_EVIDENCE_LINE_PATTERN = re.compile(r"^\s*[-*]?\s*\**根拠\**\s*[:：]\s*(.+?)\s*[:：]\s*(.+?)\s*$")
+
+
+def _parse_fix_subtask_satisfied_answer(text: str) -> tuple:
+    """事前確認の回答から`(実装済みと判定されたか, [(ファイル名, 識別子), ...])`
+    を取り出す。判定行が無い・「実装済み」と「未実装」の両方を含む等、
+    判定が曖昧な場合は「実装済みではない」とみなす。
+    """
+    satisfied = False
+    evidence = []
+    verdict_seen = False
+    for line in (text or "").splitlines():
+        verdict_match = _FIX_SUBTASK_VERDICT_LINE_PATTERN.match(line)
+        if verdict_match and not verdict_seen:
+            verdict_seen = True
+            verdict = verdict_match.group(1)
+            satisfied = _FIX_SUBTASK_SATISFIED_VERDICT in verdict and _FIX_SUBTASK_UNSATISFIED_VERDICT not in verdict
+            continue
+        evidence_match = _FIX_SUBTASK_EVIDENCE_LINE_PATTERN.match(line)
+        if evidence_match:
+            filename = evidence_match.group(1).strip().strip("`")
+            identifier = evidence_match.group(2).strip().strip("`")
+            evidence.append((filename, identifier))
+    return satisfied, evidence
+
+
+def _fix_subtask_evidence_is_grounded(project_dir: str, file_list: list, evidence: list) -> tuple:
+    """根拠がすべて実在するファイル・実在する識別子を指しているかを
+    機械的に確かめる。`(裏付けられたか, 裏付けられなかった理由)`を返す。
+    根拠が1件も無い場合・照合できる識別子が1つも無い場合も「裏付けられ
+    ない」とする。
+    """
+    if not evidence:
+        return False, "根拠が示されませんでした"
+    verified_count = 0
+    for filename, text in evidence:
+        if filename not in file_list:
+            return False, f"根拠のファイル {filename} がプロジェクトに存在しません"
+        file_text = _read_project_file_text_for_evidence(project_dir, filename)
+        if file_text is None:
+            return False, f"根拠のファイル {filename} を読み取れません"
+        for identifier in dict.fromkeys(_FIX_SUBTASK_EVIDENCE_IDENTIFIER_PATTERN.findall(text)):
+            if identifier.strip("_") and identifier not in file_text:
+                return False, f"根拠の識別子「{identifier}」が {filename} に見つかりません"
+            verified_count += 1
+    if verified_count == 0:
+        return False, "根拠に照合できる識別子が含まれていませんでした"
+    return True, ""
+
+
+def _read_project_file_text_for_evidence(project_dir: str, filename: str):
+    safe_path, error = _resolve_safe_project_path(project_dir, filename)
+    if error:
+        return None
+    try:
+        with open(safe_path, encoding="utf-8") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _fix_subtask_precheck_gate(project_dir: str, verify_command: str) -> tuple:
+    """事前確認の前提ゲート。`(スキップ判定を行ってよいか, 理由)`を返す。
+    構文エラーが残っている、または記録済みの検証コマンドが通らない
+    状態では、コードが「満たしている」と言える前提が崩れているため、
+    1件もスキップしない。
+    """
+    broken_files = _syntax_check_all_files(project_dir)
+    if broken_files:
+        return False, f"構文エラーが残っているファイルがあります: {', '.join(broken_files)}"
+    if _has_verify_command(verify_command):
+        try:
+            result = json.loads(_run_project_command(project_dir, verify_command))
+        except (TypeError, ValueError):
+            result = {"ok": False}
+        if not result.get("ok"):
+            return False, f"検証コマンド({verify_command})が成功しませんでした"
+    return True, ""
+
+
+def _check_fix_subtask_satisfied(
+    candidate: dict, org_fingerprint: str, subtask: str, project_dir: str, file_list: list, language: str,
+    print_lock: threading.Lock = None, tag: str = None,
+) -> tuple:
+    """1件のサブタスクが現在のコードですでに満たされているかを確認する。
+    `(満たされているか, 理由)`を返す。理由は、満たされている場合は根拠の
+    一覧、満たされていない場合は判定の経緯(ログ用)。
+    """
+    prompt = _FIX_SUBTASK_SATISFIED_CHECK_PROMPT_TEMPLATE.format(
+        language=language, file_list="\n".join(file_list), subtask=subtask,
+        satisfied=_FIX_SUBTASK_SATISFIED_VERDICT, unsatisfied=_FIX_SUBTASK_UNSATISFIED_VERDICT,
+    )
+    answer, error, truncated = _collect_review_answer_with_read_file(
+        candidate, org_fingerprint, [{"role": "user", "content": prompt}], project_dir,
+        print_lock=print_lock, tag=tag,
+    )
+    if error:
+        return False, f"確認の問い合わせに失敗しました: {error}"
+    if truncated:
+        return False, "確認の回答が途中で打ち切られました"
+    satisfied, evidence = _parse_fix_subtask_satisfied_answer(answer)
+    if not satisfied:
+        return False, "未実装と判定されました"
+    grounded, reason = _fix_subtask_evidence_is_grounded(project_dir, file_list, evidence)
+    if not grounded:
+        return False, reason
+
+    # 2段目: 要素ごとの対応確認(詳細は`_FIX_SUBTASK_REQUIREMENT_CHECK_PROMPT`
+    # のコメント参照)。1段目の会話の続きとして問い合わせる。
+    followup_messages = [
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": answer},
+        {"role": "user", "content": _FIX_SUBTASK_REQUIREMENT_CHECK_PROMPT},
+    ]
+    followup, error, truncated = _collect_review_answer_with_read_file(
+        candidate, org_fingerprint, followup_messages, project_dir, print_lock=print_lock, tag=tag,
+    )
+    if error:
+        return False, f"要素ごとの確認の問い合わせに失敗しました: {error}"
+    if truncated:
+        return False, "要素ごとの確認の回答が途中で打ち切られました"
+    requirements = _parse_fix_subtask_requirement_lines(followup)
+    if not requirements:
+        return False, "要素ごとの対応が示されませんでした"
+    for requirement, requirement_evidence in requirements:
+        if requirement_evidence is None:
+            return False, f"要素「{requirement}」に対応する実装が示されませんでした"
+        grounded, reason = _fix_subtask_evidence_is_grounded(project_dir, file_list, [requirement_evidence])
+        if not grounded:
+            return False, f"要素「{requirement}」: {reason}"
+    return True, ", ".join(f"{filename}: {identifier}" for _req, (filename, identifier) in requirements)
+
+
+# 仮の判断(実ノードでの計測結果への対応): 1段目(判定+根拠)だけでは、
+# 「CLIとテストの整備」まで求めるサブタスクを、managerの実装だけを根拠に
+# 「実装済み」と判定してしまう誤スキップが実測で53件中1件あった。
+# 根拠の裏付けは「挙げられた識別子が実在するか」までしか見ないため、
+# 要件の網羅性は、サブタスクが求める要素を1つずつ列挙させ、要素ごとに
+# 根拠を対応させることで確かめる。根拠の無い要素・裏付けの取れない要素が
+# 1つでもあれば、従来どおり実行する側に倒す。
+_FIX_SUBTASK_REQUIREMENT_NONE = "なし"
+
+_FIX_SUBTASK_REQUIREMENT_CHECK_PROMPT = f"""念のため、要素ごとに確認してください。確認するサブタスクが求めている変更を、要素(関数・引数・オプション・エラー処理・テストの追加など)ごとに1行ずつすべて列挙し、それぞれに対応する実装を書いてください。必要ならread_file・search_in_fileで改めて確認してください。
+
+回答は次の形式の行だけで書いてください(他の説明文は不要です):
+要素: <サブタスクが求める要素> => <ファイル名>: <その要素を実装している、ファイル内に実際に書かれている関数名・引数名・オプション名などを、省略・要約せずそのまま>
+
+対応する実装が見つからない要素は、「要素: <要素> => {_FIX_SUBTASK_REQUIREMENT_NONE}」と書いてください。サブタスクがテストの追加・更新を求めている場合は、テストも1つの要素として必ず列挙してください。逆に、サブタスクの文に書かれていない要素(サブタスクが求めていないテスト等)は付け加えないでください。
+"""
+
+_FIX_SUBTASK_REQUIREMENT_LINE_PATTERN = re.compile(r"^\s*[-*]?\s*\**要素\**\s*[:：]\s*(.+?)\s*(?:=>|→|⇒)\s*(.+?)\s*$")
+
+
+def _parse_fix_subtask_requirement_lines(text: str) -> list:
+    """要素ごとの確認の回答から`[(要素, (ファイル名, 識別子) または None), ...]`
+    を取り出す。対応する実装が「なし」とされた要素・「ファイル名: 識別子」
+    の形になっていない要素は`None`とする。
+    """
+    requirements = []
+    for line in (text or "").splitlines():
+        match = _FIX_SUBTASK_REQUIREMENT_LINE_PATTERN.match(line)
+        if not match:
+            continue
+        requirement, target = match.group(1).strip(), match.group(2).strip()
+        parts = re.split(r"[:：]", target, maxsplit=1)
+        if target.strip("`* ") == _FIX_SUBTASK_REQUIREMENT_NONE or len(parts) != 2:
+            requirements.append((requirement, None))
+            continue
+        requirements.append((requirement, (parts[0].strip().strip("`"), parts[1].strip().strip("`"))))
+    return requirements
+
+
+def _short_subtask_label(subtask: str, limit: int = 60) -> str:
+    flat = " ".join(subtask.split())
+    return flat if len(flat) <= limit else flat[:limit] + "…"
+
+
+def _skip_already_satisfied_fix_subtasks(
+    subtasks: list, candidates: list, org_fingerprint: str, project_dir: str,
+    request: str, parsed: dict, file_list: list, language: str,
+) -> list:
+    """`subtasks`のうち、現在のコードですでに満たされているものを取り除いた
+    リストを返す(元の順序を保つ)。スキップしたサブタスクは理由付きで
+    ログに出し、PROGRESS.mdの「更新履歴」に記録したうえで、「未完了の
+    修正サブタスク」も残りの分だけに書き直す(この後のセッションが
+    タイムアウト等で打ち切られても、次の再開で古いキューが復活しない
+    ようにするため)。確認は候補メンバー全員で並行して行う。
+    """
+    latest_parsed = _parse_progress_markdown(os.path.join(project_dir, PROGRESS_FILENAME)) or parsed
+    verify_command = latest_parsed.get("verify_command", "")
+    gate_ok, gate_reason = _fix_subtask_precheck_gate(project_dir, verify_command)
+    if not gate_ok:
+        print(f"[🔎 実装済みかどうかの事前確認は行いません({gate_reason})。全{len(subtasks)}件をそのまま実行します]")
+        return list(subtasks)
+
+    print(f"[🔎 割り当て前に、{len(subtasks)}件のサブタスクが実装済みかどうかを確認しています...]")
+    print_lock = threading.Lock()
+    queue_lock = threading.Lock()
+    remaining_indices = list(range(len(subtasks)))
+    results = {}
+
+    def worker(candidate):
+        while True:
+            with queue_lock:
+                if not remaining_indices:
+                    return
+                index = remaining_indices.pop(0)
+            tag = f"事前確認{index + 1}"
+            try:
+                results[index] = _check_fix_subtask_satisfied(
+                    candidate, org_fingerprint, subtasks[index], project_dir, file_list, language,
+                    print_lock=print_lock, tag=tag,
+                )
+            except Exception as e:  # 確認の失敗は常に「実行する」側に倒す
+                results[index] = (False, f"確認中にエラーが発生しました: {e}")
+
+    threads = [threading.Thread(target=worker, args=(c,)) for c in candidates]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    kept = []
+    skipped = []
+    for index, subtask in enumerate(subtasks):
+        satisfied, reason = results.get(index, (False, "確認されませんでした"))
+        if satisfied:
+            skipped.append((subtask, reason))
+            _print_tagged(
+                print_lock, f"事前確認{index + 1}",
+                f"[⏭️ 「{_short_subtask_label(subtask)}」は実装済みのためスキップします(根拠: {reason})]",
+            )
+        else:
+            kept.append(subtask)
+
+    print(
+        f"[🔎 事前確認の結果: {len(subtasks)}件中{len(skipped)}件を実装済みのためスキップし、"
+        f"残り{len(kept)}件をキューに入れます]"
+    )
+    if not skipped:
+        return kept
+
+    today = datetime.date.today().isoformat()
+    changelog = list(latest_parsed["changelog"])
+    for subtask, reason in skipped:
+        changelog.append(
+            f"- {today}: 修正サブタスク「{_short_subtask_label(subtask)}」は実装済みのためスキップ(根拠: {reason})"
+        )
+    _write_progress_md(
+        project_dir, latest_parsed["request"], latest_parsed["tasks"], latest_parsed["checklist"],
+        review_feedback={}, auto_resume_count=latest_parsed["auto_resume_count"], changelog=changelog,
+        language=latest_parsed["language"] or language,
+        pending_fix_request=request if kept else "",
+        pending_fix_subtasks=kept,
+        **_preserved_progress_verification_fields(latest_parsed),
+    )
+    return kept
+
+
 def _run_fix_task_queue(
     subtasks: list, candidates: list, org_fingerprint: str, project_dir: str,
     request: str, parsed: dict, full_plan: str, file_list: list, language: str,
@@ -7904,6 +8251,16 @@ def _run_fix_task_queue(
       まま`//resume-all`へ引き継いでも、次に担当するメンバーも同じ
       堂々巡りを繰り返すだけだった実機報告への対応)。
     """
+    # 割り当て前に、すでに満たされているサブタスクを取り除く(詳細は
+    # `_skip_already_satisfied_fix_subtasks`参照)。Gap批評からの新規実行・
+    # 同一依頼文の再投入による再開・`//resume-all`のいずれもここを通る。
+    subtasks = _skip_already_satisfied_fix_subtasks(
+        subtasks, candidates, org_fingerprint, project_dir, request, parsed, file_list, language,
+    )
+    if not subtasks:
+        print("[✅ すべてのサブタスクが実装済みだったため、実装は行いませんでした]")
+        return
+
     numbered_subtasks = list(enumerate(subtasks, start=1))
     numbered_subtasks.sort(key=lambda t: _estimate_task_weight(t[1]), reverse=True)
     checklist = _build_task_checklist([(f"サブタスク{i}", st) for i, st in numbered_subtasks])
