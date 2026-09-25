@@ -320,7 +320,8 @@ def test_repl_agree_command_writes_conversation_to_log_file():
         yoriai._ask_organization_collaborate = original_ask_collaborate
 
         log_dir = os.path.join(out_dir, yoriai._CHAT_LOG_SUBDIR_NAME)
-        log_files = os.listdir(log_dir)
+        # 作業ログ(work_*.log)も同じフォルダに作られるため、会話ログだけに絞る。
+        log_files = [name for name in os.listdir(log_dir) if name.startswith("chat_")]
         assert len(log_files) == 1, log_files
         assert re.match(r"^chat_\d{8}_\d{6}\.md$", log_files[0]), log_files[0]
 

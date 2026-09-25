@@ -9367,6 +9367,9 @@ class _ChatOutputRouter:
         # 参照しており、同じ対策をここでも踏襲する。
         self._app_session.output
         self._lock = threading.Lock()
+        # 作業ログ(`_WorkLog`)。`_run_repl_client`が会話ログと同じ起動時刻で
+        # 作って後から設定する(詳細は`_WorkLog`のコメント参照)。
+        self.work_log = None
 
     def _append_to_log_buffer(self, text: str) -> None:
         with self._lock:
@@ -9380,6 +9383,9 @@ class _ChatOutputRouter:
     def write(self, text: str) -> int:
         if not text:
             return 0
+        work_log = self.work_log
+        if work_log is not None:
+            work_log.write(text)
         app = self._app_session.app
         if app is not None and app.loop is not None and not app.loop.is_closed():
             # 仮の判断: 実際の書き込みをApplicationのイベントループの
@@ -9418,7 +9424,7 @@ def _chat_output_context():
     sys.stdout = router
     sys.stderr = router
     try:
-        yield
+        yield router
     finally:
         sys.stdout = original_stdout
         sys.stderr = original_stderr
@@ -9829,14 +9835,95 @@ class _ChatLog(list):
             f.write(f"## [{timestamp}] {role}\n\n{content}\n\n")
 
 
-def _create_chat_log(out_dir: str) -> "_ChatLog":
+def _create_chat_log(out_dir: str, stamp: str = None) -> "_ChatLog":
     """起動時刻(`YYYYMMDD_HHMMSS`)をファイル名に持つ会話ログを作る
     (依頼: 別のセッションで見返せるように、起動時刻をファイル名に
-    入れて記録を残す)。
+    入れて記録を残す)。`stamp`を渡すと、その値をファイル名に使う
+    (作業ログと対になるファイル名にそろえるため)。
     """
     log_dir = os.path.join(out_dir, _CHAT_LOG_SUBDIR_NAME)
-    log_path = os.path.join(log_dir, f"chat_{time.strftime('%Y%m%d_%H%M%S')}.md")
+    log_path = os.path.join(log_dir, f"chat_{stamp or time.strftime('%Y%m%d_%H%M%S')}.md")
     return _ChatLog(log_path)
+
+
+# ---------------------------------------------------------------------------
+# 作業ログ(画面に流れた作業の流れそのものの記録)
+# ---------------------------------------------------------------------------
+#
+# 依頼: 動作中に流れる「[サブタスク6] [🔍 ... を検索しています...]」のような
+# ログ(作業の流れそのもの)をファイルに残したい。
+#
+# 会話ログ(`_ChatLog`)にもバックグラウンドジョブの出力は記録されるが、
+# ジョブが終わった時点でまとめて1件として書かれ、しかも会話履歴用に
+# `_BACKGROUND_JOB_HISTORY_TRUNCATE_CHARS`文字で切り詰められる。そのため
+# (1)長いジョブの途中経過が残らない、(2)ジョブの途中でプロセスが落ちると
+# 何も残らない、(3)「どの行がいつ出たか」が分からず、堂々巡りにどれだけ
+# 時間を使ったか等を後から追えない、という問題があった。
+#
+# 仮の判断: `_ChatOutputRouter`(対話モード中の`sys.stdout`/`sys.stderr`の
+# 差し替え先)を通るすべての出力を、1行ずつ時刻付きで、切り詰めずに
+# `chat_logs/work_<YYYYMMDD_HHMMSS>.log`へ逐次追記する。会話ログと同じ
+# 起動時刻をファイル名に使い、対になるファイルとして見つけやすくする。
+# 1行書くたびにflushするため、実行中に`tail -f`で追いかけることもできる。
+#
+# 仮の判断: 複数のワーカースレッドが並行してprint()すると、print()は
+# 本文と改行を別々の`write()`で書くため、行の途中に別スレッドの出力が
+# 割り込みうる。未完成の行はスレッドごとに分けて溜め、改行が来た時点で
+# 1行として書き出すことで、ファイル上で行が混ざらないようにする。
+# LLMの応答のように改行を含まない細切れの書き込みも、同じ仕組みで
+# 1行にまとまる。色付け用のANSIエスケープシーケンスはファイルでは
+# 読みにくいだけなので取り除く。
+
+_WORK_LOG_ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+class _WorkLog:
+    """画面に流れた出力を、1行ずつ時刻付きでファイルへ逐次追記する。
+    詳細はこのセクション冒頭のコメントを参照。
+    """
+
+    def __init__(self, log_path: str):
+        self.path = log_path
+        self._lock = threading.Lock()
+        self._partial_lines = {}
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        self._file = open(log_path, "w", encoding="utf-8")
+        self._file.write(f"# Yoriai 作業ログ ({time.strftime('%Y-%m-%d %H:%M:%S')} 開始)\n")
+        self._file.flush()
+
+    def write(self, text: str) -> None:
+        thread_id = threading.get_ident()
+        with self._lock:
+            if self._file is None:
+                return
+            pending = self._partial_lines.pop(thread_id, "") + text
+            *lines, rest = pending.split("\n")
+            if rest:
+                self._partial_lines[thread_id] = rest
+            for line in lines:
+                self._write_line(line)
+            if lines:
+                self._file.flush()
+
+    def _write_line(self, line: str) -> None:
+        line = _WORK_LOG_ANSI_ESCAPE_PATTERN.sub("", line).rstrip("\r")
+        self._file.write(f"{time.strftime('%H:%M:%S')} {line}\n")
+
+    def close(self) -> None:
+        """書きかけの(改行で終わっていない)行も書き出してから閉じる。"""
+        with self._lock:
+            if self._file is None:
+                return
+            for rest in self._partial_lines.values():
+                self._write_line(rest)
+            self._partial_lines.clear()
+            self._file.close()
+            self._file = None
+
+
+def _create_work_log(out_dir: str, stamp: str) -> "_WorkLog":
+    log_path = os.path.join(out_dir, _CHAT_LOG_SUBDIR_NAME, f"work_{stamp}.log")
+    return _WorkLog(log_path)
 
 
 class _StdoutTee:
@@ -10197,7 +10284,7 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
     # を複数回呼び出した場合、2回目以降の出力が最初の呼び出し時点の
     # (既に閉じられた)出力先に書き込まれて消えてしまう不具合が実際に
     # 発生した。
-    with create_app_session(), _chat_output_context():
+    with create_app_session(), _chat_output_context() as output_router:
         # 仮の判断(依頼への対応): 会話履歴(messages)は、この起動中は
         # 単発質問・//multiだけでなく、//agree・//fix・//plan-only・
         # //parallel・//resume-allも含めたすべてのやり取りを共有・
@@ -10206,8 +10293,13 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
         # 終了しても記録自体はディスク上に残る(次回起動時に自動で
         # 読み込んで引き継ぐ機能は今回のスコープ外。ログファイルを
         # 見返せば、別のセッションでも過去の会話内容を確認できる)。
-        chat_log = _create_chat_log(out_dir)
+        log_stamp = time.strftime("%Y%m%d_%H%M%S")
+        chat_log = _create_chat_log(out_dir, log_stamp)
         messages = chat_log
+        # 画面に流れる作業の流れそのもの(サブタスクごとの進行ログ等)を、
+        # 会話ログと対になるファイルへ時刻付きで逐次記録する(`_WorkLog`参照)。
+        work_log = _create_work_log(out_dir, log_stamp)
+        output_router.work_log = work_log
         # 仮の判断: テストのように同一プロセス内で`_run_repl_client`を
         # 複数回呼び出すケースに備え、前回起動時の残骸(前回セッションの
         # 入力・EOF・Ctrl+Cが積まれたまま残っている可能性)を捨てておく。
@@ -10565,6 +10657,9 @@ def _run_repl_client(port: int, org_fingerprint: str, out_dir: str) -> None:
         session.app.exit()
         ui_thread.join(timeout=5.0)
         print("対話モードを終了します。")
+        print(f"(この起動中の作業ログ: {work_log.path})")
+        output_router.work_log = None
+        work_log.close()
 
 
 def handle_chat(port: int, out_dir: str) -> None:
