@@ -39,6 +39,23 @@ TOKEN_BYTES = 32  # ランダム生成する場合の長さ(32バイト=64文字
 DEFAULT_TEMPERATURE = float(os.environ.get("YORIAI_TEMPERATURE", "0.4"))
 DEFAULT_REPEAT_PENALTY = float(os.environ.get("YORIAI_REPEAT_PENALTY", "1.15"))
 
+# 仮の判断(実運用ログでの思考ループ調査への対応): 対話プロトコル(`//agree`)で、
+# 思考過程(thinking/reasoning)の中だけで同じ数行の文章を延々と繰り返し、
+# 最終回答に到達しないままトークン上限まで止まらない現象が実機で見つかった。
+# 既存の文字化け検知(`yoriai._looks_garbled`)は1〜6文字の短いパターンしか
+# 見ないため検知できない。そのため、思考ストリームの途中で「一定以上の長さの
+# ブロックが連続して繰り返されている」ことを検知して問い合わせを打ち切る
+# (`yoriai._looks_looping`)。値はいずれも暫定の初期値で、実機の様子を見ながら
+# 環境変数で調整できるようにする。
+# - LOOP_MIN_BLOCK_CHARS: 繰り返しの単位とみなす最小のブロック長(文字数)
+# - LOOP_MIN_REPEATS: そのブロックが連続して何回現れたらループとみなすか
+# - LOOP_CHECK_INTERVAL_CHARS: 思考が何文字増えるごとに1回判定するか
+# - LOOP_SCAN_WINDOW_CHARS: 判定時に見る末尾の範囲(文字数)
+LOOP_MIN_BLOCK_CHARS = int(os.environ.get("YORIAI_LOOP_MIN_BLOCK_CHARS", "30"))
+LOOP_MIN_REPEATS = int(os.environ.get("YORIAI_LOOP_MIN_REPEATS", "3"))
+LOOP_CHECK_INTERVAL_CHARS = int(os.environ.get("YORIAI_LOOP_CHECK_INTERVAL_CHARS", "500"))
+LOOP_SCAN_WINDOW_CHARS = int(os.environ.get("YORIAI_LOOP_SCAN_WINDOW_CHARS", "2000"))
+
 # 仮の判断: モデルによって最適な値が異なりうるため(例: 特定モデルが
 # 環境変数側のデフォルトでも堂々巡りしやすいと分かった場合など)、モデル名
 # ごとの個別上書きをここに追記できるようにする。キーはモデル名、値は

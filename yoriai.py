@@ -983,6 +983,11 @@ def _stream_chat_from_candidate(
                 continue
     except Exception as exc:
         yield {"error": str(exc)}
+    finally:
+        # 仮の判断(思考ループの早期打ち切りへの対応): 呼び出し元が途中で
+        # ジェネレータを閉じた場合も接続を確実に閉じ、相手のキッチンに
+        # 受信打ち切りを伝える。
+        resp.close()
 
 
 def _selection_reason_label(task_type: str, top_candidate: dict) -> str:
@@ -1201,27 +1206,37 @@ def _collect_answer_from_candidate(
     `on_thinking`(1引数のcallable)を渡した場合のみ、思考過程のチャンクが
     届くたびにそれを呼び出す(画面表示・収集などは呼び出し元に委ねる)。
     既定はNoneで、既存の呼び出し元はすべて指定しないため挙動は変わらない。
+
+    仮の判断(思考ループの早期打ち切りへの対応): `on_thinking`が真値を
+    返した場合は「これ以上受信したくない」という呼び出し元の意思表示と
+    みなし、その時点でストリームを閉じて問い合わせを打ち切る(それまでに
+    集まったcontentはそのまま返す)。戻り値を返さない(`None`)既存の
+    コールバックは従来通り最後まで受信を続ける。
     """
     answer_parts = []
     error = None
     truncated = False
-    for event in _stream_chat_from_candidate(
+    stream = _stream_chat_from_candidate(
         candidate, org_fingerprint, messages, disable_web_search=disable_web_search,
-    ):
-        if "error" in event:
-            error = event["error"]
-            break
-        thinking = event.get("thinking")
-        if thinking:
-            if on_thinking:
-                on_thinking(thinking)
-            continue
-        content = event.get("content")
-        if content:
-            answer_parts.append(content)
-        if event.get("done"):
-            truncated = bool(event.get("truncated"))
-            break
+    )
+    try:
+        for event in stream:
+            if "error" in event:
+                error = event["error"]
+                break
+            thinking = event.get("thinking")
+            if thinking:
+                if on_thinking and on_thinking(thinking):
+                    break
+                continue
+            content = event.get("content")
+            if content:
+                answer_parts.append(content)
+            if event.get("done"):
+                truncated = bool(event.get("truncated"))
+                break
+    finally:
+        stream.close()
     return "".join(answer_parts), error, truncated
 
 
@@ -1968,6 +1983,34 @@ def _looks_garbled(text: str) -> bool:
     return unique_ratio < _GARBLED_UNIQUE_CHAR_RATIO_THRESHOLD
 
 
+# 仮の判断(実運用ログでの思考ループ調査への対応): `_looks_garbled`は1〜6文字の
+# 短いパターンしか見ないため、同じ数行の文章を延々と繰り返す思考ループは
+# 検知できない。思考ストリームの末尾に、一定以上の長さのブロックが連続して
+# 繰り返されているかどうかを調べる。閾値はconfig.LOOP_*(環境変数で上書き可)。
+# 1種類の文字だけの繰り返し(罫線`-----`等)は正常な出力でも現れうるうえ
+# `_looks_garbled`の守備範囲でもあるため、ブロックの文字種が少なすぎる
+# 場合は対象外にする。
+_LOOPING_MIN_BLOCK_UNIQUE_CHARS = 5
+
+
+def _looks_looping(text: str) -> bool:
+    """`text`の末尾が、同じブロック(`config.LOOP_MIN_BLOCK_CHARS`文字以上)の
+    `config.LOOP_MIN_REPEATS`回以上の連続繰り返しで終わっているかを返す。
+    見る範囲は末尾`config.LOOP_SCAN_WINDOW_CHARS`文字まで。ループは位相が
+    どこでも末尾から遡れば検出できるため、末尾を基準に周期を総当たりする。
+    """
+    min_block = config.LOOP_MIN_BLOCK_CHARS
+    repeats = config.LOOP_MIN_REPEATS
+    tail = (text or "")[-config.LOOP_SCAN_WINDOW_CHARS:]
+    for period in range(min_block, len(tail) // repeats + 1):
+        block = tail[-period:]
+        if len(set(block)) < _LOOPING_MIN_BLOCK_UNIQUE_CHARS:
+            continue
+        if all(tail[-period * (k + 1):len(tail) - period * k] == block for k in range(1, repeats)):
+            return True
+    return False
+
+
 # 仮の判断(バグ報告への対応: 同じ内容の繰り返しで議論が"進化"しない):
 # 「ほぼ一字一句同じ」かどうかの判定に、標準ライブラリの`difflib`による
 # 文字列類似度(0〜1)を使う。しきい値0.92は、多少の言い回しの変化(語尾・
@@ -2317,6 +2360,10 @@ def _run_dialogue(
         # `reasoning_chunks`(議事録記録用の全文収集)とは別枠で、届いた
         # チャンクは表示タイミングに関わらずそちらへは即座に追記する。
         pending_display = []
+        # 思考ループ検知用: 判定対象の末尾だけを保持し(全文の再連結を避ける)、
+        # 前回判定してからの増分文字数を数える。
+        loop_scan_tail = ""
+        chars_since_loop_check = 0
 
         def _flush_pending_display() -> None:
             if not pending_display:
@@ -2328,7 +2375,8 @@ def _run_dialogue(
                 f"[🤔 {candidate['label']}さん({role_ja}・ラウンド{round_num}) 思考中] " + buffered,
             )
 
-        def _on_thinking(text: str) -> None:
+        def _on_thinking(text: str):
+            nonlocal loop_scan_tail, chars_since_loop_check
             reasoning_chunks.append(text)
             pending_display.append(text)
             buffered_tail = "".join(pending_display)
@@ -2336,6 +2384,20 @@ def _run_dialogue(
                 buffered_tail and buffered_tail[-1] in _THINKING_DISPLAY_SENTENCE_END_CHARS
             ):
                 _flush_pending_display()
+            # 仮の判断(思考ループの早期打ち切り): 最終回答にしか適用されて
+            # いなかった異常検知を思考ストリームにも適用する。毎チャンク判定
+            # すると重いため、一定文字数たまるごとに1回だけ判定する。真を
+            # 返すと`_collect_answer_from_candidate`が問い合わせを打ち切る。
+            loop_scan_tail = (loop_scan_tail + text)[-config.LOOP_SCAN_WINDOW_CHARS:]
+            chars_since_loop_check += len(text)
+            if chars_since_loop_check < config.LOOP_CHECK_INTERVAL_CHARS:
+                return False
+            chars_since_loop_check = 0
+            if _looks_looping(loop_scan_tail):
+                state["garbled_by"] = candidate["label"]
+                state["garbled_in_thinking"] = True
+                return True
+            return False
 
         # 仮の判断(実機バグ報告への対応): 対話プロトコルの各ラウンド
         # (提案役・反論役・統合役)は、コンテンツ系依頼なら別途独立した
@@ -2376,6 +2438,8 @@ def _run_dialogue(
             # 積む`content`は実際の`answer`のまま変更しない(後続ラウンドの
             # プロンプトにエラー文言を発言内容として混入させないため)。
             display_text = f"(問い合わせに失敗しました: {error})"
+        elif state.get("garbled_in_thinking") and not answer:
+            display_text = "(思考過程で同じ内容の繰り返しを検知したため、問い合わせを打ち切りました)"
         elif answer:
             display_text = answer
         elif truncated:
@@ -2405,8 +2469,9 @@ def _run_dialogue(
 
     def garbled_finish():
         speaker_label = state.get("garbled_by", "")
+        where = "思考過程" if state.get("garbled_in_thinking") else "発言"
         human_message = (
-            f"{speaker_label}さんの発言が文字化け・異常な繰り返しパターンと判定されたため、"
+            f"{speaker_label}さんの{where}が文字化け・異常な繰り返しパターンと判定されたため、"
             "この時点で議論を打ち切りました。"
         )
         return _finish_dialogue(DIALOGUE_STATUS_GARBLED, transcript, state["total_utterances"], None, human_message, participant_labels)
@@ -2427,14 +2492,16 @@ def _run_dialogue(
                 transcript=_format_dialogue_transcript_for_prompt(transcript), output_instruction=output_instruction,
             )
         speak(DIALOGUE_ROLE_PROPOSER, proposer_prompt, round_num)
+        if state.get("garbled_by"):
+            # 思考ループで打ち切られた場合は回答が空なので、疎通の問題
+            # (NO_ENGAGEMENT)より先にこちらを判定する。
+            return garbled_finish()
         if not state["any_real_content"]:
             # 提案役からすら一度も実のある応答が得られていない場合、
             # これ以上反論役・統合役に問い合わせても無駄になる可能性が
             # 高いため、早期に切り上げる(疎通の問題であって議論の
             # 結果ではないため、呼び出し元は安全側フォールバックしてよい)。
             return _finish_dialogue(DIALOGUE_STATUS_NO_ENGAGEMENT, transcript, state["total_utterances"], None, None, participant_labels)
-        if state.get("garbled_by"):
-            return garbled_finish()
         if state["total_utterances"] >= DIALOGUE_SAFETY_LIMIT_UTTERANCES:
             return _finish_dialogue(DIALOGUE_STATUS_SAFETY_LIMIT, transcript, state["total_utterances"], None, None, participant_labels)
 

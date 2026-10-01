@@ -238,6 +238,11 @@ def _stream_ollama_turn(model: str, messages: list, tools: list, max_output_toke
     except Exception as exc:
         yield {"error": str(exc)}
         return
+    finally:
+        # 仮の判断(思考ループの早期打ち切りへの対応): 呼び出し元が途中で
+        # ジェネレータを閉じた場合(`GeneratorExit`)も含め、必ず応答を閉じて
+        # バックエンド(Ollama)側の生成を止める。
+        resp.close()
     for think_event in think_splitter.flush():
         yield think_event
     yield {"tool_calls": tool_calls, "truncated": truncated}
@@ -432,6 +437,10 @@ def _stream_openai_compatible_turn(
     except Exception as exc:
         yield {"error": str(exc)}
         return
+    finally:
+        # 仮の判断(同上): 早期打ち切り時も確実に応答を閉じ、LM Studio/MLX-LM側の
+        # 生成を止める。
+        resp.close()
     for think_event in think_splitter.flush():
         yield think_event
 
