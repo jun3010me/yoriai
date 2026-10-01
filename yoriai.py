@@ -704,6 +704,64 @@ MAX_READ_FILE_CALLS_PER_REVIEW = 6
 # 常駐サービスを止めずに何度でも起動でき、複数の対話モードを同時に開くことすらできる。
 # ---------------------------------------------------------------------------
 
+def _probe_peer_llm(peer: dict, org_fingerprint: str) -> bool:
+    """ピアのキッチンの`/card`を取り直し、そのノード自身の目から見て
+    LLMバックエンドに繋がっている(ロード済みモデルがある)かを確認する。
+    成功した場合は`peer["card"]`を最新のカードに差し替える。
+
+    仮の判断: LLMへの問い合わせ(`localhost:1234`等)は各ノード自身の
+    キッチンが自分のローカルLLMに対して行う設計のため、他ノードからLLMの
+    ポートを直接叩くのではなく、相手のキッチンにカードを再生成させて
+    (`build_profile_card`が3秒タイムアウトで各バックエンドを確認する)
+    判定する。接続失敗・403・ロード済みモデルなしはいずれも「LLM未検出」扱い。
+    """
+    try:
+        resp = requests.get(
+            f"http://{peer.get('address')}:{peer.get('port')}/card",
+            headers={ORG_FINGERPRINT_HEADER: org_fingerprint},
+            timeout=CARD_REQUEST_TIMEOUT_SEC,
+        )
+        resp.raise_for_status()
+        card = resp.json()
+    except Exception:
+        return False
+    if not card.get("models", {}).get("loaded"):
+        return False
+    peer["card"] = card
+    return True
+
+
+def _mark_llm_availability(data: dict, org_fingerprint: str) -> None:
+    """`/status`のスナップショットの各ピアに`llm_available`(bool)を付ける。
+    `_select_chat_candidates`は`False`のピアを推論系の候補から外す。ノード
+    一覧・ステータス表示には影響しない(ピア自体は残る)。
+
+    仮の判断: 除外は毎回この確認の結果だけで決める一時的な扱いで、状態は
+    持ち越さない(LM Studioが後から起動すれば次の確認で自動的に復帰する)。
+    単発の瞬断への猶予は設けない(必要になった時点で追加する方針)。
+    """
+    peers = data.get("peers", [])
+    results = [False] * len(peers)
+
+    def worker(index: int) -> None:
+        results[index] = _probe_peer_llm(peers[index], org_fingerprint)
+
+    threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(len(peers))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    for peer, available in zip(peers, results):
+        peer["llm_available"] = available
+        if not available:
+            name = peer.get("card", {}).get("device_name", peer.get("address"))
+            print(f"[⚠️ {name}: LLM未検出のため推論タスクの対象外]")
+    self_card = data.get("self", {})
+    if not self_card.get("models", {}).get("loaded"):
+        print(f"[⚠️ {self_card.get('device_name', '自分')}(自分): LLM未検出のため推論タスクの対象外]")
+
+
 def _fetch_org_snapshot(port: int, org_fingerprint: str, fail_fast: bool = False, quiet: bool = False):
     """キッチン(常駐エージェント)の`/status`に問い合わせ、自分自身のカードと
     ピア一覧を取得する。接続できない場合はNoneを返す
@@ -725,7 +783,7 @@ def _fetch_org_snapshot(port: int, org_fingerprint: str, fail_fast: bool = False
             timeout=CARD_REQUEST_TIMEOUT_SEC,
         )
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
     except Exception as exc:
         if not quiet:
             print("実行中のYoriaiエージェントに接続できませんでした。")
@@ -735,6 +793,12 @@ def _fetch_org_snapshot(port: int, org_fingerprint: str, fail_fast: bool = False
         if fail_fast:
             sys.exit(1)
         return None
+    # 仮の判断: 数秒おきのポーリング(quiet)や起動時・--statusの表示用
+    # (fail_fast)は一覧表示だけが目的で、ピアごとの追加HTTPを避けるため
+    # LLM疎通確認は行わない(候補選定に使う通常の呼び出しだけで確認する)。
+    if not quiet and not fail_fast:
+        _mark_llm_availability(data, org_fingerprint)
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -851,6 +915,8 @@ def _select_chat_candidates(self_card: dict, peers: list, local_port: int, task_
     if self_candidate:
         candidates.append(self_candidate)
     for peer in peers:
+        if peer.get("llm_available") is False:
+            continue  # LLM疎通不可のピアは推論系の候補から外す(一覧表示には残る)
         candidate = _build_chat_candidate(
             peer.get("card", {}), is_self=False, address=peer.get("address"), port=peer.get("port"), task_type=task_type,
         )
